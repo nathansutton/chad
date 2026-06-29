@@ -1,0 +1,73 @@
+[project]
+name = "chad"
+version = "0.1.0"
+description = "Local MLX-backed, Claude-Code-style coding agent (Apple Silicon, Ornith 35B/9B)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Upper-bounded on purpose: chad's model loading rides on mlx-lm's qwen3_5/qwen3_5_moe
+    # loader (expert-weight stacking + vision-tower strip). A minor bump could refactor it
+    # and silently break the `uvx --from git+…` install path, which resolves fresh from
+    # PyPI and ignores uv.lock. Stay on the known-good 0.31 line; bump deliberately.
+    "mlx>=0.31.2,<0.32",
+    "mlx-lm>=0.31.3,<0.32",
+    "numpy>=1.26,<2",
+    "huggingface-hub>=0.34", # first-run model download (cli.py/engine.py); imported directly, not just transitively
+    "jedi>=0.19.2", # in-process symbolic code intelligence (read/search/edit)
+    "prompt_toolkit>=3.0.43",
+    "tree-sitter>=0.25.2",
+    "tree-sitter-language-pack>=1.11.0",
+    "mcp>=1.28.1",
+]
+
+# The one entrypoint: `uv run chad`. (`chad-bench` reproduces docs/benchmarks.md.)
+[project.scripts]
+chad = "chad.cli:main"
+chad-bench = "chad.bench:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+# Standard src layout: the importable package lives at src/chad/. setuptools
+# auto-discovers it from the src dir below; the installed `chad` console script
+# then resolves `chad.cli:main` regardless of cwd.
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The model-backed eval tiers self-skip without weights; the fast unit gate stays green.
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Start tight-but-small and high-signal: pyflakes (F) catches real bugs
+# (unused/undefined names, bad imports); E9 (syntax errors); isort (I, auto-fixable).
+# The E4/E7 pycodestyle groups are intentionally NOT selected: this codebase
+# deliberately uses compound one-liners (`a; b`, `if x: return`) — 44 pre-existing
+# E701/E702/E731 hits — so enabling them would force churny, behavior-adjacent edits
+# far past this gate's mechanical-change limit. Expand (B, UP, SIM, E7) in a follow-up.
+select = ["F", "E9", "I"]
+ignore = ["E741"]  # ambiguous var names (l/I) appear in existing math code
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/chad"]
+ignore_missing_imports = true   # mlx/jedi/tree_sitter/mcp ship partial or no stubs
+warn_unused_ignores = true
+implicit_optional = true        # `x: T = None` defaults are idiomatic throughout; this
+                                # restores the pre-PEP-484 reading rather than rewriting
+                                # ~10 signatures to Optional[...] for a no-op annotation.
+# Lenient first pass: no --strict. `var-annotated` only flags empty-container vars whose
+# element type mypy can't infer (e.g. `box = {}`); it's low-signal and clearing it would
+# touch ~20 unrelated lines, so it's disabled now and re-enabled in the tightening pass.
+disable_error_code = ["var-annotated"]
+# Tighten (disallow_untyped_defs, re-enable var-annotated, add B/UP/SIM in ruff) in a
+# follow-up once this baseline holds.

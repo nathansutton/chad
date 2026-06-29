@@ -1,0 +1,32 @@
+name: tests
+
+# The fast unit gate loads NO model, so it runs in CI in seconds. The model-backed
+# eval tiers (Ornith) self-skip without the weights present — they are not run here;
+# run `uv run python run_tests.py --evals` locally with the model on disk for those.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fast-suite:
+    # Apple Silicon runner — MLX only builds/runs on arm64 macOS.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Lint + typecheck
+        run: |
+          uv run ruff check src tests
+          uv run mypy src/chad
+
+      - name: Run fast test gate (no model)
+        run: uv run pytest -q

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+*.log
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.DS_Store
+
+# local agent guide — not published (kept locally, references the private workshop)
+/CLAUDE.md
