@@ -1,32 +1,80 @@
 name: tests
 
-# The fast unit gate loads NO model, so it runs in CI in seconds. The model-backed
-# eval tiers (Ornith) self-skip without the weights present — they are not run here;
-# run `uv run python run_tests.py --evals` locally with the model on disk for those.
+# Apple Silicon only: MLX builds/runs on arm64 macOS, so every job that imports
+# chad runs on macos-14 (GitHub's arm64 runner). The fast unit gate loads NO model
+# and finishes in seconds; the model-backed eval tiers (Ornith) self-skip without
+# weights and are not run here — run `uv run python run_tests.py --evals` locally
+# with the model on disk for those.
 on:
   push:
     branches: [main]
   pull_request:
 
+# One run per ref; a new push cancels the in-flight run for that ref.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  fast-suite:
-    # Apple Silicon runner — MLX only builds/runs on arm64 macOS.
+  lint:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+      - run: uv sync
+      - name: ruff (lint + import order)
+        run: uv run ruff check src tests
+      - name: mypy (src only; config pins python 3.11)
+        run: uv run mypy src/chad
 
-      - name: Sync dependencies
-        run: uv sync
+  test:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync dependencies (python ${{ matrix.python }})
+        run: uv sync --python ${{ matrix.python }}
+      - name: Fast test gate (no model)
+        run: uv run --python ${{ matrix.python }} pytest -q
+      - name: CLI smoke (entrypoint imports + parses, no model)
+        run: uv run --python ${{ matrix.python }} chad --help
 
-      - name: Lint + typecheck
+  build:
+    # Guards the public install path: `uvx --from git+https://… chad` resolves fresh
+    # from PyPI and IGNORES uv.lock. A dep bump that breaks a clean resolve would pass
+    # the locked test job but break every new user, so we build the dist and install
+    # it into a lock-free venv, then confirm the console script resolves.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Fresh resolve install (no uv.lock) + entrypoint check
         run: |
-          uv run ruff check src tests
-          uv run mypy src/chad
+          uv venv --python 3.11 /tmp/fresh
+          VIRTUAL_ENV=/tmp/fresh uv pip install .
+          /tmp/fresh/bin/chad --help
 
-      - name: Run fast test gate (no model)
-        run: uv run pytest -q
+  lock:
+    # uv.lock must stay in sync with pyproject.toml. Pure metadata check — no MLX,
+    # so it runs on a cheap linux runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Lockfile is up to date
+        run: uv lock --check
