@@ -20,6 +20,11 @@ permissions:
 
 jobs:
   analyze:
+    # Code scanning is free on public repos but unavailable on private ones (it needs
+    # GitHub Advanced Security), where analyze@v3 fails on result upload. Gate on
+    # visibility so this skips cleanly while private and goes live the moment the repo
+    # is made public — no further setup needed.
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
