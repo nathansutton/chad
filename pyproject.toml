@@ -11,12 +11,12 @@ dependencies = [
     # PyPI and ignores uv.lock. Stay on the known-good 0.31 line; bump deliberately.
     "mlx>=0.31.2,<0.32",
     "mlx-lm>=0.31.3,<0.32",
-    "numpy>=1.26,<2",
+    "numpy>=2.4.6,<3",
     "huggingface-hub>=0.34", # first-run model download (cli.py/engine.py); imported directly, not just transitively
     "jedi>=0.19.2", # in-process symbolic code intelligence (read/search/edit)
     "prompt_toolkit>=3.0.43",
     "tree-sitter>=0.25.2",
-    "tree-sitter-language-pack>=1.11.0",
+    "tree-sitter-language-pack>=1.12.0",
     "mcp>=1.28.1",
 ]
 
@@ -29,7 +29,7 @@ chad-bench = "chad.bench:main"
 dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=82.0.1"]
 build-backend = "setuptools.build_meta"
 
 # Standard src layout: the importable package lives at src/chad/. setuptools
