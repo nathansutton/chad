@@ -21,7 +21,7 @@ that balloons: every step appends the model's reply, the tool call, and the tool
 output to the transcript, so a naive backend re-reads an ever-longer prompt *every
 step*. That is O(n) work per step and O(n²) over a session.
 
-Concretely, on a 24 GB M4 Pro at Ornith's ~350 tok/s prefill: by step 20 a real coding
+Concretely, on a 24 GB M4 Pro at Ornith's ~500 tok/s prefill: by step 20 a real coding
 session is ~5,000 tokens of transcript. Re-prefilling all of it is **~15 seconds of
 dead air before the model says anything — every step, and growing.** Over a 40-step
 task, prefill (not generation) is where the minutes vanish.
@@ -37,7 +37,7 @@ step N prompt:  [ system + tools | cwd · CLAUDE.md | turn 1 | … | turn N-1 | 
 ```
 
 Same session, ~30 new tokens per step instead of 5,000: **~0.1 s of prefill per step
-instead of ~15 s.** That gap is the entire reason a 9B model on a laptop can feel like
+instead of ~15 s.** That gap is the entire reason a 35B model on a laptop can feel like
 an agent instead of a batch job.
 
 ### Why prefill is *hard*, not just expensive
@@ -113,7 +113,7 @@ Implementation lives in `engine.py` (`_trimmable`, `warm_prefix`, the prefix dif
 
 A frontier model can often hold a repo's structure in its head: it reads a few files,
 infers the call graph, and keeps "which `save()` is the method and which is the free
-function" straight while it works. A 9B model on a laptop can't. It has weaker reasoning
+function" straight while it works. A 35B model on a laptop can't. It has weaker reasoning
 *and* a smaller context window where — as the whole prefill argument above shows — every
 extra token it reads to orient itself is wall-clock you pay for. So the two things a small
 local model is worst at, **navigation** and **context economy**, are exactly the two
@@ -186,9 +186,8 @@ cli.py ──▶ agent.py (agentic loop + guardrails) ──▶ engine.py (MLX +
 
 - **engine.py** — loads Ornith once, keeps its KV cache alive across turns, and on every
   turn diffs the new prompt against the cached token ids so it only prefills the appended
-  tokens. That's why multi-step tool loops
-  stay snappy: re-rendering the whole transcript each step prefills ~20–50 new tokens
-  while 5000+ are served from cache.
+  tokens. That's why multi-step tool loops stay snappy: re-rendering the whole transcript   
+  each step prefills ~20–50 new tokens while 5000+ are served from cache.  
 - **agent.py** — renders the conversation through the model's chat template (with tool
   schemas), streams the turn, parses tool calls, runs them, feeds results back, loops
   until the model stops calling tools.

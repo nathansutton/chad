@@ -1,15 +1,13 @@
-# Chad — a local, MLX-backed Claude-Code-style coding agent
+# Chad — a local, MLX-backed coding agent
 
 ![Claude: Master of the Universe (an ornate, impossibly intricate carved-horse banister) vs Chad: Master of Your Laptop (a plastic toy horse gaffer-taped to a stair post)](docs/chad-vs-claude.png)
 
 > Claude can do anything, for anyone, anywhere. Chad does one thing. 🗿
 > *We are not the same.*
 
-Chad has the same moves as Claude Code — tool use, plan mode, a real TUI — but driven
+Chad has some of the same moves as Claude — tool use, plan mode, a real TUI — but driven
 by a local model on your laptop instead of a frontier model in a datacenter. He isn't a
-smaller Claude; he's a sharper knife for a narrower cut. The strength *is* the narrowness:
-Chad does exactly one thing — MLX inference on a MacBook Pro — and he does it about as
-fast as that machine can.
+smaller Claude; he's a blunter instrument.  
 
 |                     | **Claude**                                       | **Chad** 🗿                                |
 |---------------------|--------------------------------------------------|--------------------------------------------|
@@ -21,11 +19,11 @@ fast as that machine can.
 | **Harness**         | open-ended, anything you can imagine             | plan. execute. nothing else.               |
 | **When it's wrong** | reasons its way out                              | already shipped it 🗿                      |
 
-> Chad isn't an H100 server, and never will be — the big leagues are for Claude. Chad
-> does **one** thing, MLX inference on a MacBook Pro, and the whole repo is about making
-> that one thing as fast as the laptop allows: a persistent prefix KV cache so prefill
-> never re-reads the transcript, and a model that decodes near the memory-bandwidth
-> ceiling. He's not here to win benchmarks. He's just here to help. 🗿
+> Chad doesn't run on a H100 server, and you don't have one.  He will never will be in the 
+> big leagues.  Those are for Claude. Chad does **one** thing, MLX inference on a MacBook Pro, 
+> and the whole repo is about making that one thing as fast as the laptop allows: a persistent
+> prefix KV cache so prefill never re-reads the transcript, and a model that decodes near the
+> memory-bandwidth ceiling. He's not here to win SOTA benchmarks. He's just here to help. 🗿
 
 ![Chad fixing a failing test end to end — reason, read, edit, rerun pytest, all on a local 35B](docs/demo.gif)
 
