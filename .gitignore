@@ -10,3 +10,4 @@ dist/
 
 # local agent guide — not published (kept locally, references the private workshop)
 /CLAUDE.md
+.gstack/
