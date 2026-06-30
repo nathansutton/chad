@@ -1,15 +1,15 @@
-# Chad — a local, MLX-backed coding agent
+# chad — a local, MLX-backed coding agent
 
-![Claude: Master of the Universe (an ornate, impossibly intricate carved-horse banister) vs Chad: Master of Your Laptop (a plastic toy horse gaffer-taped to a stair post)](docs/chad-vs-claude.png)
+![Claude: Master of the Universe (an ornate, impossibly intricate carved-horse banister) vs chad: Master of Your Laptop (a plastic toy horse gaffer-taped to a stair post)](docs/chad-vs-claude.png)
 
-> Claude can do anything, for anyone, anywhere. Chad does one thing. 🗿
+> Claude can do anything, for anyone, anywhere. chad does one thing. 🗿    
 > *We are not the same.*
 
-Chad has some of the same moves as Claude — tool use, plan mode, a real TUI — but driven
+chad has some of the same moves as Claude — tool use, plan mode, a real TUI — but driven
 by a local model on your laptop instead of a frontier model in a datacenter. He isn't a
 smaller Claude; he's a blunter instrument.  
 
-|                     | **Claude**                                       | **Chad** 🗿                                |
+|                     | **Claude**                                       | **chad** 🗿                                |
 |---------------------|--------------------------------------------------|--------------------------------------------|
 | **Range**           | every workflow, every person, incredible nuance  | one job: code, on your machine             |
 | **Runs**            | anywhere — cloud, IDE, terminal, phone           | your laptop. that's it.                    |
@@ -19,13 +19,13 @@ smaller Claude; he's a blunter instrument.
 | **Harness**         | open-ended, anything you can imagine             | plan. execute. nothing else.               |
 | **When it's wrong** | reasons its way out                              | already shipped it 🗿                      |
 
-> Chad doesn't run on a H100 server, and you don't have one.  He will never will be in the 
-> big leagues.  Those are for Claude. Chad does **one** thing, MLX inference on a MacBook Pro, 
+> chad doesn't run on a H100 server, and you don't have one.  He will never will be in the 
+> big leagues.  Those are for Claude. chad does **one** thing, MLX inference on a MacBook Pro, 
 > and the whole repo is about making that one thing as fast as the laptop allows: a persistent
 > prefix KV cache so prefill never re-reads the transcript, and a model that decodes near the
 > memory-bandwidth ceiling. He's not here to win SOTA benchmarks. He's just here to help. 🗿
 
-![Chad fixing a failing test end to end — reason, read, edit, rerun pytest, all on a local 35B](docs/demo.gif)
+![chad fixing a failing test end to end — reason, read, edit, rerun pytest, all on a local 35B](docs/demo.gif)
 
 > Real session, unedited: the default local 35B reasons through the failure, edits the
 > file, reruns the tests, and confirms green. The cold model load is cut; everything after
@@ -66,7 +66,7 @@ uv run chad -c               # resume this directory's last conversation
 To measure throughput on your own machine, `uv run chad-bench` (see
 [Throughput & performance](docs/benchmarks.md)).
 
-**The model.** Chad picks one model for you and downloads it once into the shared Hugging
+**The model.** chad picks one model for you and downloads it once into the shared Hugging
 Face cache (`~/.cache/huggingface`, reused across every project):
 
 | Your Mac | Model | Footprint |
@@ -74,11 +74,11 @@ Face cache (`~/.cache/huggingface`, reused across every project):
 | **≥ 24 GB** (default) | [Ornith-1.0-35B `UD-Q2_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX) — 35B MoE, 2-bit experts | ~12 GB |
 | **16 / 18 GB** (auto-fallback) | [Ornith-1.0-9B `UD-Q4_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX) — 4-bit AWQ | ~5 GB |
 
-Chad detects your RAM and chooses; the first run asks before downloading (~12 GB / ~5 GB),
+chad detects your RAM and chooses; the first run asks before downloading (~12 GB / ~5 GB),
 or auto-downloads when headless. No model picker, no flags. Override with `CHAD_MODEL=<repo
 or local dir>` to force a specific one. Quant names follow
 [Unsloth's dynamic-quant convention](https://docs.unsloth.ai/) (`UD-…`) so the scheme is
-recognizable. Chad downloads the pre-quantized model from Hugging Face on first run.
+recognizable. chad downloads the pre-quantized model from Hugging Face on first run.
 
 That's the whole on-ramp. The model and the throughput numbers you can reproduce live in
 [Throughput & performance](docs/benchmarks.md).
@@ -134,12 +134,12 @@ echo "fix the typo in greet.py" | uv run chad "$(cat)"   # pipe a task in
 | `--no-think` | skip Ornith's `<think>` blocks — faster on well-scoped work (thinking is on by default) |
 | `--repl` | plain line REPL instead of the TUI |
 
-No model flag: Chad runs Ornith (the RAM-appropriate size — see [Quickstart](#quickstart)).
+No model flag: chad runs Ornith (the RAM-appropriate size — see [Quickstart](#quickstart)).
 A headless task (positional, or piped with no TTY) auto-approves mutating tools — otherwise
 the confirm prompt would EOF and no file could ever change. Use `--plan` for a read-only
 investigation.
 
-The model runs greedy (temp 0). On first run Chad downloads it from Hugging Face into
+The model runs greedy (temp 0). On first run chad downloads it from Hugging Face into
 `~/.cache/huggingface` (~12 GB for the 35B, ~5 GB for the 9B); thereafter it loads from
 that cache.
 
@@ -147,16 +147,16 @@ The rarely-touched tuning knobs (`CHAD_MAX_CONTEXT`, `CHAD_KV_BITS`, `CHAD_MODEL
 safety/A-B opt-outs, and the session-log controls) live in environment variables, fully
 documented in the [Configuration reference](docs/configuration.md).
 
-## Extending Chad
+## Extending chad
 
-Chad speaks the same two extension formats as Claude Code:
+chad speaks the same two extension formats as Claude Code:
 
 - **[Agent Skills](https://agentskills.io)** — drop a `SKILL.md` folder in
-  `./.claude/skills/` (or `~/.claude/skills/`) and Chad discovers it, loading the full
+  `./.claude/skills/` (or `~/.claude/skills/`) and chad discovers it, loading the full
   instructions only when a task matches (progressive disclosure keeps context small).
 - **[MCP servers](https://modelcontextprotocol.io)** — configure stdio or HTTP servers in
   `./.mcp.json` (or `~/.chad/mcp.json`) to expose external tools (GitHub, Postgres, Linear,
-  Slack, …) alongside Chad's builtins, with static-token and OAuth auth.
+  Slack, …) alongside chad's builtins, with static-token and OAuth auth.
 
 Both are covered in full — discovery rules, config schema, OAuth flow, the harness
 behavior — in the [Configuration reference](docs/configuration.md).

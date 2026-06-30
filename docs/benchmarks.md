@@ -57,12 +57,12 @@ Token generation is **memory-bandwidth bound**: each token streams the resident 
 through the chip once, so `tok/s ≈ bandwidth / resident-bytes-per-token`. On this M4 Pro
 (~273 GB/s) the 9B's ~5 GB of 4-bit weights cap decode near **~46 tok/s**; the 35B MoE
 touches fewer bytes per token (sparse experts) and lands near **~71 tok/s**. This is a
-property of the machine, not the harness — it's the ceiling Chad runs *at*, not past. "As
+property of the machine, not the harness — it's the ceiling chad runs *at*, not past. "As
 fast as a MacBook Pro gets — no faster." 🗿
 
 ## The model: Ornith
 
-Chad runs **one** model from the Ornith family, picked by your RAM: the **35B** MoE
+chad runs **one** model from the Ornith family, picked by your RAM: the **35B** MoE
 (2-bit experts) on ≥24 GB Macs, the **9B** dense (4-bit) on 16/18 GB ones (see
 [Quickstart](../README.md#quickstart)). Both are converted to MLX with a mixed-precision
 quant (the vision tower is stripped at load by mlx-lm's `qwen3_5` loader). It's a *thinking*

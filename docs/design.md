@@ -1,10 +1,10 @@
 # Design & internals
 
-*The engineering story behind Chad — why it's built the way it is. For install and
+*The engineering story behind chad — why it's built the way it is. For install and
 usage, see the [README](../README.md). For measured numbers, see
 [benchmarks](benchmarks.md).*
 
-## Why Chad exists
+## Why chad exists
 
 The interesting engineering in a local coding agent isn't the tool use — it's making a
 small model on a laptop feel *responsive* in an agentic loop. That comes down to one
@@ -26,7 +26,7 @@ session is ~5,000 tokens of transcript. Re-prefilling all of it is **~15 seconds
 dead air before the model says anything — every step, and growing.** Over a 40-step
 task, prefill (not generation) is where the minutes vanish.
 
-Chad's answer is a **persistent prefix KV cache**: keep the KV state alive across turns
+chad's answer is a **persistent prefix KV cache**: keep the KV state alive across turns
 and diff each new prompt against what's already cached, so you only prefill the handful
 of *appended* tokens.
 
@@ -43,15 +43,15 @@ an agent instead of a batch job.
 ### Why prefill is *hard*, not just expensive
 
 The cache only helps if the new prompt is a strict *extension* of the cached one. Two
-things fight that, and Chad handles both:
+things fight that, and chad handles both:
 
 - **Compaction.** Long sessions overflow the context window, so old tool output must be
   trimmed — which changes the prefix and would normally throw the whole cache away.
-  Chad compacts oldest-first and reclaims enough in a single pass that it won't
+  chad compacts oldest-first and reclaims enough in a single pass that it won't
   re-trigger next step (see [Context window](configuration.md#context-window-agentic-coding-needs-room)).
 - **A non-trimmable cache.** Ornith is a hybrid SSM/attention model: its recurrent
   layers carry state that *can't be rewound to an arbitrary earlier token*. The cache
-  can only grow by append; any divergence forces a full rebuild. Chad leans into that —
+  can only grow by append; any divergence forces a full rebuild. chad leans into that —
   it reuses by extension and keeps a disk-checkpointed copy of the stable system+tools
   prefix, so even a divergence reloads that ~3k-token base instead of re-prefilling it
   from scratch.
@@ -59,11 +59,11 @@ things fight that, and Chad handles both:
 Everything below is how that gets built — and the rest of what it takes to make a small
 model act like a coding agent.
 
-## Trimmable vs. append-only: the cache trade Chad lives with
+## Trimmable vs. append-only: the cache trade chad lives with
 
 The whole prefill story above hinges on reusing the KV cache. There's a second property of
 a KV cache that decides *how* you're allowed to reuse it, and it's worth naming because
-Chad's model gives one up: **trimmability** — the ability to rewind the cache to an
+chad's model gives one up: **trimmability** — the ability to rewind the cache to an
 arbitrary earlier token and keep going from there.
 
 A **pure-attention** transformer is trimmable. Each token's K/V is computed independently
@@ -89,14 +89,14 @@ gated on that flag and falls back cleanly — it can never speed up the shipped 
 
 That's not a pure loss — it's the *same* recurrent design that keeps Ornith's KV footprint
 flat (a fixed-size SSM state no matter how long the context grows; see the
-[Context window](configuration.md#context-window-agentic-coding-needs-room) table). Chad trades
+[Context window](configuration.md#context-window-agentic-coding-needs-room) table). chad trades
 trimmability for a memory profile that fits comfortably in 24 GB. The job, then, is to stay
-fast on an **append-only** cache, which Chad does three ways:
+fast on an **append-only** cache, which chad does three ways:
 
 1. **Reuse by *extension* only.** The normal agentic loop only ever *appends* — the model's
    reply, the tool call, the tool output — so each new prompt is a strict extension of the
    cached one and hits the cache verbatim. That's the 99% case, and it's free.
-2. **Compaction that protects the prefix.** When the window fills, Chad compacts
+2. **Compaction that protects the prefix.** When the window fills, chad compacts
    oldest-first and reclaims enough in one pass that it won't re-trigger next step, keeping
    recent turns byte-identical so the cache extension still holds.
 3. **A disk-checkpointed stable base.** The system+tools prefix (~3k tokens — the part that
@@ -105,7 +105,7 @@ fast on an **append-only** cache, which Chad does three ways:
    divergence that can't be reused in RAM, that base reloads with **zero prefill** instead
    of being rebuilt from scratch.
 
-So where a trimmable model would lean on PLD and partial-prefix repair, Chad leans on
+So where a trimmable model would lean on PLD and partial-prefix repair, chad leans on
 append-only reuse + a warm on-disk base — and gets the responsive agentic loop anyway.
 Implementation lives in `engine.py` (`_trimmable`, `warm_prefix`, the prefix diff).
 
@@ -120,7 +120,7 @@ local model is worst at, **navigation** and **context economy**, are exactly the
 things a language server fixes. That makes the LSP layer disproportionately valuable here:
 it's not a nicety, it's how a small model navigates a real repo without flailing.
 
-Chad's code intelligence is a **two-phase symbolic stack**, deliberately split by what
+chad's code intelligence is a **two-phase symbolic stack**, deliberately split by what
 each phase is good at:
 
 - **Structure (tree-sitter, `repomap.py`).** Fast and language-agnostic. `repo_map` ranks

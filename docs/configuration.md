@@ -1,17 +1,17 @@
 # Configuration & reference
 
-*Extending Chad (Agent Skills, MCP servers) and the full flag/env-var reference. For the
+*Extending chad (Agent Skills, MCP servers) and the full flag/env-var reference. For the
 basics, see the [README](../README.md).*
 
 ## Agent Skills (agentskills.io)
 
-Chad implements the open [Agent Skills](https://agentskills.io) format, so a skill
+chad implements the open [Agent Skills](https://agentskills.io) format, so a skill
 authored for Claude Code (or any compatible client) works here unchanged. A *skill* is a
 folder with a `SKILL.md` — YAML frontmatter (`name` + `description`, plus optional
 `license`/`compatibility`/`metadata`/`allowed-tools`) followed by markdown instructions —
 optionally bundling `scripts/`, `references/`, and `assets/`.
 
-**Where Chad looks** (project skills override user skills on a name clash):
+**Where chad looks** (project skills override user skills on a name clash):
 
 | Scope   | Paths |
 | ------- | ----- |
@@ -38,10 +38,10 @@ no-op. Implementation: `src/chad/skills.py` (discovery/parse/activate), with the
 
 ## MCP servers (modelcontextprotocol.io)
 
-Agent Skills add *instructions*; **MCP** adds *tools*. Chad can connect to external
+Agent Skills add *instructions*; **MCP** adds *tools*. chad can connect to external
 [Model Context Protocol](https://modelcontextprotocol.io) servers — a GitHub server, a
 Postgres server, a company's internal API server, or hosted connectors like Linear and
-Slack — and expose their tools to the model alongside its builtins. Chad uses the official
+Slack — and expose their tools to the model alongside its builtins. chad uses the official
 `mcp` SDK for transport, so it speaks both **stdio** (local subprocess servers) and
 **Streamable HTTP** (hosted/remote servers).
 
@@ -75,7 +75,7 @@ the `url`/`command` presence is authoritative. A stdio server's `command`/`args`
 launches it; an HTTP server's `url` is reached over the network and any `headers` (e.g. a
 static `Authorization: Bearer …` token) are sent on every request. `"disabled": true` skips
 a server, `"timeout"` (seconds) overrides the per-call limit, and `"connect_timeout"`
-(seconds) bounds the initial connect. At startup Chad connects every server **in parallel
+(seconds) bounds the initial connect. At startup chad connects every server **in parallel
 and time-bounded** (one dead endpoint can't stall the others), runs the `initialize`
 handshake, lists each server's tools (paginated), and registers them.
 
@@ -116,7 +116,7 @@ refreshes the token as needed). Notes:
 
 **How they behave in the harness:**
 
-- **Namespaced** `mcp__<server>__<tool>`, so server tools can't collide with Chad's
+- **Namespaced** `mcp__<server>__<tool>`, so server tools can't collide with chad's
   builtins (`bash`/`read`/…) or with each other.
 - **Same validation path** as builtins — each tool's `inputSchema` drives the typed-coerce
   + self-repair loop (`"3"`→`3`, missing-required detection), no schema duplication.
@@ -153,7 +153,7 @@ eval bench keeps for research), where the KV cache grows linearly with context:
 | 128k (YaRN) | 4.8 GB | 2.4 GB |
 | 256k | 9.7 GB | 4.8 GB |
 
-Ornith — the model Chad ships — is a **hybrid SSM/attention** model: its recurrent
+Ornith — the model chad ships — is a **hybrid SSM/attention** model: its recurrent
 layers carry a *fixed-size* state no matter how long the context gets, so only its
 attention layers grow. Its real footprint is flatter than the table above and sits well
 inside 24 GB alongside the ~5 GB of weights. When the prompt nears the window, old
@@ -176,13 +176,13 @@ CHAD_CTX_LIMIT=28000    uv run chad      # prompt-token budget before old tool o
 CHAD_MODEL=/path/to/mlx-model uv run chad  # power-user escape hatch: run a different MLX model
 ```
 
-`CHAD_MODEL` points Chad at any local MLX model directory instead of Ornith. The harness
+`CHAD_MODEL` points chad at any local MLX model directory instead of Ornith. The harness
 is tuned for Ornith, so this is unsupported and mostly there for research — the happy
 path is the single bundled model, no flag.
 
 ### Safety & A/B opt-outs
 
-These flip behavior off rather than tune it. The two safety opt-outs **weaken** Chad's
+These flip behavior off rather than tune it. The two safety opt-outs **weaken** chad's
 defenses — leave them unset in normal use; they exist for measurement and edge cases.
 
 ```bash
@@ -197,7 +197,7 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
 - **`CHAD_NO_VALIDATE`** — **disables** the typia-style lenient-parse → typed-validate →
   self-repair loop for tool-call arguments (`validate.py`), falling back to a strict
   `json.loads` plus a terse missing-required check. This *weakens* input handling (malformed
-  or loosely-typed tool calls that Chad would normally coerce/repair will instead error). An
+  or loosely-typed tool calls that chad would normally coerce/repair will instead error). An
   A/B knob to measure what validation buys per model — leave unset in normal use.
 - **`CHAD_NO_DESTRUCTIVE_GUARD`** — **disables** the catastrophic-bash seatbelt
   (`guardrails.py`) even in `--yolo`/auto mode. With it set, an injected `rm -rf ~`,
@@ -212,6 +212,6 @@ and result previews — to `~/.chad/session.log`. It's now size-bounded (rotated
 5 MB × 3) and passes previews through a best-effort secret redactor, but it still
 records command/file previews in plaintext outside the repo, so treat it as
 sensitive. Set **`CHAD_NO_SESSION_LOG=1`** (any truthy value) to disable the session
-log entirely — Chad installs a null handler and won't create `~/.chad` for the log's
+log entirely — chad installs a null handler and won't create `~/.chad` for the log's
 sake. (For the same privacy reason, the resumable conversation store under
 `~/.chad/sessions/` — which holds full tool args and results — is created mode `0600`.)
