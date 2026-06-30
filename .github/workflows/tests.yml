@@ -9,6 +9,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 # One run per ref; a new push cancels the in-flight run for that ref.
 concurrency:

@@ -1,5 +1,7 @@
 # chad — a local, MLX-backed coding agent
 
+[![tests](https://github.com/nathansutton/chad/actions/workflows/tests.yml/badge.svg)](https://github.com/nathansutton/chad/actions/workflows/tests.yml)
+
 ![Claude: Master of the Universe (an ornate, impossibly intricate carved-horse banister) vs chad: Master of Your Laptop (a plastic toy horse gaffer-taped to a stair post)](docs/chad-vs-claude.png)
 
 > Claude can do anything, for anyone, anywhere. chad does one thing. 🗿    
