@@ -48,6 +48,7 @@ def _trace_prefill(row: dict) -> None:
     """Append one JSON line to the prefill trace and flush (sessions get killed mid-run,
     so we durably land every row). Best-effort: a trace IO error must never break a turn,
     so swallow it. Only ever called when _PREFILL_TRACE is set."""
+    assert _PREFILL_TRACE is not None
     try:
         with open(_PREFILL_TRACE, "a") as f:
             f.write(json.dumps(row) + "\n")

@@ -24,15 +24,14 @@ smaller Claude; he's a blunter instrument.
 Think of it as report cards. On [terminal-bench 2.1](https://www.tbench.ai/leaderboard) —
 the standard exam for CLI coding agents — Claude (Opus 4.8) is the **A student** at
 **82.7%**, near the top of the class. Ornith, the model behind chad, is a **C+ student**
-(terminus-2 harness): **64.2%** for the 35B that runs on a 24 GB Mac. The bet was never 
-that chad out-scores Claude — it's that a C+ student running free on your own machine
-is still worth having around. 🗿
+at **64.2%**.  The bet was never that chad out-scores Claude — it's that a C+ student 
+running free on your own machine is still worth having around. 🗿
 
 > chad doesn't run on a H100 server, and you don't have one.  He will never will be in the 
 > big leagues.  Those are for Claude. chad does **one** thing, MLX inference on a MacBook Pro, 
-> and the whole repo is about making that one thing as fast as the laptop allows: a persistent
+> and this whole repo is about making that one thing as fast as the laptop allows: a persistent
 > prefix KV cache so prefill never re-reads the transcript, and a model that decodes near the
-> memory-bandwidth ceiling. He's not here to win SOTA benchmarks. He's just here to help. 🗿
+> memory-bandwidth ceiling. chad is not here to win SOTA benchmarks. He's just here to help. 🗿
 
 ![chad fixing a failing test end to end — reason, read, edit, rerun pytest, all on a local 35B](docs/demo.gif)
 
