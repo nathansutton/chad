@@ -108,6 +108,46 @@ def test_no_match():
     check("no-match returns empty", got == [], repr(got))
 
 
+def test_prefill_progress_callback():
+    """Tier 1 (no weights): `_prefill` reports per-chunk progress via on_progress(done,
+    total) — monotonic, ending exactly at total — and runs identically with NO callback.
+
+    The added line is `if on_progress: on_progress(i, n)` AFTER the model forward + i
+    increment, so with no callback the cache-feeding loop is byte-identical. We prove
+    that here by asserting the sequence of forward-pass shapes is the same with and
+    without the callback (full decoded-output equivalence is the model-gated tier-2
+    job; this path feeds the non-trimmable cache, so the no-op guarantee matters)."""
+    import mlx.core as mx
+    from chad.engine import Engine
+
+    class _FakeCacheItem:
+        def __init__(self):
+            self.state = mx.array([0.0])
+
+    def _make_engine(forward_shapes):
+        eng = object.__new__(Engine)  # bypass __init__ (no weights to load)
+        eng._cache = [_FakeCacheItem(), _FakeCacheItem()]
+        eng.model = lambda arr, cache=None: forward_shapes.append(int(arr.shape[1]))
+        return eng
+
+    # 70 tokens, chunk 32 -> forwards of 32,32,6; progress fires done=32,64,70.
+    shapes, seen = [], []
+    fed = _make_engine(shapes)._prefill(
+        list(range(70)), chunk=32, on_progress=lambda d, t: seen.append((d, t)))
+    dones = [d for d, _ in seen]
+    check("prefill returns full count", fed == 70, f"fed={fed}")
+    check("progress fired per chunk, ending at total", dones == [32, 64, 70], str(seen))
+    check("progress total constant", all(t == 70 for _, t in seen), str(seen))
+    check("progress monotonic", dones == sorted(dones), str(dones))
+
+    # No callback: same forward-pass shapes, same fed count -> instrumentation is a no-op.
+    shapes_none = []
+    fed_none = _make_engine(shapes_none)._prefill(list(range(70)), chunk=32)
+    check("no-callback fed identical", fed_none == fed, f"{fed_none} vs {fed}")
+    check("no-callback forward shapes identical", shapes_none == shapes,
+          f"{shapes_none} vs {shapes}")
+
+
 def test_guards():
     # num_draft <= 0 -> [] even with an obvious match.
     check("num_draft=0 guard", prompt_lookup_draft([1, 2, 1, 2], 0) == [])
@@ -403,7 +443,7 @@ def test_truncation_recovery_matches_fresh():
 
 if __name__ == "__main__":
     tier1 = (test_longest_match_wins, test_recency_tie_break, test_no_match,
-             test_guards, test_draft_length)
+             test_guards, test_draft_length, test_prefill_progress_callback)
     tier2 = (test_pld_equals_greedy,
              test_pld_hybrid_equals_greedy,
              test_degenerate_reprefill_matches_fresh,

@@ -21,6 +21,14 @@ smaller Claude; he's a blunter instrument.
 | **Harness**         | open-ended, anything you can imagine             | plan. execute. nothing else.               |
 | **When it's wrong** | reasons its way out                              | already shipped it 🗿                      |
 
+Think of it as report cards. On [terminal-bench 2.1](https://www.tbench.ai/leaderboard) —
+the standard exam for CLI coding agents — Claude (Opus 4.8) is the **A student** at
+**82.7%**, near the top of the class. Ornith, the model behind chad, is a **C student**
+(terminus-2 harness): **64.2%** for the 35B that runs on a 24 GB Mac, **43.1%** for the 9B
+that fits 16/18 GB — small local models that run on your laptop, not in a datacenter. The
+bet was never that chad out-scores Claude — it's that a C student running free on your own
+machine, offline, is still worth having around. 🗿
+
 > chad doesn't run on a H100 server, and you don't have one.  He will never will be in the 
 > big leagues.  Those are for Claude. chad does **one** thing, MLX inference on a MacBook Pro, 
 > and the whole repo is about making that one thing as fast as the laptop allows: a persistent
@@ -96,7 +104,12 @@ That's the whole on-ramp. The model and the throughput numbers you can reproduce
   order. The status bar shows the queued count.
 - **ctrl-c interrupts the running turn** (stops generation) without killing the session.
 - **inline y/n approval** for mutating tools in normal mode.
-- **live status line** — model, mode, context %, tok/s (and PLD acceptance when active).
+- **live status line** — model, mode, context %, and a live activity readout: a state
+  glyph + verb (Reading / Editing / Running…), elapsed seconds, and **↑prefilled /
+  ↓generated** token counts. When the prefix cache can't be reused and a full prefill is
+  unavoidable (after a `/compact` or a truncation invalidates the cached prefix), it shows
+  an advancing **%** so that otherwise-silent re-prefill is legible. (Raw tok/s and
+  PLD-acceptance diagnostics still go to `~/.chad/session.log`.)
 - **slash commands** — `/init` (scaffold a `CLAUDE.md` from the actual project files),
   `/skills` (list discovered Agent Skills), `/mcp` (list configured MCP servers + their
   tools), `/reset` (`/clear`), `/compact` (reclaim context now — strips old reasoning +
@@ -114,7 +127,11 @@ The agent loop runs on a worker thread; the UI owns the asyncio loop. Agent I/O
 (`emit`/`confirm`/`should_stop`) is injected, so the *same* `Agent` code drives both the
 TUI and the plain line REPL (`--repl`). The loop stays fast on a **persistent prefix KV
 cache**: each step re-renders the whole transcript but only prefills the handful of new
-tokens (see [Design & internals](docs/design.md)).
+tokens. The few moments it *can't* — Ornith's hybrid SSM/attention cache is non-trimmable,
+so `/compact` or a mid-turn truncation invalidates the prefix and forces a one-time full
+re-prefill — are exactly when the status line's advancing **%** earns its place: the long
+prefill is the price of the cache design, now shown rather than silent (see
+[Design & internals](docs/design.md)).
 
 ## Usage
 

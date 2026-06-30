@@ -103,7 +103,52 @@ def test_pick_model_prefers_local_dir(monkeypatch):
     check("local 35B preferred over HF repo", model == cli._LOCAL_35B, model)
 
 
+def test_ram_aware_ctx_limit():
+    GB = 1e9
+    # Measured 24 GB M4 Pro numbers (scripts/kv_ram_probe.py): 19.07 GB working set,
+    # 12.06 GB resident after load, 20,578 B/token, 262 k window. Expect a trigger well
+    # above the old 120 k cap but below the window.
+    n = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
+                                reserve_gb=1.5, safety=0.90)
+    check("24GB box: above old 120k cap", n > 120_000, n)
+    check("24GB box: below the window", n < 262144 - 2048, n)
+    check("24GB box: in the measured ~175k range", 150_000 < n < 200_000, n)
+
+    # Tight box (less working set) compacts sooner — strictly smaller window.
+    tight = cli.ram_aware_ctx_limit(262144, 10.0 * GB, 8.0 * GB, 20578)
+    check("tight box compacts sooner", tight < n, (tight, n))
+
+    # Huge box is capped at the model window minus the gen margin, never above it.
+    huge = cli.ram_aware_ctx_limit(262144, 400.0 * GB, 12.0 * GB, 20578)
+    check("huge box capped at window-margin", huge == 262144 - 2048, huge)
+
+    # Degenerate inputs -> None so the caller keeps the old fixed cap.
+    check("no KV cost -> None", cli.ram_aware_ctx_limit(262144, 19 * GB, 12 * GB, 0) is None)
+    check("no budget -> None", cli.ram_aware_ctx_limit(262144, 0, 12 * GB, 20578) is None)
+
+    # Reserve eats into the budget: a bigger scratch reserve -> a smaller window.
+    big_reserve = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
+                                          reserve_gb=4.0)
+    check("bigger reserve shrinks window", big_reserve < n, (big_reserve, n))
+
+    # Over-subscribed (model already past the safe budget) -> floor, never negative.
+    floored = cli.ram_aware_ctx_limit(262144, 14 * GB, 18 * GB, 20578)
+    check("over-subscribed -> floor", floored == 8192, floored)
+
+
+def test_env_float(monkeypatch):
+    monkeypatch.delenv("CHAD_X_F", raising=False)
+    check("unset float -> None", cli._env_float("CHAD_X_F") is None)
+    monkeypatch.setenv("CHAD_X_F", "2.5")
+    check("float parses", cli._env_float("CHAD_X_F") == 2.5)
+    monkeypatch.setenv("CHAD_X_F", "")
+    check("empty float -> None", cli._env_float("CHAD_X_F") is None)
+
+
 if __name__ == "__main__":
+    test_ram_aware_ctx_limit()
+    with pytest.MonkeyPatch.context() as mp:
+        test_env_float(mp)
     with pytest.MonkeyPatch.context() as mp:
         test_env_int(mp)
     with pytest.MonkeyPatch.context() as mp:

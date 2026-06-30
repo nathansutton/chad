@@ -123,6 +123,7 @@ class Engine:
     _trimmable: bool = field(init=False, default=False)
     _pld_hybrid: bool = field(init=False, default=False)
     _warm_prefix_ids: Any = field(init=False, default=None)
+    kv_bytes_per_token: float = field(init=False, default=0.0)  # measured at load (036)
 
     def _read_config(self, repo):
         import json
@@ -185,7 +186,37 @@ class Engine:
             self.draft, _ = load(self.draft_id, model_config=d_override) if d_override \
                 else load(self.draft_id)
         self._reset_cache()
+        self.kv_bytes_per_token = self._measure_kv_bytes_per_token()
         return time.time() - t0
+
+    def _measure_kv_bytes_per_token(self, probe: int = 8) -> float:
+        """One-time: per-token bytes the growing attention KV cache costs, so the
+        RAM-aware compaction trigger (plan 036, cli.py) can size context from real
+        per-token cost instead of a magic constant — model/quant-agnostic.
+
+        Feeds a few tokens through a fresh cache and reads each KVCache layer's
+        per-token stride straight from its array shape (`nbytes / seq_len`), which is
+        exact regardless of MLX's step-padding (both numerator and denominator include
+        the padding). The 30 SSM/DeltaNet ArraysCache layers hold a fixed recurrent
+        state that does NOT grow with context, so they're excluded — only the 10
+        attention layers scale. Cheap (~0.1 s, 8-token forward); leaves a clean reset
+        cache behind. Returns 0.0 on any failure (cli then falls back to the old cap)."""
+        try:
+            self._reset_cache()
+            self._prefill(list(range(100, 100 + probe)))
+            mx.eval([c.state for c in self._cache])
+            bpt = 0.0
+            for c in self._cache:
+                if isinstance(c, cache_utils.KVCache):
+                    for arr in (getattr(c, "keys", None), getattr(c, "values", None)):
+                        if arr is not None and len(arr.shape) >= 3 and arr.shape[2]:
+                            bpt += arr.nbytes / arr.shape[2]
+            return bpt
+        except Exception:  # noqa: BLE001 — instrumentation must never break load
+            return 0.0
+        finally:
+            self._reset_cache()
+            mx.clear_cache()
 
     # -- cache management -------------------------------------------------
 
@@ -360,11 +391,18 @@ class Engine:
 
     # -- generation -------------------------------------------------------
 
-    def _prefill(self, ids: list, should_stop=None, chunk: int = 256) -> int:
+    def _prefill(self, ids: list, should_stop=None, chunk: int = 256,
+                 on_progress=None) -> int:
         """Feed token ids through the model into the live cache in chunks, checking
         should_stop between chunks. Returns the count actually fed (< len(ids) when
         interrupted). This is what makes a large re-prefill abortable: MLX runs one
-        chunk at a time and we get a chance to bail between them."""
+        chunk at a time and we get a chance to bail between them.
+
+        on_progress(done, total), if given, fires once per chunk with the tokens fed
+        so far (monotonic, ending at `total` on a clean pass) so a caller can show a
+        live progress %. It is **only** called when not None — the hot loop is
+        byte-identical to a no-callback run, which matters because this feeds the
+        non-trimmable cache."""
         mc = self._cache
         n = len(ids)
         i = 0
@@ -375,6 +413,8 @@ class Engine:
             self.model(mx.array(ids[i : i + step], dtype=mx.uint32)[None], cache=mc)
             mx.eval([c.state for c in mc])
             i += step
+            if on_progress:
+                on_progress(i, n)
         return i
 
     def generate(
@@ -385,13 +425,16 @@ class Engine:
         stop_texts: Optional[list] = None,
         should_stop: Optional[Callable[[], bool]] = None,
         on_prefill: Optional[Callable[[int, int], None]] = None,
+        on_prefill_progress: Optional[Callable[[int, int], None]] = None,
     ):
         """Generate a completion for the already-templated prompt_ids.
 
         Uses the persistent prefix cache: only prompt_ids[common:] is prefilled.
         Streams decoded text to on_token. Returns (text, GenStats). on_prefill(new,
         cached) fires once the prefill size is known, before the (potentially slow)
-        prefill runs, so the caller can show honest status.
+        prefill runs, so the caller can show honest status. on_prefill_progress(done,
+        total) fires once per prefill chunk so the caller can show an advancing % during
+        a big re-prefill; both prefill hooks are optional and pure instrumentation.
         """
         # Prompt-lookup decoding path: needs no draft model, greedy decoding (exact),
         # an unquantized cache, and a trimmable cache (cheap rollback). A qwen3_5-style
@@ -403,7 +446,8 @@ class Engine:
                 and not self.kv_bits
                 and (self._trimmable or (self._pld_hybrid and self.enable_pld_hybrid))):
             return self._generate_prompt_lookup(prompt_ids, max_tokens, on_token,
-                                                stop_texts, should_stop, on_prefill)
+                                                stop_texts, should_stop, on_prefill,
+                                                on_prefill_progress)
 
         common = self._sync_to(prompt_ids)
         suffix = prompt_ids[common:]
@@ -459,7 +503,7 @@ class Engine:
         # stream_generate then only has to prefill the final token before decoding.
         gen_prompt = suffix
         if self.draft is None and not self.kv_bits and len(suffix) > 1:
-            fed = self._prefill(suffix[:-1], should_stop)
+            fed = self._prefill(suffix[:-1], should_stop, on_progress=on_prefill_progress)
             if fed < len(suffix) - 1:  # interrupted mid-prefill
                 self._cached_ids = prompt_ids[: common + fed]
                 stats.prefill_s = time.time() - t0
@@ -505,7 +549,8 @@ class Engine:
         return ids
 
     def _generate_prompt_lookup(self, prompt_ids, max_tokens, on_token, stop_texts,
-                                should_stop=None, on_prefill=None):
+                                should_stop=None, on_prefill=None,
+                                on_prefill_progress=None):
         """Single-model speculative decoding using n-gram prompt lookup as the
         drafter. Mirrors the prefix-cache contract of `generate`: only the new
         suffix is prefilled, drafts are verified in one batched forward, accepted
@@ -530,7 +575,8 @@ class Engine:
             a clean prefill, False if interrupted (caller returns an empty turn). One
             helper for both branches below — previously this loop was inlined twice and
             the hybrid copy silently dropped the should_stop check (un-abortable)."""
-            fed = self._prefill(suffix[:-1], should_stop, chunk=prefill_step)
+            fed = self._prefill(suffix[:-1], should_stop, chunk=prefill_step,
+                                on_progress=on_prefill_progress)
             if fed < len(suffix) - 1:  # interrupted mid-prefill
                 self._cached_ids = list(prompt_ids[: common + fed])
                 stats.prefill_s = time.time() - t0

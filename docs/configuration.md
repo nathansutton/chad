@@ -172,9 +172,20 @@ The rarely-touched tuning knobs live in environment variables so they stay off t
 ```bash
 CHAD_MAX_CONTEXT=131072 uv run chad      # YaRN-extend to the model's full 128k window
 CHAD_KV_BITS=8          uv run chad      # quantize the KV cache (~half the RAM, ~20-30% slower)
-CHAD_CTX_LIMIT=28000    uv run chad      # prompt-token budget before old tool outputs compact
+CHAD_CTX_LIMIT=28000    uv run chad      # force the compaction threshold (overrides the RAM-aware default)
+CHAD_CTX_RESERVE_GB=2.5 uv run chad      # scratch RAM held back when auto-sizing that threshold
 CHAD_MODEL=/path/to/mlx-model uv run chad  # power-user escape hatch: run a different MLX model
 ```
+
+By default the auto-compaction threshold (when chad reclaims old context — a full
+re-prefill on this non-trimmable cache, so we do it as rarely as RAM allows) is **sized
+automatically** from the live Metal memory budget and the model's measured per-token KV
+cost, then capped at the model's window. On a 24 GB Mac running the 35B that lands around
+~175k tokens (vs a fixed 120k before) — long sessions stay warm and TTFT flat. It
+self-calibrates per machine: less RAM compacts sooner, more RAM runs nearer the full
+window. `CHAD_CTX_LIMIT` forces an exact threshold (used by evals/tests);
+`CHAD_CTX_RESERVE_GB` (default 1.5) tunes how much headroom is held back for
+prefill/decode scratch — raise it if you run other memory-hungry apps alongside chad.
 
 `CHAD_MODEL` points chad at any local MLX model directory instead of Ornith. The harness
 is tuned for Ornith, so this is unsupported and mostly there for research — the happy

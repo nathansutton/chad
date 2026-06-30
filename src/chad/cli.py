@@ -48,6 +48,36 @@ def _env_int(name):
     return int(val) if val else None
 
 
+def _env_float(name):
+    val = os.environ.get(name)
+    return float(val) if val else None
+
+
+def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
+                        reserve_gb=1.5, safety=0.90, gen_margin=2048, floor=8192):
+    """Plan 036: largest prompt-token budget (= the compaction trigger) that keeps the
+    growing KV cache inside a safe slice of the Metal *recommended working set*, given the
+    model's already-resident footprint and the *measured* per-token KV cost. Pure +
+    measured — replaces the magic `CTX_CAP = 120_000`, which was an OOM guard set blind to
+    the real per-token cost (it over-compacts: on a 24 GB M4 Pro the 20 KiB/token hybrid
+    cache fits ~175 k tokens, not 120 k).
+
+    `budget*safety` leaves a headroom band below Apple's recommendation; subtract the
+    resident model+SSM floor (`active_bytes`) and a scratch reserve for prefill/decode
+    buffers to get the bytes free for KV; divide by `kv_bytes_per_token` for the token
+    ceiling. Capped at `eff_ctx − gen_margin` (the model's real window) and floored so a
+    tight box still gets a usable window. Self-calibrates per machine (16 GB → small,
+    64 GB → near the window). Returns None if inputs are unusable so the caller can keep
+    the old fixed cap."""
+    if not (budget_bytes and kv_bytes_per_token and active_bytes):
+        return None
+    usable = budget_bytes * safety - active_bytes - reserve_gb * 1e9
+    if usable <= 0:
+        return floor
+    ram_ctx = int(usable / kv_bytes_per_token)
+    return max(floor, min(eff_ctx - gen_margin, ram_ctx))
+
+
 def _preflight():
     """chad runs only on Apple Silicon — MLX has no CPU/CUDA build. Hard-stop with a
     human message instead of letting `uv sync`/import fail cryptically elsewhere."""
@@ -184,11 +214,26 @@ def main():
     except Exception as e:  # noqa: BLE001 — convert any load failure into guidance
         _fail_model_load(model_id, e)
 
-    # Use the model's full window by default, reserving generation headroom, but cap
-    # the auto-compaction threshold so a 256k-window model can't set a limit that
-    # would OOM a 24 GB box if a session ever filled it.
-    CTX_CAP = 120_000
-    ctx_limit = _env_int("CHAD_CTX_LIMIT") or min(max(4096, eng.effective_ctx - 2048), CTX_CAP)
+    # Auto-compaction threshold. On this non-trimmable hybrid cache compaction forces a
+    # full body re-prefill (plan 035: ~79 % of all prefill), so we want to compact as
+    # rarely as RAM safely allows. Size the trigger from the live Metal budget + the
+    # model's *measured* per-token KV cost (plan 036) instead of a blind 120 k cap that
+    # over-compacts — self-calibrating + OOM-safe. CHAD_CTX_LIMIT still wins (evals/tests);
+    # CHAD_CTX_RESERVE_GB tunes the scratch headroom. Fall back to the old cap if the
+    # memory APIs or the KV measurement are unavailable.
+    ctx_limit = _env_int("CHAD_CTX_LIMIT")
+    if not ctx_limit:
+        try:
+            import mlx.core as mx
+            ctx_limit = ram_aware_ctx_limit(
+                eng.effective_ctx,
+                mx.device_info()["max_recommended_working_set_size"],
+                mx.get_active_memory(), eng.kv_bytes_per_token,
+                reserve_gb=_env_float("CHAD_CTX_RESERVE_GB") or 1.5)
+        except Exception:  # noqa: BLE001 — never let memory probing break startup
+            ctx_limit = None
+    if not ctx_limit:
+        ctx_limit = min(max(4096, eng.effective_ctx - 2048), 120_000)  # old fixed cap
     sys.stderr.write(f"ready in {load_s:.1f}s | context {eng.effective_ctx} tokens "
                      f"(compact at {ctx_limit})\n")
 

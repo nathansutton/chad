@@ -66,6 +66,29 @@ _PHASE_VERB = {"Read": "Reading", "Edit": "Editing", "Write": "Writing", "Run": 
                "Search": "Searching", "Find": "Searching", "Plan": "Planning",
                "Overview": "Reading", "View": "Reading", "Refs": "Searching"}
 
+# A one-cell state glyph coupled to the activity verb, so the indicator carries phase at
+# a glance (the spinner braille is the *motion*; this is the *identity*). Matched on a
+# verb prefix; prefill/compaction labels and anything unknown fall back to a neutral dot.
+_PHASE_GLYPH = {"Thinking": "✶", "Planning": "✶", "Responding": "◆", "Reading": "◇",
+                "Editing": "✎", "Writing": "✎", "Running": "▸", "Searching": "⌕"}
+
+
+def _phase_glyph(phase: str) -> str:
+    g = _PHASE_GLYPH.get(phase)
+    if g:
+        return g
+    low = phase.lower()
+    if "prefill" in low or "compact" in low:
+        return "⋯"
+    return "•"
+
+
+def _kfmt(n: int) -> str:
+    """Compact token count for the status line: 8200 → "8.2k", <1000 → "900"."""
+    if n < 1000:
+        return str(n)
+    return f"{n / 1000:.1f}k"
+
 
 class TUI:
     def __init__(self, engine: Engine, ctx_limit: int, mode: str = "normal",
@@ -84,6 +107,12 @@ class TUI:
         self._cur_prompt_tokens = 0        # last rendered prompt size (context gauge)
         self._tick = 0                     # animation frame counter (spinner)
         self._phase = "Thinking"           # current activity verb shown by the spinner
+        # Live activity readouts for the bottom status line (plans 033/034). Reset per
+        # turn in _worker; updated by the agent's gen/prefill emits. Display-only.
+        self._turn_start = 0.0             # time.monotonic() at turn start (elapsed timer)
+        self._gen_tokens = 0               # ↓ generated this step (live)
+        self._prefilled = 0                # ↑ tokens prefilled so far (live)
+        self._prefill_total = 0            # total tokens in the active prefill (for %)
 
         # interrupt + confirmation plumbing between UI and worker threads
         self._interrupt = threading.Event()
@@ -138,6 +167,20 @@ class TUI:
             try:
                 self._cur_prompt_tokens = int(text)
             except ValueError:
+                pass
+            return
+        elif kind == "gen":     # live ↓ generated-token count (no transcript)
+            try:
+                self._gen_tokens = int(text)
+            except ValueError:
+                pass
+            return
+        elif kind == "prefill":  # live ↑ prefill progress as "done/total" (no transcript)
+            try:
+                done, total = text.split("/", 1)
+                self._prefilled = int(done)
+                self._prefill_total = int(total)
+            except (ValueError, IndexError):
                 pass
             return
         elif kind == "stream":
@@ -209,14 +252,23 @@ class TUI:
         mode = self.agent.mode
         pct = int(100 * self._cur_prompt_tokens / self.ctx_limit) if self.ctx_limit else 0
         qn = len(self._queue)
-        # Left: an animated activity indicator (a verb, not throughput numbers —
-        # tok/s and prefill ratio are logged to ~/.chad/session.log instead).
+        # Left: an animated activity indicator. Plans 033/034 reverse the old "verb only"
+        # choice for THIS live line only (session.log still carries the rate diagnostics):
+        # a state glyph + the verb, then the two numbers that are reassurance not noise —
+        # elapsed seconds and ↑prefilled/↓generated counts — plus an advancing % while a
+        # big prefill streams (the silent gap this is meant to make legible).
         if self._busy:
             frame = _SPINNER[(self._tick // 2) % len(_SPINNER)]
-            left = [("class:spinner", f" {frame} {self._phase}… "),
-                    ("class:idle", "(ctrl-c to interrupt) ")]
+            glyph = _phase_glyph(self._phase)
+            elapsed = int(time.monotonic() - self._turn_start) if self._turn_start else 0
+            prog = ""
+            if self._prefill_total and self._gen_tokens == 0:  # still prefilling this step
+                prog = f"{int(100 * self._prefilled / self._prefill_total)}%  "
+            left = [("class:spinner", f" {frame} {glyph} {self._phase}…  "),
+                    ("class:idle", f"{prog}{elapsed}s · ↑{_kfmt(self._prefilled)} "
+                                   f"↓{_kfmt(self._gen_tokens)} · ctrl-c ")]
         else:
-            left = [("class:idle", " ready ")]
+            left = [("class:idle", f" {_phase_glyph(self._phase)} ready ")]
         bits = [
             f" {self.engine.model_id.split('/')[-1]} ",
             f" {MODE_LABEL[mode]} (shift-tab) ",
@@ -457,6 +509,10 @@ class TUI:
                 continue
             msg = self._queue.popleft()
             self._busy = True
+            self._turn_start = time.monotonic()  # elapsed timer for the status line
+            self._gen_tokens = 0
+            self._prefilled = 0
+            self._prefill_total = 0
             is_shell = msg.startswith("!")
             self._phase = "Running" if is_shell else "Thinking"
             self._interrupt.clear()

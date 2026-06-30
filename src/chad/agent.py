@@ -8,6 +8,7 @@ Prefix caching lives in Engine: re-rendering the whole transcript each step is
 cheap because only the newly appended tokens get prefilled.
 """
 
+import json
 import os
 import re
 import sys
@@ -34,6 +35,25 @@ from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_rep
 
 # Validation (VALIDATE knob, legacy_validate baseline) lives in validate.py, the
 # single source of truth shared with toolcall_parse.py — imported above.
+
+# Plan 035 (measurement spike): env-gated per-step prefill telemetry. Resolved ONCE at
+# import (like diag._DISABLED) so the hot loop pays only a truthiness check when unset —
+# zero string/dict/IO work, per plan 020's "instrumentation must not tax the product"
+# rule. Set CHAD_PREFILL_TRACE=path/to/trace.jsonl to capture one JSON row per engine
+# generate() call (== one prefill event) for scripts/prefill_tax.py to analyze offline.
+_PREFILL_TRACE = os.environ.get("CHAD_PREFILL_TRACE") or None
+
+
+def _trace_prefill(row: dict) -> None:
+    """Append one JSON line to the prefill trace and flush (sessions get killed mid-run,
+    so we durably land every row). Best-effort: a trace IO error must never break a turn,
+    so swallow it. Only ever called when _PREFILL_TRACE is set."""
+    try:
+        with open(_PREFILL_TRACE, "a") as f:
+            f.write(json.dumps(row) + "\n")
+            f.flush()
+    except OSError:
+        pass
 
 # @file mentions (Claude-Code parity): a message like "why is @geo.py slow?" pulls the
 # named file into context directly, no `read` round-trip. `@` must be at start-of-string
@@ -192,6 +212,12 @@ class Agent:
         # This is the metric symbolic/repo-map retrieval is meant to shrink.
         self.prefill_tokens = 0   # sum of newly-prefilled (uncached) tokens, all steps
         self.peak_ctx = 0         # largest prompt the turn ever rendered (tokens)
+        # Plan 035: total cache length (cached+prefilled+generated) after the prior
+        # traced step, so the trace can name this step's sync_kind by comparing this
+        # step's `cached_tokens` against it. Persists across run_turn calls (file order
+        # is chronological). Only updated when CHAD_PREFILL_TRACE is set.
+        self._prefill_trace_prev = 0
+        self._prefill_trace_seq = 0
 
     @property
     def yolo(self) -> bool:
@@ -352,28 +378,57 @@ class Agent:
             # only the appended tokens, so a plain re-render IS the cache-extension path
             # (truncated-turn divergence is handled inside engine._sync_to, not here).
             prompt_ids = self._render()
+            _pre_compact_len = len(prompt_ids)
             prompt_ids = self._compact_if_needed(prompt_ids)
+            # Did compaction materially shrink the render this step? Derived from the
+            # length delta at the call site (not compaction internals — see plan 034),
+            # so a big next-prefill can be named as a re-prefill rather than a mystery.
+            compacted = len(prompt_ids) < _pre_compact_len
             # Live context gauge + honest activity verb (overrides any stale tool
             # verb like "Searching" left over from the previous step).
             self._emit("ctx", str(len(prompt_ids)))
             self._emit("status", "Thinking")
 
             view = _StreamView(self._emit, started_in_think=self.thinking) if stream else None
+            gen_count = [0]  # decoded chunks this step (~tokens); fed to the live ↓ counter
 
             def on_token(t):
                 if view:
                     view.feed(t)
+                gen_count[0] += 1
+                # Throttle: a status emit per ~16 tokens keeps the queue cheap while the
+                # bottom-line ↓ counter still climbs visibly (the refresher renders ~20 Hz).
+                if gen_count[0] % 16 == 0:
+                    self._emit("gen", str(gen_count[0]))
 
             def on_prefill(new, cached):
                 # A large prefill (e.g. a full recompute after compaction on a
-                # non-trimmable cache) blocks for a while — show the token count and
-                # the verb so the wait is legible and ctrl-c'able, not a frozen spinner.
+                # non-trimmable cache) blocks for a while — name the cause and let the
+                # progress hook below advance a %, so the wait is legible and ctrl-c'able
+                # rather than a frozen spinner.
                 if new > 2000:
-                    self._emit("status", f"Prefilling {new:,} tokens")
+                    self._emit("status", "Re-prefilling after compaction"
+                               if compacted else "Prefilling context")
+
+            last_pct = [-1]
+
+            def on_prefill_progress(done, total):
+                # Forward an advancing prefill % to the status line, throttled to whole-
+                # percent changes (≤101 emits per prefill). Only for big prefills — small
+                # appends stay silent (verb only), matching on_prefill's >2000 gate.
+                if total <= 2000:
+                    return
+                pct = int(100 * done / total)
+                if pct != last_pct[0]:
+                    last_pct[0] = pct
+                    self._emit("prefill", f"{done}/{total}")
 
             text, stats = self.engine.generate(
                 prompt_ids, max_tokens=self.max_gen_tokens, on_token=on_token,
-                should_stop=self._should_stop, on_prefill=on_prefill)
+                should_stop=self._should_stop, on_prefill=on_prefill,
+                on_prefill_progress=on_prefill_progress)
+            if gen_count[0] % 16:  # flush the final (un-throttled) count for the ↓ readout
+                self._emit("gen", str(gen_count[0]))
             # The generation ran to the token cap: the turn was cut off, not finished.
             # A truncated assistant turn is NOT a final answer (and on Ornith's
             # non-trimmable cache its decoded text won't re-tokenize identically, so it
@@ -419,6 +474,35 @@ class Agent:
             log.info("step %d: %d tok @ %.1f tok/s | prefill %d new + %d cached | "
                      "accept %.2f", step, stats.generated_tokens, stats.tok_per_s,
                      stats.prompt_tokens, stats.cached_tokens, self.accept_rate)
+            # Plan 035: env-gated per-step prefill telemetry (one row per prefill event).
+            # Guarded so an unset trace pays only this truthiness check — no string/dict/IO.
+            # sync_kind names *why* this step prefilled what it did, derived purely from
+            # cached_tokens vs the prior step's total cache length + the `compacted` flag
+            # (no engine internals): a step whose cached prefix shrank re-prefilled lost
+            # content; tagging that by cause is what feeds the A/B/C attribution.
+            if _PREFILL_TRACE:
+                common = stats.cached_tokens
+                if common >= self._prefill_trace_prev:
+                    sync_kind = "append"          # prefix fully retained; only new tail
+                elif compacted:
+                    sync_kind = "reprefill-compaction"  # head rewrite shrank the render
+                elif common > 0:
+                    sync_kind = "warm-reload"     # diverged but salvaged a prefix (cheap)
+                else:
+                    sync_kind = "reprefill-other" # cold reset (think-mismatch / mid-edit)
+                self._prefill_trace_seq += 1
+                _trace_prefill({
+                    "seq": self._prefill_trace_seq, "step": step,
+                    "prompt_tokens": stats.prompt_tokens,
+                    "cached_tokens": stats.cached_tokens,
+                    "prefill_s": round(stats.prefill_s, 4),
+                    "gen_tokens": stats.generated_tokens,
+                    "gen_s": round(stats.gen_s, 4),
+                    "compacted": compacted, "sync_kind": sync_kind,
+                    "peak_ctx": len(prompt_ids),
+                })
+                self._prefill_trace_prev = (
+                    common + stats.prompt_tokens + stats.generated_tokens)
             # Cache divergence: a mid-session step that re-prefills everything (0 cached)
             # means the re-rendered conversation diverged from the cache — on a
             # non-trimmable cache that's a full, costly rebuild (usually triggered by a
