@@ -2,10 +2,11 @@
 
 [![tests](https://github.com/nathansutton/chad/actions/workflows/tests.yml/badge.svg)](https://github.com/nathansutton/chad/actions/workflows/tests.yml)
 
-![Claude: Master of the Universe (an ornate, impossibly intricate carved-horse banister) vs chad: Master of Your Laptop (a plastic toy horse gaffer-taped to a stair post)](docs/chad-vs-claude.png)
+<img src="docs/chad-vs-claude.png" width="480" alt="Claude: Master of the Universe (an ornate, impossibly intricate carved-horse banister) vs chad: Master of Your Laptop (a plastic toy horse gaffer-taped to a stair post)">
+
 
 > Claude can do anything, for anyone, anywhere. chad does one thing. 🗿    
-> *We are not the same.*
+> *Coding under supervision.*
 
 chad has some of the same moves as Claude — tool use, plan mode, a real TUI — but driven
 by a local model on your laptop instead of a frontier model in a datacenter. He isn't a
@@ -15,19 +16,17 @@ smaller Claude; he's a blunter instrument.
 |---------------------|--------------------------------------------------|--------------------------------------------|
 | **Range**           | every workflow, every person, incredible nuance  | one job: code, on your machine             |
 | **Runs**            | anywhere — cloud, IDE, terminal, phone           | your laptop. that's it.                    |
-| **Brain**           | a frontier model in a datacenter                 | a 9–35B Ornith model on Apple Silicon      |
-| **Speed**           | as fast as the datacenter and the network allow  | as fast as a MacBook Pro gets — no faster  |
+| **Brain**           | a frontier model in a datacenter                 | Ornith model on Apple Silicon              |
 | **Disposition**     | understands what you *really* meant              | does what you *said*                       |
 | **Harness**         | open-ended, anything you can imagine             | plan. execute. nothing else.               |
-| **When it's wrong** | reasons its way out                              | already shipped it 🗿                      |
+| **When wrong**      | reasons a way out                                | already shipped 🗿                         |
 
 Think of it as report cards. On [terminal-bench 2.1](https://www.tbench.ai/leaderboard) —
 the standard exam for CLI coding agents — Claude (Opus 4.8) is the **A student** at
-**82.7%**, near the top of the class. Ornith, the model behind chad, is a **C student**
-(terminus-2 harness): **64.2%** for the 35B that runs on a 24 GB Mac, **43.1%** for the 9B
-that fits 16/18 GB — small local models that run on your laptop, not in a datacenter. The
-bet was never that chad out-scores Claude — it's that a C student running free on your own
-machine, offline, is still worth having around. 🗿
+**82.7%**, near the top of the class. Ornith, the model behind chad, is a **C+ student**
+(terminus-2 harness): **64.2%** for the 35B that runs on a 24 GB Mac. The bet was never 
+that chad out-scores Claude — it's that a C+ student running free on your own machine
+is still worth having around. 🗿
 
 > chad doesn't run on a H100 server, and you don't have one.  He will never will be in the 
 > big leagues.  Those are for Claude. chad does **one** thing, MLX inference on a MacBook Pro, 

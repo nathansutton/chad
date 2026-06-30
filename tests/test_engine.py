@@ -118,6 +118,7 @@ def test_prefill_progress_callback():
     without the callback (full decoded-output equivalence is the model-gated tier-2
     job; this path feeds the non-trimmable cache, so the no-op guarantee matters)."""
     import mlx.core as mx
+
     from chad.engine import Engine
 
     class _FakeCacheItem:
