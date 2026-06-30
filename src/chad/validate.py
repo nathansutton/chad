@@ -281,6 +281,13 @@ def _walk(value: Any, schema: dict, path: str) -> Tuple[Any, List[Err]]:
         return out, errs
 
     if typ == "array":
+        # A lone scalar where an array was wanted (focus="agent.py" instead of
+        # ["agent.py"]) is the most common weak-model array mistake — wrap it into a
+        # one-element list and let the item walk below validate/coerce it, rather than
+        # burning a self-repair round-trip. A JSON-encoded array string was already
+        # un-stringified above; a dict/None stays an error (genuine shape mismatch).
+        if isinstance(value, (str, int, float, bool)):
+            value = [value]
         if not isinstance(value, list):
             return value, [Err(path, "array", _tname(value))]
         item_schema = schema.get("items", {})

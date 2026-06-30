@@ -88,6 +88,25 @@ def _has_open_tool_call(text: str) -> bool:
             or text.count("<function=") > text.count("</function>"))
 
 
+def close_unclosed_think(text: str, thinking: bool) -> str:
+    """Close a dangling `<think>` block so the stored assistant turn re-tokenizes into
+    a prefix of the live KV cache.
+
+    On a thinking model the chat template auto-opens `<think>\\n` in the generation
+    prompt, so the model's output *continues inside* the think block and a normal turn
+    emits its own `</think>`. A turn truncated at the token cap can stop BEFORE that
+    close. The template then renders the stored (unclosed) content as an EMPTY think
+    block + trailing content — which diverges from the cache at the very first content
+    token. On Ornith's non-trimmable cache that single divergence forces a FULL
+    re-prefill of the whole transcript next step (measured: tens of thousands of tokens
+    at large context). Appending the missing `</think>` keeps the cached tokens a strict
+    prefix of the re-render, so only a couple of tokens prefill instead. No-op when
+    thinking is off or the block is already closed."""
+    if thinking and "<think>" not in text and "</think>" not in text and text:
+        return text + "\n</think>"
+    return text
+
+
 # Permission modes (Claude Code parity, cycled with shift-tab in the TUI):
 #   normal — confirm each mutating tool (bash/write/edit)
 #   auto   — auto-approve mutating tools (yolo)
@@ -380,11 +399,16 @@ class Agent:
             if self._should_stop():
                 self.interrupted = True
                 if text:
-                    self.messages.append({"role": "assistant", "content": text})
+                    self.messages.append({"role": "assistant",
+                                          "content": close_unclosed_think(text, self.thinking)})
                 self._emit("info", "  [interrupted]")
                 return "[interrupted]"
 
-            self.messages.append({"role": "assistant", "content": text})
+            # Close a think block left dangling by a token-cap/interrupt truncation so the
+            # stored turn stays a prefix of the live KV cache (else: full re-prefill next
+            # step on the non-trimmable cache). See close_unclosed_think.
+            self.messages.append({"role": "assistant",
+                                  "content": close_unclosed_think(text, self.thinking)})
 
             # Estimate reasoning overhead: the generation opens inside <think> (the
             # template emits the opening tag), so everything up to </think> is thinking.

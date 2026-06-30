@@ -16,7 +16,7 @@ import tempfile
 
 import pytest
 
-from chad.agent import _has_open_tool_call, expand_mentions
+from chad.agent import _has_open_tool_call, close_unclosed_think, expand_mentions
 
 PASS = 0
 FAIL = 0
@@ -83,6 +83,23 @@ def test_has_open_tool_call():
     check("plain prose -> False", _has_open_tool_call("here is the answer") is False)
 
 
+def test_close_unclosed_think():
+    # A turn truncated mid-think (template auto-opened <think>, model never closed it):
+    # close it so the stored turn re-tokenizes into a prefix of the live KV cache.
+    check("unclosed think -> closed",
+          close_unclosed_think("reasoning cut off here", True) == "reasoning cut off here\n</think>")
+    # Already-closed think (normal completed turn) -> untouched.
+    closed = "reasoning</think>the answer"
+    check("closed think untouched", close_unclosed_think(closed, True) == closed)
+    # Thinking disabled (--no-think) -> never inject a tag.
+    check("no-think untouched", close_unclosed_think("plain answer", False) == "plain answer")
+    # An explicit opening <think> in the text -> leave it (conservative; don't double-handle).
+    check("explicit <think> untouched",
+          close_unclosed_think("<think>partial", True) == "<think>partial")
+    # Empty text -> no spurious tag.
+    check("empty untouched", close_unclosed_think("", True) == "")
+
+
 if __name__ == "__main__":
     with pytest.MonkeyPatch.context() as mp:
         with tempfile.TemporaryDirectory() as d:
@@ -97,5 +114,6 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory() as d:
             test_expand_mentions_dedupes(mp, d)
     test_has_open_tool_call()
+    test_close_unclosed_think()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

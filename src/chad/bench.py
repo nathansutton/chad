@@ -71,6 +71,104 @@ def _encode_suffix(tok, text: str) -> list:
         return ids
 
 
+def _render(tok, messages, thinking=True) -> list:
+    """Render a transcript exactly as Agent._render does (chat template + tool schemas
+    + generation prompt), so the benchmark exercises the same token stream the real
+    agentic loop feeds the engine."""
+    from .tools import active_schemas
+    return tok.apply_chat_template(
+        messages, tools=active_schemas(), add_generation_prompt=True,
+        enable_thinking=thinking)
+
+
+def _agentic(model_id: str, why: str, context_tokens: int, apply_fix: bool):
+    """Drive the REAL engine through a scripted agentic session that forces a
+    truncated (token-cap) turn at large context, and measure the prefill the FOLLOWING
+    step pays. This is the cache-miss the logs show: a turn cut off mid-`<think>` leaves
+    the stored assistant turn unable to re-tokenize into a prefix of the non-trimmable
+    KV cache, so the next step re-prefills the whole transcript (0 cached).
+
+    With `apply_fix`, the dangling think block is closed before the turn is stored
+    (chad.agent.close_unclosed_think) — the same normalization run_turn now applies — so
+    the cached tokens stay a prefix and the next step prefills only a handful of tokens.
+
+    Returns (miss_prefill_tokens, miss_prefill_s, cached_tokens)."""
+    from .agent import build_system_prompt, close_unclosed_think
+    from .engine import Engine
+
+    eng = Engine(model_id=model_id, draft_id=None, cache_dir=None)
+    eng.load()
+    tok = eng.tok
+
+    # Seed a large, realistic context: system + a user task that pastes a big code blob,
+    # padded to roughly `context_tokens` so the re-prefill cost is at the scale the user
+    # hit (tens of thousands of tokens).
+    blob = (_FILLER * max(1, context_tokens // max(1, len(tok.encode(_FILLER)))))
+    messages = [
+        {"role": "system", "content": build_system_prompt()},
+        {"role": "user", "content": "Review this module and fix the validation bug.\n\n"
+                                     "```python\n" + blob + "\n```"},
+    ]
+
+    # The render up to the generation prompt: the template auto-opens `<think>\n` here, so
+    # the model's turn continues INSIDE the think block.
+    p1 = _render(tok, messages)
+    # A turn that hit the token cap MID-THINK: reasoning with no closing `</think>` (the
+    # `hit_cap=True` truncation the logs flag). Constructed deterministically rather than
+    # generated, so the benchmark reliably exercises the divergence (a short stochastic
+    # generation may close `</think>` within the cap and hide it).
+    # Ends on punctuation (not bare whitespace), as a real cap-hit truncation does — a
+    # token ending in a trailing space would merge under BPE on re-render and cost a
+    # 1-token tail divergence that no text-level close can avoid on a non-trimmable cache.
+    reasoning = (("Let me trace the validation path and reason about the boundary "
+                  "conditions step by step. ") * 24).strip()
+    gen_ids = tok.encode(reasoning, add_special_tokens=False)
+    # Put the engine in the EXACT state generate() leaves after that truncated turn:
+    # the live KV cache holds prompt + the raw (unclosed) reasoning tokens.
+    cache_ids = list(p1) + gen_ids
+    eng._reset_cache()
+    eng._prefill(cache_ids)
+    eng._cached_ids = cache_ids
+
+    # Store the assistant turn the way run_turn does — with or without the fix — then
+    # append a canned tool result (as the loop would after a tool call).
+    stored = close_unclosed_think(reasoning, True) if apply_fix else reasoning
+    messages.append({"role": "assistant", "content": stored})
+    messages.append({"role": "tool", "name": "read",
+                     "content": "def validate(x):\n    return x is not None\n"})
+
+    # The FOLLOWING render. Its prefill is the cache miss we're measuring: with the fix
+    # off the unclosed think makes the stored turn re-tokenize so it is no longer a prefix
+    # of the cache -> non-trimmable reset -> full re-prefill. With the fix on the cache
+    # stays warm and only the appended tokens prefill.
+    p2 = _render(tok, messages)
+    _, s2 = eng.generate(p2, max_tokens=8)
+    return s2.prompt_tokens, s2.prefill_s, s2.cached_tokens
+
+
+def _run_agentic(model_id: str, why: str, context_tokens: int) -> int:
+    w = 72
+    print(f"\nloading {model_id} [{why}] ...", flush=True)
+    # Fresh process-cold cache for each variant (separate Engine in _agentic).
+    off_new, off_s, off_cached = _agentic(model_id, why, context_tokens, apply_fix=False)
+    on_new, on_s, on_cached = _agentic(model_id, why, context_tokens, apply_fix=True)
+    ctx = on_new + on_cached  # actual rendered transcript size at the measured step
+    print("=" * w)
+    print(f"agentic prefill — truncated-turn cache miss @ {ctx:,} ctx tokens")
+    print("=" * w)
+    print(f"{'':22}{'new prefill':>14}{'cached':>10}{'prefill s':>12}")
+    print("-" * w)
+    print(f"{'truncation, fix OFF':22}{off_new:>14,}{off_cached:>10,}{off_s:>12.2f}")
+    print(f"{'truncation, fix ON':22}{on_new:>14,}{on_cached:>10,}{on_s:>12.2f}")
+    print("-" * w)
+    saved = off_new - on_new
+    speedup = (off_s / on_s) if on_s else float("inf")
+    print(f"fix avoids re-prefilling {saved:,} tokens on the step after a truncation "
+          f"(~{off_s - on_s:.1f}s, {speedup:.0f}x faster prefill).")
+    print("=" * w + "\n")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="chad-bench",
@@ -80,7 +178,18 @@ def main(argv=None) -> int:
                     help="size of the cold prompt to prefill (default: 5000)")
     ap.add_argument("--gen-tokens", type=int, default=128,
                     help="tokens to decode for the decode measurement (default: 128)")
+    ap.add_argument("--agentic", action="store_true",
+                    help="run the agentic-session prefill benchmark: reproduce the "
+                         "truncated-turn cache miss and the fix, measuring the re-prefill "
+                         "the next step pays (with/without the think-close fix)")
+    ap.add_argument("--context-tokens", type=int, default=24000,
+                    help="seeded context size for --agentic (default: 24000)")
     args = ap.parse_args(argv)
+
+    if args.agentic:
+        model_id, why = _pick_model()
+        _ensure_model(model_id)
+        return _run_agentic(model_id, why, args.context_tokens)
 
     model_id, why = _pick_model()
     _ensure_model(model_id)

@@ -63,6 +63,14 @@ def test_coercion():
         "write_todos", {"todos": '[{"content": "x", "status": "pending"}]'})
     check("nested array un-stringified", not e and isinstance(a["todos"], list)
           and a["todos"][0]["status"] == "pending", f"a={a} e={[str(x) for x in e]}")
+    # lone scalar where array<string> wanted (focus="agent.py" not ["agent.py"]) -> wrap
+    a, e = coerce_and_validate("repo_map", {"focus": "src/chad/agent.py"})
+    check("scalar->one-element array", not e and a["focus"] == ["src/chad/agent.py"],
+          f"a={a} e={[str(x) for x in e]}")
+    # a real shape mismatch (object where array wanted) still REJECTS, not wrapped
+    a, e = coerce_and_validate("repo_map", {"focus": {"path": "agent.py"}})
+    check("object->array still rejects", any(x.path == "$focus" for x in e),
+          f"a={a} e={[str(x) for x in e]}")
 
 
 # --- Stages 2+3: validation (broken calls should REJECT precisely) ----------
