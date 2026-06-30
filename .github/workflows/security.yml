@@ -25,8 +25,8 @@ jobs:
     # venv, which is both faster and avoids ensurepip flakiness.
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - run: uv sync
@@ -38,8 +38,12 @@ jobs:
     # key needed for public repos.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: gitleaks
         uses: gitleaks/gitleaks-action@v2
+        env:
+          # Required for scanning pull_request events (incl. forks/Dependabot);
+          # push events scan the commit range and don't need it.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
