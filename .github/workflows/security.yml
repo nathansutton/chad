@@ -42,7 +42,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
           # Required for scanning pull_request events (incl. forks/Dependabot);
           # push events scan the commit range and don't need it.
