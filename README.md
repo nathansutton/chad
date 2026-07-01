@@ -51,6 +51,46 @@ MacBook** — and the whole design follows from one constraint that machine impo
 never re-reads the transcript is the core engineering. The full story is in
 [Design & internals](docs/design.md).
 
+## The bet: at this end of the report card, the harness beats the model
+
+Every serious coding harness was designed for a frontier model behind a datacenter
+API. That design bakes in two assumptions: the model is an A student, and prefill is
+somebody else's electricity. Both are false on a laptop. A C+ student emits tool calls
+with typos, quotes edits it never applies, and rambles — and every token of transcript
+it drags around must be re-read by *your* GPU at a few hundred tokens a second.
+
+So chad's real thesis isn't "run a model locally" — plenty of tools do that. It's that
+**for a small model, harness quality is worth more than a model upgrade**, and that the
+harness and the inference engine have to be designed *together*. You can measure it: a
+private rig runs the **same Ornith-9B weights** on the **same 34 Exercism-style tasks**
+on the **same MacBook**, varying only the harness (external harnesses reach the model
+through an OpenAI-style local server — the standard way to attach them to a local
+backend):
+
+| harness | tasks passed | median time-to-first-token | median prefix-cache reuse |
+|---|---|---|---|
+| **chad** | **17/34** | **0.71 s** | **99%** |
+| pi | 10/34 | 3.2 s | 77% |
+| opencode | 2/34 | 2.9 s | 0% |
+| aider / cline / goose / Claude Code (via router) | 0/34 | 3.3–6.1 s | 0–85% |
+
+(One model, one machine, n=34 — read it as a measurement of *fit to a local backend*,
+not of those harnesses in general; they're excellent at what they were built for, which
+is a frontier model on the other end of a fast API.)
+
+The gap is entirely nameable failure modes. The model pours its edit into the
+reasoning channel and the harness drops it. The model asks for a `read` tool the
+harness doesn't ship. The harness rejects nested tool arguments a weak model loves to
+emit. The context balloons, cache reuse hits 0%, decode falls to 2 tok/s. chad handles
+each of these *inside* the harness: tool calls are parsed in four dialects and
+repaired, arguments are schema-coerced with an annotated self-repair loop, edits go
+through a forgiveness cascade before failing, loop/thrash/verify guards keep the turn
+honest — and, above all, the transcript is engineered to remain a **strict token-prefix
+of the live KV cache** across every step, because on a local model prefix stability is
+a *harness* property, not a server feature. That co-design is the whole moat: it's why
+the same C+ student passes 17 tasks under chad and 0 under harnesses built for the A
+student. A C+ student with a good tutor, running free on your own machine. 🗿
+
 ## Quickstart
 
 Apple Silicon + [uv](https://docs.astral.sh/uv/). No clone, no model build — install and

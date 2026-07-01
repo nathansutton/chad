@@ -90,6 +90,41 @@ def test_edit_truth_table():
         os.chdir(cwd)
 
 
+# --- tool_bash ----------------------------------------------------------------
+
+def test_bash():
+    # short output passes through untouched
+    check("bash: short echo", tools.tool_bash("printf hi") == "hi")
+
+    # no output -> sentinel
+    check("bash: no output", tools.tool_bash("true") == "[no output]")
+
+    # nonzero exit -> [exit N] prefix
+    res = tools.tool_bash("printf oops; exit 3")
+    check("bash: exit prefix", res.startswith("[exit 3]\n") and "oops" in res, res)
+
+    # timeout -> sentinel (0s deadline fires immediately)
+    check("bash: timeout", tools.tool_bash("sleep 5", timeout=0)
+          == "[timed out after 0s]")
+
+    # long output keeps HEAD + TAIL + an omission marker, and the tail bias means
+    # the last line (a failure summary lives here) survives when a head-only cut
+    # would drop it.
+    big = tools.tool_bash(
+        "printf 'FIRST_LINE\\n'; head -c 40000 /dev/zero | tr '\\0' 'x'; "
+        "printf '\\nLAST_LINE_FAILURE_SUMMARY\\n'")
+    check("bash: long output truncated", len(big) < 25000, len(big))
+    check("bash: keeps head", "FIRST_LINE" in big, big[:80])
+    check("bash: keeps tail", "LAST_LINE_FAILURE_SUMMARY" in big, big[-80:])
+    check("bash: omission marker", "chars omitted" in big, big)
+
+    # the [exit N] prefix survives truncation (it's at the head we keep)
+    fail = tools.tool_bash(
+        "printf 'HEAD\\n'; head -c 40000 /dev/zero | tr '\\0' 'x'; "
+        "printf '\\nTAIL\\n'; exit 1")
+    check("bash: exit prefix survives truncation", fail.startswith("[exit 1]\n"), fail[:40])
+
+
 # --- tool_grep ----------------------------------------------------------------
 
 def test_grep():
@@ -115,6 +150,77 @@ def test_grep():
         # no matches
         check("grep: no matches",
               tools.tool_grep("ZZZ_no_such_token") == "[no matches]")
+    finally:
+        os.chdir(cwd)
+
+
+def test_grep_default_byte_identical():
+    """Default-args output must stay byte-for-byte what the pre-plan-037 code emitted:
+    `path:line: text` lines joined by \\n, no notices when no cap binds."""
+    cwd = os.getcwd()
+    try:
+        _seed({"a.py": "import os\nNEEDLE here\nalso NEEDLE\nbye\n"})
+        out = tools.tool_grep("NEEDLE")
+        check("grep: default byte-identical",
+              out == "./a.py:2: NEEDLE here\n./a.py:3: also NEEDLE", repr(out))
+    finally:
+        os.chdir(cwd)
+
+
+def test_grep_line_cap():
+    """A match inside a huge single line is clipped so it can't blow up the transcript."""
+    cwd = os.getcwd()
+    try:
+        _seed({"big.js": "x" * 50000 + "NEEDLE" + "y" * 50000 + "\n"})
+        out = tools.tool_grep("NEEDLE")
+        check("grep: single output line", "\n" not in out, len(out))
+        check("grep: line clipped to <=600", len(out) <= 600, len(out))
+        check("grep: clip marker present", "…[line clipped]" in out, out)
+    finally:
+        os.chdir(cwd)
+
+
+def test_grep_truncation_notices():
+    """The 200-line output cap announces itself with shown/total counts."""
+    cwd = os.getcwd()
+    try:
+        _seed({"m.txt": "".join(f"NEEDLE line {i}\n" for i in range(500))})
+        out = tools.tool_grep("NEEDLE")
+        lines = out.splitlines()
+        check("grep: capped at 200 + notice", len(lines) == 201, len(lines))
+        check("grep: truncation notice text",
+              lines[-1] == "[results truncated: 200/500 lines — narrow the pattern "
+                           "or add a path]", lines[-1])
+    finally:
+        os.chdir(cwd)
+
+
+def test_grep_ignore_case_and_context():
+    cwd = os.getcwd()
+    try:
+        _seed({"a.py": "alpha\nBETA match\ngamma\ndelta\n"})
+
+        # ignore_case: lowercase pattern finds the uppercase line
+        ci = tools.tool_grep("beta", ignore_case=True)
+        check("grep: ignore_case hits", "a.py:2:" in ci and "BETA match" in ci, ci)
+        check("grep: case-sensitive misses",
+              tools.tool_grep("beta") == "[no matches]")
+
+        # context: N lines before/after, match uses ':' and context uses '-'
+        c1 = tools.tool_grep("BETA", context=1)
+        check("grep: context before", "a.py:1- alpha" in c1, c1)
+        check("grep: context match sep", "a.py:2: BETA match" in c1, c1)
+        check("grep: context after", "a.py:3- gamma" in c1, c1)
+        check("grep: no stray group sep for single group", "--" not in c1, c1)
+
+        # two non-adjacent matches -> two groups separated by --
+        _seed({"b.py": "one\nHIT\nx\nx\nx\nx\nHIT\nend\n"})
+        c2 = tools.tool_grep("HIT", context=1)
+        check("grep: two groups separated", "\n--\n" in c2, c2)
+
+        # context clamps to 0-5 (6 is treated as 5, still valid output)
+        check("grep: context clamp doesn't error",
+              "b.py:" in tools.tool_grep("HIT", context=6))
     finally:
         os.chdir(cwd)
 
@@ -165,7 +271,12 @@ def test_write():
 
 if __name__ == "__main__":
     test_edit_truth_table()
+    test_bash()
     test_grep()
+    test_grep_default_byte_identical()
+    test_grep_line_cap()
+    test_grep_truncation_notices()
+    test_grep_ignore_case_and_context()
     test_glob()
     test_write()
     print(f"\n{PASS} passed, {FAIL} failed")

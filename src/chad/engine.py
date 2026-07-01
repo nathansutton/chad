@@ -436,6 +436,14 @@ class Engine:
         total) fires once per prefill chunk so the caller can show an advancing % during
         a big re-prefill; both prefill hooks are optional and pure instrumentation.
         """
+        # Fairness / measurement knob (CHAD_NO_PREFIX_CACHE): drop the persistent prefix
+        # cache before every turn so each step full-prefills from scratch. This forfeits
+        # chad's core prefill win on purpose — the apples-to-apples TTFT baseline for
+        # head-to-head harness benchmarks (cache OFF on both sides). Off in normal use;
+        # matches the CHAD_NO_* opt-out family.
+        if os.environ.get("CHAD_NO_PREFIX_CACHE"):
+            self._reset_cache()
+
         # Prompt-lookup decoding path: needs no draft model, greedy decoding (exact),
         # an unquantized cache, and a trimmable cache (cheap rollback). A qwen3_5-style
         # hybrid (Ornith) CAN also roll back, via recurrent-snapshot + KV-trim + re-feed

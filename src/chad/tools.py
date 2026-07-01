@@ -85,7 +85,28 @@ def tool_bash(command: str, timeout: int = 120, should_stop=None) -> str:
     out = (box.get("out") or "").strip()
     if p.returncode not in (0, None):
         out = f"[exit {p.returncode}]\n{out}"
-    return out[:20000] if out else "[no output]"
+    return _bash_headtail(out) if out else "[no output]"
+
+
+# Bash output budget. A plain head-slice is exactly wrong for the thing bash is used
+# for most — running tests/builds — because pytest/compilers put the actionable
+# summary (`=== N failed ===`, the traceback tail) at the BOTTOM. On a noisy run a
+# head-only cap shows 20k chars of passing dots and hides the failure, undermining the
+# verify loop guardrails.py exists to enforce. So keep HEAD and TAIL (Claude Code does
+# the same), biased toward the tail where the summary lives.
+BASH_MAX_CHARS = 20000
+BASH_HEAD_CHARS = 8000
+BASH_TAIL_CHARS = 12000
+
+
+def _bash_headtail(s: str) -> str:
+    if len(s) <= BASH_MAX_CHARS:
+        return s
+    omitted = len(s) - BASH_HEAD_CHARS - BASH_TAIL_CHARS
+    return (s[:BASH_HEAD_CHARS]
+            + f"\n[… {omitted} chars omitted — output truncated; the TAIL below is "
+              f"usually the failure summary …]\n"
+            + s[-BASH_TAIL_CHARS:])
 
 
 # Local-model read budget. Every token a read returns must be PREFILLED into the
@@ -305,28 +326,87 @@ def tool_glob(pattern: str, should_stop=None) -> str:
     return "\n".join(hits[:200]) or "[no matches]"
 
 
-def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", should_stop=None) -> str:
+# grep output budgets. A single match in a minified JS/JSON file dumps a multi-MB
+# line straight into the transcript — the same blowup READ_MAX_CHARS guards on the
+# read path, and every char is prefill on a ~350 tok/s model. So cap each emitted
+# line, the total number of lines, and the number of files walked — and, unlike the
+# old code, ANNOUNCE when a cap binds so the model narrows the query instead of
+# concluding "no matches".
+GREP_MAX_LINES = 200
+GREP_MAX_FILES = 5000
+GREP_LINE_CHARS = 500
+
+
+def _grep_clip(s: str) -> str:
+    return s if len(s) <= GREP_LINE_CHARS else s[:GREP_LINE_CHARS] + "…[line clipped]"
+
+
+def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bool = False,
+              context: int = 0, should_stop=None) -> str:
     try:
-        rx = re.compile(pattern)
+        rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except re.error as e:
         return f"[bad regex: {e}]"
-    out = []
+    ctx = max(0, min(int(context or 0), 5))
+    out: list[str] = []
+    matches = 0        # total match lines seen (may exceed what we emit once capped)
+    capped = False     # hit the GREP_MAX_LINES output cap
+
+    def emit(s: str):
+        nonlocal capped
+        if len(out) < GREP_MAX_LINES:
+            out.append(s)
+        else:
+            capped = True
+
     files = _glob.glob(os.path.join(path, glob), recursive=True)
-    for fp in files[:5000]:
+    files_truncated = len(files) > GREP_MAX_FILES
+    for fp in files[:GREP_MAX_FILES]:
         if should_stop and should_stop():
             return "[interrupted by user]"
         if _skip(fp) or not os.path.isfile(fp):
             continue
         try:
-            with open(fp, errors="ignore") as f:
-                for i, ln in enumerate(f, 1):
-                    if rx.search(ln):
-                        out.append(f"{fp}:{i}: {ln.rstrip()}")
-                        if len(out) >= 200:
-                            return "\n".join(out)
+            if ctx:
+                # context mode needs surrounding lines, so read the whole file and
+                # emit `--`-separated groups (merging overlapping windows), like grep -C.
+                with open(fp, errors="ignore") as f:
+                    flines = [ln.rstrip("\n") for ln in f]
+                idxs = [i for i, ln in enumerate(flines) if rx.search(ln)]
+                if not idxs:
+                    continue
+                matches += len(idxs)
+                groups: list[list[int]] = []  # merged [start, end] inclusive windows
+                for i in idxs:
+                    s, e = max(0, i - ctx), min(len(flines) - 1, i + ctx)
+                    if groups and s <= groups[-1][1] + 1:
+                        groups[-1][1] = max(groups[-1][1], e)
+                    else:
+                        groups.append([s, e])
+                for gi, (s, e) in enumerate(groups):
+                    if gi:
+                        emit("--")
+                    for j in range(s, e + 1):
+                        sep = ":" if rx.search(flines[j]) else "-"
+                        emit(f"{fp}:{j+1}{sep} {_grep_clip(flines[j])}")
+            else:
+                with open(fp, errors="ignore") as f:
+                    for i, ln in enumerate(f, 1):
+                        if rx.search(ln):
+                            matches += 1
+                            emit(f"{fp}:{i}: {_grep_clip(ln.rstrip())}")
         except OSError:
             continue
-    return "\n".join(out) or "[no matches]"
+
+    if not out:
+        return "[no matches]"
+    notices = []
+    if capped:
+        notices.append(f"[results truncated: {len(out)}/{matches} lines — narrow the "
+                       f"pattern or add a path]")
+    if files_truncated:
+        notices.append(f"[searched first {GREP_MAX_FILES} files]")
+    return "\n".join(out + notices)
 
 
 # Each entry takes (args, should_stop); long-running tools honor should_stop so a
@@ -340,7 +420,9 @@ DISPATCH = {
     "edit": lambda a, ss=None: tool_edit(a["path"], a["old"], a["new"]),
     "glob": lambda a, ss=None: tool_glob(a["pattern"], should_stop=ss),
     "grep": lambda a, ss=None: tool_grep(a["pattern"], a.get("path", "."),
-                                         a.get("glob", "**/*"), should_stop=ss),
+                                         a.get("glob", "**/*"),
+                                         a.get("ignore_case", False),
+                                         a.get("context", 0), should_stop=ss),
     # Symbolic code tools. READS go through the tree-sitter backend (repomap) — it's
     # language-agnostic and the repo_map gives a ranked skeleton for cheap navigation.
     # EDITS stay on the jedi backend (symbols), the proven Python symbol editor.
@@ -510,6 +592,11 @@ SCHEMAS: list[dict[str, Any]] = [
                     "pattern": {"type": "string"},
                     "path": {"type": "string", "description": "Directory to search (default '.')."},
                     "glob": {"type": "string", "description": "File glob (default '**/*')."},
+                    "ignore_case": {"type": "boolean",
+                                    "description": "Case-insensitive match (default false)."},
+                    "context": {"type": "integer",
+                                "description": "Lines of context to show before/after each "
+                                               "match, 0-5 (default 0)."},
                 },
                 "required": ["pattern"],
             },
