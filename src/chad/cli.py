@@ -179,6 +179,10 @@ def main():
                     help="auto-approve bash/write/edit (skip confirmation prompts)")
     ap.add_argument("--no-think", action="store_true",
                     help="skip the model's <think> reasoning blocks (faster)")
+    ap.add_argument("--think-budget", type=int, default=None, dest="think_budget",
+                    help="soft-cap each step's <think> run at N tokens, then force-close "
+                         "it and continue (escalates when stuck); off by default. Also "
+                         "settable via CHAD_THINK_BUDGET.")
     ap.add_argument("--repl", action="store_true",
                     help="plain line REPL instead of the full-screen TUI")
     # Back-compat: -p/--prompt was the old one-shot spelling, now the positional task.
@@ -186,6 +190,10 @@ def main():
     args = ap.parse_args()
 
     _preflight()  # Apple Silicon only — fail clearly before importing/loading MLX
+    # --think-budget (plan 039) reaches the TUI/REPL Agents through the same env knob
+    # their __init__ reads, so the flag works on every entrypoint, not just headless.
+    if args.think_budget is not None:
+        os.environ["CHAD_THINK_BUDGET"] = str(args.think_budget)
     task = args.task or args.prompt_flag
     # Ornith; no draft, ever. RAM-aware default, local-dir-preferred, HF fallback.
     model_id, why = _pick_model()
@@ -260,7 +268,8 @@ def main():
             run_mode = "auto"
             sys.stderr.write("[headless: auto-approving tools (use --plan for read-only)]\n")
         agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
-                      mode=run_mode, thinking=thinking, resume=resume, persist=True)
+                      mode=run_mode, thinking=thinking, resume=resume, persist=True,
+                      think_budget=args.think_budget)
         agent.run_turn(task)
         agent.save()  # persist so a follow-up `chad -c "..."` picks up the thread
     elif args.repl:

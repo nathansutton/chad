@@ -30,6 +30,7 @@ from chad.guardrails import (
     loop_should_abort,
     loop_signature,
     nudge_for_no_calls,
+    think_budget,
     update_thrash,
     update_work_flags,
 )
@@ -280,6 +281,27 @@ def test_destructive_bash_guard():
         check(f"safe does NOT fire: {cmd!r}", not is_destructive_bash(cmd))
 
 
+def test_think_budget():
+    # Plan 039 soft think-cap escalation ramp. stuck_level 0 => base (cheap default).
+    check("stuck 0 => base", think_budget(0) == 512, think_budget(0))
+    check("negative clamps to base", think_budget(-3) == 512, think_budget(-3))
+    # Each increment climbs THINK_CAP_RAMP = (1024, 2048, 4096).
+    check("stuck 1 => 1024", think_budget(1) == 1024, think_budget(1))
+    check("stuck 2 => 2048", think_budget(2) == 2048, think_budget(2))
+    check("stuck 3 => 4096", think_budget(3) == 4096, think_budget(3))
+    # Clamped at the top of the ramp — never grows unbounded.
+    check("stuck 9 clamps to 4096", think_budget(9) == 4096, think_budget(9))
+    # Monotonic non-decreasing in stuck_level (a stuck-er step never gets LESS room).
+    seq = [think_budget(s) for s in range(6)]
+    check("monotonic non-decreasing", seq == sorted(seq), str(seq))
+    # A caller-supplied base is honored at level 0 and never undercut by the ramp.
+    check("custom base at level 0", think_budget(0, base=800) == 800, think_budget(0, 800))
+    check("base wins when it exceeds a ramp rung",
+          think_budget(1, base=800) == 1024, think_budget(1, 800))
+    check("large base never undercut by ramp",
+          think_budget(2, base=5000) == 5000, think_budget(2, 5000))
+
+
 if __name__ == "__main__":
     test_bash_result_verifies()
     test_done_rejection()
@@ -289,5 +311,6 @@ if __name__ == "__main__":
     test_landing_nudge()
     test_thrash_guard()
     test_destructive_bash_guard()
+    test_think_budget()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

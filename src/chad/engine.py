@@ -44,6 +44,8 @@ class GenStats:
     forwards: int = 0               # model forward passes (PLD: < generated_tokens)
     draft_proposed: int = 0         # PLD: n-gram tokens proposed
     draft_accepted: int = 0         # PLD: n-gram tokens accepted
+    stop_condition_fired: bool = False  # generation halted by the caller's stop_condition
+                                    # (plan 039 soft think-cap), not by EOS / max_tokens
 
     @property
     def tok_per_s(self) -> float:
@@ -426,6 +428,7 @@ class Engine:
         should_stop: Optional[Callable[[], bool]] = None,
         on_prefill: Optional[Callable[[int, int], None]] = None,
         on_prefill_progress: Optional[Callable[[int, int], None]] = None,
+        stop_condition: Optional[Callable[[str, int], bool]] = None,
     ):
         """Generate a completion for the already-templated prompt_ids.
 
@@ -435,6 +438,13 @@ class Engine:
         prefill runs, so the caller can show honest status. on_prefill_progress(done,
         total) fires once per prefill chunk so the caller can show an advancing % during
         a big re-prefill; both prefill hooks are optional and pure instrumentation.
+
+        stop_condition(text_so_far, n_generated) -> bool is an OPTIONAL caller predicate
+        checked after each decoded token (composing with should_stop); when it returns
+        True generation halts and stats.stop_condition_fired is set, so the caller can
+        distinguish a deliberate early stop from an EOS/max_tokens finish. This is the
+        soft think-cap hook (plan 039): run_turn uses it to stop a ballooning <think>
+        run and force-close the block. None => byte-identical to a plain generate call.
         """
         # Fairness / measurement knob (CHAD_NO_PREFIX_CACHE): drop the persistent prefix
         # cache before every turn so each step full-prefills from scratch. This forfeits
@@ -455,7 +465,7 @@ class Engine:
                 and (self._trimmable or (self._pld_hybrid and self.enable_pld_hybrid))):
             return self._generate_prompt_lookup(prompt_ids, max_tokens, on_token,
                                                 stop_texts, should_stop, on_prefill,
-                                                on_prefill_progress)
+                                                on_prefill_progress, stop_condition)
 
         common = self._sync_to(prompt_ids)
         suffix = prompt_ids[common:]
@@ -533,6 +543,9 @@ class Engine:
                 break
             if should_stop and should_stop():
                 break
+            if stop_condition is not None and stop_condition(text, len(gen_ids)):
+                stats.stop_condition_fired = True
+                break
         stats.gen_s = time.time() - (first_token_at or t0)
         stats.generated_tokens = len(gen_ids)
 
@@ -558,7 +571,7 @@ class Engine:
 
     def _generate_prompt_lookup(self, prompt_ids, max_tokens, on_token, stop_texts,
                                 should_stop=None, on_prefill=None,
-                                on_prefill_progress=None):
+                                on_prefill_progress=None, stop_condition=None):
         """Single-model speculative decoding using n-gram prompt lookup as the
         drafter. Mirrors the prefix-cache contract of `generate`: only the new
         suffix is prefilled, drafts are verified in one batched forward, accepted
@@ -708,6 +721,12 @@ class Engine:
                     seg = detok.last_segment
                     if seg:
                         on_token(seg)
+            # Soft think-cap (plan 039): honor the caller's stop_condition on this path
+            # too. Checked on the committed run's text/count; byte-identical when None.
+            if not stop and stop_condition is not None \
+                    and stop_condition(detok.text, len(out_ids)):
+                stats.stop_condition_fired = True
+                stop = True
             y_val = toks[n_acc]   # bonus token becomes next pending (unfed) token
             if stop:
                 break

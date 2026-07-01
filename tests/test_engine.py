@@ -149,6 +149,75 @@ def test_prefill_progress_callback():
           f"{shapes_none} vs {shapes}")
 
 
+def test_stop_condition_soft_close():
+    """Tier 1 (no weights): generate()'s soft think-cap hook (plan 039). A caller
+    `stop_condition(text, n)` is checked after each decoded token, composing with
+    should_stop; when it fires, generation halts mid-stream and stats.stop_condition_fired
+    is set so run_turn can tell a deliberate early stop from an EOS/max_tokens finish.
+    We drive it with a faked `stream_generate` (the model itself is never called on the
+    decode path once tokens stream), asserting: the cap stops us while still inside
+    <think> (before the faked </think>), the flag is set, and — critically — a None
+    stop_condition is a byte-identical no-op (same tokens consumed, flag stays False)."""
+    from chad import engine as eng_mod
+    from chad.engine import Engine
+
+    class _Resp:
+        def __init__(self, text, token):
+            self.text, self.token = text, token
+
+    # Faked stream: 8 in-think chunks, then a </think>, then an answer chunk. A cap of 5
+    # (still-in-think) must cut generation before the </think> token is ever reached.
+    def _fake_stream(model, tok, arr, **kw):
+        for i in range(8):
+            yield _Resp("x", 1000 + i)
+        yield _Resp("</think>", 2000)
+        yield _Resp("ans", 2001)
+
+    def _mk_engine():
+        eng = object.__new__(Engine)  # bypass __init__ (no weights)
+        eng.draft = None
+        eng.prompt_lookup = False      # force the standard (non-PLD) generate path
+        eng.temp = 0.0
+        eng.kv_bits = None
+        eng._trimmable = False
+        eng._pld_hybrid = False
+        eng.enable_pld_hybrid = False
+        eng._cached_ids = []
+        eng._sync_to = lambda ids: 0            # nothing cached -> whole prompt is suffix
+        eng._prefill = lambda ids, ss=None, chunk=256, on_progress=None: len(ids)
+        eng.model = object()
+        eng.tok = object()
+        return eng
+
+    orig = eng_mod.stream_generate
+    try:
+        eng_mod.stream_generate = _fake_stream
+        cap = 5
+
+        def _sc(text_so_far, n):
+            return n >= cap and "</think>" not in text_so_far
+
+        eng = _mk_engine()
+        text, stats = eng.generate([1, 2, 3, 4], max_tokens=100, stop_condition=_sc)
+        check("stopped while still inside <think>", "</think>" not in text, repr(text))
+        check("stop_condition_fired flag set", stats.stop_condition_fired is True)
+        check("halted at the cap (not the full stream)",
+              stats.generated_tokens == cap, stats.generated_tokens)
+
+        # None stop_condition: byte-identical no-op. The faked stream self-terminates at
+        # 10 tokens (max_tokens is higher), so all 10 are consumed and the flag stays off.
+        eng2 = _mk_engine()
+        text2, stats2 = eng2.generate([1, 2, 3, 4], max_tokens=100, stop_condition=None)
+        check("no stop_condition consumes the whole stream",
+              stats2.generated_tokens == 10, stats2.generated_tokens)
+        check("no stop_condition leaves flag False",
+              stats2.stop_condition_fired is False)
+        check("no stop_condition emits the closed think + answer",
+              "</think>" in text2 and text2.endswith("ans"), repr(text2))
+    finally:
+        eng_mod.stream_generate = orig
+
+
 def test_guards():
     # num_draft <= 0 -> [] even with an obvious match.
     check("num_draft=0 guard", prompt_lookup_draft([1, 2, 1, 2], 0) == [])
@@ -444,7 +513,8 @@ def test_truncation_recovery_matches_fresh():
 
 if __name__ == "__main__":
     tier1 = (test_longest_match_wins, test_recency_tie_break, test_no_match,
-             test_guards, test_draft_length, test_prefill_progress_callback)
+             test_guards, test_draft_length, test_prefill_progress_callback,
+             test_stop_condition_soft_close)
     tier2 = (test_pld_equals_greedy,
              test_pld_hybrid_equals_greedy,
              test_degenerate_reprefill_matches_fresh,

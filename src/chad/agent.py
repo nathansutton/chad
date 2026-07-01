@@ -165,7 +165,8 @@ class Agent:
     def __init__(self, engine: Engine, yolo: bool = False, max_steps: int = 40,
                  ctx_limit: int = 24000, mode: str = None, emit=None,
                  confirm=None, should_stop=None, thinking: bool = True,
-                 max_gen_tokens: int = 8192, resume: list = None, persist: bool = False):
+                 max_gen_tokens: int = 8192, resume: list = None, persist: bool = False,
+                 think_budget: int = None):
         self.engine = engine
         # Fresh session: clear any skills activated in a prior Agent and re-discover for
         # the current cwd, so the system prompt built below reflects this project's skills
@@ -190,6 +191,16 @@ class Agent:
         # (the "answers on paper then stops" bug). 8192 leaves room for think + a
         # full-file write; truncation past it is now detected and nudged, not accepted.
         self.max_gen_tokens = max_gen_tokens
+        # Soft think-cap base (plan 039). None => the mechanism is OFF and generation is
+        # byte-identical to before. Falls back to the CHAD_THINK_BUDGET env knob so the
+        # eval harness can arm an arm without a code change (matches the CHAD_* family).
+        # When set, run_turn stops each step's <think> run once it exceeds this many
+        # tokens and force-closes the block (prefix-safe); the cap escalates with the
+        # turn's stuck-signals (see guardrails.think_budget).
+        if think_budget is None:
+            _tb = os.environ.get("CHAD_THINK_BUDGET")
+            think_budget = int(_tb) if _tb else None
+        self.think_budget = think_budget
         self.ctx_limit = ctx_limit  # prompt-token budget before compaction kicks in
         self.messages = [{"role": "system", "content": build_system_prompt()}]
         if resume:
@@ -208,6 +219,7 @@ class Agent:
         self.draft_proposed = 0
         self.draft_accepted = 0
         self.think_tokens = 0   # tokens spent inside <think> blocks (reasoning overhead)
+        self.think_capped = 0   # times the soft think-cap force-closed a step (plan 039)
         # prefill accounting: the master cost for a local model is how many *new*
         # tokens it has to prefill across a turn (context bloat -> big prefills).
         # This is the metric symbolic/repo-map retrieval is meant to shrink.
@@ -355,6 +367,7 @@ class Agent:
         landing_nudges = 0  # one-shot "you're out of steps, land the edit" near the cap
         consecutive_failed_bash = 0  # back-to-back errored bash with no edit (thrash)
         thrash_nudges = 0
+        think_cap_hits = 0  # soft think-cap firings this turn (plan 039; drives escalation)
         # Action vs Q&A intent (see classify_intent): a task that asks to change code
         # should END in an applied edit, not a prose explanation. Telemetry caught the
         # model navigating to the right function then "answering on paper" without
@@ -389,6 +402,24 @@ class Agent:
             # verb like "Searching" left over from the previous step).
             self._emit("ctx", str(len(prompt_ids)))
             self._emit("status", "Thinking")
+
+            # Plan 039 soft think-cap: when armed (self.think_budget set) and thinking is
+            # on, stop this step's generation once its <think> run exceeds a budget so
+            # reasoning can't balloon. The budget escalates with the turn's stuck-signals
+            # (prior caps this turn + loop/thrash/verify nudges) so a genuinely hard step
+            # gets more room instead of being chunked repeatedly. None => generation is
+            # byte-identical to before (the mechanism is off by default).
+            stop_condition = None
+            think_cap = None
+            if self.think_budget and self.thinking:
+                stuck = (think_cap_hits + self._loop_nudges + thrash_nudges
+                         + verify_nudges)
+                think_cap = guardrails.think_budget(stuck, base=self.think_budget)
+
+                def stop_condition(text_so_far, n, _cap=think_cap):
+                    # Still inside <think> (no close emitted) and over budget -> stop; the
+                    # turn is then force-closed by close_unclosed_think, a prefix-safe append.
+                    return n >= _cap and "</think>" not in text_so_far
 
             view = _StreamView(self._emit, started_in_think=self.thinking) if stream else None
             gen_count = [0]  # decoded chunks this step (~tokens); fed to the live ↓ counter
@@ -427,7 +458,7 @@ class Agent:
             text, stats = self.engine.generate(
                 prompt_ids, max_tokens=self.max_gen_tokens, on_token=on_token,
                 should_stop=self._should_stop, on_prefill=on_prefill,
-                on_prefill_progress=on_prefill_progress)
+                on_prefill_progress=on_prefill_progress, stop_condition=stop_condition)
             if gen_count[0] % 16:  # flush the final (un-throttled) count for the ↓ readout
                 self._emit("gen", str(gen_count[0]))
             # The generation ran to the token cap: the turn was cut off, not finished.
@@ -468,7 +499,12 @@ class Agent:
 
             # Estimate reasoning overhead: the generation opens inside <think> (the
             # template emits the opening tag), so everything up to </think> is thinking.
-            if "</think>" in text and len(text):
+            # A soft-cap stop (plan 039) fires only while still inside <think>, so ALL of
+            # this step's tokens are reasoning — count them so think-token telemetry (the
+            # metric the budget is measured against) doesn't under-report the capped runs.
+            if stats.stop_condition_fired:
+                self.think_tokens += stats.generated_tokens
+            elif "</think>" in text and len(text):
                 frac = len(text.split("</think>", 1)[0]) / len(text)
                 self.think_tokens += int(stats.generated_tokens * frac)
 
@@ -512,6 +548,21 @@ class Agent:
                 log.warning("CACHE DIVERGENCE at step %d: full re-prefill of %d tokens "
                             "(non-trimmable cache reset — see prior turn for a truncated "
                             "generation)", step, stats.prompt_tokens)
+
+            # Plan 039: the soft think-cap fired — generation was stopped while still
+            # inside <think> (the reasoning run exceeded this step's budget). The assistant
+            # turn was force-closed by close_unclosed_think above (it ends with </think>,
+            # no content after), so it re-tokenizes as a strict prefix of the live KV cache
+            # — next step is a ~2-token append, not a rebuild (the close_unclosed_think
+            # contract). Count it (escalates the budget for the next step so we don't chunk
+            # forever) and continue; the model resumes reasoning / acts next step.
+            if stats.stop_condition_fired:
+                think_cap_hits += 1
+                self.think_capped += 1
+                log.info("THINK-CAP at step %d: closed <think> after %d tok "
+                         "(cap=%d, hits=%d)", step, stats.generated_tokens,
+                         think_cap, think_cap_hits)
+                continue
 
             calls = parse_tool_calls(text)
             if not calls:

@@ -200,6 +200,28 @@ def bash_thrash_nudge(consecutive_failed_bash, thrash_nudges):
     return None
 
 
+# --- soft think-cap (plan 039) -----------------------------------------------------
+# <think> blocks are 36–41% of all generated tokens on the eval suite and decode is
+# bandwidth-bound, so an unbounded reasoning run is the single largest wall-clock
+# multiplier the harness controls. When armed, run_turn stops a step's <think> run once
+# it exceeds this cap and force-closes the block (prefix-safe — see
+# agent.close_unclosed_think), then continues. The cap ESCALATES with a turn's
+# stuck-signals so a genuinely hard step gets more reasoning room instead of being
+# chunked repeatedly into re-thinks.
+THINK_CAP_RAMP = (1024, 2048, 4096)
+
+
+def think_budget(stuck_level: int, base: int = 512) -> int:
+    """Per-step <think>-token cap. `stuck_level` 0 => `base` (the cheap default); each
+    increment climbs THINK_CAP_RAMP (clamped to the top), giving more reasoning room when
+    run_turn has a concrete stuck-signal for this turn — a prior cap hit, or a loop /
+    thrash / verify-fail nudge. Never returns below `base` (so a caller that sets a large
+    base is respected). Pure and testable; run_turn owns `stuck_level` and `base`."""
+    if stuck_level <= 0:
+        return base
+    return max(base, THINK_CAP_RAMP[min(stuck_level - 1, len(THINK_CAP_RAMP) - 1)])
+
+
 def loop_signature(calls) -> str:
     """Canonical signature of a tool-call set, for the repeated-call loop guard."""
     return json.dumps(calls, sort_keys=True)
