@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Any
 
-from . import repomap, symbols
+from . import repomap, symbols, syntaxgate
 from .ignore import IGNORE_DIRS, slash_wrapped
 
 # Directories never worth walking: huge, generated, or VCS internals. The canonical set
@@ -157,7 +157,7 @@ def tool_read(path: str, offset: int = 0, limit: int = READ_DEFAULT_LIMIT) -> st
     # prefill page by page. Nudge toward symbol-targeted reads (the bigfile tasks show
     # this is the expensive losing move on a non-trimmable cache).
     lead = ""
-    if offset > 0 and total > READ_SKELETON_LINES and repomap.service()._lang_for(path):
+    if offset > 0 and total > READ_SKELETON_LINES and repomap.service().lang_for(path):
         lead = (f"[paging a {total}-line code file — view_symbol(name) returns just the one "
                 f"function (~10x cheaper than reading pages); overview({_rel(path)}) lists "
                 f"the symbols.]\n")
@@ -180,10 +180,19 @@ def tool_read(path: str, offset: int = 0, limit: int = READ_DEFAULT_LIMIT) -> st
 
 
 def tool_write(path: str, content: str) -> str:
+    before = None
+    if os.path.exists(path):
+        try:
+            with open(path, errors="replace") as f:
+                before = f.read()
+        except OSError:
+            pass
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as f:
         f.write(content)
-    return f"[wrote {len(content)} bytes to {_rel(path)}]"
+    result = f"[wrote {len(content)} bytes to {_rel(path)}]"
+    warn = syntaxgate.check_syntax(path, before)
+    return result + warn if warn else result
 
 
 # Edit robustness. Dogfooding logs showed ~1 in 6 `edit` calls failed to apply —
@@ -259,7 +268,9 @@ def _apply_edit(path: str, before: str, after: str, note: str) -> str:
         return "[no-op edit: the replacement leaves the file unchanged]"
     with open(path, "w") as f:
         f.write(after)
-    return f"[edited {_rel(path)}{note}]"
+    result = f"[edited {_rel(path)}{note}]"
+    warn = syntaxgate.check_syntax(path, before)
+    return result + warn if warn else result
 
 
 def tool_edit(path: str, old: str, new: str) -> str:

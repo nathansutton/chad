@@ -120,7 +120,7 @@ class RepoMap:
 
     # -- tree-sitter plumbing --------------------------------------------
 
-    def _lang_for(self, path):
+    def lang_for(self, path):
         try:
             return tlp.detect_language_from_path(path)
         except Exception:
@@ -169,7 +169,7 @@ class RepoMap:
                     continue
             except OSError:
                 continue
-            if self._lang_for(f):
+            if self.lang_for(f):
                 out.append(f)
         result = sorted(out)[:_MAX_FILES]
         if not interrupted:        # never cache a partial scan
@@ -203,7 +203,7 @@ class RepoMap:
             return cached[1], cached[2]
 
         defs, refs = [], []
-        tools = self._lang_tools(self._lang_for(path))
+        tools = self._lang_tools(self.lang_for(path))
         if tools:
             parser, query = tools
             try:
@@ -372,7 +372,7 @@ class RepoMap:
             return f"[no such file: {path}]"
         defs, _ = self._extract(path)
         if not defs:
-            if not self._lang_for(path):
+            if not self.lang_for(path):
                 return "[no tree-sitter grammar for this file type; use read]"
             return "[no functions or classes]"
         lines = []

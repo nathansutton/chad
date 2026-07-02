@@ -21,6 +21,7 @@ import os
 
 import jedi
 
+from . import syntaxgate
 from .ignore import IGNORE_DIRS, slash_wrapped
 
 _SKIP = slash_wrapped(IGNORE_DIRS)
@@ -153,7 +154,9 @@ class SymbolService:
                 if not d.startswith(("---", "+++", "@@"))]
         adds = sum(d.startswith("+") for d in diff)
         dels = sum(d.startswith("-") for d in diff)
-        return f"[{label} in {self._rel(fp)}: +{adds} -{dels}]\n" + "\n".join(diff)
+        result = f"[{label} in {self._rel(fp)}: +{adds} -{dels}]\n" + "\n".join(diff)
+        warn = syntaxgate.check_syntax(fp, code)  # `code` is the pre-edit content
+        return result + warn if warn else result
 
     def _locate_one(self, name, path, should_stop=None):
         parts = _norm_path(name)
