@@ -523,9 +523,13 @@ def test_truncation_recovery_matches_fresh():
 def test_push_pop_bit_exact():
     if os.environ.get("CHAD_FAST_TESTS"):
         return skip("push_pop_bit_exact", "CHAD_FAST_TESTS set (fast gate)")
-    eng = _build_engine()
+    # push/pop is model-agnostic (RAM-tuple stash + optional disk spill); the trimmable
+    # default is the CI path. Plan 041 also wants a run on the real hybrid (bf16 Ornith),
+    # so CHAD_TEST_HYBRID_MODEL — when set — points THIS test at those weights.
+    model_id = os.environ.get("CHAD_TEST_HYBRID_MODEL", TIER2_MODEL)
+    eng = _build_engine(model_id=model_id)
     if eng is None:
-        return skip("push_pop_bit_exact", f"could not load {TIER2_MODEL}")
+        return skip("push_pop_bit_exact", f"could not load {model_id}")
 
     def _tmpl(user):
         return list(eng.tok.apply_chat_template(
