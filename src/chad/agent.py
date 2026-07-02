@@ -15,8 +15,8 @@ import sys
 import time
 
 from . import compaction, guardrails, session
+from .base_engine import BaseEngine
 from .diag import args_preview, log, redact, result_preview
-from .engine import Engine
 from .prompt import build_subagent_prompt, build_system_prompt, classify_intent
 from .render import (
     C_DIM,
@@ -172,7 +172,7 @@ INIT_PROMPT = (
 
 
 class Agent:
-    def __init__(self, engine: Engine, yolo: bool = False, max_steps: int = 40,
+    def __init__(self, engine: BaseEngine, yolo: bool = False, max_steps: int = 40,
                  ctx_limit: int = 24000, mode: str = None, emit=None,
                  confirm=None, should_stop=None, thinking: bool = True,
                  max_gen_tokens: int = 8192, resume: list = None, persist: bool = False,
@@ -942,12 +942,13 @@ class Agent:
         return "[stopped: hit max tool steps]"
 
 
-def repl(engine: Engine, yolo: bool, ctx_limit: int = 24000, resume: list = None,
+def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = None,
          thinking: bool = True):
     agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking,
                   resume=resume, persist=True)
     print(f"{C_DIM}chad ready. model={engine.model_id}"
-          f"{' + draft' if engine.draft else ''}. type a task, or /reset, /exit.{C_RST}")
+          f"{' + draft' if getattr(engine, 'draft', None) else ''}. "
+          f"type a task, or /reset, /exit.{C_RST}")
     while True:
         try:
             line = input(f"{C_YEL}» {C_RST}").strip()
@@ -960,7 +961,7 @@ def repl(engine: Engine, yolo: bool, ctx_limit: int = 24000, resume: list = None
         if line in ("/reset", "/clear"):
             agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking,
                           persist=True)
-            engine._reset_cache()
+            engine.reset()
             print(f"{C_DIM}session reset.{C_RST}")
             continue
         if line == "/mode":

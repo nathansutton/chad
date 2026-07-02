@@ -48,7 +48,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
 from .agent import INIT_PROMPT, MODE_LABEL, Agent
-from .engine import Engine
+from .base_engine import BaseEngine
 from .ignore import IGNORE_DIRS
 from .render import C_BOLD, C_DIM, C_GREEN, C_RED, C_RST, C_YEL, confirm_preview, render_tool_result
 
@@ -252,7 +252,7 @@ def _make_history():
 
 
 class TUI:
-    def __init__(self, engine: Engine, ctx_limit: int, mode: str = "normal",
+    def __init__(self, engine: BaseEngine, ctx_limit: int, mode: str = "normal",
                  thinking: bool = True, max_chars: int = 400_000, resume: list = None):
         self.engine = engine
         self.ctx_limit = ctx_limit
@@ -595,7 +595,7 @@ class TUI:
         self._pending_plan = None
         self._pending_budget_note = None
         self._interrupt.clear()        # the new turn must start un-interrupted
-        self.engine._reset_cache()
+        self.engine.reset()
         return True
 
     def _accept_plan(self):
@@ -839,6 +839,6 @@ class TUI:
             refresher.cancel()
 
 
-def run_tui(engine: Engine, ctx_limit: int, mode: str = "normal", thinking: bool = True,
+def run_tui(engine: BaseEngine, ctx_limit: int, mode: str = "normal", thinking: bool = True,
             resume: list = None):
     asyncio.run(TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume).run())

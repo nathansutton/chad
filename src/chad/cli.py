@@ -224,6 +224,20 @@ def main():
                     help="on a one-shot run, if the governor hard-stops a turn, relaunch a "
                          "FRESH turn (cleared context) seeded with the progress note, up to N "
                          "times (default 0 = off). Sheds the ramble and the huge prefill.")
+    # Backend selection (plan 046 spike). Default 'mlx' is the in-process engine and the
+    # whole point of chad; 'openai' drives the SAME harness against an OpenAI-compatible
+    # endpoint to separate harness-value from engine-value (honest degradations apply —
+    # see openai_engine.py). The MLX path below is untouched when --backend is unset.
+    ap.add_argument("--backend", choices=("mlx", "openai"), default="mlx",
+                    help="inference backend: 'mlx' (default, in-process KV cache) or "
+                         "'openai' (spike: run the chad harness against an OpenAI-compatible "
+                         "/v1/chat/completions endpoint; requires --base-url).")
+    ap.add_argument("--base-url", dest="base_url", default=None,
+                    help="OpenAI-compatible base URL for --backend openai (e.g. "
+                         "http://localhost:8080/v1). Also CHAD_OPENAI_BASE_URL.")
+    ap.add_argument("--api-key-env", dest="api_key_env", default=None,
+                    help="name of the env var holding the API key for --backend openai; the "
+                         "key is read from that var, never passed on the command line.")
     ap.add_argument("--repl", action="store_true",
                     help="plain line REPL instead of the full-screen TUI")
     # Back-compat: -p/--prompt was the old one-shot spelling, now the positional task.
@@ -244,7 +258,6 @@ def main():
     task = args.task or args.prompt_flag
     # Ornith; no draft, ever. RAM-aware default, local-dir-preferred, HF fallback.
     model_id, why = _pick_model()
-    _ensure_model(model_id)  # first-run download-on-consent if it's an uncached HF repo
 
     # Advanced, rarely-touched knobs live in env vars to keep the CLI sane:
     #   CHAD_MAX_CONTEXT  YaRN-extend the window (e.g. 131072 for 128k)
@@ -256,14 +269,32 @@ def main():
     # ds4-style on-disk KV warm-start of the stable system+tools prefix.
     cache_dir = os.path.expanduser("~/.cache/chad/kv")
 
-    eng = Engine(
-        model_id=model_id,
-        draft_id=None,
-        kv_bits=kv_bits,
-        max_context=max_context,
-        cache_dir=cache_dir,
-    )
-    sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} [{why}] ...\n")
+    if args.backend == "openai":
+        # Plan 046 spike: drive the chad harness against an OpenAI-compatible endpoint
+        # instead of the in-process MLX engine. Only a tokenizer is loaded locally (to
+        # render/decode prompts); generation is proxied over HTTP. Weights are NOT
+        # downloaded (we don't run them here). The MLX default path is untouched.
+        from .openai_engine import OpenAIEngine
+        base_url = args.base_url or os.environ.get("CHAD_OPENAI_BASE_URL")
+        if not base_url:
+            sys.stderr.write("chad --backend openai needs --base-url (or CHAD_OPENAI_BASE_URL), "
+                             "e.g. http://localhost:8080/v1\n")
+            sys.exit(1)
+        api_key = os.environ.get(args.api_key_env, "") if args.api_key_env else ""
+        eng = OpenAIEngine(model_id=model_id, base_url=base_url, api_key=api_key,
+                           effective_ctx=max_context or 32768)
+        sys.stderr.write(f"backend=openai · base_url={base_url} · model={model_id} "
+                         f"(tokenizer local, generation proxied) ...\n")
+    else:
+        _ensure_model(model_id)  # first-run download-on-consent if it's an uncached HF repo
+        eng = Engine(
+            model_id=model_id,
+            draft_id=None,
+            kv_bits=kv_bits,
+            max_context=max_context,
+            cache_dir=cache_dir,
+        )
+        sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} [{why}] ...\n")
     try:
         load_s = eng.load()
     except Exception as e:  # noqa: BLE001 — convert any load failure into guidance
@@ -348,7 +379,7 @@ def main():
             continues -= 1
             sys.stderr.write("[governor] previous turn ran out of budget; continuing fresh "
                              "with a progress note\n")
-            eng._reset_cache()
+            eng.reset()
             agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
                           mode=run_mode, thinking=thinking, persist=True,
                           think_budget=args.think_budget,

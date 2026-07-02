@@ -91,6 +91,26 @@ a *harness* property, not a server feature. That co-design is the whole moat: it
 the same C+ student passes 17 tasks under chad and 0 under harnesses built for the A
 student. A C+ student with a good tutor, running free on your own machine. 🗿
 
+### Why the engine is in-process (and not behind an OpenAI layer)
+
+A fair question is whether chad should talk to its model through an OpenAI-style
+`/v1/chat/completions` boundary — the way every external harness above does — so the
+frontend and backend decouple cleanly. It shouldn't, and the table already shows why:
+that boundary is stateless text-in/text-out, and chad's core engineering (diffing
+rendered *token ids* against a live KV cache, warm-prefix disk checkpoints,
+`close_unclosed_think` prefix repair, interruptible chunked prefill, RAM-aware context
+sizing, cache push/pop) all require *owning* the tokenizer and the cache object. None of
+it survives the API. The coupling isn't debt; it's the measured moat.
+
+To keep that answer honest rather than asserted, chad ships a thin, flag-gated adapter
+(`--backend openai`, `src/chad/openai_engine.py`) that runs the *same harness* against
+any OpenAI-compatible endpoint — so "harness value" and "engine value" can be measured
+separately as an ablation arm. The adapter's honest degradations (it can't report cache
+reuse, can't show prefill progress, and interrupts by dropping the stream) are documented
+in-code. **TODO (operator, plan 046):** paste the core-tier `chad in-process` vs
+`chad-over-mlx_lm.server` numbers here once measured on a warm GPU — expected pass-rate
+near-equal (the harness carries it), wall-clock/TTFT materially worse.
+
 ## Quickstart
 
 Apple Silicon + [uv](https://docs.astral.sh/uv/). No clone, no model build — install and

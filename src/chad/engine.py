@@ -33,31 +33,10 @@ from mlx_lm import load, stream_generate
 from mlx_lm.models import cache as cache_utils
 from mlx_lm.sample_utils import make_sampler
 
-
-@dataclass
-class GenStats:
-    prompt_tokens: int = 0          # tokens actually prefilled this turn
-    cached_tokens: int = 0          # tokens served from the prefix cache
-    generated_tokens: int = 0
-    prefill_s: float = 0.0
-    gen_s: float = 0.0
-    forwards: int = 0               # model forward passes (PLD: < generated_tokens)
-    draft_proposed: int = 0         # PLD: n-gram tokens proposed
-    draft_accepted: int = 0         # PLD: n-gram tokens accepted
-    stop_condition_fired: bool = False  # generation halted by the caller's stop_condition
-                                    # (plan 039 soft think-cap), not by EOS / max_tokens
-
-    @property
-    def tok_per_s(self) -> float:
-        return self.generated_tokens / self.gen_s if self.gen_s > 0 else 0.0
-
-    @property
-    def accept_rate(self) -> float:
-        return self.draft_accepted / self.draft_proposed if self.draft_proposed else 0.0
-
-    @property
-    def tokens_per_forward(self) -> float:
-        return self.generated_tokens / self.forwards if self.forwards else 0.0
+# GenStats moved to base_engine.py (plan 046) so a non-MLX backend can build one without
+# importing mlx.core. Re-exported here so existing `from .engine import GenStats` keeps
+# working (bench.py, tests) — the class is unchanged.
+from .base_engine import GenStats
 
 
 def prompt_lookup_draft(context, num_draft, ngram_max=3, ngram_min=1):
@@ -225,6 +204,12 @@ class Engine:
             mx.clear_cache()
 
     # -- cache management -------------------------------------------------
+
+    def reset(self):
+        """Public alias for `_reset_cache` (plan 046 BaseEngine seam). Consumers (TUI /
+        REPL / cli governor) call this; the private name stays the engine's own internal
+        spelling, used throughout the cache machinery below."""
+        self._reset_cache()
 
     def _reset_cache(self):
         self._cache = cache_utils.make_prompt_cache(self.model)
