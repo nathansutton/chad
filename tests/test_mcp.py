@@ -614,3 +614,42 @@ def test_dead_endpoint_does_not_block_healthy_server(http_server, tmp_path, monk
     assert all(not n.startswith("mcp__dead__") for n in names)  # dead one contributed none
     assert any("dead" in w for w in reg.warnings)         # parallel + isolated connect
     mcp.reset_session()
+
+
+# ---------------------------------------------------------------------------
+# stdio subprocess environment filter (plan 044 item 6)
+# ---------------------------------------------------------------------------
+
+def test_stdio_env_withholds_secrets_by_default():
+    # A parent environment carrying a secret + the essentials the subprocess needs.
+    parent = {"PATH": "/usr/bin", "HOME": "/home/me", "LANG": "en_US.UTF-8",
+              "TERM": "xterm", "OPENAI_API_KEY": "sk-secret", "AWS_SECRET_KEY": "top"}
+    env = mcp._stdio_env(parent, None)
+    assert env["PATH"] == "/usr/bin"                 # essentials pass through
+    assert env["HOME"] == "/home/me"
+    assert env["LANG"] == "en_US.UTF-8"
+    assert "OPENAI_API_KEY" not in env               # secrets withheld
+    assert "AWS_SECRET_KEY" not in env
+
+
+def test_stdio_env_config_extra_merges_and_wins():
+    # A server's own `env:` block is always honored and overrides the inherited value.
+    parent = {"PATH": "/usr/bin", "HOME": "/home/me"}
+    env = mcp._stdio_env(parent, {"MY_TOKEN": "abc", "PATH": "/custom/bin"})
+    assert env["MY_TOKEN"] == "abc"                  # explicitly declared var passes
+    assert env["PATH"] == "/custom/bin"              # config `env:` overrides inherited
+    assert env["HOME"] == "/home/me"
+
+
+def test_stdio_env_full_env_escape_hatch():
+    # CHAD_MCP_FULL_ENV=1 restores the historical full inherit for the rare server.
+    parent = {"PATH": "/usr/bin", "SECRET": "s", "CHAD_MCP_FULL_ENV": "1"}
+    env = mcp._stdio_env(parent, None)
+    assert env["SECRET"] == "s"                      # everything inherited
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_stdio_env_extra_non_dict_ignored():
+    # A malformed `env:` (not an object) must not crash the transport build.
+    env = mcp._stdio_env({"PATH": "/usr/bin"}, "not-a-dict")
+    assert env == {"PATH": "/usr/bin"}

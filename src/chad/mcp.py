@@ -188,6 +188,31 @@ def _set_trusted(cwd: str):
 # headers; OAuth (auth= provider) slots into the same call sites in plan 017.
 # ---------------------------------------------------------------------------
 
+# Env vars a stdio MCP server can reasonably need just to *start* — locate its binary,
+# resolve HOME, set the locale, find a temp dir. Everything else in the parent
+# environment (API keys, cloud tokens, provider creds) is withheld by default: a
+# user-configured stdio server runs an arbitrary local command and has no business
+# inheriting chad's whole secret-bearing environment. A server that genuinely needs a
+# specific var declares it in its config `env:` block (merged in, and it wins); the full
+# inherit is available with CHAD_MCP_FULL_ENV=1 for the rare server that needs it.
+_MCP_ENV_ALLOW = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR",
+                  "TMP", "TEMP", "SHELL", "USER", "LOGNAME")
+
+
+def _stdio_env(environ, extra) -> dict:
+    """The environment handed to a stdio MCP subprocess. Minimal allowlist by default
+    (see `_MCP_ENV_ALLOW`) so secrets in the parent environment don't leak to arbitrary
+    user-configured commands; `CHAD_MCP_FULL_ENV=1` restores the full inherit. The
+    server's own config `env:` entries are always merged last and override."""
+    if environ.get("CHAD_MCP_FULL_ENV") == "1":
+        env = dict(environ)
+    else:
+        env = {k: environ[k] for k in _MCP_ENV_ALLOW if k in environ}
+    if isinstance(extra, dict):
+        env.update({k: str(v) for k, v in extra.items()})
+    return env
+
+
 def _transport_for(spec: dict, auth=None):
     """Return (kind, build) for a server spec, where `build()` is a zero-arg factory
     that yields the SDK transport async context manager. Transport is chosen by
@@ -202,10 +227,7 @@ def _transport_for(spec: dict, auth=None):
         return "http", lambda: streamablehttp_client(url, headers=headers, auth=auth)
     command = spec.get("command")
     if isinstance(command, str) and command:
-        env = dict(os.environ)
-        extra = spec.get("env")
-        if isinstance(extra, dict):
-            env.update({k: str(v) for k, v in extra.items()})
+        env = _stdio_env(os.environ, spec.get("env"))
         params = StdioServerParameters(
             command=command,
             args=list(spec.get("args") or []),

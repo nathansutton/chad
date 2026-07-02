@@ -81,6 +81,18 @@ def test_malformed_live_emits_are_ignored():
     assert t._pending == []
 
 
+def test_settle_ctx_gauge_avoids_retokenizing():
+    # Plan 044 item 3: at end of turn the ctx gauge is refreshed from the last `ctx`
+    # emit (final step's prompt size) + the generated-token count — NOT by re-rendering
+    # the whole transcript. The helper is pure arithmetic over already-tracked state; if
+    # it ever calls self.agent._render() this bare instance (no .agent) would AttributeError.
+    t = _bare_tui()
+    t._cur_prompt_tokens = 8000   # last `ctx` emit during the turn
+    t._gen_tokens = 240           # tokens the final step generated
+    t._settle_ctx_gauge()
+    assert t._cur_prompt_tokens == 8240
+
+
 def test_info_emit_does_queue_a_fragment():
     # Contrast: a real transcript kind still appends (proves the no-queue checks above
     # aren't just because _emit never queues anything).

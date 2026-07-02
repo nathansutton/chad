@@ -56,6 +56,17 @@ def test_edit():
                      "def area(w, h):\\n    return w * w")
     check("literal-\\n both recovers", res.startswith("[edited"), res)
     check("new unescaped to real newline", "\\n" not in after and "w * w" in after, repr(after))
+    # 2c) item 4 (plan 044): unescaping `new` is ambiguous (did the model mean a newline
+    # or a literal backslash-n?), so when we DO transform it the result must DISCLOSE it
+    # rather than change the model's replacement silently.
+    check("new-unescape disclosed", "interpreted as newline" in res, res)
+
+    # 2d) item 4 SAFETY: a literal backslash-n in `new` on the EXACT-match path is written
+    # verbatim (no silent newline transform) and no disclosure fires — a model that wants a
+    # real "\\n" in its source gets exactly that.
+    res, after = run("x = 1\n", "x = 1", "x = 1  # keep \\n literal")
+    check("literal \\n in new preserved on exact path",
+          "\\n" in after and "interpreted" not in res, repr((res, after)))
 
     # 3) indentation drift: model quoted with no leading indent (construct.py case)
     src = "def f(text):\n        return text.strip()\n"

@@ -197,8 +197,16 @@ def _nlines(s: str) -> int:
 
 
 def _is_err(result: str) -> bool:
-    head = str(result)[:48].lower()
-    return str(result).startswith("[") and any(k in head for k in (
+    # Display-only heuristic: does this tool result read as a chad error message? Those
+    # are single bracketed diagnostics (`[no such file: …]`, `[exit 1]\n…`), so require a
+    # leading `[` AND scan only the FIRST line (plan 044 item 7) — otherwise a `read`/grep
+    # of `[`-leading multi-line content (a JSON array, a TOML/markdown doc) would smuggle a
+    # keyword in from a later line and get mis-styled as an error.
+    r = str(result)
+    if not r.startswith("["):
+        return False
+    head = r.split("\n", 1)[0][:48].lower()
+    return any(k in head for k in (
         "no such file", "cannot read", "error", "not found", "denied", "bad regex",
         "timed out", "exit ", "must be", "missing", "unknown tool", "no-op", "appears",
         "old string", "empty"))

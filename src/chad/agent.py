@@ -111,9 +111,6 @@ def expand_mentions(text: str):
     return augmented, [p for _, p in resolved]
 
 
-SYSTEM_PROMPT = build_system_prompt()
-
-
 def _has_open_tool_call(text: str) -> bool:
     """True if `text` opened a tool-call block it never closed — the signature of a
     generation truncated mid-call (most often a `write` whose content blew the token

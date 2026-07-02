@@ -291,11 +291,19 @@ def tool_edit(path: str, old: str, new: str) -> str:
     # (2) escape-normalized: literal \n/\t in `old` (and `new` when it has no real newline).
     uold = _unescape_ws(old)
     unew = _unescape_ws(new) if ("\n" not in new and "\\n" in new) else new
+    # STOP condition (plan 044 item 4): whether a literal `\n` in `new` is an escape the
+    # model meant as a newline, or a genuine backslash-n it wants written verbatim, is
+    # ambiguous — and `unew` is only ever used on a recovery path where `old` itself
+    # needed the same unescape, so we keep the historical transform but DISCLOSE it in the
+    # result so the model can correct a mis-transformed literal instead of it happening
+    # silently. `note_new` is the disclosure fragment, empty when `new` was left as-is.
+    note_new = (" [note: \\n in replacement interpreted as newline; re-edit with a real "
+                "newline if you meant a literal backslash-n]") if unew != new else ""
     if uold != old:
         c = data.count(uold)
         if c == 1:
             return _apply_edit(path, data, data.replace(uold, unew, 1),
-                               " (recovered: interpreted \\n/\\t escapes in `old`)")
+                               " (recovered: interpreted \\n/\\t escapes in `old`)" + note_new)
         if c > 1:
             return f"[old string appears {c} times; make it unique by including more surrounding lines]"
 
@@ -306,9 +314,11 @@ def tool_edit(path: str, old: str, new: str) -> str:
         s, e = spans[0]
         head = data[s:e].split("\n")[0]
         indent = head[: len(head) - len(head.lstrip())]
-        repl = _reindent((unew if uold != old else new).strip("\n"), indent)
+        used_unew = uold != old  # this path only unescapes `new` when `old` was unescaped
+        repl = _reindent((unew if used_unew else new).strip("\n"), indent)
         return _apply_edit(path, data, data[:s] + repl + data[e:],
-                           " (recovered: matched ignoring indentation/whitespace)")
+                           " (recovered: matched ignoring indentation/whitespace)"
+                           + (note_new if used_unew else ""))
     if len(spans) > 1:
         return (f"[old string matches {len(spans)} places ignoring whitespace; include "
                 f"more surrounding lines to make it unique]")

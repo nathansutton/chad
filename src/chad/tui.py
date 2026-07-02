@@ -576,7 +576,16 @@ class TUI:
                 with self._lock:
                     self._pending.append("\n")
                 self._busy = False
-                self._cur_prompt_tokens = len(self.agent._render())
+                self._settle_ctx_gauge()
+
+    def _settle_ctx_gauge(self):
+        """Refresh the end-of-turn context gauge WITHOUT re-tokenizing the transcript
+        (plan 044). The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
+        final step's prompt size, and generation then appended ~`_gen_tokens` tokens; the
+        sum approximates the new context size at ~zero cost. The old
+        `len(self.agent._render())` re-ran apply_chat_template over the whole conversation
+        on the worker thread just to nudge a display gauge — pure waste on long sessions."""
+        self._cur_prompt_tokens += self._gen_tokens
 
     async def run(self):
         worker = threading.Thread(target=self._worker, daemon=True)

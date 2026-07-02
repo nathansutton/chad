@@ -169,7 +169,10 @@ def _dynamic_context() -> list:
     for fname in ("CLAUDE.md", "AGENTS.md"):
         if os.path.isfile(fname):
             try:
-                doc = open(fname).read().strip()[:4000]
+                # errors="replace": these are prompt text, not code we execute — a
+                # non-UTF-8 project doc must not crash build_system_prompt (agent won't
+                # construct); replacement chars in a stray byte are harmless here.
+                doc = open(fname, encoding="utf-8", errors="replace").read().strip()[:4000]
             except OSError:
                 continue
             if doc:
@@ -218,7 +221,7 @@ _TEST_CMD_RE = re.compile(
 def _first_test_cmd(path: str) -> str:
     """First test-runner invocation found in a CI/Make file, cleaned, or ""."""
     try:
-        txt = open(path).read()
+        txt = open(path, encoding="utf-8", errors="replace").read()
     except OSError:
         return ""
     m = _TEST_CMD_RE.search(txt)
@@ -245,7 +248,7 @@ def _detect_test_command() -> str:
     # 2) A Makefile `test:` target.
     if os.path.isfile("Makefile"):
         try:
-            if re.search(r'^test:', open("Makefile").read(), re.MULTILINE):
+            if re.search(r'^test:', open("Makefile", encoding="utf-8", errors="replace").read(), re.MULTILINE):
                 return "make test"
         except OSError:
             pass
@@ -253,7 +256,7 @@ def _detect_test_command() -> str:
     #    project is uv-managed (bare `python` would miss the project's venv).
     if os.path.isfile("pyproject.toml"):
         try:
-            txt = open("pyproject.toml").read()
+            txt = open("pyproject.toml", encoding="utf-8", errors="replace").read()
         except OSError:
             txt = ""
         if "[tool.pytest" in txt:
@@ -265,7 +268,7 @@ def _detect_test_command() -> str:
         return "go test ./..."
     if os.path.isfile("package.json"):
         try:
-            if re.search(r'"test"\s*:', open("package.json").read()):
+            if re.search(r'"test"\s*:', open("package.json", encoding="utf-8", errors="replace").read()):
                 return "npm test"
         except OSError:
             pass

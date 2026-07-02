@@ -1,8 +1,8 @@
 """Characterization tests for agent.py's pure, model-free helpers — `expand_mentions`
 (the @file/@dir mention expander) and `_has_open_tool_call` (mid-call truncation
 detection). The run_turn loop needs a model and is out of scope here; its decision
-predicates live in test_agent_guards.py. Importing `agent` is cheap — it builds
-SYSTEM_PROMPT at import but loads no model.
+predicates live in test_agent_guards.py. Importing `agent` is cheap — it loads no
+model and (as of plan 044) no longer builds a system prompt at import time.
 
 A bug in `expand_mentions` resolves an email (`foo@bar.com`) as a path, or pulls in a
 file the user never referenced; a bug in `_has_open_tool_call` misreads a truncated

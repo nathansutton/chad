@@ -13,7 +13,7 @@ import os
 import tempfile
 
 from chad.agent import _has_open_tool_call, expand_mentions
-from chad.prompt import _detect_test_command, classify_intent
+from chad.prompt import _detect_test_command, build_system_prompt, classify_intent
 
 PASS = 0
 FAIL = 0
@@ -163,10 +163,30 @@ def test_detect_test_command():
         os.chdir(cwd)
 
 
+def test_non_utf8_project_docs_dont_crash():
+    # A project doc / build file that isn't UTF-8 (a latin-1 CLAUDE.md with an é byte,
+    # a latin-1 pyproject.toml) must NOT crash build_system_prompt — before plan 044 the
+    # unguarded open().read() raised UnicodeDecodeError and the agent wouldn't construct.
+    d = tempfile.mkdtemp(prefix="latin1_")
+    cwd = os.getcwd()
+    os.chdir(d)
+    try:
+        with open("CLAUDE.md", "wb") as f:
+            f.write("# Guide\nCaf\xe9 rules - na\xefve bytes here.\n".encode("latin-1"))
+        with open("pyproject.toml", "wb") as f:
+            f.write("[tool.pytest.ini_options]\n# \xe9\n".encode("latin-1"))
+        prompt = build_system_prompt()  # must not raise
+        check("prompt built despite non-utf8 docs", isinstance(prompt, str) and len(prompt) > 0)
+        check("latin-1 doc surfaced (bytes replaced, not crashed)", "Guide" in prompt)
+    finally:
+        os.chdir(cwd)
+
+
 if __name__ == "__main__":
     test_intent()
     test_open_tool_call()
     test_mentions()
     test_detect_test_command()
+    test_non_utf8_project_docs_dont_crash()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
