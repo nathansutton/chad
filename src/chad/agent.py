@@ -178,7 +178,7 @@ class Agent:
                  max_gen_tokens: int = 8192, resume: list = None, persist: bool = False,
                  think_budget: int = None, turn_budget_tokens: int = None,
                  turn_budget_s: float = None, subagent: bool = False,
-                 subagent_tools: str = "read-only"):
+                 subagent_tools: str = "read-only", session_id: str = None):
         self.engine = engine
         # A spawned sub-agent (plan 041) SHARES the parent's session — the same engine,
         # the same live skills/MCP connections — so it must NOT tear those down. Only a
@@ -201,6 +201,11 @@ class Agent:
         # save. A fresh system prompt is always rebuilt (cwd/workspace may have changed);
         # only the non-system turns are restored.
         self.persist = persist
+        # This turn-thread's session id (plan 043), minted here so every resume forks: a
+        # resumed conversation is loaded into a FRESH Agent, which mints a NEW id and
+        # saves to a NEW file — the original session file is never rewritten. `save()`
+        # writes only to this id's file.
+        self.session_id = session_id or session.new_session_id()
         # Per-step generation cap. The old 2048 default truncated legitimate work —
         # a reasoning turn that thinks, then emits a `write` of a whole test file can
         # exceed 2048 tokens, and the cut-off was being misread as a final answer
@@ -302,7 +307,8 @@ class Agent:
         """Persist the conversation for the current dir (no-op unless `persist`)."""
         if self.persist:
             session.save_session(os.getcwd(), self.messages,
-                                 {"mode": self.mode, "thinking": self.thinking})
+                                 {"mode": self.mode, "thinking": self.thinking},
+                                 session_id=self.session_id)
 
     def compact_now(self):
         """Manual context reclaim (the /compact command). Runs only the SAFE, lossless-

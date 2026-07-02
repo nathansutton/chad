@@ -150,9 +150,11 @@ That's the whole on-ramp. The model and the throughput numbers you can reproduce
   PLD-acceptance diagnostics still go to `~/.chad/session.log`.)
 - **slash commands** — `/init` (scaffold a `CLAUDE.md` from the actual project files),
   `/skills` (list discovered Agent Skills), `/mcp` (list configured MCP servers + their
-  tools), `/reset` (`/clear`), `/compact` (reclaim context now — strips old reasoning +
-  truncates old tool outputs, never drops a message), `/model` (model + context status),
-  `/mode`, `/help`, `/exit`. Same set in the `--repl` line interface.
+  tools), `/resume` (list this directory's recent sessions; `/resume <n>` forks one — see
+  [Sessions](#sessions-resume--fork)), `/reset` (`/clear`), `/compact` (reclaim context
+  now — strips old reasoning + truncates old tool outputs, never drops a message),
+  `/model` (model + context status), `/mode`, `/help`, `/exit`. Same set in the `--repl`
+  line interface.
 - **`@file` / `@dir` mentions** — write `@path` in a message and a file is pulled into
   context inline (bounded by the read tool's skeleton/cap policy, no `read` round-trip) or
   a directory becomes a short listing. Works in the TUI, `--repl`, and `-p`. Emails/
@@ -173,19 +175,21 @@ prefill is the price of the cache design, now shown rather than silent (see
 
 ## Usage
 
-One entrypoint, five flags. `uv run chad --help` is the source of truth:
+One entrypoint, a handful of flags. `uv run chad --help` is the source of truth:
 
 ```bash
 uv run chad                  # full-screen TUI (shift-tab for modes, type to queue, ctrl-c to interrupt)
 uv run chad "do the thing"   # one-shot headless task, then exit
-uv run chad -c               # resume this directory's saved conversation
+uv run chad -c               # resume this directory's most recent conversation
 uv run chad -c "now also add the --verbose flag"   # resume and continue headless
+uv run chad --resume         # list this directory's recent sessions, pick one by number
 echo "fix the typo in greet.py" | uv run chad "$(cat)"   # pipe a task in
 ```
 
 | Flag | What it does |
 |---|---|
-| `-c, --continue` | resume the per-directory saved conversation (persisted after every turn) |
+| `-c, --continue` | resume this directory's **most recent** session (non-destructive — see [Sessions](#sessions-resume--fork)) |
+| `--resume` | list the directory's recent sessions and pick one by number (interactive TTY only) |
 | `--plan` | start in read-only plan mode (investigate + propose, all edits blocked) |
 | `--yolo` | auto-approve bash/write/edit (skip confirm prompts) |
 | `--no-think` | skip Ornith's `<think>` blocks — faster on well-scoped work (thinking is on by default) |
@@ -203,6 +207,30 @@ that cache.
 The rarely-touched tuning knobs (`CHAD_MAX_CONTEXT`, `CHAD_KV_BITS`, `CHAD_MODEL`, the
 safety/A-B opt-outs, and the session-log controls) live in environment variables, fully
 documented in the [Configuration reference](docs/configuration.md).
+
+### Sessions (resume + fork)
+
+Every conversation is persisted as JSON under `~/.chad/sessions/<cwdhash>/<session_id>.json`
+(one file per session, `0600`, atomic write — the store holds full tool args/results, so
+it is never world-readable). chad keeps **multiple sessions per directory**, so a project
+can carry more than one thread of work:
+
+- **`chad -c`** resumes the **most recent** session for this directory — the simple case,
+  unchanged. Now non-destructive: older sessions are kept, not overwritten.
+- **`chad --resume`** (and **`/resume`** in the TUI) lists the last ~10 sessions —
+  `2h ago · 14 turns · "fix the flaky retry test…"` — and you pick one by number. In the
+  TUI, `/resume` prints the numbered list and `/resume <n>` selects. `--resume` needs an
+  interactive terminal; headless, use `-c`.
+- **Implicit fork.** Resuming *any* session mints a **new** session id seeded with the old
+  messages (copy-on-resume) and writes to a new file — the original is never rewritten. So
+  every resume is a branch: go back to a session from before a bad turn and continue it
+  without destroying either thread. There is no separate fork command; that's the whole
+  feature.
+- **Retention.** The newest 20 sessions per directory are kept; older ones are pruned on
+  save. A tiny per-directory `index.json` (title / timestamp / turn count) makes listing
+  cheap, and a pre-existing single-slot session file is migrated into the new layout
+  automatically the first time you list. Resume still pays a cold re-prefill of the
+  restored transcript (only the message list is stored, not the KV cache).
 
 ## Extending chad
 

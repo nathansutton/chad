@@ -164,6 +164,31 @@ def _fail_model_load(model_id, err):
     sys.exit(1)
 
 
+def _pick_session(items):
+    """Prompt the user to pick one of `items` (from session.list_sessions) by number.
+    Returns the chosen item, or None to start fresh. Requires a TTY — the caller
+    guards that before calling."""
+    from . import session
+    sys.stderr.write("Resume which session? (this directory's recent sessions)\n")
+    for i, it in enumerate(items, 1):
+        sys.stderr.write(f"  {i}. {session.describe(it)}\n")
+    try:
+        raw = input("session number (blank to cancel): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        sys.stderr.write("not a number; starting fresh\n")
+        return None
+    if 1 <= n <= len(items):
+        return items[n - 1]
+    sys.stderr.write("out of range; starting fresh\n")
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="chad",
@@ -172,7 +197,10 @@ def main():
     ap.add_argument("task", nargs="?",
                     help="one-shot task to run headless and exit; omit for the interactive TUI")
     ap.add_argument("-c", "--continue", dest="cont", action="store_true",
-                    help="resume the saved conversation for this directory")
+                    help="resume the most recent saved conversation for this directory")
+    ap.add_argument("--resume", action="store_true",
+                    help="list this directory's recent sessions and pick one by number "
+                         "(resuming forks: the picked session is never overwritten)")
     ap.add_argument("--plan", action="store_true",
                     help="start in read-only plan mode (investigate and propose, no edits)")
     ap.add_argument("--yolo", action="store_true",
@@ -267,9 +295,28 @@ def main():
     start_mode = "plan" if args.plan else ("auto" if args.yolo else "normal")
     thinking = not args.no_think
 
-    # --continue: reload the saved conversation for this directory (None if absent).
+    # Resume seeds a FRESH Agent's messages; that Agent mints a new session_id, so the
+    # picked/newest session is copied, never overwritten (implicit fork — plan 043).
+    #   --resume : list recent sessions and pick by number (needs a TTY).
+    #   -c       : the most recent session (unchanged simple case).
     resume = None
-    if args.cont:
+    if args.resume:
+        from . import session
+        items = session.list_sessions(os.getcwd(), limit=10)
+        if not items:
+            sys.stderr.write("no saved sessions for this directory; starting fresh\n")
+        elif not sys.stdin.isatty():
+            sys.stderr.write("chad --resume needs an interactive terminal to pick a "
+                             "session; use -c to resume the most recent one.\n")
+            sys.exit(1)
+        else:
+            pick = _pick_session(items)
+            if pick:
+                data = session.load_session(os.getcwd(), pick["session_id"])
+                if data:
+                    resume = data["messages"]
+                    sys.stderr.write(f"resuming (forked): {session.describe(pick)}\n")
+    elif args.cont:
         from . import session
         data = session.load_session(os.getcwd())
         if data:

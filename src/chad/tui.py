@@ -162,6 +162,7 @@ SLASH_COMMANDS = [
     ("/mcp trust", "trust this project's .mcp.json servers"),
     ("/mcp login", "authenticate an MCP server (OAuth)"),
     ("/compact", "reclaim context now"),
+    ("/resume", "list recent sessions; /resume <n> forks one"),
     ("/reset", "clear the conversation + KV cache"),
     ("/clear", "clear the conversation + KV cache"),
     ("/model", "show model + context window"),
@@ -297,6 +298,9 @@ class TUI:
         # deterministic progress note. The next typed message relaunches a FRESH turn
         # (cleared context) seeded with the note — shedding the ramble + huge prefill.
         self._pending_budget_note = None
+        # Sessions last shown by a bare `/resume` (so `/resume <n>` maps a number to a
+        # session without re-listing / a race with new saves).
+        self._resume_list = []
 
         # Multiline input that auto-grows up to 8 rows. Enter submits; alt-enter
         # (or ctrl-j) inserts a newline; pasted text keeps its newlines.
@@ -611,6 +615,46 @@ class TUI:
         self._emit("user", kickoff)
         self._wake.set()
 
+    def _handle_resume(self, arg: str):
+        """`/resume` lists this directory's recent sessions; `/resume <n>` forks the
+        picked one — a fresh Agent (new session_id, cache reset) seeded with the old
+        messages, so the original session file is never overwritten (plan 043)."""
+        from . import session
+        if not arg:
+            items = session.list_sessions(os.getcwd(), limit=10)
+            if not items:
+                self._emit("info", "no saved sessions for this directory.")
+                return
+            self._resume_list = items
+            self._emit("info", "resume which session? type /resume <n>")
+            for i, it in enumerate(items, 1):
+                self._emit("info", f"  {i}. {session.describe(it)}")
+            return
+        try:
+            n = int(arg)
+        except ValueError:
+            self._emit("info", "usage: /resume  (to list)  ·  /resume <number>")
+            return
+        items = self._resume_list or session.list_sessions(os.getcwd(), limit=10)
+        if not (1 <= n <= len(items)):
+            self._emit("info", "out of range — run /resume to see the list.")
+            return
+        pick = items[n - 1]
+        data = session.load_session(os.getcwd(), pick["session_id"])
+        if not data:
+            self._emit("info", "could not load that session.")
+            return
+        if self._busy:
+            self._emit("info", "busy — /resume once the current turn finishes.")
+            return
+        if not self._fresh_agent(self._base_mode):
+            return
+        # Seed the fresh Agent (which already minted a new session_id) with the restored
+        # transcript; next save() writes a NEW file, leaving the picked one untouched.
+        self.agent.messages += [m for m in data["messages"] if m.get("role") != "system"]
+        self._resume_list = []
+        self._emit("info", f"resumed (forked): {session.describe(pick)}")
+
     # -- input handling --------------------------------------------------
 
     def _on_accept(self, buff):
@@ -641,6 +685,9 @@ class TUI:
                 b, a = self.agent.compact_now()
                 self._emit("info", f"compacted context: {b:,}→{a:,} tokens"
                                    + (" (already lean)" if a >= b else ""))
+            return False
+        if text == "/resume" or text.startswith("/resume "):
+            self._handle_resume(text[len("/resume"):].strip())
             return False
         if text == "/model":
             self._emit("info", f"model {self.engine.model_id} · context "
@@ -680,7 +727,7 @@ class TUI:
         if text == "/help":
             self._emit("info", "shift-tab: cycle mode (normal/auto/plan) · ctrl-c: "
                                "interrupt · /init /skills /mcp /mcp trust /mcp login <server> "
-                               "/reset /clear /compact /model /mode /accept /exit · !cmd shell · @path "
+                               "/resume /reset /clear /compact /model /mode /accept /exit · !cmd shell · @path "
                                "attach · type while busy to queue · plan ready: type to "
                                "steer, ctrl-g to accept")
             return False
