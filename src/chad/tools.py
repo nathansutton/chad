@@ -356,8 +356,8 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
               context: int = 0, should_stop=None) -> str:
     try:
         rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
-    except re.error as e:
-        return f"[bad regex: {e}]"
+    except re.error as rx_err:
+        return f"[bad regex: {rx_err}]"
     ctx = max(0, min(int(context or 0), 5))
     out: list[str] = []
     matches = 0        # total match lines seen (may exceed what we emit once capped)

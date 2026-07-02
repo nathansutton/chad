@@ -242,7 +242,7 @@ class Agent:
         # Set when a turn hard-stops on budget (like last_plan_path): holds the progress
         # note so the caller (TUI / one-shot / evals) can relaunch a fresh turn seeded
         # with it. Reset at the start of every run_turn.
-        self.budget_note = None
+        self.budget_note: str | None = None
         self.messages = [{"role": "system",
                           "content": build_subagent_prompt() if subagent
                           else build_system_prompt()}]

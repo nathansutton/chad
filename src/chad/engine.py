@@ -417,7 +417,7 @@ class Engine:
             return False
         main_bytes = len(ids) * self.kv_bytes_per_token
         try:
-            budget = mx.device_info()["max_recommended_working_set_size"]
+            budget = int(mx.device_info()["max_recommended_working_set_size"])
             active = mx.get_active_memory()
         except Exception:  # noqa: BLE001 — memory probe unavailable -> keep it in RAM
             return False
@@ -447,7 +447,7 @@ class Engine:
         if self._should_spill(self._cached_ids):
             path = self._ckpt_path(self._cached_ids, tag="push")
             try:
-                os.makedirs(self.cache_dir, exist_ok=True)  # type: ignore[arg-type]
+                os.makedirs(self.cache_dir, exist_ok=True)
                 cache_utils.save_prompt_cache(path, self._cache)
                 frame["spill_path"] = path
                 frame["cache"] = None  # drop the RAM reference; reclaimed on pop

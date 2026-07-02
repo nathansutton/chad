@@ -79,7 +79,7 @@ def test_push_pop_ram_roundtrip(monkeypatch):
     invariant the subagent relies on (the main session comes back bit-identical)."""
     _no_mx(monkeypatch)
     eng = _fake_engine()
-    main_cache, main_ids = eng._cache, eng._cached_ids
+    main_cache = eng._cache
 
     eng.push_cache()
     check("push resets to a fresh empty cache", eng._cached_ids == [] and eng._cache == ["FRESH-CACHE"],
