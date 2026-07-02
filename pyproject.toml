@@ -20,6 +20,12 @@ dependencies = [
     "mcp>=1.28.1",
 ]
 
+# Optional syntax highlighting in diffs / confirm previews (plan 042 item 4). Pure-Python,
+# import-guarded in render.py: absent, output is byte-identical to the un-highlighted path.
+# Install with `uv sync --extra highlight` or `pip install 'chad[highlight]'`.
+[project.optional-dependencies]
+highlight = ["pygments>=2.17"]
+
 # The one entrypoint: `uv run chad`. (`chad-bench` reproduces docs/benchmarks.md.)
 [project.scripts]
 chad = "chad.cli:main"

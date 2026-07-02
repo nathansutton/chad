@@ -12,7 +12,7 @@ import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from chad.tui import TUI, _kfmt, _phase_glyph  # noqa: E402
+from chad.tui import TUI, _kfmt, _phase_glyph, _todo_panel_rows  # noqa: E402
 
 
 def test_kfmt():
@@ -43,6 +43,7 @@ def _bare_tui():
     """A TUI with only the fields `_emit` touches — no engine/agent constructed."""
     t = object.__new__(TUI)
     t._pending = []
+    t._todos = []
     t._lock = threading.Lock()
     t._phase = "Thinking"
     t._cur_prompt_tokens = 0
@@ -99,3 +100,32 @@ def test_info_emit_does_queue_a_fragment():
     t = _bare_tui()
     t._emit("info", "hello")
     assert t._pending and "hello" in "".join(t._pending)
+
+
+def test_todos_emit_updates_panel_not_scrollback():
+    # Plan 042 item 1: the `todos` kind feeds the pinned panel (parsed JSON list) and,
+    # like ctx/gen/prefill, never queues a transcript fragment into scrollback.
+    t = _bare_tui()
+    t._emit("todos", '[{"content": "a", "status": "completed"}, '
+                     '{"content": "b", "status": "in_progress"}]')
+    assert [x.get("status") for x in t._todos] == ["completed", "in_progress"]
+    assert t._pending == []
+    # Malformed payload clears rather than raising.
+    t._emit("todos", "not json")
+    assert t._todos == [] and t._pending == []
+
+
+def test_todo_panel_rows_collapse_and_glyphs():
+    assert _todo_panel_rows([]) == []
+    short = [{"content": "a", "status": "completed"},
+             {"content": "b", "status": "in_progress"},
+             {"content": "c", "status": "pending"}]
+    assert _todo_panel_rows(short) == [
+        ("completed", "✓ a"), ("in_progress", "▸ b"), ("pending", "· c")]
+    # A long list collapses to one summary row naming the current (in_progress) item.
+    long = [{"content": f"t{i}", "status": "completed"} for i in range(4)]
+    long += [{"content": "now", "status": "in_progress"}]
+    long += [{"content": f"p{i}", "status": "pending"} for i in range(6)]
+    rows = _todo_panel_rows(long, max_items=8)
+    assert len(rows) == 1 and rows[0][0] == "summary"
+    assert rows[0][1].startswith("4/11 done") and "now" in rows[0][1]

@@ -24,7 +24,9 @@ trigger a redraw per token.
 """
 
 import asyncio
+import json
 import os
+import re
 import sys
 import threading
 import time
@@ -32,18 +34,22 @@ from collections import deque
 from typing import Optional
 
 from prompt_toolkit.application import Application
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import Condition, has_focus
-from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
+from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
 from .agent import INIT_PROMPT, MODE_LABEL, Agent
 from .engine import Engine
+from .ignore import IGNORE_DIRS
 from .render import C_BOLD, C_DIM, C_GREEN, C_RED, C_RST, C_YEL, confirm_preview, render_tool_result
 
 # Styling for the pinned bottom region only (status line + input). The transcript
@@ -56,6 +62,10 @@ _STYLE = Style.from_dict({
     "status.auto": "bg:#3a5f3a #ffffff",
     "status.plan": "bg:#3a3a6f #ffffff",
     "confirm": "bg:#6f5a2a #ffffff",
+    "todo.done": "#6b8f6b",
+    "todo.cur": "#d7a86e bold",
+    "todo.pending": "#8a8a8a",
+    "todo.summary": "#8a8a8a",
 })
 
 MODE_STYLE = {"normal": "status.normal", "auto": "status.auto", "plan": "status.plan"}
@@ -91,6 +101,155 @@ def _kfmt(n: int) -> str:
     return f"{n / 1000:.1f}k"
 
 
+# ---------------------------------------------------------------------------
+# Pinned todo panel (plan 042 item 1). Pure helpers so the collapse/glyph logic is
+# unit-testable without constructing a prompt_toolkit layout; the TUI wraps the rows in
+# styled fragments. `write_todos` items are {content, status} dicts.
+# ---------------------------------------------------------------------------
+
+_TODO_GLYPH = {"completed": "✓", "in_progress": "▸", "pending": "·"}
+_TODO_STYLE = {"completed": "class:todo.done", "in_progress": "class:todo.cur",
+               "pending": "class:todo.pending", "summary": "class:todo.summary"}
+
+
+def _clip(s: str, n: int) -> str:
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _todo_status(t) -> str:
+    return t.get("status", "pending") if isinstance(t, dict) else "pending"
+
+
+def _todo_panel_rows(todos, max_items: int = 8):
+    """Rows to pin above the status line: `[(kind, text)]`. Empty list → hidden.
+    A long list (> max_items) collapses to one summary row (`3/7 done  ▸ current…`);
+    otherwise one glyphed row per item (✓ done / ▸ current / · pending)."""
+    if not todos:
+        return []
+    total = len(todos)
+    done = sum(1 for t in todos if _todo_status(t) == "completed")
+    if total > max_items:
+        cur = next((t.get("content", "") for t in todos
+                    if isinstance(t, dict) and _todo_status(t) == "in_progress"), "")
+        if not cur:
+            cur = next((t.get("content", "") for t in todos
+                        if isinstance(t, dict) and _todo_status(t) == "pending"), "")
+        label = f"{done}/{total} done"
+        if cur:
+            label += f"  ▸ {_clip(cur, 56)}"
+        return [("summary", label)]
+    rows = []
+    for t in todos:
+        st = _todo_status(t)
+        content = t.get("content", "") if isinstance(t, dict) else str(t)
+        rows.append((st, f"{_TODO_GLYPH.get(st, '·')} {content}"))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Input completion (plan 042 item 2). The completer wiring is thin; all the logic
+# lives in these pure helpers so it is unit-testable (prompt_toolkit Completers are
+# awkward to drive in a test — the completer/menu wiring is verified manually).
+# ---------------------------------------------------------------------------
+
+# (command, one-line description) for the `/` menu — mirrors _on_accept + /help.
+SLASH_COMMANDS = [
+    ("/help", "commands & keybindings"),
+    ("/init", "analyze the project, write CLAUDE.md"),
+    ("/skills", "list available Agent Skills"),
+    ("/mcp", "MCP server status"),
+    ("/mcp trust", "trust this project's .mcp.json servers"),
+    ("/mcp login", "authenticate an MCP server (OAuth)"),
+    ("/compact", "reclaim context now"),
+    ("/reset", "clear the conversation + KV cache"),
+    ("/clear", "clear the conversation + KV cache"),
+    ("/model", "show model + context window"),
+    ("/mode", "cycle permission mode"),
+    ("/accept", "accept a pending plan and implement it"),
+    ("/exit", "quit chad"),
+    ("/quit", "quit chad"),
+]
+
+
+def slash_matches(text: str):
+    """`[(cmd, desc)]` whose command starts with the typed line. Only fires for a
+    single-line input that starts with `/`; once the text runs past a known command
+    (an arg is being typed, e.g. `/mcp login foo`) nothing matches, so completion stops."""
+    if "\n" in text or not text.startswith("/"):
+        return []
+    return [(c, d) for (c, d) in SLASH_COMMANDS if c.startswith(text)]
+
+
+def at_path_token(text_before_cursor: str) -> Optional[str]:
+    """The `@`-path fragment under the cursor (text AFTER the `@`), or None when the
+    cursor isn't in an `@`-token. The token is the last whitespace-delimited chunk."""
+    if not text_before_cursor or "@" not in text_before_cursor:
+        return None
+    frag = re.split(r"\s", text_before_cursor)[-1]
+    if not frag.startswith("@"):
+        return None
+    return frag[1:]
+
+
+def path_matches(fragment: str, cwd: Optional[str] = None):
+    """Filesystem completions for an `@`-path `fragment` (text after `@`). Directories
+    get a trailing `/`; `IGNORE_DIRS` are skipped; dotfiles are hidden until a leading
+    dot is typed. Returns sorted display strings (the path, without the leading `@`)."""
+    base = cwd or os.getcwd()
+    dirname, partial = os.path.split(fragment or "")
+    listdir = dirname if os.path.isabs(dirname) else os.path.join(base, dirname)
+    try:
+        entries = os.listdir(listdir or ".")
+    except OSError:
+        return []
+    out = []
+    for name in entries:
+        if name in IGNORE_DIRS or not name.startswith(partial):
+            continue
+        if not partial and name.startswith("."):
+            continue
+        disp = os.path.join(dirname, name) if dirname else name
+        if os.path.isdir(os.path.join(listdir, name)):
+            disp += "/"
+        out.append(disp)
+    return sorted(out)
+
+
+class _ChadCompleter(Completer):
+    """Slash-command menu at line start + `@`-path filesystem completion. Thin wrapper
+    over the pure helpers above; keeps ⏎-submits/multiline editing untouched."""
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        for cmd, desc in slash_matches(text):
+            yield Completion(cmd, start_position=-len(text), display=cmd, display_meta=desc)
+        if text.startswith("/"):
+            return
+        frag = at_path_token(text)
+        if frag is not None:
+            for disp in path_matches(frag):
+                yield Completion(disp, start_position=-len(frag), display=disp)
+
+
+def _make_history():
+    """Persistent input history: `FileHistory` at ~/.chad/history (mode 0600 — it can
+    hold typed paths/snippets, like the session store), or `InMemoryHistory` when
+    CHAD_NO_SESSION_LOG is set. Falls back to in-memory on any filesystem error."""
+    if os.environ.get("CHAD_NO_SESSION_LOG"):
+        return InMemoryHistory()
+    path = os.path.expanduser("~/.chad/history")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.exists(path):
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        else:
+            os.chmod(path, 0o600)
+        return FileHistory(path)
+    except OSError:
+        return InMemoryHistory()
+
+
 class TUI:
     def __init__(self, engine: Engine, ctx_limit: int, mode: str = "normal",
                  thinking: bool = True, max_chars: int = 400_000, resume: list = None):
@@ -100,6 +259,7 @@ class TUI:
         self._resume = resume
 
         self._pending = []                 # ANSI chunks awaiting flush to stdout
+        self._todos = []                   # live write_todos list for the pinned panel
         self._lock = threading.Lock()
         self._queue = deque()              # user messages awaiting the worker
         self._wake = threading.Event()     # signal the worker that work/queue changed
@@ -142,15 +302,28 @@ class TUI:
         # (or ctrl-j) inserts a newline; pasted text keeps its newlines.
         self.input = TextArea(
             height=Dimension(min=1, max=8), multiline=True, wrap_lines=True,
-            prompt="» ", style="class:user", history=InMemoryHistory(),
+            prompt="» ", style="class:user", history=_make_history(),
             accept_handler=self._on_accept,
+            completer=_ChadCompleter(), complete_while_typing=True,
         )
         self.status = Window(
             content=FormattedTextControl(self._status_fragments), height=1,
         )
-        # Only the status line + input are owned by prompt_toolkit; the transcript
-        # is printed above this region into the terminal's normal scrollback.
-        root = HSplit([self.status, self.input])
+        # A pinned todo checklist above the status line (plan 042 item 1). Hidden when
+        # empty; `dont_extend_height` so it takes exactly its row count — no blank rows.
+        self.todo_panel = ConditionalContainer(
+            Window(content=FormattedTextControl(self._todo_fragments),
+                   dont_extend_height=True),
+            filter=Condition(lambda: bool(_todo_panel_rows(self._todos))),
+        )
+        # Only the todo panel + status line + input are owned by prompt_toolkit; the
+        # transcript is printed above this region into the terminal's normal scrollback.
+        # A FloatContainer hosts the `/` + `@` completion menu (plan 042 item 2).
+        root = FloatContainer(
+            HSplit([self.todo_panel, self.status, self.input]),
+            floats=[Float(xcursor=True, ycursor=True,
+                          content=CompletionsMenu(max_height=8, scroll_offset=1))],
+        )
         self.app = Application(
             layout=Layout(root, focused_element=self.input),
             key_bindings=self._bindings(),
@@ -187,6 +360,12 @@ class TUI:
                 self._prefill_total = int(total)
             except (ValueError, IndexError):
                 pass
+            return
+        elif kind == "todos":   # write_todos payload for the pinned panel (no transcript)
+            try:
+                self._todos = json.loads(text)
+            except (ValueError, TypeError):
+                self._todos = []
             return
         elif kind == "stream":
             self._phase = "Responding"
@@ -282,6 +461,15 @@ class TUI:
         if qn:
             bits.append(f" queued:{qn} ")
         return left + [("class:" + MODE_STYLE[mode], "".join(bits))]
+
+    def _todo_fragments(self):
+        # prompt_toolkit fragments for the pinned todo panel; one styled row per line.
+        frags = []
+        for i, (kind, text) in enumerate(_todo_panel_rows(self._todos)):
+            if i:
+                frags.append(("", "\n"))
+            frags.append((_TODO_STYLE.get(kind, "class:todo.pending"), " " + text))
+        return frags
 
     def _flush(self):
         # Runs on the UI loop (refresher). Under patch_stdout this writes the

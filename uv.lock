@@ -185,6 +185,11 @@ dependencies = [
     { name = "tree-sitter-language-pack" },
 ]
 
+[package.optional-dependencies]
+highlight = [
+    { name = "pygments" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "mypy" },
@@ -201,9 +206,11 @@ requires-dist = [
     { name = "mlx-lm", specifier = ">=0.31.3,<0.32" },
     { name = "numpy", specifier = ">=1.26,<2" },
     { name = "prompt-toolkit", specifier = ">=3.0.43" },
+    { name = "pygments", marker = "extra == 'highlight'", specifier = ">=2.17" },
     { name = "tree-sitter", specifier = ">=0.25.2" },
     { name = "tree-sitter-language-pack", specifier = ">=1.11.0" },
 ]
+provides-extras = ["highlight"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -20,6 +20,38 @@ import sys
 C_DIM = "\033[2m"; C_CYAN = "\033[36m"; C_GREEN = "\033[32m"; C_YEL = "\033[33m"
 C_RED = "\033[31m"; C_BOLD = "\033[1m"; C_RST = "\033[0m"
 
+# Optional syntax highlighting (plan 042 item 4). Pygments is a pure-Python OPTIONAL
+# extra (`pip install 'chad[highlight]'`): when present, diff/preview code lines get
+# per-token colors *within* the +/- line coloring; when absent, output is byte-identical
+# to the un-highlighted path. Import-guarded so a bare install never fails, and gated so
+# tests can force the plain path by flipping `_HAS_PYGMENTS`. Never run in the per-token
+# streaming hot path — only in final diffs and confirm-preview bodies (see STOP notes).
+try:
+    from pygments import highlight as _pyg_highlight
+    from pygments.formatters.terminal import TerminalFormatter as _PygTermFormatter
+    from pygments.lexers import get_lexer_by_name, guess_lexer_for_filename
+    from pygments.util import ClassNotFound as _PygClassNotFound
+    _HAS_PYGMENTS = True
+    _PYG_FMT = _PygTermFormatter()
+except ImportError:  # pragma: no cover - exercised via monkeypatched _HAS_PYGMENTS
+    _HAS_PYGMENTS = False
+
+
+def _highlight_code(code: str, filename: str = "") -> str:
+    """Return `code` with per-token ANSI colors when pygments is available, else the
+    input unchanged (byte-identical). Best-effort: any lexer/format failure falls back
+    to the plain text, so highlighting can never corrupt a diff line."""
+    if not code or not _HAS_PYGMENTS:
+        return code
+    try:
+        try:
+            lexer = guess_lexer_for_filename(filename or "x.txt", code)
+        except _PygClassNotFound:
+            lexer = get_lexer_by_name("text")
+        return _pyg_highlight(code, lexer, _PYG_FMT).rstrip("\n")
+    except Exception:  # noqa: BLE001 — display path; never let highlighting raise
+        return code
+
 
 def confirm_preview(name: str, args: dict, max_lines: int = 6) -> str:
     """A short, human-readable summary of what a mutating tool will do, shown before
@@ -224,7 +256,7 @@ def _indent_block(emit, text: str, kind: str = "muted", max_lines: int = 6):
         emit("muted", f"     … +{len(lines) - max_lines} lines")
 
 
-def _emit_diff(emit, old: str, new: str, max_lines: int = 30):
+def _emit_diff(emit, old: str, new: str, max_lines: int = 30, filename: str = ""):
     diff = [d for d in difflib.unified_diff(
         str(old).splitlines(), str(new).splitlines(), lineterm="", n=2)
         if not d.startswith(("---", "+++", "@@"))]
@@ -232,12 +264,15 @@ def _emit_diff(emit, old: str, new: str, max_lines: int = 30):
     dels = sum(1 for d in diff if d.startswith("-"))
     emit("muted", f"  ⎿ +{adds} -{dels}")
     for d in diff[:max_lines]:
+        # Syntax colors live *inside* the +/- line color (the +/- kind is the outer
+        # layer). `_highlight_code` is a no-op without pygments, so the plain path is
+        # byte-identical to the pre-042 output.
         if d.startswith("+"):
-            emit("add", "  + " + d[1:])
+            emit("add", "  + " + _highlight_code(d[1:], filename))
         elif d.startswith("-"):
-            emit("del", "  - " + d[1:])
+            emit("del", "  - " + _highlight_code(d[1:], filename))
         else:
-            emit("muted", "    " + d[1:])
+            emit("muted", "    " + _highlight_code(d[1:], filename))
     if len(diff) > max_lines:
         emit("muted", f"     … +{len(diff) - max_lines} more diff lines")
 
@@ -320,11 +355,12 @@ def render_tool_result(emit, name: str, args: dict, result: str):
         n = _nlines(result)
         emit("muted", f"  ⎿ {n} reference{'s' * (n != 1)}")
     elif name == "edit":
-        _emit_diff(emit, args.get("old", ""), args.get("new", ""))
+        _emit_diff(emit, args.get("old", ""), args.get("new", ""),
+                   filename=str(args.get("path", "")))
     elif name == "write":
         content = args.get("content", "")
         emit("muted", f"  ⎿ {_nlines(content)} lines written")
-        _emit_diff(emit, "", content, max_lines=12)
+        _emit_diff(emit, "", content, max_lines=12, filename=str(args.get("path", "")))
     elif name == "bash":
         _indent_block(emit, result)
     elif name == "task":
@@ -342,6 +378,12 @@ def render_tool_result(emit, name: str, args: dict, result: str):
     elif name == "write_todos":
         for line in result.splitlines()[1:]:  # drop the "Plan updated:" header
             emit("muted", "  " + line.strip())
+        # Also feed the structured list to the TUI's pinned todo panel (plan 042 item 1).
+        # The plain REPL / one-shot emitter drops the `todos` kind (like ctx/gen/prefill),
+        # so the inline muted lines above remain its only rendering.
+        todos = args.get("todos")
+        if isinstance(todos, list):
+            emit("todos", json.dumps(todos))
     else:
         _indent_block(emit, result)
 
@@ -365,5 +407,7 @@ def _default_emit(kind: str, text: str):
         w(f"\n{C_YEL}» {text}{C_RST}\n")
     elif kind in ("info", "muted"):
         w(f"{C_DIM}{text}{C_RST}\n")
-    # 'stat' and unknown kinds are intentionally dropped from stdout.
+    # 'stat', the live-gauge kinds (ctx/gen/prefill/status), the pinned 'todos' panel
+    # feed, and any unknown kinds are intentionally dropped from stdout — they belong to
+    # the TUI's pinned region, not the plain REPL scrollback.
     sys.stdout.flush()
