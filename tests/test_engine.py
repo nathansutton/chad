@@ -511,6 +511,58 @@ def test_truncation_recovery_matches_fresh():
           f"cached_tokens={warm_stats.cached_tokens} (expected > 0 — divergence not exercised)")
 
 
+# === Tier 2c: cache quarantine push/pop bit-exactness (plan 041) ==============
+# The subagent/Task tool runs a sub-agent on a QUARANTINED cache: engine.push_cache
+# stashes the main session's warm cache aside, the sub-agent runs on a fresh one, and
+# pop_cache restores the main cache. The invariant that makes this safe on the
+# non-trimmable hybrid is that after pop the main cache generates BYTE-IDENTICALLY to a
+# never-pushed control — i.e. push/pop is a lossless snapshot/restore. This exercises it
+# on the small trimmable model (push/pop is model-agnostic); a bug that corrupts the
+# restored cache breaks the strict equality below — do NOT loosen.
+
+def test_push_pop_bit_exact():
+    if os.environ.get("CHAD_FAST_TESTS"):
+        return skip("push_pop_bit_exact", "CHAD_FAST_TESTS set (fast gate)")
+    eng = _build_engine()
+    if eng is None:
+        return skip("push_pop_bit_exact", f"could not load {TIER2_MODEL}")
+
+    def _tmpl(user):
+        return list(eng.tok.apply_chat_template(
+            [{"role": "system", "content": "You are a precise coding assistant."},
+             {"role": "user", "content": user}], add_generation_prompt=True))
+
+    P = _tmpl("Write a one-line Python function that squares n.")
+    Q = _tmpl("Explain in one sentence what a hash map is.")  # unrelated sub-agent churn
+
+    # Control: reach state S (prime the cache with P + a short generation), snapshot the
+    # resident ids, then continue from S with an extended prompt — NO push in between.
+    eng._reset_cache()
+    eng.generate(list(P), max_tokens=8)
+    ids_s = list(eng._cached_ids)
+    P2 = ids_s + list(P[:4])                       # extend the cache with a few valid tokens
+    control, _ = eng.generate(list(P2), max_tokens=24)
+
+    # Quarantine: reach the SAME state S, push it aside, run an unrelated generation on a
+    # fresh cache (the sub-agent), pop, then continue from the restored S with the same P2.
+    eng._reset_cache()
+    eng.generate(list(P), max_tokens=8)
+    check("re-reached state S deterministically", eng._cached_ids == ids_s,
+          f"{len(eng._cached_ids)} vs {len(ids_s)}")
+    eng.push_cache()
+    check("push handed out a fresh empty cache", eng._cached_ids == [], eng._cached_ids)
+    eng.generate(list(Q), max_tokens=8)            # sub-agent work in the quarantined cache
+    eng.pop_cache()
+    check("pop restored _cached_ids to state S exactly", eng._cached_ids == ids_s,
+          f"{len(eng._cached_ids)} vs {len(ids_s)}")
+    quar, _ = eng.generate(list(P2), max_tokens=24)
+
+    # CORRUPTION GUARD: the post-pop continuation must equal the never-pushed control,
+    # byte-for-byte. If this fails, push/pop corrupted the cache — STOP and report.
+    check("post-pop generation == never-pushed control", quar == control,
+          f"\n--- QUARANTINE ---\n{quar!r}\n--- CONTROL ---\n{control!r}")
+
+
 if __name__ == "__main__":
     tier1 = (test_longest_match_wins, test_recency_tie_break, test_no_match,
              test_guards, test_draft_length, test_prefill_progress_callback,
@@ -518,7 +570,8 @@ if __name__ == "__main__":
     tier2 = (test_pld_equals_greedy,
              test_pld_hybrid_equals_greedy,
              test_degenerate_reprefill_matches_fresh,
-             test_truncation_recovery_matches_fresh)
+             test_truncation_recovery_matches_fresh,
+             test_push_pop_bit_exact)
     for fn in tier1 + tier2:
         try:
             fn()

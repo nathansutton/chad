@@ -504,6 +504,35 @@ SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "task",
+            "description": "Delegate an open-ended exploration or sub-task to a fresh "
+                           "sub-agent that works in its OWN small, isolated context and "
+                           "returns only a condensed answer. Use this for spelunking — "
+                           "'find where X is handled', 'which files touch Y', 'trace how "
+                           "Z flows' — so your MAIN context stays small and cheap (the "
+                           "sub-agent's grep/read churn never enters this conversation; "
+                           "only its final findings do). Read-only by default. The "
+                           "sub-agent does NOT see this conversation, so put everything it "
+                           "needs in `prompt`. It cannot spawn further sub-agents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string",
+                                    "description": "A short (3-6 word) label for the sub-task."},
+                    "prompt": {"type": "string",
+                               "description": "The full, self-contained instruction: what to "
+                                              "find or do, and exactly what to report back."},
+                    "tools": {"type": "string", "enum": ["read-only", "all"],
+                              "description": "Tool access: 'read-only' (default; search/read "
+                                             "only) or 'all' (also edit/run — use sparingly)."},
+                },
+                "required": ["description", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "bash",
             "description": "Run a shell command in the working directory and return combined stdout/stderr.",
             "parameters": {
@@ -788,8 +817,13 @@ def active_schemas():
     any Agent Skills are installed for the current project/user (omitted otherwise, so a
     skill-less project never sees a dead tool)."""
     schemas = SCHEMAS
+    # Subagent/Task tool (plan 041) ships opt-out: CHAD_NO_TASK hides it (the A/B arm and
+    # the escape hatch if the model misuses it). The subagent's OWN render drops it again
+    # via Agent._active_schemas — reentrancy guard, subagents can't spawn subagents.
+    if os.environ.get("CHAD_NO_TASK"):
+        schemas = [s for s in schemas if s["function"]["name"] != "task"]
     if os.environ.get("CHAD_NO_SYMBOLS"):
-        schemas = [s for s in SCHEMAS if s["function"]["name"] not in _SYMBOLIC]
+        schemas = [s for s in schemas if s["function"]["name"] not in _SYMBOLIC]
     names = _skills().skill_names()
     if names:
         schemas = schemas + [_activate_skill_schema(names)]

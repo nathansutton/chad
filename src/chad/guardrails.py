@@ -222,6 +222,118 @@ def think_budget(stuck_level: int, base: int = 512) -> int:
     return max(base, THINK_CAP_RAMP[min(stuck_level - 1, len(THINK_CAP_RAMP) - 1)])
 
 
+# --- runaway-turn governor (plan 040) ----------------------------------------------
+# chad's dominant failure mode is timeout, not wrong answers: on the polyglot sweep a
+# PASSING task burns 14–35k prefill tokens; a FAILING one balloons to 130–187k before
+# dying at the wall. Grinding a turn that's already 100k-prefill deep with no green test
+# almost never converges — the cheapest good outcome is to STOP, bank what was learned,
+# and (optionally) relaunch fresh. The existing guards are all *local* (repeat-call
+# loop, consecutive failed bash, landing nudge near max_steps); this one watches the
+# *global* trajectory: budget consumed vs progress made.
+#
+# It's a pure checkpoint state machine. run_turn tracks the cumulative prefill tokens
+# (self.prefill_tokens) + wall clock and a per-band "did real work land+verify" signal,
+# and consults turn_governor at each budget-fraction checkpoint. Soft = one strong nudge
+# at ~50%; hard = end the turn with a deterministic progress note at ~80%. Because real
+# work resets the checkpoint (progress=True => never fire), a genuinely slow-but-working
+# turn is never interrupted — only the pathological no-progress tail binds.
+GOV_SOFT_FRAC = 0.5   # first checkpoint: nudge if no progress yet
+GOV_HARD_FRAC = 0.8   # second checkpoint: bank a note and end the turn
+BUDGET_SENTINEL = "[budget]"  # run_turn return prefix on a hard governor stop
+
+GOVERNOR_SOFT_NUDGE = (
+    "[you have consumed half of this turn's budget without landing AND verifying a "
+    "single change. Stop exploring. State your current single best hypothesis in one "
+    "sentence, then act on it directly: make the edit and run the check. Do NOT re-read "
+    "files you have already read or re-run commands you have already run.]")
+
+
+def budget_fraction(tokens, token_budget, wall_s=0.0, wall_budget_s=None) -> float:
+    """Fraction of the turn budget consumed = the max of the token-budget ratio and the
+    wall-clock ratio (whichever is tighter drives the governor). A budget that is falsy
+    (None/0) is ignored; if neither is set, returns 0.0 so the governor never fires (the
+    off state). Pure and testable."""
+    fracs = []
+    if token_budget:
+        fracs.append(tokens / token_budget)
+    if wall_budget_s:
+        fracs.append(wall_s / wall_budget_s)
+    return max(fracs) if fracs else 0.0
+
+
+def budget_band(frac: float) -> int:
+    """Which checkpoint band a consumed-fraction falls in: 0 (below the soft mark),
+    1 (soft..hard), 2 (at/over the hard mark). run_turn fires the governor only when the
+    band *advances*, evaluating the just-completed band's progress."""
+    if frac >= GOV_HARD_FRAC:
+        return 2
+    if frac >= GOV_SOFT_FRAC:
+        return 1
+    return 0
+
+
+def turn_governor(band, progress, soft_fired, *, disabled=False):
+    """Decision for a checkpoint the turn just crossed into. `band` is the band being
+    entered (1 = soft ~50%, 2 = hard ~80%); `progress` is whether a change landed AND was
+    verified during the band we're leaving; `soft_fired` whether the soft nudge already
+    went out this turn. Returns 'hard' (end + bank a note), 'soft' (one nudge), or None.
+    Real progress in the completed band resets the checkpoint — a slow-but-working turn is
+    never interrupted. `disabled` (CHAD_NO_GOVERNOR) always returns None. Pure/testable."""
+    if disabled or progress:
+        return None
+    if band >= 2:
+        return "hard"
+    if band == 1 and not soft_fired:
+        return "soft"
+    return None
+
+
+# Tool results that landed a file change / were run, used to reconstruct a progress note
+# deterministically (no model call) from the transcript.
+_EDIT_TOOLS = ("write", "edit", "replace_symbol", "insert_symbol", "rename_symbol")
+_ERROR_PREFIXES = ("[exit", "[timed out", "[failed to launch", "[tool error", "[denied")
+
+
+def progress_note(messages, max_lines: int = 20) -> str:
+    """Synthesize a ≤`max_lines` progress note from the transcript with NO model call, so
+    a hard-stopped turn can seed a fresh relaunch (sheds the ramble AND the huge prefill
+    the stuck model was dragging around). Deterministic: pulls files edited and commands
+    run from the assistant turns' own <tool_call> blocks (via parse_tool_calls), plus the
+    last error seen in a tool result. Prefer facts the executor cannot reconstruct from a
+    clean context — what was already tried and what failed last."""
+    from .toolcall_parse import parse_tool_calls
+    edited, commands = [], []
+    last_error = None
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content", "") or ""
+        if role == "assistant":
+            for name, args in parse_tool_calls(content):
+                if name == "bash":
+                    cmd = str(args.get("command", "")).strip()
+                    if cmd and cmd not in commands:
+                        commands.append(cmd)
+                elif name in _EDIT_TOOLS:
+                    p = str(args.get("path", "")).strip()
+                    if p and p not in edited:
+                        edited.append(p)
+        elif role == "tool":
+            if content.startswith(_ERROR_PREFIXES) or "Traceback" in content:
+                last_error = content
+    lines = ["Progress so far (auto-summarized — the previous attempt ran out of budget):"]
+    if edited:
+        lines.append("Files already edited: " + ", ".join(edited[-8:]))
+    if commands:
+        lines.append("Commands already tried (do not blindly repeat):")
+        lines += [f"  $ {c[:120]}" for c in commands[-4:]]
+    if last_error:
+        lines.append("Last error seen:")
+        lines += ["  " + ln[:120] for ln in last_error.strip().splitlines()[-4:]]
+    if len(lines) == 1:
+        lines.append("(no edits, commands, or errors were recorded before the budget ran out)")
+    return "\n".join(lines[:max_lines])
+
+
 def loop_signature(calls) -> str:
     """Canonical signature of a tool-call set, for the repeated-call loop guard."""
     return json.dumps(calls, sort_keys=True)

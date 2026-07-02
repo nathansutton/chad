@@ -183,6 +183,19 @@ def main():
                     help="soft-cap each step's <think> run at N tokens, then force-close "
                          "it and continue (escalates when stuck); off by default. Also "
                          "settable via CHAD_THINK_BUDGET.")
+    ap.add_argument("--turn-budget-tokens", type=int, default=None, dest="turn_budget_tokens",
+                    help="runaway-turn governor: end a turn once it has burned N cumulative "
+                         "prefill tokens WITHOUT landing+verifying a change (nudges at ~50%%, "
+                         "banks a progress note and stops at ~80%%). Defaults to 3× the context "
+                         "limit; CHAD_NO_GOVERNOR=1 disables. Also CHAD_TURN_BUDGET_TOKENS.")
+    ap.add_argument("--turn-budget-s", type=float, default=None, dest="turn_budget_s",
+                    help="wall-clock variant of --turn-budget-tokens (seconds); off by "
+                         "default (interactive: the human is the wall clock). Also "
+                         "CHAD_TURN_BUDGET_S.")
+    ap.add_argument("--auto-continue", type=int, default=0, dest="auto_continue",
+                    help="on a one-shot run, if the governor hard-stops a turn, relaunch a "
+                         "FRESH turn (cleared context) seeded with the progress note, up to N "
+                         "times (default 0 = off). Sheds the ramble and the huge prefill.")
     ap.add_argument("--repl", action="store_true",
                     help="plain line REPL instead of the full-screen TUI")
     # Back-compat: -p/--prompt was the old one-shot spelling, now the positional task.
@@ -194,6 +207,12 @@ def main():
     # their __init__ reads, so the flag works on every entrypoint, not just headless.
     if args.think_budget is not None:
         os.environ["CHAD_THINK_BUDGET"] = str(args.think_budget)
+    # --turn-budget-* (plan 040) reach the TUI/REPL Agents through the same env knobs
+    # their __init__ reads, so the governor is configurable on every entrypoint.
+    if args.turn_budget_tokens is not None:
+        os.environ["CHAD_TURN_BUDGET_TOKENS"] = str(args.turn_budget_tokens)
+    if args.turn_budget_s is not None:
+        os.environ["CHAD_TURN_BUDGET_S"] = str(args.turn_budget_s)
     task = args.task or args.prompt_flag
     # Ornith; no draft, ever. RAM-aware default, local-dir-preferred, HF fallback.
     model_id, why = _pick_model()
@@ -269,8 +288,26 @@ def main():
             sys.stderr.write("[headless: auto-approving tools (use --plan for read-only)]\n")
         agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
                       mode=run_mode, thinking=thinking, resume=resume, persist=True,
-                      think_budget=args.think_budget)
+                      think_budget=args.think_budget,
+                      turn_budget_tokens=args.turn_budget_tokens,
+                      turn_budget_s=args.turn_budget_s)
         agent.run_turn(task)
+        # Plan 040: if the governor hard-stopped the turn on budget, optionally relaunch a
+        # FRESH turn (new context + reset KV cache) seeded with the deterministic progress
+        # note — shedding both the ramble and the huge prefill the stuck model dragged.
+        continues = args.auto_continue
+        while agent.budget_note and continues > 0:
+            note = agent.budget_note
+            continues -= 1
+            sys.stderr.write("[governor] previous turn ran out of budget; continuing fresh "
+                             "with a progress note\n")
+            eng._reset_cache()
+            agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
+                          mode=run_mode, thinking=thinking, persist=True,
+                          think_budget=args.think_budget,
+                          turn_budget_tokens=args.turn_budget_tokens,
+                          turn_budget_s=args.turn_budget_s)
+            agent.run_turn(f"{task}\n\n[{note}]")
         agent.save()  # persist so a follow-up `chad -c "..."` picks up the thread
     elif args.repl:
         repl(eng, yolo=args.yolo, ctx_limit=ctx_limit, resume=resume, thinking=thinking)

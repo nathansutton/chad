@@ -126,6 +126,10 @@ class Engine:
     _pld_hybrid: bool = field(init=False, default=False)
     _warm_prefix_ids: Any = field(init=False, default=None)
     kv_bytes_per_token: float = field(init=False, default=0.0)  # measured at load (036)
+    # One-deep cache quarantine stack (plan 041): push_cache stashes the live
+    # (cache, cached_ids, flags) here so a subagent can run in a fresh isolated cache;
+    # pop_cache restores it bit-identically. Depth 1 only — subagents never nest.
+    _cache_stack: list = field(init=False, default_factory=list)
 
     def _read_config(self, repo):
         import json
@@ -265,10 +269,13 @@ class Engine:
     # the recurrent SSM state serializes fine (a fixed ~51MB floor; cheap for one
     # warm-start file), and on a same-model load the state is bit-for-bit reusable.
 
-    def _ckpt_path(self, ids: list) -> str:
+    def _ckpt_path(self, ids: list, tag: str = "") -> str:
         h = hashlib.sha1()
         h.update(self.model_id.encode("utf-8", "ignore"))
         h.update(b"\x00")
+        if tag:  # namespace distinct checkpoint kinds (warm-prefix vs push-spill)
+            h.update(tag.encode("utf-8", "ignore"))
+            h.update(b"\x00")
         h.update(np.asarray(ids, dtype=np.uint32).tobytes())
         # cache_dir is Optional on the dataclass but is always set when checkpointing
         # is enabled, which is the only path that reaches _ckpt_path.
@@ -390,6 +397,88 @@ class Engine:
         except Exception:
             self._reset_cache()            # corrupt/incompatible -> clean rebuild
             return 0
+
+    # -- one-deep cache quarantine (plan 041) -----------------------------
+    # A subagent explores in a SEPARATE small context so the main transcript's warm
+    # cache isn't destroyed by the churn (grep/read spelunking). push_cache stashes the
+    # live cache aside and hands the subagent a fresh empty one; pop_cache restores the
+    # main cache bit-identically. The stash lives in RAM by default (measured cheap: a
+    # 30k-token hybrid main cache ≈ 615 MB), but spills to a disk checkpoint when holding
+    # it resident alongside the subagent's own growing cache would crowd the Metal budget.
+
+    def _should_spill(self, ids: list) -> bool:
+        """Whether to spill the pushed main cache to disk (vs holding it in RAM) while a
+        subagent runs. The fast path keeps it in RAM; we only spill when the main cache
+        is large enough that keeping it resident would leave too little headroom under
+        Apple's recommended working set for the subagent to prefill its own context.
+        Needs cache_dir (nowhere to spill), a measured per-token cost, and the live
+        Metal memory APIs — returns False (hold in RAM) if any is unavailable."""
+        if not self.cache_dir or not self.kv_bytes_per_token or not ids:
+            return False
+        main_bytes = len(ids) * self.kv_bytes_per_token
+        try:
+            budget = mx.device_info()["max_recommended_working_set_size"]
+            active = mx.get_active_memory()
+        except Exception:  # noqa: BLE001 — memory probe unavailable -> keep it in RAM
+            return False
+        # `active` already includes the resident model + the live main cache we're about
+        # to push. The free band under the (safety-scaled) working set is what the
+        # subagent gets to grow its own cache into. If that band is already tighter than
+        # the main cache we'd be holding aside, reclaim the main cache to disk.
+        free = budget * 0.90 - active
+        return free < main_bytes
+
+    def push_cache(self):
+        """Depth-1 cache quarantine: stash the live (cache, cached_ids, flags) and start
+        a fresh empty cache so a subagent can run isolated. pop_cache restores it. Raises
+        if a cache is already pushed — subagents can't nest, and depth-1 keeps the
+        lifecycle trivially auditable. Spills the stashed cache to disk when RAM is tight
+        (see _should_spill), reclaiming it on pop."""
+        if self._cache_stack:
+            raise RuntimeError("push_cache: cache stack is depth-1 only (no nesting)")
+        frame = {
+            "cached_ids": self._cached_ids,
+            "trimmable": self._trimmable,
+            "pld_hybrid": self._pld_hybrid,
+            "warm_prefix_ids": self._warm_prefix_ids,
+            "cache": self._cache,
+            "spill_path": None,
+        }
+        if self._should_spill(self._cached_ids):
+            path = self._ckpt_path(self._cached_ids, tag="push")
+            try:
+                os.makedirs(self.cache_dir, exist_ok=True)  # type: ignore[arg-type]
+                cache_utils.save_prompt_cache(path, self._cache)
+                frame["spill_path"] = path
+                frame["cache"] = None  # drop the RAM reference; reclaimed on pop
+            except Exception:  # noqa: BLE001 — disk full/read-only -> just hold in RAM
+                pass
+        self._cache_stack.append(frame)
+        self._reset_cache()
+        mx.clear_cache()  # release the freed buffers (esp. after a spill drop)
+
+    def pop_cache(self):
+        """Restore the cache stashed by push_cache, exactly. After this the main
+        session's cache + _cached_ids are bit-identical to before the push, so its
+        next turn re-syncs against a fully warm prefix (no re-prefill). Raises if
+        nothing was pushed."""
+        if not self._cache_stack:
+            raise RuntimeError("pop_cache: no pushed cache to restore")
+        frame = self._cache_stack.pop()
+        spill = frame.get("spill_path")
+        if spill:
+            self._cache = cache_utils.load_prompt_cache(spill)
+            try:
+                os.remove(spill)
+            except OSError:
+                pass
+        else:
+            self._cache = frame["cache"]
+        self._cached_ids = frame["cached_ids"]
+        self._trimmable = frame["trimmable"]
+        self._pld_hybrid = frame["pld_hybrid"]
+        self._warm_prefix_ids = frame["warm_prefix_ids"]
+        mx.clear_cache()
 
     # -- generation -------------------------------------------------------
 

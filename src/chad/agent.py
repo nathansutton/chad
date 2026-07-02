@@ -12,11 +12,12 @@ import json
 import os
 import re
 import sys
+import time
 
 from . import compaction, guardrails, session
 from .diag import args_preview, log, redact, result_preview
 from .engine import Engine
-from .prompt import build_system_prompt, classify_intent
+from .prompt import build_subagent_prompt, build_system_prompt, classify_intent
 from .render import (
     C_DIM,
     C_RED,
@@ -31,6 +32,18 @@ from .render import (
 )
 from .toolcall_parse import parse_tool_calls, strip_think
 from .tools import IGNORE_DIRS, TERMINAL, _under_plans, active_schemas, dispatch_for, is_mutating
+
+# Sub-agent / Task tool (plan 041). A spawned sub-agent runs on the SAME engine (after a
+# cache push) but a fresh transcript, with a tight step/context budget and — by default —
+# a read-only toolset, so it can spelunk without mutating anything or bloating the main
+# context. The read-only set is exploration + planning + the terminal tools; bash, write,
+# edit and the symbol editors are excluded (they land only under tools="all").
+SUBAGENT_MAX_STEPS = 12
+SUBAGENT_CTX_LIMIT = 16000
+SUBAGENT_READ_ONLY = {
+    "read", "grep", "glob", "repo_map", "overview", "view_symbol",
+    "find_symbol", "find_refs", "write_todos", "done", "finish", "stop",
+}
 from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_repair
 
 # Validation (VALIDATE knob, legacy_validate baseline) lives in validate.py, the
@@ -166,17 +179,23 @@ class Agent:
                  ctx_limit: int = 24000, mode: str = None, emit=None,
                  confirm=None, should_stop=None, thinking: bool = True,
                  max_gen_tokens: int = 8192, resume: list = None, persist: bool = False,
-                 think_budget: int = None):
+                 think_budget: int = None, turn_budget_tokens: int = None,
+                 turn_budget_s: float = None, subagent: bool = False,
+                 subagent_tools: str = "read-only"):
         self.engine = engine
-        # Fresh session: clear any skills activated in a prior Agent and re-discover for
-        # the current cwd, so the system prompt built below reflects this project's skills
-        # and no stale activation state leaks forward (matches engine._reset_cache on /reset).
-        from . import skills
-        skills.reset_session()
-        # Likewise tear down any MCP server connections from a prior Agent so a new
-        # session reconnects fresh for the current cwd (and stale processes are reaped).
-        from . import mcp
-        mcp.reset_session()
+        # A spawned sub-agent (plan 041) SHARES the parent's session — the same engine,
+        # the same live skills/MCP connections — so it must NOT tear those down. Only a
+        # top-level Agent resets them (a fresh session clears stale activation state and
+        # reaps prior MCP processes; matches engine._reset_cache on /reset).
+        self._subagent = subagent
+        # Which tools a sub-agent may see: "read-only" (default) or "all". Ignored for a
+        # top-level agent (it always gets the full toolset minus the CHAD_NO_* gates).
+        self._subagent_tools = subagent_tools
+        if not subagent:
+            from . import skills
+            skills.reset_session()
+            from . import mcp
+            mcp.reset_session()
         self.mode = mode or ("auto" if yolo else "normal")
         self.thinking = thinking  # Ornith is a reasoning model; toggles <think> blocks
         self.max_steps = max_steps
@@ -202,7 +221,31 @@ class Agent:
             think_budget = int(_tb) if _tb else None
         self.think_budget = think_budget
         self.ctx_limit = ctx_limit  # prompt-token budget before compaction kicks in
-        self.messages = [{"role": "system", "content": build_system_prompt()}]
+        # Runaway-turn governor (plan 040): a per-turn budget on cumulative prefill tokens
+        # (and optional wall-clock) that ends a turn which has burned through a checkpoint
+        # WITHOUT landing+verifying a change — banking a deterministic progress note so the
+        # caller can relaunch fresh (shedding both the ramble and the huge prefill a stuck
+        # weak model drags around). Off entirely under CHAD_NO_GOVERNOR=1 (A/B family). The
+        # token budget defaults to 3× the context limit — far above a normal task's use
+        # (passing eval tasks: 14–35k prefill tokens; the pathological timeout tail:
+        # 130–187k). Wall budget is off unless set: interactively the human is the wall
+        # clock; evals/one-shot set it via --turn-budget-s / CHAD_TURN_BUDGET_S.
+        self._no_governor = bool(os.environ.get("CHAD_NO_GOVERNOR"))
+        if turn_budget_tokens is None:
+            _tbt = os.environ.get("CHAD_TURN_BUDGET_TOKENS")
+            turn_budget_tokens = int(_tbt) if _tbt else max(0, 3 * self.ctx_limit)
+        self._turn_budget_tokens = turn_budget_tokens
+        if turn_budget_s is None:
+            _tbs = os.environ.get("CHAD_TURN_BUDGET_S")
+            turn_budget_s = float(_tbs) if _tbs else None
+        self._turn_budget_s = turn_budget_s
+        # Set when a turn hard-stops on budget (like last_plan_path): holds the progress
+        # note so the caller (TUI / one-shot / evals) can relaunch a fresh turn seeded
+        # with it. Reset at the start of every run_turn.
+        self.budget_note = None
+        self.messages = [{"role": "system",
+                          "content": build_subagent_prompt() if subagent
+                          else build_system_prompt()}]
         if resume:
             self.messages += [m for m in resume if m.get("role") != "system"]
         self._emit = emit or _default_emit
@@ -282,9 +325,29 @@ class Agent:
                 self.messages[i]["content"] = self._headtail(self.messages[i]["content"])
         return before, len(self._render())
 
+    def _active_schemas(self):
+        """The tool schemas to expose THIS agent, on top of the module-level gates
+        (CHAD_NO_SYMBOLS / CHAD_NO_TASK / skills / MCP). A sub-agent (plan 041) never
+        sees `task` — reentrancy guard, subagents can't spawn subagents — and, unless it
+        was granted tools="all", is restricted to the read-only exploration set so it
+        can't mutate the repo it's spelunking through."""
+        schemas = active_schemas()
+        if not self._subagent:
+            return schemas
+        allow = None if self._subagent_tools == "all" else SUBAGENT_READ_ONLY
+        out = []
+        for s in schemas:
+            n = s["function"]["name"]
+            if n == "task":
+                continue
+            if allow is not None and n not in allow:
+                continue
+            out.append(s)
+        return out
+
     def _render(self):
         return self.engine.tok.apply_chat_template(
-            self.messages, tools=active_schemas(), add_generation_prompt=True,
+            self.messages, tools=self._active_schemas(), add_generation_prompt=True,
             enable_thinking=self.thinking,
         )
 
@@ -298,7 +361,7 @@ class Agent:
         sysm = self.messages[0]
         def render1(u):
             return self.engine.tok.apply_chat_template(
-                [sysm, {"role": "user", "content": u}], tools=active_schemas(),
+                [sysm, {"role": "user", "content": u}], tools=self._active_schemas(),
                 add_generation_prompt=True, enable_thinking=self.thinking)
         a, b = render1("a"), render1("the quick brown fox jumps")
         n = 0
@@ -330,6 +393,69 @@ class Agent:
         warn = f"{C_RED}  ⚠ looks destructive — review carefully\n{C_RST}" if dangerous else ""
         ans = input(f"{C_YEL}  allow {name}:\n{preview}\n{warn}  approve? [y/N] {C_RST}").strip().lower()
         return ans in ("y", "yes")
+
+    def _sub_emit(self, kind: str, text: str):
+        """Emit callback handed to a spawned sub-agent so its activity renders DIMMED and
+        subordinate in the main transcript. Live status gauges (spinner verb, ctx/gen/
+        prefill counters) pass through so the UI still reflects the sub-agent's work; its
+        streamed prose and reasoning are suppressed (only its final return matters); its
+        tool activity and notices are downgraded to the dim 'muted' channel."""
+        if kind in ("status", "ctx", "gen", "prefill"):
+            self._emit(kind, text)
+        elif kind in ("stream", "think"):
+            return  # sub-agent prose/reasoning isn't the deliverable — keep it out
+        elif kind == "tool":
+            self._emit("muted", "   ⌊ " + text)
+        else:  # muted / info / add / del / error
+            self._emit("muted", "     " + str(text).lstrip())
+
+    def _run_subagent(self, description: str, prompt: str, tools: str = "read-only") -> str:
+        """Run a scoped sub-agent (plan 041) on a QUARANTINED cache and return its final
+        text as the `task` tool result. push_cache stashes the main session's warm cache
+        aside; the sub-agent runs on a fresh one with a tight step/context budget and a
+        (default) read-only toolset; pop_cache restores the main cache bit-identically —
+        even on error/interrupt (the finally), so a stuck sub-agent never corrupts the
+        parent. Its grep/read churn never enters the main transcript; only this return
+        does. Depth 1 only: a sub-agent can't itself call `task` (its schema omits it)."""
+        # In plan mode the parent is read-only; never let a sub-agent it spawns mutate.
+        if self.mode == "plan":
+            tools = "read-only"
+        self._emit("muted", f"   ⌊ delegating to sub-agent: {description}")
+        sub = None
+        self.engine.push_cache()
+        try:
+            sub = Agent(
+                self.engine,
+                mode="auto",                       # auto-approve within its restricted toolset
+                max_steps=SUBAGENT_MAX_STEPS,
+                ctx_limit=min(self.ctx_limit, SUBAGENT_CTX_LIMIT),
+                thinking=self.thinking,
+                max_gen_tokens=self.max_gen_tokens,
+                emit=self._sub_emit,
+                should_stop=self._should_stop,
+                think_budget=self.think_budget,
+                turn_budget_tokens=0,              # the sub-agent's own max_steps bounds it
+                turn_budget_s=0.0,
+                subagent=True,
+                subagent_tools=tools,
+            )
+            result = sub.run_turn(prompt)
+        except Exception as e:  # noqa: BLE001 — a sub-agent crash must not kill the parent turn
+            result = f"[task failed: {type(e).__name__}: {e}]"
+        finally:
+            self.engine.pop_cache()
+        # Roll the sub-agent's cost into the parent's rolling accounting so total turn
+        # spend stays visible (its prefill also feeds the governor budget); peak_ctx is
+        # left as the MAIN transcript's — the whole point is that it does NOT grow.
+        if sub is not None:
+            self.gen_tokens += sub.gen_tokens
+            self.gen_time += sub.gen_time
+            self.prefill_tokens += sub.prefill_tokens
+            self.think_tokens += sub.think_tokens
+            self.forwards += sub.forwards
+            if sub.interrupted:
+                return "[task interrupted]"
+        return result or "[task returned nothing]"
 
     def run_turn(self, user_text: str, stream=True):
         self.interrupted = False
@@ -368,6 +494,16 @@ class Agent:
         consecutive_failed_bash = 0  # back-to-back errored bash with no edit (thrash)
         thrash_nudges = 0
         think_cap_hits = 0  # soft think-cap firings this turn (plan 039; drives escalation)
+        # Runaway-turn governor state (plan 040). turn_start drives the optional wall
+        # budget; gov_band is the highest budget checkpoint already evaluated; gov_progress
+        # tracks whether a change landed+verified within the CURRENT band (resets each time
+        # a checkpoint is crossed, so every band must re-earn progress); gov_soft_fired
+        # bounds the soft nudge to one per turn.
+        self.budget_note = None
+        turn_start = time.monotonic()
+        gov_band = 0
+        gov_progress = False
+        gov_soft_fired = False
         # Action vs Q&A intent (see classify_intent): a task that asks to change code
         # should END in an applied edit, not a prose explanation. Telemetry caught the
         # model navigating to the right function then "answering on paper" without
@@ -377,6 +513,39 @@ class Agent:
         action_task = self.mode != "plan" and _intent["action"]
         read_only_intent = _intent["read_only"]
         for step in range(self.max_steps):
+            # Runaway-turn governor (plan 040): watch the GLOBAL trajectory — cumulative
+            # prefill tokens (+ optional wall clock) vs progress made. It fires only when a
+            # budget checkpoint is CROSSED, evaluating the just-completed band's progress:
+            # a change landed+verified in that band resets the checkpoint (slow-but-working
+            # turns are never interrupted); no progress -> one soft nudge at ~50%, then bank
+            # a deterministic progress note and end the turn at ~80% so the caller can
+            # relaunch fresh. Off under CHAD_NO_GOVERNOR / when no budget is configured.
+            if not self._no_governor:
+                frac = guardrails.budget_fraction(
+                    self.prefill_tokens, self._turn_budget_tokens,
+                    time.monotonic() - turn_start, self._turn_budget_s)
+                new_band = guardrails.budget_band(frac)
+                gov = None
+                while gov_band < new_band:
+                    gov = guardrails.turn_governor(gov_band + 1, gov_progress, gov_soft_fired)
+                    gov_band += 1
+                    gov_progress = False  # new band: progress must be re-earned
+                    if gov:
+                        break
+                if gov == "hard":
+                    self.budget_note = guardrails.progress_note(self.messages)
+                    log.info("GOVERNOR hard-stop at step %d: %d/%s prefill tokens, %.0fs — "
+                             "banking progress note, ending turn", step, self.prefill_tokens,
+                             self._turn_budget_tokens, time.monotonic() - turn_start)
+                    self._emit("info", "  [turn hit its budget with no landed+verified "
+                                       "change — stopping and banking a progress note]")
+                    return f"{guardrails.BUDGET_SENTINEL} {self.budget_note}"
+                if gov == "soft":
+                    gov_soft_fired = True
+                    log.info("GOVERNOR soft-nudge at step %d: %d/%s prefill tokens", step,
+                             self.prefill_tokens, self._turn_budget_tokens)
+                    self.messages.append({"role": "tool", "name": "edit",
+                                          "content": guardrails.GOVERNOR_SOFT_NUDGE})
             # Forced landing (A): inside the last few steps with nothing cleanly applied,
             # tell the model to stop exploring and commit its edit before the hard cap —
             # otherwise the loop just dies at max_steps with the task untouched.
@@ -662,6 +831,12 @@ class Agent:
                 })
                 continue
 
+            # Governor progress watermark (plan 040): capture the edit flags before this
+            # step's tools run so we can tell afterward whether a change actually LANDED
+            # or a pending edit got VERIFIED this step — the forward motion that resets the
+            # budget checkpoint (vs mere reads/greps, which don't count as progress).
+            _gov_prev_made = made_edit
+            _gov_prev_unverified = unverified_edit
             for name, args in calls:
                 render_tool_start(self._emit, name, args)
                 # typia stages 2+3: coerce loosely-typed args toward the schema
@@ -686,6 +861,24 @@ class Agent:
                     log.info("VALIDATE %s coerced: %s -> %s", name,
                              args_preview(args), args_preview(coerced))
                 args = coerced
+                # Subagent/Task tool (plan 041): run a scoped sub-agent on a quarantined
+                # cache and feed its condensed return back as this call's result. Handled
+                # here (not via DISPATCH) because it needs the engine + a fresh Agent. Only
+                # a top-level agent dispatches it; a sub-agent never sees `task` in its
+                # schema, so if one somehow emits it we fall through to the unknown-tool
+                # repair path rather than nesting.
+                if name == "task" and not self._subagent:
+                    result = self._run_subagent(
+                        args.get("description", ""), args.get("prompt", ""),
+                        args.get("tools", "read-only"))
+                    render_tool_result(self._emit, name, args, result)
+                    self.messages.append({"role": "tool", "name": name, "content": result})
+                    did_work = True  # exploration counts as work (like a read), not an edit
+                    if self._should_stop():
+                        self.interrupted = True
+                        self._emit("info", "  [interrupted]")
+                        return "[interrupted]"
+                    continue
                 # Plan mode is read-only EXCEPT for writing the plan file itself:
                 # write/edit are allowed only under ./plans/. Every other mutating
                 # tool (bash, symbol edits) and any write outside ./plans/ is blocked.
@@ -718,6 +911,13 @@ class Agent:
                 # Thrash counter (C): count back-to-back failed bash with no edit between.
                 consecutive_failed_bash = guardrails.update_thrash(
                     name, result, consecutive_failed_bash)
+
+            # Governor progress (plan 040): a fresh edit LANDED, or a pending edit got
+            # VERIFIED (unverified_edit cleared by a clean bash) this step — real forward
+            # motion, so mark the current budget band as having made progress (resets the
+            # checkpoint that would otherwise fire the governor).
+            if (made_edit and not _gov_prev_made) or (_gov_prev_unverified and not unverified_edit):
+                gov_progress = True
 
             # Break a flailing-probe run (e.g. guessing the test runner, repeated
             # `python -c import` checks) that the exact-call loop guard can't see because

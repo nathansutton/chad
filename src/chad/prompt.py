@@ -69,6 +69,9 @@ structure and pull only what you need:
 - `rename_symbol(name, new_name)` — rename a symbol AND every reference to it across files in one step (precise: follows imports/scope, won't touch an unrelated same-named symbol). Use this for a multi-file rename instead of editing each call site by hand.
 Rule of thumb: orient with `repo_map`, navigate BY SYMBOL, and read full files only when you must edit them; fall back to read/grep/edit for plain text.
 
+# Delegating exploration (keep your own context small)
+- For open-ended exploration — "find where X happens", "which files touch Y", "trace how Z flows" — call `task` with a self-contained prompt. A fresh sub-agent does the grep/read spelunking in its OWN small context and returns just the condensed findings, so your main context (and prefill cost) stays small. Prefer it over reading many files yourself when you're hunting rather than editing.
+
 # Tone
 - Be concise. Lead with the answer, not the reasoning. Skip preamble.
 - Reference code as file_path:line_number. If you can say it in one sentence, don't use three."""
@@ -118,11 +121,31 @@ def classify_intent(user_text: str) -> dict:
     return {"action": action, "read_only": read_only}
 
 
-def build_system_prompt() -> str:
-    # Cache-boundary trick (from the Claude Code teardown): everything above the
-    # boundary is static behavioral text that stays identical across sessions, so the
-    # prefix KV cache reuses it. Volatile per-session context (cwd, project docs) goes
-    # below, where re-prefilling a few hundred tokens is cheap.
+# Short base prompt for a spawned sub-agent (plan 041). It runs in a fresh, isolated
+# context to do ONE scoped job and report back — so it wants the same project context
+# and tool discipline as the main agent, but a tighter behavioral preamble and, above
+# all, the final-answer contract: its last message is returned verbatim to the caller.
+_SUBAGENT_BASE = """You are a focused sub-agent spawned by chad to do ONE scoped job in \
+an ISOLATED context, then report back. You act on the REAL codebase in the working \
+directory by calling tools — you are not a chatbot.
+
+# How you work
+- The ONLY way to do anything is to emit a tool call inside <tool_call></tool_call> tags. A command in a ```bash code fence does NOTHING. Emit a real <tool_call>, wait for the result, then continue.
+- Stay tightly scoped to the task you were given. Do not wander into unrelated files or side quests. Navigate cheaply: grep/glob to locate, repo_map/overview/view_symbol to read structure, read only what you must.
+- You were spawned WITHOUT the caller's conversation. Everything you need is in the task prompt below; if something is genuinely missing, make the most reasonable assumption and note it — do not stall.
+- You CANNOT delegate further (no nested sub-agents).
+
+# Your final answer is the deliverable (CRITICAL)
+- Your LAST message is returned VERBATIM to the caller as the result of their `task` call — it is the ONLY thing they see. The caller does not see your tool calls, your reasoning, or your intermediate steps.
+- So make the last message count: return concrete FACTS — exact file paths with line numbers, short code excerpts, and direct answers. Be dense and specific. Do NOT narrate what you did ("I looked at…", "then I searched…"); state the findings.
+- When you have the answer, call `done` with your findings as the summary."""
+
+
+def _dynamic_context() -> list:
+    """The volatile, per-session tail of the system prompt (cwd, workspace snapshot,
+    test command, project docs, skills catalog). Shared by the main and sub-agent
+    prompt builders so a sub-agent gets the same project grounding below its own
+    (different) behavioral preamble."""
     dynamic = [
         "\n\n# Environment",
         f"- OS: {platform.system()} {platform.release()} ({platform.machine()})",
@@ -158,7 +181,23 @@ def build_system_prompt() -> str:
     catalog = skills.catalog_block()
     if catalog:
         dynamic.append(catalog)
-    return _BASE_PROMPT + "\n".join(dynamic)
+    return dynamic
+
+
+def build_system_prompt() -> str:
+    # Cache-boundary trick (from the Claude Code teardown): everything above the
+    # boundary is static behavioral text that stays identical across sessions, so the
+    # prefix KV cache reuses it. Volatile per-session context (cwd, project docs) goes
+    # below, where re-prefilling a few hundred tokens is cheap.
+    return _BASE_PROMPT + "\n".join(_dynamic_context())
+
+
+def build_subagent_prompt() -> str:
+    """The system prompt for a spawned sub-agent: the tight sub-agent preamble + the
+    same per-session project context the main agent gets. Its own stable head means the
+    sub-agent warm-prefixes to its OWN disk checkpoint (plan 041), so repeated tasks in a
+    session skip re-prefilling this prefix."""
+    return _SUBAGENT_BASE + "\n".join(_dynamic_context())
 
 
 # A test-runner invocation we can lift verbatim from CI / Make config. Anchored at the

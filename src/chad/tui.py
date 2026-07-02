@@ -64,7 +64,8 @@ MODE_STYLE = {"normal": "status.normal", "auto": "status.auto", "plan": "status.
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _PHASE_VERB = {"Read": "Reading", "Edit": "Editing", "Write": "Writing", "Run": "Running",
                "Search": "Searching", "Find": "Searching", "Plan": "Planning",
-               "Overview": "Reading", "View": "Reading", "Refs": "Searching"}
+               "Overview": "Reading", "View": "Reading", "Refs": "Searching",
+               "Task": "Delegating"}
 
 # A one-cell state glyph coupled to the activity verb, so the indicator carries phase at
 # a glance (the spinner braille is the *motion*; this is the *identity*). Matched on a
@@ -132,6 +133,10 @@ class TUI:
         # session's baseline permission mode (auto when launched --yolo, else normal).
         self._pending_plan = None
         self._base_mode = self.agent.mode if self.agent.mode != "plan" else "normal"
+        # Governor handoff (plan 040): after a turn hard-stops on its budget, holds the
+        # deterministic progress note. The next typed message relaunches a FRESH turn
+        # (cleared context) seeded with the note — shedding the ramble + huge prefill.
+        self._pending_budget_note = None
 
         # Multiline input that auto-grows up to 8 rows. Enter submits; alt-enter
         # (or ctrl-j) inserts a newline; pasted text keeps its newlines.
@@ -396,6 +401,7 @@ class TUI:
             should_stop=self._interrupt.is_set,
         )
         self._pending_plan = None
+        self._pending_budget_note = None
         self._interrupt.clear()        # the new turn must start un-interrupted
         self.engine._reset_cache()
         return True
@@ -490,6 +496,19 @@ class TUI:
                                "attach · type while busy to queue · plan ready: type to "
                                "steer, ctrl-g to accept")
             return False
+        # A typed message while a governor budget note is pending = continue fresh:
+        # clear context and relaunch, seeding the note + the user's steer (plan 040).
+        if self._pending_budget_note and not self._busy:
+            note = self._pending_budget_note
+            self._pending_budget_note = None
+            if not self._fresh_agent(self._base_mode):
+                return False
+            seed = f"{text}\n\n[{note}]"
+            self._queue.append(seed)
+            self._emit("info", "context cleared · continuing with the progress note")
+            self._emit("user", text)
+            self._wake.set()
+            return False
         # A typed message while a plan is pending = steer: continue the plan-mode
         # session so the model revises the plan file. Drop the pending banner state.
         self._pending_plan = None
@@ -530,6 +549,15 @@ class TUI:
                 else:
                     self.agent.run_turn(msg, stream=True)
                     self.agent.save()  # persist conversation for --continue
+                    # Governor hard-stop (plan 040): the turn ran out of budget with no
+                    # landed+verified change. Surface the banked progress note and arm the
+                    # fresh-continue handoff — the next typed message starts clean, seeded.
+                    if self.agent.budget_note:
+                        self._pending_budget_note = self.agent.budget_note
+                        self.agent.budget_note = None
+                        self._emit("info", "turn hit its budget — no verified change landed.")
+                        self._emit("info", "  type to continue fresh (context cleared, "
+                                           "seeded with what was learned) — or start a new task")
                     # A finished plan-mode turn that wrote a plan file -> offer the
                     # steer (type) / accept (ctrl-g or /accept) handoff.
                     if self.agent.mode == "plan" and self.agent.last_plan_path:

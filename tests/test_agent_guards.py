@@ -21,8 +21,12 @@ Run: `uv run python test_agent_guards.py`
 """
 
 from chad.guardrails import (
+    GOV_HARD_FRAC,
+    GOV_SOFT_FRAC,
     bash_result_verifies,
     bash_thrash_nudge,
+    budget_band,
+    budget_fraction,
     done_rejection,
     is_destructive_bash,
     is_repeat_loop,
@@ -30,7 +34,9 @@ from chad.guardrails import (
     loop_should_abort,
     loop_signature,
     nudge_for_no_calls,
+    progress_note,
     think_budget,
+    turn_governor,
     update_thrash,
     update_work_flags,
 )
@@ -302,6 +308,103 @@ def test_think_budget():
           think_budget(2, base=5000) == 5000, think_budget(2, 5000))
 
 
+def test_budget_fraction_and_band():
+    # Token-budget ratio.
+    check("half of token budget", budget_fraction(50, 100) == 0.5)
+    check("over token budget", budget_fraction(160, 100) == 1.6)
+    # No budget configured -> 0.0 (governor off, never fires).
+    check("no budget -> 0.0", budget_fraction(999999, None) == 0.0)
+    check("zero budget -> 0.0", budget_fraction(10, 0) == 0.0)
+    # Wall clock counts too, and the TIGHTER (max) of the two budgets drives it.
+    check("wall ratio alone", budget_fraction(0, None, wall_s=90, wall_budget_s=100) == 0.9)
+    check("max of token vs wall",
+          budget_fraction(20, 100, wall_s=90, wall_budget_s=100) == 0.9)
+    # Bands: below soft / soft..hard / at-or-over hard.
+    check("band 0 below soft", budget_band(GOV_SOFT_FRAC - 0.01) == 0)
+    check("band 1 at soft", budget_band(GOV_SOFT_FRAC) == 1)
+    check("band 1 mid", budget_band((GOV_SOFT_FRAC + GOV_HARD_FRAC) / 2) == 1)
+    check("band 2 at hard", budget_band(GOV_HARD_FRAC) == 2)
+    check("band 2 over", budget_band(1.5) == 2)
+
+
+def test_turn_governor():
+    # Entering the soft band with no progress and no prior soft nudge -> soft.
+    check("soft on band 1, no progress",
+          turn_governor(1, progress=False, soft_fired=False) == "soft")
+    # Progress in the completed band resets the checkpoint -> never fire.
+    check("progress resets soft",
+          turn_governor(1, progress=True, soft_fired=False) is None)
+    check("progress resets hard",
+          turn_governor(2, progress=True, soft_fired=False) is None)
+    # Soft is one-shot: already fired -> no second soft.
+    check("soft is one-shot",
+          turn_governor(1, progress=False, soft_fired=True) is None)
+    # Entering the hard band with no progress -> hard, regardless of the soft state.
+    check("hard on band 2, soft already fired",
+          turn_governor(2, progress=False, soft_fired=True) == "hard")
+    check("hard on band 2 even if soft never fired (a single big jump)",
+          turn_governor(2, progress=False, soft_fired=False) == "hard")
+    # Opt-out (CHAD_NO_GOVERNOR) always yields None.
+    check("disabled never fires",
+          turn_governor(2, progress=False, soft_fired=False, disabled=True) is None)
+    # Band 0 (below the soft mark) never fires.
+    check("band 0 never fires",
+          turn_governor(0, progress=False, soft_fired=False) is None)
+
+    # Integration: replay the run_turn band walk. No progress -> soft at the 50%
+    # crossing, hard at the 80% crossing.
+    def walk(progress_by_band):
+        """progress_by_band[b] = did a change land+verify while in band b?"""
+        gov_band, soft_fired, events = 0, False, []
+        for frac in (0.2, 0.6, 0.95):  # steps that land in bands 0,1,2
+            new_band = budget_band(frac)
+            while gov_band < new_band:
+                d = turn_governor(gov_band + 1, progress_by_band.get(gov_band, False),
+                                  soft_fired)
+                gov_band += 1
+                if d == "soft":
+                    soft_fired = True
+                if d:
+                    events.append((new_band, d))
+                    break
+        return events
+    check("no-progress walk: soft then hard",
+          walk({}) == [(1, "soft"), (2, "hard")], str(walk({})))
+    # Progress in band 1 (between 50% and 80%) resets the checkpoint -> no hard stop.
+    check("progress in band 1 suppresses hard",
+          walk({1: True}) == [(1, "soft")], str(walk({1: True})))
+
+
+def test_progress_note():
+    # A transcript: two edits, a failing command, then a passing one. The note must name
+    # the edited files and the commands, and surface the LAST error — all deterministically.
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "fix the parser"},
+        {"role": "assistant",
+         "content": '<tool_call>{"name": "edit", "arguments": {"path": "parser.py"}}</tool_call>'},
+        {"role": "tool", "name": "edit", "content": "[edited parser.py]"},
+        {"role": "assistant",
+         "content": '<tool_call>{"name": "bash", "arguments": {"command": "pytest -q"}}</tool_call>'},
+        {"role": "tool", "name": "bash", "content": "[exit 1]\nE   AssertionError: bad parse"},
+        {"role": "assistant",
+         "content": '<tool_call>{"name": "write", "arguments": {"path": "util.py"}}</tool_call>'},
+        {"role": "tool", "name": "write", "content": "[wrote util.py]"},
+    ]
+    note = progress_note(messages)
+    check("note names first edited file", "parser.py" in note, note)
+    check("note names second edited file", "util.py" in note, note)
+    check("note names the command run", "pytest -q" in note, note)
+    check("note surfaces the last error", "AssertionError" in note, note)
+    check("note is bounded to max_lines", len(note.splitlines()) <= 20, note)
+    # An empty/idle transcript yields a note that says nothing was recorded (still safe
+    # to seed a retry with).
+    empty = progress_note([{"role": "system", "content": "s"},
+                           {"role": "user", "content": "do x"}])
+    check("empty transcript -> explicit 'nothing recorded'",
+          "nothing" in empty.lower() or "no edits" in empty.lower(), empty)
+
+
 if __name__ == "__main__":
     test_bash_result_verifies()
     test_done_rejection()
@@ -312,5 +415,8 @@ if __name__ == "__main__":
     test_thrash_guard()
     test_destructive_bash_guard()
     test_think_budget()
+    test_budget_fraction_and_band()
+    test_turn_governor()
+    test_progress_note()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

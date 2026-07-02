@@ -170,7 +170,7 @@ class _StreamView:
 
 _VERB = {"read": "Read", "edit": "Edit", "write": "Write", "bash": "Run",
          "grep": "Search", "glob": "Find", "write_todos": "Plan",
-         "repo_map": "Mapping"}
+         "repo_map": "Mapping", "task": "Task"}
 
 
 def _disp_path(p) -> str:
@@ -248,6 +248,8 @@ def render_tool_start(emit, name: str, args: dict):
         emit("tool", f"Find {_oneline(args.get('pattern', ''), 50)}")
     elif name == "write_todos":
         emit("tool", "Plan")
+    elif name == "task":
+        emit("tool", f"Task {_oneline(args.get('description', ''), 50)}")
     elif name == "overview":
         emit("tool", f"Overview {_disp_path(args.get('path', ''))}")
     elif name == "view_symbol":
@@ -317,6 +319,10 @@ def render_tool_result(emit, name: str, args: dict, result: str):
         _emit_diff(emit, "", content, max_lines=12)
     elif name == "bash":
         _indent_block(emit, result)
+    elif name == "task":
+        n = _nlines(result)
+        emit("muted", f"  ⎿ sub-agent returned {n} line{'s' * (n != 1)}")
+        _indent_block(emit, result, max_lines=4)
     elif name == "grep":
         lines = [l for l in result.splitlines() if ":" in l]
         files = len({l.split(":", 1)[0] for l in lines})

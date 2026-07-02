@@ -198,6 +198,7 @@ defenses — leave them unset in normal use; they exist for measurement and edge
 
 ```bash
 CHAD_NO_SYMBOLS=1            uv run chad  # A/B knob: hide the tree-sitter symbolic tools
+CHAD_NO_TASK=1              uv run chad  # A/B knob: hide the subagent/Task delegation tool
 CHAD_NO_VALIDATE=1          uv run chad  # A/B knob: DISABLE arg coercion + schema validation
 CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbelt (unsafe)
 ```
@@ -205,6 +206,13 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
 - **`CHAD_NO_SYMBOLS`** — drops the tree-sitter symbolic code-intel tools from the toolset
   (`tools.py`). A measurement knob used by the eval harness to A/B whether symbols help a
   given model; the plain bash/read/grep tools still work.
+- **`CHAD_NO_TASK`** — hides the `task` tool (plan 041), which delegates open-ended
+  exploration ("find where X happens") to a fresh **sub-agent** running in its own small,
+  isolated context on a quarantined KV cache (`engine.push_cache`/`pop_cache`) and returns
+  only a condensed answer — so the main transcript (and its prefill cost) stays small. The
+  sub-agent is read-only by default and cannot spawn further sub-agents (depth 1). This
+  knob is the A/B arm for measuring adoption/impact, and the escape hatch if a model
+  misuses it.
 - **`CHAD_NO_VALIDATE`** — **disables** the typia-style lenient-parse → typed-validate →
   self-repair loop for tool-call arguments (`validate.py`), falling back to a strict
   `json.loads` plus a terse missing-required check. This *weakens* input handling (malformed
