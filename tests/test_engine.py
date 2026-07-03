@@ -149,6 +149,73 @@ def test_prefill_progress_callback():
           f"{shapes_none} vs {shapes}")
 
 
+def test_interrupted_prefill_records_only_fed_tokens():
+    """Tier 1 (no weights): a mid-prefill interrupt must leave `_cached_ids` recording
+    ONLY the tokens actually pushed into the KV cache — never the full intended prefix.
+
+    This is the append-only-cache invariant the design calls catastrophic if broken. The
+    cache holds exactly `fed` tokens after an interrupt, so `_cached_ids` (the engine's
+    record of what is resident) must have length `fed`. If it recorded the full prefix
+    while the cache held fewer, every later turn's prefix-diff would count phantom
+    resident tokens and splice the next prefill at the wrong offset — silent corruption of
+    every subsequent turn. We drive the REAL cold-miss path in `warm_prefix` (engine.py
+    ~294-297, which owns the `_cached_ids = prefix_ids[:fed]` accounting) with a
+    `should_stop` that fires after the first chunk, then prove a clean resume of the
+    remaining suffix rebuilds the full prefix with every token fed exactly once (no gap,
+    no double-feed). Removing the `fed < len(prefix_ids)` guard (recording the full prefix)
+    makes the length assertion below go RED."""
+    import mlx.core as mx
+
+    from chad.engine import Engine
+
+    class _FakeCacheItem:
+        def __init__(self):
+            self.state = mx.array([0.0])
+
+    forwards = []                          # width (in tokens) of every model forward pass
+    eng = object.__new__(Engine)           # bypass __init__ (no weights)
+    eng._cache = [_FakeCacheItem(), _FakeCacheItem()]
+    eng.model = lambda arr, cache=None: forwards.append(int(arr.shape[1]))
+    eng.draft = None                       # single-model cache -> warm_prefix is valid
+    eng.cache_dir = "/tmp/chad-test-nonexistent"   # truthy so warm_prefix doesn't 'skip'
+    eng._cached_ids = []                            # cold: nothing resident yet
+    eng._reset_cache = lambda: None                 # keep our fake _cache in place
+    eng._ckpt_path = lambda ids, tag=None: "/tmp/chad-test-nonexistent/no.ckpt"  # -> miss
+
+    prefix = list(range(600))              # > 2 chunks at the 256-token default
+    checks = {"n": 0}
+
+    def should_stop():
+        # False on the first check (feed chunk 0..256), True after (break before chunk 2).
+        checks["n"] += 1
+        return checks["n"] > 1
+
+    status, fed = eng.warm_prefix(prefix, should_stop=should_stop)
+
+    check("cold-miss path taken", status == "miss", status)
+    check("prefill was interrupted (fed < full prefix)", fed < len(prefix), fed)
+    check("interrupt fed exactly one 256-chunk", fed == 256, fed)
+    # THE invariant: _cached_ids length == tokens actually pushed == sum of forward widths.
+    check("_cached_ids records only the fed tokens (NOT the full prefix)",
+          len(eng._cached_ids) == fed, f"len={len(eng._cached_ids)} vs fed={fed}")
+    check("_cached_ids is the fed PREFIX exactly", eng._cached_ids == prefix[:fed],
+          eng._cached_ids[:5])
+    check("cache holds exactly fed tokens (forwards sum == _cached_ids)",
+          sum(forwards) == len(eng._cached_ids),
+          f"{sum(forwards)} vs {len(eng._cached_ids)}")
+
+    # Clean resume: feed the remaining suffix into the SAME cache and extend _cached_ids as
+    # the engine's diff/extend math would. Because the interrupt recorded only `fed`, the
+    # resume starts at the correct offset — every token lands exactly once, no gap/overlap.
+    fed2 = eng._prefill(prefix[fed:])          # no should_stop -> runs to completion
+    eng._cached_ids = eng._cached_ids + prefix[fed:]
+    check("resume fed exactly the remaining tail", fed2 == len(prefix) - fed, fed2)
+    check("resumed cache == full prefix, once each", eng._cached_ids == prefix,
+          f"len={len(eng._cached_ids)}")
+    check("no token fed twice or skipped (total forwards == prefix length)",
+          sum(forwards) == len(prefix), f"{sum(forwards)} vs {len(prefix)}")
+
+
 def test_stop_condition_soft_close():
     """Tier 1 (no weights): generate()'s soft think-cap hook (plan 039). A caller
     `stop_condition(text, n)` is checked after each decoded token, composing with
@@ -570,6 +637,7 @@ def test_push_pop_bit_exact():
 if __name__ == "__main__":
     tier1 = (test_longest_match_wins, test_recency_tie_break, test_no_match,
              test_guards, test_draft_length, test_prefill_progress_callback,
+             test_interrupted_prefill_records_only_fed_tokens,
              test_stop_condition_soft_close)
     tier2 = (test_pld_equals_greedy,
              test_pld_hybrid_equals_greedy,
