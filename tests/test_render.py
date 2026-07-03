@@ -16,7 +16,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from chad.render import _is_err, render_tool_result  # noqa: E402
+from chad.render import _is_err, ansi_fragment, render_tool_result  # noqa: E402
+from chad.tui import TUI  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -36,6 +37,21 @@ def _emits(name, args, result):
     out = []
     render_tool_result(lambda k, t: out.append((k, t)), name, args, result)
     return out
+
+
+def test_ansi_fragment_parity():
+    # Plan 053: the REPL emitter and the TUI must build byte-identical fragments for
+    # every SHARED kind. `_ansi_for` routes through `ansi_fragment`, so pin that the two
+    # paths can never silently diverge on a shared kind again. (stream/user are the two
+    # deliberate divergences and are excluded here.)
+    tui = object.__new__(TUI)  # shared kinds touch no instance state
+    for kind in ("think", "tool", "add", "del", "error", "info", "muted"):
+        frag = ansi_fragment(kind, "sample")
+        assert frag is not None, kind
+        assert frag == tui._ansi_for(kind, "sample"), kind
+    # Non-shared / dropped kinds return None from the shared function.
+    for kind in ("stream", "user", "stat", "ctx", "definitely-unknown"):
+        assert ansi_fragment(kind, "x") is None, kind
 
 
 def test_is_err_flags_real_diagnostics():

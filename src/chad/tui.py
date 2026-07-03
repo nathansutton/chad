@@ -50,7 +50,7 @@ from prompt_toolkit.widgets import TextArea
 from .agent import INIT_PROMPT, MODE_LABEL, Agent
 from .base_engine import BaseEngine
 from .ignore import IGNORE_DIRS
-from .render import C_BOLD, C_DIM, C_GREEN, C_RED, C_RST, C_YEL, confirm_preview, render_tool_result
+from .render import C_RST, C_YEL, ansi_fragment, confirm_preview, render_tool_result
 
 # Styling for the pinned bottom region only (status line + input). The transcript
 # above is plain ANSI (see _ansi_for), so it lives in normal terminal scrollback.
@@ -383,23 +383,12 @@ class TUI:
     def _ansi_for(self, kind: str, text: str) -> str:
         # Transcript fragments as raw ANSI for the terminal scrollback. Prose is
         # left at the terminal's default foreground (near-white); reasoning is dim.
-        if kind == "stream":
+        if kind == "stream":  # DIVERGES from the REPL: raw here, green-wrapped there.
             return text
-        if kind == "think":
-            return C_DIM + text + C_RST
-        if kind == "tool":
-            return f"\n{C_GREEN}●{C_RST} {C_BOLD}{text}{C_RST}\n"
-        if kind == "user":
+        if kind == "user":  # DIVERGES from the REPL: multi-line here, single-line there.
             return self._user_ansi(text)
-        if kind == "add":
-            return f"{C_GREEN}{text}{C_RST}\n"
-        if kind == "del":
-            return f"{C_RED}{text}{C_RST}\n"
-        if kind == "error":
-            return f"{C_YEL}{text}{C_RST}\n"
-        if kind in ("info", "muted"):
-            return f"{C_DIM}{text}{C_RST}\n"
-        return ""  # 'stat' and unknowns are dropped from the UI
+        frag = ansi_fragment(kind, text)
+        return frag if frag is not None else ""  # 'stat'/unknowns drop from the UI
 
     @staticmethod
     def _user_ansi(text: str) -> str:

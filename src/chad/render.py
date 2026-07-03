@@ -388,26 +388,36 @@ def render_tool_result(emit, name: str, args: dict, result: str):
         _indent_block(emit, result)
 
 
+def ansi_fragment(kind: str, text: str) -> str | None:
+    """The transcript ANSI fragment shared by the REPL emitter and the TUI. Returns None
+    for kinds a caller renders specially (stream, user) or drops (gauges/unknowns)."""
+    if kind == "think":
+        return C_DIM + text + C_RST
+    if kind == "tool":
+        return f"\n{C_GREEN}●{C_RST} {C_BOLD}{text}{C_RST}\n"
+    if kind == "add":
+        return f"{C_GREEN}{text}{C_RST}\n"
+    if kind == "del":
+        return f"{C_RED}{text}{C_RST}\n"
+    if kind == "error":
+        return f"{C_YEL}{text}{C_RST}\n"
+    if kind in ("info", "muted"):
+        return f"{C_DIM}{text}{C_RST}\n"
+    return None
+
+
 def _default_emit(kind: str, text: str):
     """Default emitter: colored stdout, used by the plain REPL and one-shot mode."""
     w = sys.stdout.write
-    if kind == "stream":
+    if kind == "stream":  # DIVERGES from the TUI: green-wrapped here, raw there.
         w(C_GREEN + text + C_RST)
-    elif kind == "think":
-        w(C_DIM + text + C_RST)
-    elif kind == "tool":
-        w(f"\n{C_GREEN}●{C_RST} {C_BOLD}{text}{C_RST}\n")
-    elif kind == "add":
-        w(f"{C_GREEN}{text}{C_RST}\n")
-    elif kind == "del":
-        w(f"{C_RED}{text}{C_RST}\n")
-    elif kind == "error":
-        w(f"{C_YEL}{text}{C_RST}\n")
-    elif kind == "user":
+    elif kind == "user":  # DIVERGES from the TUI: single-line here, multi-line there.
         w(f"\n{C_YEL}» {text}{C_RST}\n")
-    elif kind in ("info", "muted"):
-        w(f"{C_DIM}{text}{C_RST}\n")
-    # 'stat', the live-gauge kinds (ctx/gen/prefill/status), the pinned 'todos' panel
-    # feed, and any unknown kinds are intentionally dropped from stdout — they belong to
-    # the TUI's pinned region, not the plain REPL scrollback.
+    else:
+        frag = ansi_fragment(kind, text)
+        if frag is not None:
+            w(frag)
+        # 'stat', the live-gauge kinds (ctx/gen/prefill/status), the pinned 'todos' panel
+        # feed, and any unknown kinds return None and are intentionally dropped from
+        # stdout — they belong to the TUI's pinned region, not the plain REPL scrollback.
     sys.stdout.flush()
