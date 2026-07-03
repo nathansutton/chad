@@ -250,6 +250,50 @@ def test_subagent_skips_session_reset(monkeypatch):
     check("top-level agent resets the session", set(calls) == {"skills", "mcp"}, calls)
 
 
+# === Tier 1: autonomy clamp (plan 048) ========================================
+
+def test_subagent_tools_policy():
+    """A sub-agent auto-approves its own tool calls, so it must never hold more autonomy
+    than its parent: only an 'auto' (--yolo/headless) parent may delegate 'all'. Anything
+    else — including a 'normal' parent whose safety promise is human confirmation of every
+    mutation — clamps to read-only."""
+    from chad.agent import subagent_tools_for
+    for parent_mode, requested, expected in [
+        ("auto", "all", "all"),
+        ("normal", "all", "read-only"),
+        ("plan", "all", "read-only"),
+        ("normal", "read-only", "read-only"),
+        ("auto", "read-only", "read-only"),
+    ]:
+        check(f"subagent_tools_for({parent_mode!r}, {requested!r})",
+              subagent_tools_for(parent_mode, requested) == expected,
+              subagent_tools_for(parent_mode, requested))
+
+
+def test_normal_parent_never_spawns_mutating_subagent(monkeypatch):
+    """Integration seam: _run_subagent on a mode='normal' parent downgrades an explicit
+    tools='all' request and says so in the transcript (the muted clamp notice), while a
+    default read-only request stays silent. run_turn is stubbed class-level so no model
+    or real sub-agent turn is needed."""
+    from chad.agent import Agent
+    monkeypatch.setattr(Agent, "run_turn", lambda self, prompt, stream=True: "ok")
+    agent = _mk_agent(mode="normal")
+    agent.engine.push_cache = lambda: None
+    agent.engine.pop_cache = lambda: None
+    seen = []
+    agent._emit = lambda k, t: seen.append((k, t))
+
+    result = agent._run_subagent("d", "p", tools="all")
+    check("stubbed sub-agent turn ran", result == "ok", result)
+    check("clamp notice emitted for downgraded 'all'",
+          any(k == "muted" and "clamped to read-only" in t for k, t in seen), seen)
+
+    seen.clear()
+    agent._run_subagent("d", "p", tools="read-only")
+    check("no clamp notice for a default read-only request",
+          not any("clamped" in t for _, t in seen), seen)
+
+
 # === Tier 1: dimmed sub-agent emit remapping ==================================
 
 def test_sub_emit_remaps_kinds():

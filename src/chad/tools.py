@@ -545,7 +545,8 @@ SCHEMAS: list[dict[str, Any]] = [
                                               "find or do, and exactly what to report back."},
                     "tools": {"type": "string", "enum": ["read-only", "all"],
                               "description": "Tool access: 'read-only' (default; search/read "
-                                             "only) or 'all' (also edit/run — use sparingly)."},
+                                             "only) or 'all' (also edit/run — honored only in "
+                                             "--yolo/auto mode; otherwise clamped to read-only)."},
                 },
                 "required": ["description", "prompt"],
             },

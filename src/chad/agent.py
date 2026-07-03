@@ -44,6 +44,19 @@ SUBAGENT_READ_ONLY = {
     "read", "grep", "glob", "repo_map", "overview", "view_symbol",
     "find_symbol", "find_refs", "write_todos", "done", "finish", "stop",
 }
+
+
+def subagent_tools_for(parent_mode: str, requested: str) -> str:
+    """The toolset a sub-agent may run with. A sub-agent auto-approves its own tool
+    calls (mode='auto', no confirm callback), so it must never hold more autonomy
+    than its parent: only an 'auto' parent (--yolo / headless) may delegate 'all';
+    a 'normal' parent's human-approval promise and plan mode's read-only promise
+    both clamp the sub-agent to read-only."""
+    if parent_mode == "auto" and requested == "all":
+        return "all"
+    return "read-only"
+
+
 from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_repair
 
 # Validation (VALIDATE knob, legacy_validate baseline) lives in validate.py, the
@@ -420,9 +433,13 @@ class Agent:
         even on error/interrupt (the finally), so a stuck sub-agent never corrupts the
         parent. Its grep/read churn never enters the main transcript; only this return
         does. Depth 1 only: a sub-agent can't itself call `task` (its schema omits it)."""
-        # In plan mode the parent is read-only; never let a sub-agent it spawns mutate.
-        if self.mode == "plan":
-            tools = "read-only"
+        # Never grant a sub-agent more autonomy than its parent: the sub-agent runs
+        # mode='auto' with no confirm callback, so an 'all' toolset is honored only when
+        # the parent itself is auto-approved (--yolo/headless); 'normal' (human confirms
+        # every mutation) and 'plan' (read-only) parents clamp it to read-only.
+        requested, tools = tools, subagent_tools_for(self.mode, tools)
+        if requested == "all" and tools == "read-only":
+            self._emit("muted", "   ⌊ sub-agent clamped to read-only (parent mode is not auto)")
         self._emit("muted", f"   ⌊ delegating to sub-agent: {description}")
         sub = None
         self.engine.push_cache()
