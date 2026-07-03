@@ -21,8 +21,14 @@ import atexit
 import os
 import threading
 
+from .diag import log
+
 # solidlsp pulls a fair bit of machinery; import lazily inside _server() so a normal
 # session / cold start doesn't pay for it unless references are actually requested.
+# It ships in the optional `lsp` extra (serena-agent) — absent, we log once and every
+# caller degrades to the tree-sitter backend.
+
+_MISSING_LOGGED = False
 
 _IGNORED = ["__pycache__", ".git", ".venv", "venv", "node_modules", ".mypy_cache",
             ".pytest_cache", "dist", "build", ".cache", "models"]
@@ -63,6 +69,15 @@ class LspService:
                 from solidlsp import SolidLanguageServer
                 from solidlsp.ls_config import Language, LanguageServerConfig
                 from solidlsp.settings import SolidLSPSettings
+            except ImportError:
+                global _MISSING_LOGGED
+                if not _MISSING_LOGGED:
+                    _MISSING_LOGGED = True
+                    log.info("lsp: solidlsp not installed (install the 'lsp' extra for "
+                             "precise refs/rename); using tree-sitter fallback")
+                self._servers[lang] = None
+                return None
+            try:
                 cfg = LanguageServerConfig(code_language=Language[lang],
                                            ignored_paths=list(_IGNORED))
                 srv = SolidLanguageServer.create(cfg, self.root,

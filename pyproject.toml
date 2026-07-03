@@ -17,7 +17,10 @@ dependencies = [
     "prompt_toolkit>=3.0.43",
     "tree-sitter>=0.25.2",
     "tree-sitter-language-pack>=1.11.0",
-    "mcp>=1.28.1",
+    # Floor lowered from 1.28.1: serena-agent (the `lsp` extra) hard-pins mcp==1.27.0, and
+    # chad's mcp surface (ClientSession, stdio/streamable-http clients, OAuthClientProvider)
+    # is stable across 1.27+. The 1.27->1.28 delta is only deprecations chad doesn't touch.
+    "mcp>=1.27",
 ]
 
 # Optional syntax highlighting in diffs / confirm previews (plan 042 item 4). Pure-Python,
@@ -25,6 +28,11 @@ dependencies = [
 # Install with `uv sync --extra highlight` or `pip install 'chad[highlight]'`.
 [project.optional-dependencies]
 highlight = ["pygments>=2.17"]
+# Precision code intelligence (docs/design.md "Precision" phase): solidlsp ships inside
+# serena-agent and backs lsp.py's find-refs/rename via pyright. Optional on purpose —
+# heavyweight tree; absent, every caller falls back to the tree-sitter backend.
+# Install with `uv sync --extra lsp` or `pip install 'chad[lsp]'`.
+lsp = ["serena-agent>=1.5"]
 
 # The one entrypoint: `uv run chad`. (`chad-bench` reproduces docs/benchmarks.md.)
 [project.scripts]
@@ -32,7 +40,10 @@ chad = "chad.cli:main"
 chad-bench = "chad.bench:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+# types-pyyaml: skills.py imports yaml directly; mypy 1.x refuses to honor
+# ignore_missing_imports for packages with known typeshed stubs, so the gate
+# needs the stubs installed to pass on a plain (no-extra) sync.
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "types-pyyaml>=6"]
 
 [build-system]
 requires = ["setuptools>=61"]

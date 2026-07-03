@@ -134,6 +134,11 @@ uv run chad -c               # resume this directory's last conversation
 To measure throughput on your own machine, `uv run chad-bench` (see
 [Throughput & performance](docs/benchmarks.md)).
 
+**Optional: precise refs/rename.** LSP-precise cross-file find-references and
+scope-correct rename need `uv sync --extra lsp` (or `pip install 'chad[lsp]'`); without
+it chad uses the tree-sitter fallback automatically (see
+[the symbolic stack](docs/design.md)).
+
 **The model.** chad picks one model for you and downloads it once into the shared Hugging
 Face cache (`~/.cache/huggingface`, reused across every project):
 

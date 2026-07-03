@@ -151,10 +151,13 @@ Why each of those earns its place specifically on a *small* model:
   call sites is a broken build, and a small model doing it by grep+edit *will* miss one.
   `rename_symbol` follows scope and renames every site or none.
 
-**Never a hard dependency.** If the language server can't start — no Node, offline,
-unsupported language — every caller falls back to the tree-sitter backend. Python is the
-proven backend (pyright); the other languages light up automatically once their server is
-available. The LSP is a precision *upgrade*, and the harness runs fine without it.
+**Never a hard dependency.** The precision layer ships as the optional `lsp` extra
+(`serena-agent`, which contains solidlsp): `uv sync --extra lsp` or `pip install
+'chad[lsp]'`; a default install runs entirely on tree-sitter. And even with the extra
+installed, if the language server can't start — no Node, offline, unsupported language —
+every caller falls back to the tree-sitter backend. Python is the proven backend
+(pyright); the other languages light up automatically once their server is available. The
+LSP is a precision *upgrade*, and the harness runs fine without it.
 
 The honest payoff is **reliability, not raw prefill savings**. On a small repo a capable
 model can often just `grep` its way to a name-greppable symbol, so the symbolic tools don't
