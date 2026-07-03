@@ -158,6 +158,41 @@ def test_push_pop_spill_roundtrip(monkeypatch, tmp_path):
     check("pop removed the spill file", not os.path.isfile(spill_path), spill_path)
 
 
+def test_pop_cache_survives_corrupt_spill(monkeypatch, tmp_path):
+    """If the spilled checkpoint is missing/corrupt, pop_cache must NOT raise — it runs in
+    the finally of _run_subagent, outside the sub-agent's except, so a raise would abort the
+    parent turn with a traceback (contradicting 'a stuck sub-agent never corrupts the
+    parent'). It degrades to a clean re-prefill: _reset_cache, spill file removed, no raise
+    (plan 052)."""
+    _no_mx(monkeypatch)
+
+    def _fake_save(path, cache):
+        with open(path, "w") as f:
+            f.write("x")
+
+    def _corrupt_load(path):
+        raise ValueError("bad checkpoint magic")
+
+    monkeypatch.setattr(eng_mod.cache_utils, "save_prompt_cache", _fake_save)
+    monkeypatch.setattr(eng_mod.cache_utils, "load_prompt_cache", _corrupt_load)
+
+    eng = _fake_engine(cache_dir=str(tmp_path))
+    monkeypatch.setattr(eng, "_should_spill", lambda ids: True)
+
+    eng.push_cache()  # push itself resets once (hands the sub-agent a fresh cache)
+    spill_path = eng._cache_stack[0]["spill_path"]
+    check("push spilled to disk", spill_path and os.path.isfile(spill_path), spill_path)
+    resets_after_push = eng._reset_count[0]
+
+    eng.pop_cache()  # must not raise even though load_prompt_cache blows up
+    check("corrupt spill degraded to a reset (re-prefill)",
+          eng._reset_count[0] == resets_after_push + 1, eng._reset_count[0])
+    check("reset cleared cached_ids for a clean re-prefill", eng._cached_ids == [],
+          eng._cached_ids)
+    check("corrupt spill file cleaned up", not os.path.isfile(spill_path), spill_path)
+    check("stack emptied even on the failure path", eng._cache_stack == [], eng._cache_stack)
+
+
 def test_spill_ckpt_path_namespaced(monkeypatch, tmp_path):
     """The push-spill checkpoint is namespaced (tag='push') so it can never collide with
     a warm-prefix checkpoint that happens to share the same ids."""
@@ -206,6 +241,26 @@ def _mk_agent(**kw):
     return Agent(_NoModelEngine(), **kw)
 
 
+def test_agent_env_parse_tolerates_garbage(monkeypatch):
+    """A non-numeric CHAD_* budget knob must degrade to the default, not crash
+    Agent.__init__ (plan 052). Before the fix, int('x')/float('x') raised inside __init__
+    so chad refused to start at all rather than warning and using the default."""
+    monkeypatch.setenv("CHAD_THINK_BUDGET", "x")
+    monkeypatch.setenv("CHAD_TURN_BUDGET_TOKENS", "not-a-number")
+    monkeypatch.setenv("CHAD_TURN_BUDGET_S", "garbage")
+    agent = _mk_agent(ctx_limit=1000)  # must not raise
+    check("bad CHAD_THINK_BUDGET -> None default", agent.think_budget is None, agent.think_budget)
+    check("bad CHAD_TURN_BUDGET_TOKENS -> max(0, 3*ctx_limit) default",
+          agent._turn_budget_tokens == 3000, agent._turn_budget_tokens)
+    check("bad CHAD_TURN_BUDGET_S -> None default", agent._turn_budget_s is None, agent._turn_budget_s)
+    # A well-formed value is still honored (the lenient parse only catches typos).
+    monkeypatch.setenv("CHAD_THINK_BUDGET", "512")
+    monkeypatch.setenv("CHAD_TURN_BUDGET_S", "1.5")
+    good = _mk_agent(ctx_limit=1000)
+    check("valid CHAD_THINK_BUDGET honored", good.think_budget == 512, good.think_budget)
+    check("valid CHAD_TURN_BUDGET_S honored", good._turn_budget_s == 1.5, good._turn_budget_s)
+
+
 def test_toplevel_agent_sees_task():
     names = {s["function"]["name"] for s in _mk_agent()._active_schemas()}
     check("top-level agent sees task", "task" in names, names)
@@ -227,6 +282,20 @@ def test_subagent_readonly_restriction():
           not (names & {"bash", "write", "edit", "replace_symbol", "insert_symbol", "rename_symbol"}),
           names)
     check("read-only set is a subset of the allowlist", names <= SUBAGENT_READ_ONLY, names)
+
+
+def test_subagent_cannot_write_todos():
+    """A sub-agent must not see write_todos: it mutates a process-global _TODOS and would
+    clobber the parent's pinned todo panel (plan 052). A sub-agent's plan is not the
+    parent's, so the tool is absent from both the allowlist and the visible schema."""
+    from chad.agent import SUBAGENT_READ_ONLY
+    check("write_todos removed from the sub-agent allowlist",
+          "write_todos" not in SUBAGENT_READ_ONLY, SUBAGENT_READ_ONLY)
+    names = {s["function"]["name"] for s in _mk_agent(subagent=True)._active_schemas()}
+    check("sub-agent schema omits write_todos", "write_todos" not in names, names)
+    # The parent still has it — this only clamps the sub-agent.
+    parent = {s["function"]["name"] for s in _mk_agent()._active_schemas()}
+    check("top-level agent keeps write_todos", "write_todos" in parent, parent)
 
 
 def test_subagent_all_keeps_mutators_but_not_task():

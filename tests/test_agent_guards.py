@@ -23,6 +23,7 @@ Run: `uv run python test_agent_guards.py`
 from chad.guardrails import (
     GOV_HARD_FRAC,
     GOV_SOFT_FRAC,
+    advance_governor,
     bash_result_verifies,
     bash_thrash_nudge,
     budget_band,
@@ -375,6 +376,31 @@ def test_turn_governor():
           walk({1: True}) == [(1, "soft")], str(walk({1: True})))
 
 
+def test_governor_two_band_jump_credits_progress():
+    """A single step can leap two bands at once (a large re-prefill consuming ~30%+ of the
+    budget: 0 -> 2). If that step genuinely landed+verified a change, it must NOT be
+    hard-stopped — the earned progress is credited to the whole interval, not just the first
+    band crossed (plan 052). Before the fix the loop reset progress after crediting band 1,
+    then evaluated band 2 with progress=False and returned 'hard'."""
+    gov, band, prog = advance_governor(0, 2, progress=True, soft_fired=False)
+    check("0->2 jump WITH progress is not hard-stopped", gov is None, str((gov, band, prog)))
+    check("0->2 jump advances to the new band", band == 2, band)
+    check("progress consumed after the crossing (must re-earn next band)",
+          prog is False, prog)
+    # No-progress jumps still fire: soft at the first crossing, and the next step (already at
+    # band 2) hard-stops — the fix protects only the interval where progress was earned.
+    g0, _, _ = advance_governor(0, 2, progress=False, soft_fired=False)
+    check("0->2 jump WITHOUT progress still nudges (soft)", g0 == "soft", g0)
+    g2, _, _ = advance_governor(1, 2, progress=False, soft_fired=True)
+    check("crossing into band 2 without progress hard-stops", g2 == "hard", g2)
+    # A step that crosses no band leaves the progress flag untouched (it must persist to the
+    # next real crossing).
+    g_none, band_none, prog_none = advance_governor(1, 1, progress=True, soft_fired=False)
+    check("no crossing returns no decision", g_none is None, g_none)
+    check("no crossing preserves the progress flag", prog_none is True, prog_none)
+    check("no crossing leaves the band unchanged", band_none == 1, band_none)
+
+
 def test_progress_note():
     # A transcript: two edits, a failing command, then a passing one. The note must name
     # the edited files and the commands, and surface the LAST error — all deterministically.
@@ -417,6 +443,7 @@ if __name__ == "__main__":
     test_think_budget()
     test_budget_fraction_and_band()
     test_turn_governor()
+    test_governor_two_band_jump_credits_progress()
     test_progress_note()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

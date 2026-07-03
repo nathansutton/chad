@@ -288,6 +288,29 @@ def turn_governor(band, progress, soft_fired, *, disabled=False):
     return None
 
 
+def advance_governor(gov_band, new_band, progress, soft_fired):
+    """Walk the governor across every budget checkpoint crossed in a SINGLE step
+    (`gov_band` -> `new_band`). Returns `(decision, gov_band, progress)`: the first non-None
+    `turn_governor` result (or None), the updated band, and the carried-over progress flag.
+
+    A single step can leap two bands at once (e.g. a large re-prefill that consumes ~30%+ of
+    the budget in one go, jumping 0 -> 2). The earned `progress` is credited to EVERY band
+    crossed in this one step — you can't re-earn progress mid-jump, so a step that genuinely
+    landed+verified a change must not be hard-stopped just because it also spanned two bands
+    (plan 052). Progress is consumed (reset to False) once any band is crossed, so the next
+    band must re-earn it; a step that crosses nothing leaves the flag untouched. Pure/testable."""
+    decision = None
+    crossed = gov_band < new_band
+    while gov_band < new_band:
+        decision = turn_governor(gov_band + 1, progress, soft_fired)
+        gov_band += 1
+        if decision:
+            break
+    if crossed:
+        progress = False
+    return decision, gov_band, progress
+
+
 # Tool results that landed a file change / were run, used to reconstruct a progress note
 # deterministically (no model call) from the transcript.
 _EDIT_TOOLS = ("write", "edit", "replace_symbol", "insert_symbol", "rename_symbol")

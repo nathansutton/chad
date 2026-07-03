@@ -37,6 +37,7 @@ from mlx_lm.sample_utils import make_sampler
 # importing mlx.core. Re-exported here so existing `from .engine import GenStats` keeps
 # working (bench.py, tests) — the class is unchanged.
 from .base_engine import GenStats
+from .diag import log
 
 
 def prompt_lookup_draft(context, num_draft, ngram_max=3, ngram_min=1):
@@ -452,7 +453,23 @@ class Engine:
         frame = self._cache_stack.pop()
         spill = frame.get("spill_path")
         if spill:
-            self._cache = cache_utils.load_prompt_cache(spill)
+            try:
+                self._cache = cache_utils.load_prompt_cache(spill)
+            except Exception:
+                # The spilled checkpoint is missing/corrupt (spills only happen under
+                # Metal memory pressure, so this is narrow). Degrade to a clean re-prefill
+                # rather than propagate: pop_cache must never abort the parent — the
+                # invariant is that a stuck sub-agent can't corrupt it. _reset_cache clears
+                # _cached_ids, so the next turn re-syncs from empty and warms the prefix.
+                log.warning("pop_cache: spilled checkpoint %s unreadable; "
+                            "re-prefilling the parent from scratch", spill)
+                self._reset_cache()
+                try:
+                    os.remove(spill)
+                except OSError:
+                    pass
+                mx.clear_cache()
+                return
             try:
                 os.remove(spill)
             except OSError:
