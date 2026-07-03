@@ -175,7 +175,9 @@ That's the whole on-ramp. The model and the throughput numbers you can reproduce
   PLD-acceptance diagnostics still go to `~/.chad/session.log`.)
 - **slash commands** — `/init` (scaffold a `CLAUDE.md` from the actual project files),
   `/skills` (list discovered Agent Skills), `/mcp` (list configured MCP servers + their
-  tools), `/resume` (list this directory's recent sessions; `/resume <n>` forks one — see
+  tools; `/mcp trust` trusts this project's `./.mcp.json` servers so they start, `/mcp
+  login <server>` does an OAuth login), `/accept` (accept a pending plan and implement it),
+  `/resume` (list this directory's recent sessions; `/resume <n>` forks one — see
   [Sessions](#sessions-resume--fork)), `/reset` (`/clear`), `/compact` (reclaim context
   now — strips old reasoning + truncates old tool outputs, never drops a message),
   `/model` (model + context status), `/mode`, `/help`, `/exit`. Same set in the `--repl`
@@ -220,6 +222,12 @@ echo "fix the typo in greet.py" | uv run chad "$(cat)"   # pipe a task in
 | `--no-think` | skip Ornith's `<think>` blocks — faster on well-scoped work (thinking is on by default) |
 | `--repl` | plain line REPL instead of the TUI |
 
+Curated on purpose — `uv run chad --help` is the full set. Notable extras it lists:
+`--think-budget` / `--turn-budget-tokens` / `--turn-budget-s` / `--auto-continue` (the
+think-cap and runaway-turn governor — see the [Configuration reference](docs/configuration.md#turn-budgets--think-cap))
+and `--backend openai` / `--base-url` / `--api-key-env` (a research spike that runs the
+harness against an OpenAI-compatible endpoint).
+
 No model flag: chad runs Ornith (the RAM-appropriate size — see [Quickstart](#quickstart)).
 A headless task (positional, or piped with no TTY) auto-approves mutating tools — otherwise
 the confirm prompt would EOF and no file could ever change. Use `--plan` for a read-only
@@ -230,8 +238,9 @@ The model runs greedy (temp 0). On first run chad downloads it from Hugging Face
 that cache.
 
 The rarely-touched tuning knobs (`CHAD_MAX_CONTEXT`, `CHAD_KV_BITS`, `CHAD_MODEL`, the
-safety/A-B opt-outs, and the session-log controls) live in environment variables, fully
-documented in the [Configuration reference](docs/configuration.md).
+turn-budget/think-cap and alternate-backend knobs, the safety/A-B opt-outs, and the
+session-log controls) live in environment variables, fully documented in the
+[Configuration reference](docs/configuration.md).
 
 ### Sessions (resume + fork)
 

@@ -75,9 +75,32 @@ the `url`/`command` presence is authoritative. A stdio server's `command`/`args`
 launches it; an HTTP server's `url` is reached over the network and any `headers` (e.g. a
 static `Authorization: Bearer …` token) are sent on every request. `"disabled": true` skips
 a server, `"timeout"` (seconds) overrides the per-call limit, and `"connect_timeout"`
-(seconds) bounds the initial connect. At startup chad connects every server **in parallel
-and time-bounded** (one dead endpoint can't stall the others), runs the `initialize`
-handshake, lists each server's tools (paginated), and registers them.
+(seconds) bounds the initial connect. At startup chad connects the **eligible** servers
+**in parallel and time-bounded** (one dead endpoint can't stall the others), runs the
+`initialize` handshake, lists each server's tools (paginated), and registers them.
+"Eligible" excludes servers that are gated: `"disabled": true` servers are skipped, OAuth
+servers are deferred until you log in (see below), and — most importantly — **project-scope
+`./.mcp.json` servers do not start until you `/mcp trust` the project** (next section).
+User-scope `~/.chad/mcp.json` servers are authored by you and auto-connect.
+
+**Project trust.** Dropping a `./.mcp.json` into a repo does **nothing** until you run
+`/mcp trust` in that directory. This is deliberate: a project file is content you may have
+just cloned, and a stdio server is an arbitrary local command — an untrusted repo must not
+be able to auto-launch a subprocess the moment you open chad in it. Until trusted, its
+servers show gated in `/mcp` (`project server not started — project not trusted (run /mcp
+trust)`) and contribute no tools. `/mcp trust` records the project's absolute path in
+`~/.chad/trusted_mcp.json` (mode `0600`); the path is the trust anchor, so moving the repo
+to a new directory re-prompts. User-scope servers are exempt (you wrote them).
+
+> **`CHAD_MCP_FULL_ENV`** — a stdio MCP subprocess inherits only a **minimal env allowlist**
+> by default (`PATH`, `HOME`, `LANG`/locale, `TMPDIR`, `SHELL`, `USER`, … — enough to find
+> its binary and start), **not** chad's full environment. A user-configured server runs an
+> arbitrary local command and has no business inheriting your API keys, cloud tokens, or
+> provider creds. A server that genuinely needs one var declares it in its config `env:`
+> block (merged in, and it wins). Setting `CHAD_MCP_FULL_ENV=1` restores the full
+> parent-environment inherit for the rare server that needs it — but it hands **every**
+> secret in chad's environment to **every** stdio server, so leave it unset unless you know
+> exactly which server needs what.
 
 > **Auth:** static bearer/PAT tokens via `headers` work out of the box. Hosted connectors
 > that require **OAuth** (Linear, Slack, Atlassian, most SaaS) are supported behind an
@@ -191,6 +214,48 @@ prefill/decode scratch — raise it if you run other memory-hungry apps alongsid
 is tuned for Ornith, so this is unsupported and mostly there for research — the happy
 path is the single bundled model, no flag.
 
+### Alternate backend (spike)
+
+The default backend is the in-process MLX engine — the whole point of chad (a persistent
+prefix KV cache on-device). A research **spike** (`--backend openai`) drives the *same*
+harness against any OpenAI-compatible `/v1/chat/completions` endpoint instead, to separate
+harness-value from engine-value. It's unsupported and lossy (no local KV cache; honest
+degradations apply) — not a general "use a cloud model" path.
+
+```bash
+uv run chad --backend openai --base-url http://localhost:8080/v1   # or CHAD_OPENAI_BASE_URL
+```
+
+- **`--base-url`** / **`CHAD_OPENAI_BASE_URL`** — the endpoint base URL; required for
+  `--backend openai` (the flag wins; the env var is the fallback).
+- **`--api-key-env NAME`** — the *name* of the env var holding the API key (read from that
+  var, never passed on the command line). Omit for a local endpoint that needs no key.
+
+### Turn budgets & think-cap
+
+A runaway-turn **governor** ends a turn that burns a lot of prefill without landing and
+verifying a change — it nudges at ~50% of budget and, at ~80%, banks a one-line progress
+note and stops. On by default in one-shot/eval runs (interactively the human is the wall
+clock). All three are also settable as flags (`--think-budget`, `--turn-budget-tokens`,
+`--turn-budget-s`); the flag just sets the matching env knob.
+
+```bash
+CHAD_THINK_BUDGET=1500        uv run chad  # soft-cap each step's <think> at N tokens, then force-close + continue
+CHAD_TURN_BUDGET_TOKENS=90000 uv run chad  # governor token budget (default 3× the context limit)
+CHAD_TURN_BUDGET_S=600        uv run chad  # wall-clock variant (seconds); off by default
+```
+
+- **`CHAD_THINK_BUDGET`** — soft-caps each step's `<think>` run at N tokens, force-closes it,
+  and continues (escalates when the model is stuck); off by default (plan 039).
+- **`CHAD_TURN_BUDGET_TOKENS`** — the governor's cumulative-prefill budget per turn; defaults
+  to 3× the context limit. Disable the governor entirely with `CHAD_NO_GOVERNOR=1` (below).
+- **`CHAD_TURN_BUDGET_S`** — a wall-clock (seconds) variant of the same governor; off by
+  default.
+
+> **`CHAD_PREFILL_TRACE=path.jsonl`** is a dev/instrumentation knob, **not** supported
+> config: it captures one JSON row per engine prefill to the given path for measurement
+> spikes. Leave it unset in normal use.
+
 ### Safety & A/B opt-outs
 
 These flip behavior off rather than tune it. The two safety opt-outs **weaken** chad's
@@ -200,6 +265,9 @@ defenses — leave them unset in normal use; they exist for measurement and edge
 CHAD_NO_SYMBOLS=1            uv run chad  # A/B knob: hide the tree-sitter symbolic tools
 CHAD_NO_TASK=1              uv run chad  # A/B knob: hide the subagent/Task delegation tool
 CHAD_NO_VALIDATE=1          uv run chad  # A/B knob: DISABLE arg coercion + schema validation
+CHAD_NO_GOVERNOR=1          uv run chad  # A/B knob: DISABLE the runaway-turn governor
+CHAD_NO_SYNTAX_GATE=1       uv run chad  # A/B knob: DISABLE the post-edit syntax gate
+CHAD_NO_PREFIX_CACHE=1      uv run chad  # measurement knob: drop the persistent prefix KV cache
 CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbelt (unsafe)
 ```
 
@@ -218,6 +286,16 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
   `json.loads` plus a terse missing-required check. This *weakens* input handling (malformed
   or loosely-typed tool calls that chad would normally coerce/repair will instead error). An
   A/B knob to measure what validation buys per model — leave unset in normal use.
+- **`CHAD_NO_GOVERNOR`** — **disables** the runaway-turn governor (see [Turn budgets &
+  think-cap](#turn-budgets--think-cap)), so a turn is never force-ended on its
+  prefill/wall-clock budget. An A/B knob for measuring what the governor buys; the turn
+  runs until the model stops on its own.
+- **`CHAD_NO_SYNTAX_GATE`** — **disables** the post-edit syntax gate (`syntaxgate.py`),
+  which normally warns when an edit *introduces* a new syntax error (it never flags a
+  pre-existing one). An A/B arm for `run_evals --ab`; leave unset in normal use.
+- **`CHAD_NO_PREFIX_CACHE`** — a fairness/measurement knob that **drops** the persistent
+  prefix KV cache (`engine.py`), forcing a full re-prefill every step. It exists to measure
+  what the cache is worth and makes chad much slower — never set it in normal use.
 - **`CHAD_NO_DESTRUCTIVE_GUARD`** — **disables** the catastrophic-bash seatbelt
   (`guardrails.py`) even in `--yolo`/auto mode. With it set, an injected `rm -rf ~`,
   `mkfs`, `dd of=/dev/…`, fork bomb, or `curl … | sh` is **not** screened before running.
