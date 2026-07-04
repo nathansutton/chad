@@ -247,6 +247,24 @@ CHAD_TURN_BUDGET_S=600        uv run chad  # wall-clock variant (seconds); off b
 
 - **`CHAD_THINK_BUDGET`** — soft-caps each step's `<think>` run at N tokens, force-closes it,
   and continues (escalates when the model is stuck); off by default (plan 039).
+
+  This is the **adaptive think-cap** — a smarter reasoning lever than the blunt `--no-think`:
+
+  - **`--no-think`** kills **all** `<think>` for the whole session. It's the biggest,
+    bluntest time saver (see [benchmarks](benchmarks.md) — "the most effective time-to-done
+    lever on well-scoped agentic work"), but it costs pass-rate on hard tasks that genuinely
+    need to reason. All-or-nothing.
+  - **the adaptive think-cap** (`--think-budget N` / `CHAD_THINK_BUDGET=N`) leaves reasoning
+    **on**, and only trims a step whose `<think>` run runs past N tokens — force-closing it
+    (prefix-safe, so the next step is a cheap append, not a re-prefill) so reasoning can't
+    balloon. The cap **escalates** with the turn's stuck-signals: a genuinely hard step that
+    keeps getting capped is given more room instead of being chopped repeatedly. So it keeps
+    full reasoning on well-scoped work and only trims the rambling. **Off by default today**
+    — flipping it on by default is an eval-gated decision (see plan 057 / plan 039).
+
+  When the cap fires during a turn, the TUI status line shows a small **`✂N`** counter (N =
+  steps trimmed this turn) alongside the live ↑prefill / ↓generated readouts — so you can see
+  it acting. With the cap off (the default) nothing renders.
 - **`CHAD_TURN_BUDGET_TOKENS`** — the governor's cumulative-prefill budget per turn; defaults
   to 3× the context limit. Disable the governor entirely with `CHAD_NO_GOVERNOR=1` (below).
 - **`CHAD_TURN_BUDGET_S`** — a wall-clock (seconds) variant of the same governor; off by

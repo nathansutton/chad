@@ -765,6 +765,11 @@ class Agent:
             if stats.stop_condition_fired:
                 think_cap_hits += 1
                 self.think_capped += 1
+                # Display-only signal (plan 057): tell the surface a step was trimmed this
+                # turn, carrying the running per-turn count so the status line can show it.
+                # Only ever emitted when the cap is armed (self.think_budget set), so the
+                # default path is byte-identical — the surface renders nothing when off.
+                self._emit("thinkcap", str(think_cap_hits))
                 log.info("THINK-CAP at step %d: closed <think> after %d tok "
                          "(cap=%d, hits=%d)", step, stats.generated_tokens,
                          think_cap, think_cap_hits)

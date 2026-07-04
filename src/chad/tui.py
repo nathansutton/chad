@@ -276,6 +276,7 @@ class TUI:
         self._gen_tokens = 0               # ↓ generated this step (live)
         self._prefilled = 0                # ↑ tokens prefilled so far (live)
         self._prefill_total = 0            # total tokens in the active prefill (for %)
+        self._think_capped = 0             # soft think-cap firings this turn (plan 057)
 
         # interrupt + confirmation plumbing between UI and worker threads
         self._interrupt = threading.Event()
@@ -366,6 +367,12 @@ class TUI:
             except (ValueError, IndexError):
                 pass
             return
+        elif kind == "thinkcap":  # soft think-cap fired this turn (plan 057; no transcript)
+            try:
+                self._think_capped = int(text)
+            except ValueError:
+                pass
+            return
         elif kind == "todos":   # write_todos payload for the pinned panel (no transcript)
             try:
                 self._todos = json.loads(text)
@@ -442,9 +449,13 @@ class TUI:
             prog = ""
             if self._prefill_total and self._gen_tokens == 0:  # still prefilling this step
                 prog = f"{int(100 * self._prefilled / self._prefill_total)}%  "
+            # ✂N: the adaptive soft think-cap (plan 039) trimmed N over-long reasoning runs
+            # this turn. Shown only when it actually fired — the cap is off by default, so the
+            # default line is byte-identical to before (plan 057).
+            cap = f"✂{self._think_capped} · " if self._think_capped else ""
             left = [("class:spinner", f" {frame} {glyph} {self._phase}…  "),
                     ("class:idle", f"{prog}{elapsed}s · ↑{_kfmt(self._prefilled)} "
-                                   f"↓{_kfmt(self._gen_tokens)} · ctrl-c ")]
+                                   f"↓{_kfmt(self._gen_tokens)} · {cap}ctrl-c ")]
         else:
             left = [("class:idle", f" {_phase_glyph(self._phase)} ready ")]
         bits = [
@@ -757,6 +768,7 @@ class TUI:
             self._gen_tokens = 0
             self._prefilled = 0
             self._prefill_total = 0
+            self._think_capped = 0
             is_shell = msg.startswith("!")
             self._phase = "Running" if is_shell else "Thinking"
             self._interrupt.clear()

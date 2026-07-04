@@ -52,6 +52,7 @@ def _bare_tui():
     t._gen_tokens = 0
     t._prefilled = 0
     t._prefill_total = 0
+    t._think_capped = 0
     return t
 
 
@@ -115,6 +116,37 @@ def test_todos_emit_updates_panel_not_scrollback():
     # Malformed payload clears rather than raising.
     t._emit("todos", "not json")
     assert t._todos == [] and t._pending == []
+
+
+def test_thinkcap_emit_updates_state_not_scrollback():
+    # Plan 057: the `thinkcap` kind carries the per-turn soft think-cap count for the
+    # status line. Like gen/prefill/ctx it updates state but never queues a transcript
+    # fragment, and a malformed payload is ignored rather than raising.
+    t = _bare_tui()
+    t._emit("thinkcap", "2")
+    assert t._think_capped == 2
+    assert t._pending == []
+    t._emit("thinkcap", "not-an-int")
+    assert t._think_capped == 2  # unchanged
+    assert t._pending == []
+
+
+def test_thinkcap_glyph_absent_by_default_present_when_capped():
+    # Plan 057: the ✂N indicator appears in the busy status line ONLY when the soft
+    # think-cap fired this turn (_think_capped > 0). With the cap off (the default,
+    # _think_capped == 0) the line is byte-identical to before — no ✂ anywhere.
+    tui = TUI(_fake_engine(), ctx_limit=24000)
+    tui._busy = True
+    tui._turn_start = time.monotonic()
+
+    def line():
+        return "".join(txt for _style, txt in tui._status_fragments())
+
+    tui._think_capped = 0
+    assert "✂" not in line()
+
+    tui._think_capped = 3
+    assert "✂3" in line()
 
 
 def test_todo_panel_rows_collapse_and_glyphs():
