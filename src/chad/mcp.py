@@ -204,6 +204,9 @@ def _stdio_env(environ, extra) -> dict:
     (see `_MCP_ENV_ALLOW`) so secrets in the parent environment don't leak to arbitrary
     user-configured commands; `CHAD_MCP_FULL_ENV=1` restores the full inherit. The
     server's own config `env:` entries are always merged last and override."""
+    # Strict `== "1"` (not config.flag: any non-empty value would loosen it), and read off
+    # the passed-in `environ` param (tests inject a custom dict) rather than os.environ — so
+    # this stays inline rather than routing through config.
     if environ.get("CHAD_MCP_FULL_ENV") == "1":
         env = dict(environ)
     else:

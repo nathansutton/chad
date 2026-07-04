@@ -15,6 +15,7 @@ import platform
 import subprocess
 import sys
 
+from . import config
 from .agent import Agent, repl
 from .engine import Engine
 
@@ -43,6 +44,11 @@ _LOCAL_9B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-9B-4bit-awq")
 _BIG_RAM_GB = 23.5
 
 
+# These are the STRICT siblings of config.env_int/env_float: a non-numeric value raises
+# (int()/float() propagate) rather than warning-and-defaulting. test_cli.py pins that
+# contract, and a garbled CHAD_MAX_CONTEXT/CHAD_KV_BITS should fail loud at startup rather
+# than silently reverting to the model default. Kept inline here on purpose; the lenient
+# config helpers back the mid-run budget knobs in agent.py instead.
 def _env_int(name):
     val = os.environ.get(name)
     return int(val) if val else None
@@ -104,7 +110,7 @@ def _pick_model():
     Order: explicit CHAD_MODEL override → RAM-aware default (35B on big boxes, 9B on
     small) → prefer a locally-built models/ dir over the HF repo when it exists.
     """
-    env = os.environ.get("CHAD_MODEL")
+    env = config.env_str("CHAD_MODEL")
     if env:
         return env, "CHAD_MODEL override"
     ram = _detect_ram_gb()
@@ -275,7 +281,7 @@ def main():
         # render/decode prompts); generation is proxied over HTTP. Weights are NOT
         # downloaded (we don't run them here). The MLX default path is untouched.
         from .openai_engine import OpenAIEngine
-        base_url = args.base_url or os.environ.get("CHAD_OPENAI_BASE_URL")
+        base_url = args.base_url or config.env_str("CHAD_OPENAI_BASE_URL")
         if not base_url:
             sys.stderr.write("chad --backend openai needs --base-url (or CHAD_OPENAI_BASE_URL), "
                              "e.g. http://localhost:8080/v1\n")

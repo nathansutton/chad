@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Any
 
-from . import repomap, symbols, syntaxgate
+from . import config, repomap, symbols, syntaxgate
 from .ignore import IGNORE_DIRS, slash_wrapped
 
 # Directories never worth walking: huge, generated, or VCS internals. The canonical set
@@ -842,9 +842,9 @@ def active_schemas():
     # Subagent/Task tool (plan 041) ships opt-out: CHAD_NO_TASK hides it (the A/B arm and
     # the escape hatch if the model misuses it). The subagent's OWN render drops it again
     # via Agent._active_schemas — reentrancy guard, subagents can't spawn subagents.
-    if os.environ.get("CHAD_NO_TASK"):
+    if config.flag("CHAD_NO_TASK"):
         schemas = [s for s in schemas if s["function"]["name"] != "task"]
-    if os.environ.get("CHAD_NO_SYMBOLS"):
+    if config.flag("CHAD_NO_SYMBOLS"):
         schemas = [s for s in schemas if s["function"]["name"] not in _SYMBOLIC]
     names = _skills().skill_names()
     if names:

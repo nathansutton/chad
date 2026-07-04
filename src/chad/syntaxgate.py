@@ -15,7 +15,7 @@ never warn on a pre-existing one). Gated by CHAD_NO_SYNTAX_GATE for run_evals --
 import ast
 import os
 
-from . import repomap
+from . import config, repomap
 
 _MAX_BYTES = 1_000_000  # skip pathologically large files — the parse cost isn't worth it
 _PARSERS: dict = {}     # lang -> tree_sitter.Parser | None (grammar download cached by tlp)
@@ -68,7 +68,7 @@ def check_syntax(path: str, before: str | None) -> str | None:
     content is read here, so a tool that left the file unchanged (a failed or no-op
     edit → before == after) never warns, and callers don't have to detect success.
     """
-    if os.environ.get("CHAD_NO_SYNTAX_GATE"):
+    if config.flag("CHAD_NO_SYNTAX_GATE"):
         return None
     try:
         if os.path.getsize(path) > _MAX_BYTES:

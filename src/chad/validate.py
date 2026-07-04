@@ -25,10 +25,10 @@ drift. Three entry points:
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Any, List, Optional, Tuple
 
+from . import config
 from .tools import SCHEMAS
 
 # A/B knob (mirrors CHAD_NO_SYMBOLS), the single source of truth for both the
@@ -37,7 +37,7 @@ from .tools import SCHEMAS
 # typed-validate + self-repair loop and fall back to strict json.loads + the terse
 # missing-required check in `legacy_validate` below. Lets the eval harness measure
 # exactly what the validation harness buys, per model.
-VALIDATE = not os.environ.get("CHAD_NO_VALIDATE")
+VALIDATE = not config.flag("CHAD_NO_VALIDATE")
 
 # Per-tool `parameters` schema, keyed by tool name. Single source of truth with
 # what the model is shown.

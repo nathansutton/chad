@@ -36,6 +36,7 @@ from mlx_lm.sample_utils import make_sampler
 # GenStats moved to base_engine.py (plan 046) so a non-MLX backend can build one without
 # importing mlx.core. Re-exported here so existing `from .engine import GenStats` keeps
 # working (bench.py, tests) — the class is unchanged.
+from . import config
 from .base_engine import GenStats
 from .diag import log
 
@@ -542,7 +543,7 @@ class Engine:
         # chad's core prefill win on purpose — the apples-to-apples TTFT baseline for
         # head-to-head harness benchmarks (cache OFF on both sides). Off in normal use;
         # matches the CHAD_NO_* opt-out family.
-        if os.environ.get("CHAD_NO_PREFIX_CACHE"):
+        if config.flag("CHAD_NO_PREFIX_CACHE"):
             self._reset_cache()
 
         # Prompt-lookup decoding path: needs no draft model, greedy decoding (exact),

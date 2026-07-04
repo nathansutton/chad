@@ -21,7 +21,10 @@ permissions:
 
 jobs:
   lint:
-    runs-on: macos-14
+    # ruff + mypy need no Apple Silicon (mypy runs with ignore_missing_imports, so the
+    # mlx/jedi/tree_sitter stubs never matter for type-checking) — run on the cheap Linux
+    # runner like the `lock` job, not the ~10×-pricier macos-14.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7

@@ -18,13 +18,15 @@ import os
 import re
 from logging.handlers import RotatingFileHandler
 
+from . import config
+
 _LOG_DIR = os.path.expanduser("~/.chad")
 log = logging.getLogger("chad")
 # Local privacy opt-out: set CHAD_NO_SESSION_LOG (any truthy value) to disable the
 # diagnostic session log entirely, matching the CHAD_NO_VALIDATE convention. When opted
 # out we install a NullHandler (so the many log.info calls stay cheap no-ops and Python
 # never warns about missing handlers) and never create ~/.chad for the log's sake.
-_DISABLED = bool(os.environ.get("CHAD_NO_SESSION_LOG"))
+_DISABLED = config.flag("CHAD_NO_SESSION_LOG")
 if _DISABLED:
     log.addHandler(logging.NullHandler())
     log.propagate = False

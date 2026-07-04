@@ -14,7 +14,7 @@ import re
 import sys
 import time
 
-from . import compaction, guardrails, session
+from . import compaction, config, guardrails, session
 from .base_engine import BaseEngine
 from .diag import args_preview, log, redact, result_preview
 from .prompt import build_subagent_prompt, build_system_prompt, classify_intent
@@ -61,32 +61,6 @@ def subagent_tools_for(parent_mode: str, requested: str) -> str:
     return "read-only"
 
 
-def _env_int(name, default=None):
-    """Parse an int from env var `name`, or fall back to `default`. A non-numeric value
-    warns and degrades to the default instead of raising — the CHAD_* budget knobs follow
-    the repo's lenient-parse rule, so a typo can't abort Agent.__init__ (plan 052)."""
-    v = os.environ.get(name)
-    if not v:
-        return default
-    try:
-        return int(v)
-    except ValueError:
-        log.warning("ignoring non-integer %s=%r; using default %r", name, v, default)
-        return default
-
-
-def _env_float(name, default=None):
-    """float sibling of `_env_int` — same lenient-parse contract."""
-    v = os.environ.get(name)
-    if not v:
-        return default
-    try:
-        return float(v)
-    except ValueError:
-        log.warning("ignoring non-float %s=%r; using default %r", name, v, default)
-        return default
-
-
 from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_repair
 
 # Validation (VALIDATE knob, legacy_validate baseline) lives in validate.py, the
@@ -97,7 +71,7 @@ from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_rep
 # zero string/dict/IO work, per plan 020's "instrumentation must not tax the product"
 # rule. Set CHAD_PREFILL_TRACE=path/to/trace.jsonl to capture one JSON row per engine
 # generate() call (== one prefill event) for scripts/prefill_tax.py to analyze offline.
-_PREFILL_TRACE = os.environ.get("CHAD_PREFILL_TRACE") or None
+_PREFILL_TRACE = config.env_str("CHAD_PREFILL_TRACE")
 
 
 def _trace_prefill(row: dict) -> None:
@@ -262,7 +236,7 @@ class Agent:
         # tokens and force-closes the block (prefix-safe); the cap escalates with the
         # turn's stuck-signals (see guardrails.think_budget).
         if think_budget is None:
-            think_budget = _env_int("CHAD_THINK_BUDGET")
+            think_budget = config.env_int("CHAD_THINK_BUDGET")
         self.think_budget = think_budget
         self.ctx_limit = ctx_limit  # prompt-token budget before compaction kicks in
         # Runaway-turn governor (plan 040): a per-turn budget on cumulative prefill tokens
@@ -274,12 +248,12 @@ class Agent:
         # (passing eval tasks: 14–35k prefill tokens; the pathological timeout tail:
         # 130–187k). Wall budget is off unless set: interactively the human is the wall
         # clock; evals/one-shot set it via --turn-budget-s / CHAD_TURN_BUDGET_S.
-        self._no_governor = bool(os.environ.get("CHAD_NO_GOVERNOR"))
+        self._no_governor = config.flag("CHAD_NO_GOVERNOR")
         if turn_budget_tokens is None:
-            turn_budget_tokens = _env_int("CHAD_TURN_BUDGET_TOKENS", max(0, 3 * self.ctx_limit))
+            turn_budget_tokens = config.env_int("CHAD_TURN_BUDGET_TOKENS", max(0, 3 * self.ctx_limit))
         self._turn_budget_tokens = turn_budget_tokens
         if turn_budget_s is None:
-            turn_budget_s = _env_float("CHAD_TURN_BUDGET_S")
+            turn_budget_s = config.env_float("CHAD_TURN_BUDGET_S")
         self._turn_budget_s = turn_budget_s
         # Set when a turn hard-stops on budget (like last_plan_path): holds the progress
         # note so the caller (TUI / one-shot / evals) can relaunch a fresh turn seeded
@@ -421,7 +395,7 @@ class Agent:
         # channel exists (TTY or callback) we force the prompt; headless with no channel
         # we BLOCK rather than execute on injection. CHAD_NO_DESTRUCTIVE_GUARD=1 opts out.
         dangerous = (name == "bash" and isinstance(args, dict)
-                     and not os.environ.get("CHAD_NO_DESTRUCTIVE_GUARD")
+                     and not config.flag("CHAD_NO_DESTRUCTIVE_GUARD")
                      and guardrails.is_destructive_bash(str(args.get("command", ""))))
         if self.mode == "auto" or not is_mutating(name):
             if not dangerous:

@@ -47,6 +47,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
+from . import config
 from .agent import INIT_PROMPT, MODE_LABEL, Agent
 from .base_engine import BaseEngine
 from .ignore import IGNORE_DIRS
@@ -237,7 +238,7 @@ def _make_history():
     """Persistent input history: `FileHistory` at ~/.chad/history (mode 0600 — it can
     hold typed paths/snippets, like the session store), or `InMemoryHistory` when
     CHAD_NO_SESSION_LOG is set. Falls back to in-memory on any filesystem error."""
-    if os.environ.get("CHAD_NO_SESSION_LOG"):
+    if config.flag("CHAD_NO_SESSION_LOG"):
         return InMemoryHistory()
     path = os.path.expanduser("~/.chad/history")
     try:
