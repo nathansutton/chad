@@ -136,6 +136,25 @@ def _has_open_tool_call(text: str) -> bool:
             or text.count("<function=") > text.count("</function>"))
 
 
+def reject_escalation(name: str) -> str:
+    """Extra guidance appended when the SAME tool call has been rejected identically
+    back-to-back. The plain repair message clearly is not landing — the model can't see
+    the fix (or the call genuinely can't succeed as written), so re-emitting it verbatim
+    just burns turns. Break the loop: stop repeating, and — critically — do NOT fabricate
+    the result the tool would have returned. A silently-failed `activate_skill` that the
+    model papers over by reciting a skill from memory is the worst outcome: confident
+    output that never loaded the real instructions."""
+    extra = ("\n[you have now emitted this exact call twice and it was rejected both "
+             "times — re-emitting it unchanged will not work. Either change the flagged "
+             "field(s), or use a DIFFERENT tool. Do NOT invent or guess the output this "
+             "tool would have returned.]")
+    if name == "activate_skill":
+        extra += ("\n[the skill was NOT loaded. Do not proceed from memory or fabricate "
+                  "its steps. Check the exact skill `name` against the '# Skills' list, or "
+                  "continue the task with the normal read/grep/bash tools instead.]")
+    return extra
+
+
 def close_unclosed_think(text: str, thinking: bool) -> str:
     """Close a dangling `<think>` block so the stored assistant turn re-tokenizes into
     a prefix of the live KV cache.
@@ -504,6 +523,8 @@ class Agent:
         recent_sigs = []  # forge-style loop guard: detect repeated identical tool calls
         self._loop_nudges = 0
         self._validate_fails = 0  # typia self-repair rounds this turn (telemetry)
+        self._last_reject_sig = None  # (name,args) of the last validation-rejected call
+        self._reject_repeats = 0      # consecutive identical rejections (loop breaker)
         unverified_edit = False  # files changed but not run/tested since
         verify_nudges = 0
         did_work = False  # a substantive tool (not plan/done) ran this turn
@@ -869,6 +890,21 @@ class Agent:
                 if reject is not None:
                     result = reject
                     self._validate_fails += 1
+                    # Loop breaker (plan): the same call rejected identically back-to-back
+                    # means the repair message isn't landing (the model can't see the fix,
+                    # or the call can't succeed as written). Escalate — tell it to stop
+                    # re-emitting and to NOT fabricate the tool's result — instead of
+                    # letting it flail. Signature is over (name, args) so a *different*
+                    # attempt at the same tool resets the counter.
+                    rej_sig = guardrails.loop_signature([(name, args)])
+                    if rej_sig == self._last_reject_sig:
+                        self._reject_repeats += 1
+                    else:
+                        self._last_reject_sig, self._reject_repeats = rej_sig, 0
+                    if self._reject_repeats >= 1:  # 2nd identical rejection
+                        result += reject_escalation(name)
+                        log.info("VALIDATE %s rejected identically %dx -> escalate",
+                                 name, self._reject_repeats + 1)
                     log.info("VALIDATE %s rejected (%d): %s", name, self._validate_fails, detail)
                     render_tool_result(self._emit, name, args, result)
                     self.messages.append({"role": "tool", "name": name, "content": result})

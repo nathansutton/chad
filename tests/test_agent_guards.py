@@ -431,7 +431,36 @@ def test_progress_note():
           "nothing" in empty.lower() or "no edits" in empty.lower(), empty)
 
 
+def test_reject_escalation():
+    # Loop breaker: appended when the SAME call is rejected twice back-to-back. Must tell
+    # the model to stop re-emitting AND forbid fabricating the tool's result.
+    from chad.agent import reject_escalation
+    generic = reject_escalation("read")
+    check("escalation says stop repeating", "twice" in generic and "not work" in generic,
+          generic)
+    check("escalation forbids fabricating output",
+          "Do NOT invent" in generic or "not invent" in generic.lower(), generic)
+    # activate_skill gets the extra anti-confabulation clause — the trace's failure mode.
+    sk = reject_escalation("activate_skill")
+    check("skill escalation says skill NOT loaded", "NOT loaded" in sk, sk)
+    check("skill escalation forbids proceeding from memory",
+          "from memory" in sk or "fabricate" in sk, sk)
+
+
+def test_reject_loop_signature_resets_on_change():
+    # The rejection loop breaker keys on (name, args): a *different* attempt at the same
+    # tool must reset the counter (it's a new try, not a repeat), while an identical
+    # re-emit matches.
+    a = loop_signature([("activate_skill", {"name": "widgets"})])
+    b = loop_signature([("activate_skill", {"name": "widgets"})])
+    c = loop_signature([("activate_skill", {"name": "gadgets"})])
+    check("identical rejected call -> same sig", a == b, (a, b))
+    check("changed arg -> different sig (counter resets)", a != c, (a, c))
+
+
 if __name__ == "__main__":
+    test_reject_escalation()
+    test_reject_loop_signature_resets_on_change()
     test_bash_result_verifies()
     test_done_rejection()
     test_update_work_flags()
