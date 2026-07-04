@@ -29,7 +29,7 @@ import re
 from typing import Any, List, Optional, Tuple
 
 from . import config
-from .tools import SCHEMAS
+from .tools import active_schemas
 
 # A/B knob (mirrors CHAD_NO_SYMBOLS), the single source of truth for both the
 # typed-validate path here and the lenient tool-call parse in toolcall_parse.py.
@@ -39,31 +39,32 @@ from .tools import SCHEMAS
 # exactly what the validation harness buys, per model.
 VALIDATE = not config.flag("CHAD_NO_VALIDATE")
 
-# Per-tool `parameters` schema, keyed by tool name. Single source of truth with
-# what the model is shown.
-PARAM_SCHEMAS = {
-    s["function"]["name"]: s["function"].get("parameters", {"type": "object"})
-    for s in SCHEMAS
-}
-
-
 def _param_schema(name):
-    """The `parameters` JSON-Schema for a tool — chad's builtins first, then any
-    connected MCP server's tool. None if the name is unknown. Single source of truth
-    with what the model is shown (no schema duplication for either kind)."""
-    schema = PARAM_SCHEMAS.get(name)
-    if schema is not None:
-        return schema
+    """The `parameters` JSON-Schema for a tool as it is exposed to the model RIGHT NOW —
+    chad's builtins plus every dynamically-appended tool (`activate_skill` when skills are
+    installed, `task`, and any connected MCP server's tool). None if the name is not
+    currently callable.
+
+    This reads the LIVE `active_schemas()` set rather than a frozen import-time snapshot.
+    The snapshot was the bug: dynamic tools like `activate_skill` are appended by
+    `active_schemas()` (so the model sees them) but were absent from the frozen table, so a
+    perfectly valid `activate_skill` call validated as an "unknown tool" — while the same
+    error listed it as available (`_known_tools` reads the dispatch table, which *does*
+    contain it). Sourcing both from `active_schemas()` guarantees the validation contract
+    can never drift from what the model is shown."""
+    for s in active_schemas():
+        if s["function"]["name"] == name:
+            return s["function"].get("parameters", {"type": "object"})
     from . import mcp
     return mcp.param_schema(name)
 
 
 def _known_tools():
-    """All currently-callable tool names (builtins + connected MCP tools), for the
-    'available tools' hint in unknown-tool repair messages."""
-    from . import mcp
-    from .tools import DISPATCH
-    return list(DISPATCH) + mcp.service().tool_names()
+    """All currently-callable tool names, for the 'available tools' hint in unknown-tool
+    repair messages. Sourced from the same live `active_schemas()` set as `_param_schema`
+    so the hint can never advertise a name the validator would then reject (the exact
+    inconsistency that produced 'unknown tool X ... Available: ...X...')."""
+    return [s["function"]["name"] for s in active_schemas()]
 
 
 def legacy_validate(name, args):
