@@ -161,16 +161,16 @@ agent loop (`agent.py`).
 ## Context window (agentic coding needs room)
 
 By default the harness uses the model's **full native window** instead of an arbitrary
-cap. `--max-context` requests more and **YaRN-extends** a model past native when its
-config supports it, capped at the model's documented max — so `--max-context 262144`
+cap. `CHAD_MAX_CONTEXT` requests more and **YaRN-extends** a model past native when its
+config supports it, capped at the model's documented max — so `CHAD_MAX_CONTEXT=262144`
 resolves to "256k, or the model's max". KV cache grows lazily, so a large window costs
-nothing until tokens fill it, and `--kv-bits 8` halves its footprint.
+nothing until tokens fill it, and `CHAD_KV_BITS=8` halves its footprint.
 
 How much it costs depends on the model's attention design. The table below is
 illustrative for a **pure-attention** transformer (e.g. the Qwen2.5-Coder models the
 eval bench keeps for research), where the KV cache grows linearly with context:
 
-| Context | KV cache (fp16) | KV cache (`--kv-bits 8`) |
+| Context | KV cache (fp16) | KV cache (`CHAD_KV_BITS=8`) |
 |---|---|---|
 | 32k | 1.2 GB | 0.6 GB |
 | 128k (YaRN) | 4.8 GB | 2.4 GB |

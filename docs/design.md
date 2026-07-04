@@ -152,8 +152,8 @@ Why each of those earns its place specifically on a *small* model:
   `rename_symbol` follows scope and renames every site or none.
 
 **Never a hard dependency.** The precision layer ships as the optional `lsp` extra
-(`serena-agent`, which contains solidlsp): `uv sync --extra lsp` or `pip install
-'chad[lsp]'`; a default install runs entirely on tree-sitter. And even with the extra
+(`serena-agent`, which contains solidlsp): `uv sync --extra lsp`; a default install
+runs entirely on tree-sitter. And even with the extra
 installed, if the language server can't start — no Node, offline, unsupported language —
 every caller falls back to the tree-sitter backend. Python is the proven backend
 (pyright); the other languages light up automatically once their server is available. The
@@ -245,5 +245,5 @@ existing agents:
 - **Context compaction** — when the prompt nears the limit, reclaim space oldest-first:
   strip stale `<think>` reasoning from older assistant turns (Ornith's blocks are large
   and rarely matter later), then head/tail-truncate the oldest large tool outputs,
-  keeping recent turns verbatim (`--ctx-limit`). This and verified append-only cache
+  keeping recent turns verbatim (`CHAD_CTX_LIMIT`). This and verified append-only cache
   reuse are what keep long agentic sessions responsive.

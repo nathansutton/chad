@@ -145,6 +145,28 @@ def test_env_float(monkeypatch):
     check("empty float -> None", cli._env_float("CHAD_X_F") is None)
 
 
+def test_version_flag(monkeypatch, capsys):
+    # argparse's `version` action prints to stdout and exits 0 during parse_args(),
+    # BEFORE _preflight() ever runs — so --version works even off Apple Silicon.
+    monkeypatch.setattr("sys.argv", ["chad", "--version"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    check("--version exits 0", exc.value.code == 0, repr(exc.value.code))
+    out = capsys.readouterr().out
+    check("--version prints chad 0.1.0", out.startswith("chad 0.1.0"), out)
+
+
+def test_version_string_never_raises(monkeypatch):
+    # The commit detail is best-effort: if distribution metadata is unreadable the
+    # helper must still return a plain "chad <version>" string, never propagate.
+    def boom(*_a, **_k):
+        raise RuntimeError("no metadata")
+    monkeypatch.setattr("importlib.metadata.distribution", boom)
+    s = cli._version_string()
+    check("still a string", isinstance(s, str), repr(s))
+    check("starts with chad ", s.startswith("chad "), s)
+
+
 if __name__ == "__main__":
     test_ram_aware_ctx_limit()
     with pytest.MonkeyPatch.context() as mp:
@@ -157,5 +179,7 @@ if __name__ == "__main__":
         test_pick_model_ram_thresholds(mp)
     with pytest.MonkeyPatch.context() as mp:
         test_pick_model_prefers_local_dir(mp)
+    with pytest.MonkeyPatch.context() as mp:
+        test_version_string_never_raises(mp)
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

@@ -59,6 +59,27 @@ def _env_float(name):
     return float(val) if val else None
 
 
+def _version_string():
+    """chad <version> (<vcs commit>) — commit resolves for git installs via
+    dist-info/direct_url.json, or from the dev clone's .git; absent otherwise."""
+    from . import __version__
+    detail = ""
+    try:
+        import json
+        from importlib.metadata import distribution
+        raw = distribution("chad").read_text("direct_url.json") or ""
+        commit = json.loads(raw).get("vcs_info", {}).get("commit_id", "") if raw else ""
+        if not commit and os.path.isdir(os.path.join(_PROJECT_ROOT, ".git")):
+            commit = subprocess.check_output(
+                ["git", "-C", _PROJECT_ROOT, "rev-parse", "--short", "HEAD"],
+                text=True, stderr=subprocess.DEVNULL).strip()
+        if commit:
+            detail = f" ({commit[:12]})"
+    except Exception:  # noqa: BLE001 — version detail is best-effort, never fatal
+        pass
+    return f"chad {__version__}{detail}"
+
+
 def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
                         reserve_gb=1.5, safety=0.90, gen_margin=2048, floor=8192):
     """Plan 036: largest prompt-token budget (= the compaction trigger) that keeps the
@@ -225,6 +246,7 @@ def main():
         prog="chad",
         description="Local MLX-backed coding agent (Ornith). Run with `uv run chad`.",
     )
+    ap.add_argument("--version", action="version", version=_version_string())
     ap.add_argument("task", nargs="?",
                     help="one-shot task to run headless and exit; omit for the interactive TUI")
     ap.add_argument("-c", "--continue", dest="cont", action="store_true",

@@ -107,9 +107,9 @@ To keep that answer honest rather than asserted, chad ships a thin, flag-gated a
 any OpenAI-compatible endpoint — so "harness value" and "engine value" can be measured
 separately as an ablation arm. The adapter's honest degradations (it can't report cache
 reuse, can't show prefill progress, and interrupts by dropping the stream) are documented
-in-code. **TODO (operator, plan 046):** paste the core-tier `chad in-process` vs
-`chad-over-mlx_lm.server` numbers here once measured on a warm GPU — expected pass-rate
-near-equal (the harness carries it), wall-clock/TTFT materially worse.
+in-code. A measured in-process vs. served comparison (the same harness through
+`mlx_lm.server`) is queued on the maintainer's eval rig; the expected result is a
+pass-rate near-equal (the harness carries it), with wall-clock/TTFT materially worse.
 
 ## Quickstart
 
@@ -135,7 +135,7 @@ To measure throughput on your own machine, `uv run chad-bench` (see
 [Throughput & performance](docs/benchmarks.md)).
 
 **Optional: precise refs/rename.** LSP-precise cross-file find-references and
-scope-correct rename need `uv sync --extra lsp` (or `pip install 'chad[lsp]'`); without
+scope-correct rename need `uv sync --extra lsp`; without
 it chad uses the tree-sitter fallback automatically (see
 [the symbolic stack](docs/design.md)).
 
@@ -224,9 +224,10 @@ echo "fix the typo in greet.py" | uv run chad "$(cat)"   # pipe a task in
 
 Curated on purpose — `uv run chad --help` is the full set. Notable extras it lists:
 `--think-budget` / `--turn-budget-tokens` / `--turn-budget-s` / `--auto-continue` (the
-think-cap and runaway-turn governor — see the [Configuration reference](docs/configuration.md#turn-budgets--think-cap))
-and `--backend openai` / `--base-url` / `--api-key-env` (a research spike that runs the
-harness against an OpenAI-compatible endpoint).
+think-cap and runaway-turn governor — see the [Configuration reference](docs/configuration.md#turn-budgets--think-cap));
+`--backend openai` / `--base-url` / `--api-key-env` (a research spike that runs the
+harness against an OpenAI-compatible endpoint); and `--version` (prints `chad 0.1.0`
+plus the checkout's commit — quote it in bug reports).
 
 No model flag: chad runs Ornith (the RAM-appropriate size — see [Quickstart](#quickstart)).
 A headless task (positional, or piped with no TTY) auto-approves mutating tools — otherwise

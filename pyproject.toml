@@ -30,13 +30,15 @@ dependencies = [
 
 # Optional syntax highlighting in diffs / confirm previews (plan 042 item 4). Pure-Python,
 # import-guarded in render.py: absent, output is byte-identical to the un-highlighted path.
-# Install with `uv sync --extra highlight` or `pip install 'chad[highlight]'`.
+# Install with `uv sync --extra highlight`.
+# NOTE: no PyPI release exists; 'pip install chad' installs an unrelated squatted
+# package. Document uv/git installs only.
 [project.optional-dependencies]
 highlight = ["pygments>=2.17"]
 # Precision code intelligence (docs/design.md "Precision" phase): solidlsp ships inside
 # serena-agent and backs lsp.py's find-refs/rename via pyright. Optional on purpose —
 # heavyweight tree; absent, every caller falls back to the tree-sitter backend.
-# Install with `uv sync --extra lsp` or `pip install 'chad[lsp]'`.
+# Install with `uv sync --extra lsp`.
 lsp = ["serena-agent>=1.5"]
 
 # The one entrypoint: `uv run chad`. (`chad-bench` reproduces docs/benchmarks.md.)
