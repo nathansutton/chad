@@ -1,0 +1,28 @@
+name: install-canary
+
+# The public install path (`uvx --from git+https://… chad`) resolves fresh from PyPI
+# and ignores uv.lock, so an upstream dep release can break new users while the
+# locked test suite stays green (it happened: transformers 5.13, capped in e35c6df).
+# tests.yml's `build` job guards this on push/PR; this canary guards it over TIME —
+# weekly, from the default branch, running the exact README one-liner on the arm64
+# runner. Failure → GitHub's scheduled-workflow email to the maintainer.
+on:
+  schedule:
+    - cron: "17 11 * * 1"   # Mondays 11:17 UTC — off the :00 spike
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cold-install:
+    runs-on: macos-14
+    steps:
+      - uses: astral-sh/setup-uv@v7
+        # NO actions/checkout and NO uv cache: the point is to reproduce what a new
+        # user gets — a cold resolve of the git ref straight from GitHub + PyPI.
+      - name: README one-liner resolves and the entrypoint parses
+        run: uvx --from 'git+https://github.com/nathansutton/chad' chad --help
+      - name: Version stamp (for the failure-email breadcrumb)
+        if: always()
+        run: uvx --from 'git+https://github.com/nathansutton/chad' chad --version || true
