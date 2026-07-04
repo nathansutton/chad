@@ -406,6 +406,45 @@ def ansi_fragment(kind: str, text: str) -> str | None:
     return None
 
 
+# chad's moai (🗿) mascot rendered as a bone-club silhouette — the startup banner art.
+# Three rows so it sits beside three info lines (name/version, model, cwd), Claude-Code
+# style. Kept as a module constant so tests can assert on it without a live engine.
+_BANNER_ART = ("▟█▙▂▂▂", "▜█▛▔▔▔", "▘ ▝   ")
+
+
+def _tilde(path: str) -> str:
+    """Collapse the home-directory prefix to ~, like a shell prompt."""
+    home = os.path.expanduser("~")
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def banner(model: str, ctx_limit: int | None, mode: str = "normal",
+           version: str | None = None, cwd: str | None = None) -> str:
+    """The startup banner: bone-club art on the left, live session info on the right.
+
+    Mirrors Claude Code's header — name+version, model+context, and the working
+    directory — so a fresh session states what it is at a glance. Returns a plain
+    multi-line ANSI string (no trailing newline); the caller emits it verbatim."""
+    if version is None:
+        from . import __version__ as version
+    if cwd is None:
+        cwd = os.getcwd()
+    ctx = f"{ctx_limit / 1000:.0f}k context" if ctx_limit else "context tbd"
+    info = [
+        f"{C_BOLD}chad{C_RST} {C_DIM}v{version}{C_RST}",
+        f"{model} {C_DIM}· {ctx} · {mode} mode{C_RST}",
+        f"{C_DIM}{_tilde(cwd)}{C_RST}",
+    ]
+    width = max(len(a) for a in _BANNER_ART)
+    rows = [f"{C_YEL}{art:<{width}}{C_RST}   {text}"
+            for art, text in zip(_BANNER_ART, info)]
+    return "\n".join(rows)
+
+
 def _default_emit(kind: str, text: str):
     """Default emitter: colored stdout, used by the plain REPL and one-shot mode."""
     w = sys.stdout.write

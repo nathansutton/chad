@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from chad.render import _is_err, ansi_fragment, render_tool_result  # noqa: E402
+from chad.render import _is_err, _tilde, ansi_fragment, banner, render_tool_result  # noqa: E402
 from chad.tui import TUI  # noqa: E402
 
 PASS = 0
@@ -52,6 +52,71 @@ def test_ansi_fragment_parity():
     # Non-shared / dropped kinds return None from the shared function.
     for kind in ("stream", "user", "stat", "ctx", "definitely-unknown"):
         assert ansi_fragment(kind, "x") is None, kind
+
+
+def test_banner_states_the_session():
+    # The startup banner names the product, model, context, mode, and cwd on three
+    # rows beside the moai art — so a fresh session says what it is at a glance.
+    out = banner("Ornith-9B", 75000, mode="plan", version="0.1.0",
+                 cwd="/tmp/proj")
+    rows = out.split("\n")
+    assert len(rows) == 3
+    assert "chad" in rows[0] and "v0.1.0" in rows[0]
+    assert "Ornith-9B" in rows[1] and "75k context" in rows[1] and "plan mode" in rows[1]
+    assert "/tmp/proj" in rows[2]
+    # Art column is present on every row and equal width (left-justified).
+    assert all("▙" in rows[0] or "▛" in r or "▝" in rows[2] for r in rows)
+
+
+def test_banner_handles_unknown_context():
+    # ctx_limit not yet resolved (None) must not crash the header.
+    assert "context tbd" in banner("m", None)
+
+
+def _stub_tui(finalize):
+    # A TUI shell exercising just the background-load handoff, without a real engine/app.
+    import threading
+    from types import SimpleNamespace
+    tui = object.__new__(TUI)
+    tui._model_ready = threading.Event()
+    tui._wake = threading.Event()
+    tui._load_error = None
+    tui.ctx_limit = 8192  # provisional, set pre-load
+    tui.agent = SimpleNamespace(ctx_limit=8192)
+    tui.engine = SimpleNamespace(effective_ctx=262144)
+    tui._emit = lambda kind, text: None
+    tui._finalize = finalize
+    return tui
+
+
+def test_background_load_adopts_ram_aware_ctx_limit():
+    # The worker gate stays closed until the weights are in; then the provisional limit
+    # is replaced by the RAM-aware one on both the TUI and the agent, and the worker wakes.
+    tui = _stub_tui(lambda: (5.4, 175802))
+    assert not tui._model_ready.is_set()
+    tui._load_model()
+    assert tui._model_ready.is_set()
+    assert tui._wake.is_set()
+    assert tui.ctx_limit == 175802 and tui.agent.ctx_limit == 175802
+    assert tui._load_error is None
+
+
+def test_background_load_failure_unblocks_worker():
+    # A load crash must record the error AND open the gate, so a queued turn reports the
+    # failure instead of hanging the session forever.
+    def boom():
+        raise RuntimeError("no metal")
+    tui = _stub_tui(boom)
+    tui._load_model()
+    assert tui._model_ready.is_set()
+    assert "no metal" in tui._load_error
+
+
+def test_tilde_collapses_home():
+    home = os.path.expanduser("~")
+    assert _tilde(home) == "~"
+    assert _tilde(os.path.join(home, "assist")) == os.path.join("~", "assist")
+    assert _tilde("/etc/hosts") == "/etc/hosts"  # non-home paths untouched
 
 
 def test_is_err_flags_real_diagnostics():

@@ -41,6 +41,47 @@ from .base_engine import GenStats
 from .diag import log
 
 
+def _local_path(model_id: str) -> str:
+    """Resolve a cached HF repo id to its on-disk snapshot dir so `mlx_lm.load` (and
+    `_read_config`) skip the hub revision check — a ~1s network/stat round-trip on every
+    launch, pure overhead once the weights are local. A local dir or an uncached id
+    passes through unchanged; the uncached case is downloaded by `cli._ensure_model`
+    before `load()` runs, so by then it's a cache hit here too."""
+    if os.path.isdir(model_id):
+        return model_id
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        hit = try_to_load_from_cache(model_id, "config.json")
+        if isinstance(hit, str):
+            return os.path.dirname(hit)
+    except Exception:  # noqa: BLE001 — never let a resolver hiccup block a real load
+        pass
+    return model_id
+
+
+def peek_context_window(model_id: str, max_context: Optional[int] = None) -> Optional[int]:
+    """The model's context window read from `config.json` alone — no weights, no
+    tokenizer. Lets the startup banner state the window immediately while the weights
+    load in the background. Mirrors the default-path result of `_ctx_override`: the
+    native window (nested under `text_config` on VL checkpoints), YaRN-extended to
+    `max_context` when that's larger. Returns None if the config can't be read."""
+    try:
+        import json
+        path = _local_path(model_id)
+        cfg_path = os.path.join(path, "config.json")
+        if not os.path.isfile(cfg_path):
+            from huggingface_hub import hf_hub_download
+            cfg_path = hf_hub_download(model_id, "config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        native = (cfg.get("max_position_embeddings")
+                  or cfg.get("text_config", {}).get("max_position_embeddings")
+                  or 32768)
+        return max(native, max_context) if max_context else native
+    except Exception:  # noqa: BLE001 — banner falls back to "context tbd"
+        return None
+
+
 def prompt_lookup_draft(context, num_draft, ngram_max=3, ngram_min=1):
     """Prompt-lookup (n-gram) drafting: propose the next `num_draft` tokens by
     finding the most recent earlier occurrence of the current suffix in `context`
@@ -161,17 +202,21 @@ class Engine:
 
     def load(self):
         t0 = time.time()
+        # Resolve a cached repo id to its local snapshot dir once, then load from disk —
+        # skips the per-launch hub revision check on both the weights and _read_config.
+        path = _local_path(self.model_id)
         # Load tokenizer first (cheap) so _ctx_override can read its documented max.
-        self.model, self.tok = load(self.model_id)
-        override, eff = self._ctx_override(self.model_id)
+        self.model, self.tok = load(path)
+        override, eff = self._ctx_override(path)
         self.effective_ctx = eff
         if override is not None:
             # reload main with YaRN extension applied
-            self.model, self.tok = load(self.model_id, model_config=override)
+            self.model, self.tok = load(path, model_config=override)
         if self.draft_id:
-            d_override, _ = self._ctx_override(self.draft_id)
-            self.draft, _ = load(self.draft_id, model_config=d_override) if d_override \
-                else load(self.draft_id)
+            dpath = _local_path(self.draft_id)
+            d_override, _ = self._ctx_override(dpath)
+            self.draft, _ = load(dpath, model_config=d_override) if d_override \
+                else load(dpath)
         self._reset_cache()
         self.kv_bytes_per_token = self._measure_kv_bytes_per_token()
         return time.time() - t0

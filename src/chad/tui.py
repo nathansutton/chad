@@ -51,7 +51,7 @@ from . import config
 from .agent import INIT_PROMPT, MODE_LABEL, Agent
 from .base_engine import BaseEngine
 from .ignore import IGNORE_DIRS
-from .render import C_RST, C_YEL, ansi_fragment, confirm_preview, render_tool_result
+from .render import C_RST, C_YEL, ansi_fragment, banner, confirm_preview, render_tool_result
 
 # Styling for the pinned bottom region only (status line + input). The transcript
 # above is plain ANSI (see _ansi_for), so it lives in normal terminal scrollback.
@@ -254,11 +254,24 @@ def _make_history():
 
 class TUI:
     def __init__(self, engine: BaseEngine, ctx_limit: int, mode: str = "normal",
-                 thinking: bool = True, max_chars: int = 400_000, resume: list = None):
+                 thinking: bool = True, max_chars: int = 400_000, resume: list = None,
+                 ctx_window: int = None, finalize=None):
         self.engine = engine
         self.ctx_limit = ctx_limit
+        self.ctx_window = ctx_window or ctx_limit  # window shown in the banner
         self.thinking = thinking
         self._resume = resume
+
+        # Background model load (plan: instant startup). When `finalize` is given the
+        # weights load on a worker thread while the banner + input are already on screen;
+        # `_model_ready` gates the turn worker until they're in, `_load_error` records a
+        # load failure so a queued turn reports it instead of hanging. With no finalize
+        # (tests, or an already-loaded engine) the model is ready immediately.
+        self._finalize = finalize
+        self._model_ready = threading.Event()
+        self._load_error = None
+        if finalize is None:
+            self._model_ready.set()
 
         self._pending = []                 # ANSI chunks awaiting flush to stdout
         self._todos = []                   # live write_todos list for the pinned panel
@@ -442,6 +455,15 @@ class TUI:
         # a state glyph + the verb, then the two numbers that are reassurance not noise —
         # elapsed seconds and ↑prefilled/↓generated counts — plus an advancing % while a
         # big prefill streams (the silent gap this is meant to make legible).
+        if not self._model_ready.is_set():
+            # Startup: weights still loading on the background thread. Show a live spinner
+            # so the pinned line reads as "working", not hung, while you type ahead.
+            frame = _SPINNER[(self._tick // 2) % len(_SPINNER)]
+            label = self.engine.model_id.split("/")[-1]
+            hint = "type ahead — runs when ready" if not qn else f"queued:{qn} — runs when ready"
+            left = [("class:spinner", f" {frame} loading {label}…  "),
+                    ("class:idle", f"{hint} ")]
+            return left
         if self._busy:
             frame = _SPINNER[(self._tick // 2) % len(_SPINNER)]
             glyph = _phase_glyph(self._phase)
@@ -458,8 +480,8 @@ class TUI:
                                    f"↓{_kfmt(self._gen_tokens)} · {cap}ctrl-c ")]
         else:
             left = [("class:idle", f" {_phase_glyph(self._phase)} ready ")]
+        # Model id lives in the startup banner now — no need to repeat it every frame.
         bits = [
-            f" {self.engine.model_id.split('/')[-1]} ",
             f" {MODE_LABEL[mode]} (shift-tab) ",
             f" ctx {pct}% ",
         ]
@@ -667,6 +689,13 @@ class TUI:
             self._wake.set()
             self.app.exit()
             return False
+        # While the weights load in the background the engine isn't built yet, so the
+        # commands that reset/compact/reslot the KV cache would crash. Typing a task is
+        # fine — it just queues (type-ahead). Everything else waits for the model.
+        if not self._model_ready.is_set() and (
+                text.startswith(("/reset", "/clear", "/compact", "/resume", "/accept"))):
+            self._emit("info", "still loading the model — try that once it's ready.")
+            return False
         if text in ("/reset", "/clear"):
             if self._fresh_agent(self.agent.mode):
                 self._emit("info", "session reset.")
@@ -762,6 +791,15 @@ class TUI:
                 self._wake.wait(timeout=0.2)
                 self._wake.clear()
                 continue
+            # Hold queued messages until the background weight load finishes (the input
+            # accepts and queues them meanwhile, so typing ahead feels instant).
+            if not self._model_ready.is_set():
+                self._model_ready.wait(timeout=0.2)
+                continue
+            if self._load_error:
+                self._queue.clear()
+                self._emit("error", f"[cannot run — model load failed: {self._load_error}]")
+                continue
             msg = self._queue.popleft()
             self._busy = True
             self._turn_start = time.monotonic()  # elapsed timer for the status line
@@ -824,12 +862,35 @@ class TUI:
         on the worker thread just to nudge a display gauge — pure waste on long sessions."""
         self._cur_prompt_tokens += self._gen_tokens
 
+    def _load_model(self):
+        """Load the weights off the UI thread, then adopt the RAM-aware compaction limit
+        and unblock the turn worker. Runs once, at startup, only when `finalize` was given."""
+        try:
+            load_s, ctx_limit = self._finalize()
+            self.ctx_limit = ctx_limit
+            self.agent.ctx_limit = ctx_limit
+            self._emit("info", f"ready in {load_s:.0f}s · context {self.engine.effective_ctx:,} "
+                               f"(compact at {ctx_limit:,})")
+        except Exception as e:  # noqa: BLE001 — surface load failure; don't hang the worker
+            self._load_error = f"{type(e).__name__}: {e}"
+            self._emit("error", f"[model load failed: {self._load_error}]")
+        finally:
+            self._model_ready.set()
+            self._wake.set()  # nudge the worker if a message was queued while loading
+
     async def run(self):
         worker = threading.Thread(target=self._worker, daemon=True)
         worker.start()
         refresher = asyncio.create_task(self._refresher())
-        self._emit("info", f"chad ready · model={self.engine.model_id.split('/')[-1]}"
-                           f" · shift-tab for modes · /help")
+        art = banner(self.engine.model_id.split("/")[-1], self.ctx_window,
+                     mode=self.agent.mode)
+        with self._lock:
+            self._pending.append("\n" + art + "\n")
+        self._emit("info", "shift-tab for modes · /help")
+        if self._finalize is not None:
+            self._emit("info", f"loading {self.engine.model_id.split('/')[-1]}… "
+                               "(type ahead — your first message runs when it's ready)")
+            threading.Thread(target=self._load_model, daemon=True).start()
         try:
             # raw=True passes our ANSI through untouched; patch_stdout keeps the
             # input/status region pinned below while output scrolls above it.
@@ -842,5 +903,6 @@ class TUI:
 
 
 def run_tui(engine: BaseEngine, ctx_limit: int, mode: str = "normal", thinking: bool = True,
-            resume: list = None):
-    asyncio.run(TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume).run())
+            resume: list = None, ctx_window: int = None, finalize=None):
+    asyncio.run(TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume,
+                    ctx_window=ctx_window, finalize=finalize).run())

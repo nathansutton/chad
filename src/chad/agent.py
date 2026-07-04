@@ -26,6 +26,7 @@ from .render import (
     _default_emit,
     _disp_path,
     _StreamView,
+    banner,
     confirm_preview,
     render_tool_result,
     render_tool_start,
@@ -1000,9 +1001,9 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
          thinking: bool = True):
     agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking,
                   resume=resume, persist=True)
-    print(f"{C_DIM}chad ready. model={engine.model_id}"
-          f"{' + draft' if getattr(engine, 'draft', None) else ''}. "
-          f"type a task, or /reset, /exit.{C_RST}")
+    label = engine.model_id.split("/")[-1] + (" + draft" if getattr(engine, "draft", None) else "")
+    print(banner(label, ctx_limit, mode=agent.mode))
+    print(f"{C_DIM}type a task, or /reset, /exit.{C_RST}")
     while True:
         try:
             line = input(f"{C_YEL}» {C_RST}").strip()

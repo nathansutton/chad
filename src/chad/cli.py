@@ -84,6 +84,31 @@ def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
     return max(floor, min(eff_ctx - gen_margin, ram_ctx))
 
 
+def _compute_ctx_limit(eng):
+    """The auto-compaction threshold for a loaded engine. On this non-trimmable hybrid
+    cache, compaction forces a full body re-prefill (plan 035: ~79 % of all prefill), so
+    we compact as rarely as RAM safely allows: size the trigger from the live Metal
+    budget + the model's *measured* per-token KV cost (plan 036) instead of a blind 120 k
+    cap that over-compacts. CHAD_CTX_LIMIT still wins (evals/tests); CHAD_CTX_RESERVE_GB
+    tunes the scratch headroom. Falls back to the old fixed cap if the memory APIs or the
+    KV measurement are unavailable. Needs eng.load() to have run (reads effective_ctx +
+    kv_bytes_per_token)."""
+    ctx_limit = _env_int("CHAD_CTX_LIMIT")
+    if not ctx_limit:
+        try:
+            import mlx.core as mx
+            ctx_limit = ram_aware_ctx_limit(
+                eng.effective_ctx,
+                mx.device_info()["max_recommended_working_set_size"],
+                mx.get_active_memory(), eng.kv_bytes_per_token,
+                reserve_gb=_env_float("CHAD_CTX_RESERVE_GB") or 1.5)
+        except Exception:  # noqa: BLE001 — never let memory probing break startup
+            ctx_limit = None
+    if not ctx_limit:
+        ctx_limit = min(max(4096, eng.effective_ctx - 2048), 120_000)  # old fixed cap
+    return ctx_limit
+
+
 def _preflight():
     """chad runs only on Apple Silicon — MLX has no CPU/CUDA build. Hard-stop with a
     human message instead of letting `uv sync`/import fail cryptically elsewhere."""
@@ -300,34 +325,26 @@ def main():
             max_context=max_context,
             cache_dir=cache_dir,
         )
-        sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} [{why}] ...\n")
-    try:
-        load_s = eng.load()
-    except Exception as e:  # noqa: BLE001 — convert any load failure into guidance
-        _fail_model_load(model_id, e)
 
-    # Auto-compaction threshold. On this non-trimmable hybrid cache compaction forces a
-    # full body re-prefill (plan 035: ~79 % of all prefill), so we want to compact as
-    # rarely as RAM safely allows. Size the trigger from the live Metal budget + the
-    # model's *measured* per-token KV cost (plan 036) instead of a blind 120 k cap that
-    # over-compacts — self-calibrating + OOM-safe. CHAD_CTX_LIMIT still wins (evals/tests);
-    # CHAD_CTX_RESERVE_GB tunes the scratch headroom. Fall back to the old cap if the
-    # memory APIs or the KV measurement are unavailable.
-    ctx_limit = _env_int("CHAD_CTX_LIMIT")
-    if not ctx_limit:
+    # The full-screen TUI loads the 11 GB of weights on a BACKGROUND thread so the banner
+    # + input come up in ~0.6 s and you can read/queue while it loads (the load itself is
+    # disk-bound and can't be made faster). Headless one-shot and the plain --repl still
+    # load synchronously — there's nothing to interact with until the model answers, and
+    # a background download prompt would be worse than a blocking one. `--backend openai`
+    # only loads a tokenizer (cheap), so it stays synchronous too.
+    background = args.backend != "openai" and not task and not args.repl
+
+    ctx_limit = None
+    if not background:
+        if args.backend != "openai":
+            sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} [{why}] ...\n")
         try:
-            import mlx.core as mx
-            ctx_limit = ram_aware_ctx_limit(
-                eng.effective_ctx,
-                mx.device_info()["max_recommended_working_set_size"],
-                mx.get_active_memory(), eng.kv_bytes_per_token,
-                reserve_gb=_env_float("CHAD_CTX_RESERVE_GB") or 1.5)
-        except Exception:  # noqa: BLE001 — never let memory probing break startup
-            ctx_limit = None
-    if not ctx_limit:
-        ctx_limit = min(max(4096, eng.effective_ctx - 2048), 120_000)  # old fixed cap
-    sys.stderr.write(f"ready in {load_s:.1f}s | context {eng.effective_ctx} tokens "
-                     f"(compact at {ctx_limit})\n")
+            load_s = eng.load()
+        except Exception as e:  # noqa: BLE001 — convert any load failure into guidance
+            _fail_model_load(model_id, e)
+        ctx_limit = _compute_ctx_limit(eng)
+        sys.stderr.write(f"ready in {load_s:.1f}s | context {eng.effective_ctx} tokens "
+                         f"(compact at {ctx_limit})\n")
 
     start_mode = "plan" if args.plan else ("auto" if args.yolo else "normal")
     thinking = not args.no_think
@@ -396,8 +413,21 @@ def main():
     elif args.repl:
         repl(eng, yolo=args.yolo, ctx_limit=ctx_limit, resume=resume, thinking=thinking)
     else:
+        from .engine import peek_context_window
         from .tui import run_tui
-        run_tui(eng, ctx_limit, mode=start_mode, thinking=thinking, resume=resume)
+        # Cheap config-only window for the banner + a provisional compaction limit, both
+        # shown instantly; `finalize` runs the real load on the TUI's background thread and
+        # returns (load_s, ctx_limit) once weights are in.
+        window = peek_context_window(model_id, max_context)
+        provisional = ctx_limit or _env_int("CHAD_CTX_LIMIT") \
+            or min(max(4096, (window or 32768) - 2048), 120_000)
+
+        def finalize():
+            load_s = eng.load()
+            return load_s, _compute_ctx_limit(eng)
+
+        run_tui(eng, provisional, mode=start_mode, thinking=thinking, resume=resume,
+                ctx_window=window, finalize=finalize)
 
 
 if __name__ == "__main__":
