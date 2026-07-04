@@ -203,6 +203,7 @@ dependencies = [
     { name = "mlx-lm" },
     { name = "numpy" },
     { name = "prompt-toolkit" },
+    { name = "transformers" },
     { name = "tree-sitter" },
     { name = "tree-sitter-language-pack" },
 ]
@@ -234,6 +235,7 @@ requires-dist = [
     { name = "prompt-toolkit", specifier = ">=3.0.43" },
     { name = "pygments", marker = "extra == 'highlight'", specifier = ">=2.17" },
     { name = "serena-agent", marker = "extra == 'lsp'", specifier = ">=1.5" },
+    { name = "transformers", specifier = ">=5.0,<5.13" },
     { name = "tree-sitter", specifier = ">=0.25.2" },
     { name = "tree-sitter-language-pack", specifier = ">=1.11.0" },
 ]

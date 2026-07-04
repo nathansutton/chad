@@ -11,6 +11,11 @@ dependencies = [
     # PyPI and ignores uv.lock. Stay on the known-good 0.31 line; bump deliberately.
     "mlx>=0.31.2,<0.32",
     "mlx-lm>=0.31.3,<0.32",
+    # mlx-lm requires transformers>=5.0, but 5.13.0 regressed AutoTokenizer.register:
+    # it now does `key.__module__.startswith("transformers.")` with no hasattr guard, and
+    # mlx-lm's tokenizer_utils passes the *string* "NewlineTokenizer" as config_class →
+    # AttributeError at import. Cap below 5.13 until mlx-lm or transformers fixes it.
+    "transformers>=5.0,<5.13",
     "numpy>=1.26,<2",
     "huggingface-hub>=0.34", # first-run model download (cli.py/engine.py); imported directly, not just transitively
     "jedi>=0.19.2", # in-process symbolic code intelligence (read/search/edit)
