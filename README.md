@@ -120,6 +120,13 @@ run in one line; the model downloads itself on first use:
 uvx --from git+https://github.com/nathansutton/chad chad     # run chad anywhere, no clone
 ```
 
+Or install it for good — then it's just `chad`:
+
+```bash
+uv tool install --from git+https://github.com/nathansutton/chad chad   # install to ~/.local/bin
+chad                                                                    # then it's just `chad`
+```
+
 Or, working from a clone (the dev path):
 
 ```bash
@@ -147,14 +154,19 @@ Face cache (`~/.cache/huggingface`, reused across every project):
 | **≥ 24 GB** (default) | [Ornith-1.0-35B `UD-Q2_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX) — 35B MoE, 2-bit experts | ~12 GB |
 | **16 / 18 GB** (auto-fallback) | [Ornith-1.0-9B `UD-Q4_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX) — 4-bit AWQ | ~5 GB |
 
-chad detects your RAM and chooses; the first run asks before downloading (~12 GB / ~5 GB),
-or auto-downloads when headless. No model picker, no flags. Override with `CHAD_MODEL=<repo
+chad detects your RAM and chooses; the first run asks before downloading (~12 GB / ~5 GB —
+2-4 minutes on gigabit fiber, 15-25 on a 100 Mbit line; the download is resumable, so a
+killed first run picks up where it left off), or auto-downloads when headless. No model
+picker, no flags. Override with `CHAD_MODEL=<repo
 or local dir>` to force a specific one. Quant names follow
 [Unsloth's dynamic-quant convention](https://docs.unsloth.ai/) (`UD-…`) so the scheme is
 recognizable. chad downloads the pre-quantized model from Hugging Face on first run.
 
 That's the whole on-ramp. The model and the throughput numbers you can reproduce live in
 [Throughput & performance](docs/benchmarks.md).
+
+Run `chad` from inside the project you want it to work on — it snapshots the working
+directory into context at startup.
 
 ## Interactive UX (Claude Code parity)
 
@@ -291,5 +303,7 @@ behavior — in the [Configuration reference](docs/configuration.md).
   levers.
 - **[Configuration reference](docs/configuration.md)** — Agent Skills, MCP servers, the
   context window, every environment variable, and the safety opt-outs.
+- **[Troubleshooting](docs/troubleshooting.md)** — when a session rambles, loops, or slows:
+  the symptom→knob map for a small local model.
 - **[Contributing](CONTRIBUTING.md)** — what lands easily, and what needs a conversation
   first (behavior changes are eval-gated on a private rig).

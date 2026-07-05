@@ -180,7 +180,8 @@ def _ensure_model(model_id):
         return  # already in the HF cache
     size = "~12 GB" if "35B" in model_id else "~5 GB"
     sys.stderr.write(
-        f"\nchad needs the model '{model_id}' ({size}).\n"
+        f"\nchad needs the model '{model_id}' "
+        f"({size} — minutes on fast fiber, ~20 min on 100 Mbit; resumable).\n"
         "It downloads once into ~/.cache/huggingface and is reused across projects.\n")
     if sys.stdin.isatty():
         ans = input("Download now? [Y/n] ").strip().lower()
@@ -214,6 +215,17 @@ def _fail_model_load(model_id, err):
             "  fix:   a partial/corrupt download or not enough free RAM. Re-run (the HF\n"
             f"         download resumes), or try the smaller model: CHAD_MODEL={_HF_9B}\n")
     sys.exit(1)
+
+
+def _maybe_home_dir_note():
+    """chad snapshots the working directory into context at startup, so the home dir is
+    rarely the intended workspace. Nudge once — no exit, no behavior change. Home-dir
+    only: guessing "is this a project" from marker files false-positives on legit
+    non-git work dirs."""
+    if os.getcwd() == os.path.expanduser("~"):
+        sys.stderr.write(
+            "note: running in your home directory — chad works best inside a project "
+            "(cd into one and rerun).\n")
 
 
 def _pick_session(items):
@@ -437,6 +449,7 @@ def main():
     else:
         from .engine import peek_context_window
         from .tui import run_tui
+        _maybe_home_dir_note()
         # Cheap config-only window for the banner + a provisional compaction limit, both
         # shown instantly; `finalize` runs the real load on the TUI's background thread and
         # returns (load_s, ctx_limit) once weights are in.

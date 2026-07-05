@@ -878,6 +878,18 @@ class TUI:
             self._model_ready.set()
             self._wake.set()  # nudge the worker if a message was queued while loading
 
+    def _emit_first_task_hint(self):
+        """One muted line under the banner on a FRESH session (resume is None): a small
+        local model needs a *scoped* ask, so a blinking cursor doesn't invite a
+        frontier-sized request that flails. Resumed sessions already have a thread going,
+        so they stay hint-free."""
+        if self._resume is not None:
+            return
+        self._emit("muted",
+                   'tip: small model, scoped asks — "fix the failing test in '
+                   'tests/test_x.py" lands; "improve my codebase" flails. '
+                   "shift-tab cycles plan mode.")
+
     async def run(self):
         worker = threading.Thread(target=self._worker, daemon=True)
         worker.start()
@@ -887,6 +899,7 @@ class TUI:
         with self._lock:
             self._pending.append("\n" + art + "\n")
         self._emit("info", "shift-tab for modes · /help")
+        self._emit_first_task_hint()
         if self._finalize is not None:
             self._emit("info", f"loading {self.engine.model_id.split('/')[-1]}… "
                                "(type ahead — your first message runs when it's ready)")

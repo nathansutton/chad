@@ -167,6 +167,24 @@ def test_version_string_never_raises(monkeypatch):
     check("starts with chad ", s.startswith("chad "), s)
 
 
+def test_home_dir_note_written_in_home(monkeypatch, capsys):
+    # Plan 060: launching in ~ prints a one-line nudge to cd into a project — no exit,
+    # no behavior change. chad snapshots the cwd, so home is rarely the intended dir.
+    home = os.path.expanduser("~")
+    monkeypatch.setattr(os, "getcwd", lambda: home)
+    cli._maybe_home_dir_note()
+    err = capsys.readouterr().err
+    check("home-dir note written", "home directory" in err, err)
+
+
+def test_home_dir_note_absent_in_project(monkeypatch, capsys):
+    # A real project dir (not ~) gets no note — home-dir only, no marker-file guessing.
+    monkeypatch.setattr(os, "getcwd", lambda: "/Users/x/some/project")
+    cli._maybe_home_dir_note()
+    err = capsys.readouterr().err
+    check("no note outside home", err == "", repr(err))
+
+
 if __name__ == "__main__":
     test_ram_aware_ctx_limit()
     with pytest.MonkeyPatch.context() as mp:
@@ -182,4 +200,5 @@ if __name__ == "__main__":
     with pytest.MonkeyPatch.context() as mp:
         test_version_string_never_raises(mp)
     print(f"\n{PASS} passed, {FAIL} failed")
+    # Note: the home-dir note tests need pytest's capsys fixture; run them via `pytest`.
     raise SystemExit(1 if FAIL else 0)

@@ -149,6 +149,25 @@ def test_thinkcap_glyph_absent_by_default_present_when_capped():
     assert "✂3" in line()
 
 
+def test_first_task_hint_shown_on_fresh_session():
+    # Plan 060: a fresh session (resume is None) gets exactly one muted hint line under
+    # the banner — the scoped-ask nudge — queued into the scrollback like any fragment.
+    t = _bare_tui()
+    t._resume = None
+    t._emit_first_task_hint()
+    joined = "".join(t._pending)
+    assert "scoped asks" in joined
+    assert len([f for f in t._pending if "scoped asks" in f]) == 1
+
+
+def test_first_task_hint_absent_on_resumed_session():
+    # A resumed session (resume is a message list) already has a thread going — no hint.
+    t = _bare_tui()
+    t._resume = [{"role": "user", "content": "earlier turn"}]
+    t._emit_first_task_hint()
+    assert t._pending == []
+
+
 def test_todo_panel_rows_collapse_and_glyphs():
     assert _todo_panel_rows([]) == []
     short = [{"content": "a", "status": "completed"},

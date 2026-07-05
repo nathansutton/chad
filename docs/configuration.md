@@ -214,6 +214,15 @@ prefill/decode scratch — raise it if you run other memory-hungry apps alongsid
 is tuned for Ornith, so this is unsupported and mostly there for research — the happy
 path is the single bundled model, no flag.
 
+**Forcing the small model.** `CHAD_MODEL` also names another Ornith on Hugging Face, so
+it doubles as the "use the 9B" recipe. chad's default keys on *physical* RAM, so a 24 GB
+Mac with a lot already resident still gets the 35B (~14 GB peak) and can swap-thrash —
+close other apps, or pin the 9B (~5 GB) for the session:
+
+```bash
+CHAD_MODEL=nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX uv run chad
+```
+
 ### Alternate backend (spike)
 
 The default backend is the in-process MLX engine — the whole point of chad (a persistent
