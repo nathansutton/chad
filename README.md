@@ -168,6 +168,24 @@ That's the whole on-ramp. The model and the throughput numbers you can reproduce
 Run `chad` from inside the project you want it to work on — it snapshots the working
 directory into context at startup.
 
+### Upgrading
+
+chad tracks the latest `main` — there's no release cadence to wait on. How you refresh
+depends on how you installed it (verified locally against uv 0.7.3):
+
+- **`uv tool install` users**: `uv tool upgrade chad` re-resolves and installs the latest
+  `main`. (If chad isn't a uv tool, uv tells you so — install it with the `uv tool
+  install` line above.)
+- **`uvx` users**: `uvx` caches the resolved environment, so a plain re-run can stay
+  pinned to an old git resolve. Force the latest with
+  `uvx --refresh --from git+https://github.com/nathansutton/chad chad`.
+- **Dev clones**: `git pull && uv sync`.
+
+What changed lands in [`CHANGELOG.md`](CHANGELOG.md). Model weights are versioned
+separately from the code: a code upgrade never re-downloads the model, and a *model* bump
+announces itself in the changelog (superseded snapshots can then be freed — see
+[Troubleshooting](docs/troubleshooting.md)).
+
 ## Interactive UX (Claude Code parity)
 
 `uv run chad` launches a full-screen terminal UI (`tui.py`, built on prompt_toolkit):
