@@ -192,7 +192,7 @@ wheels = [
 ]
 
 [[package]]
-name = "chad"
+name = "chad-code"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

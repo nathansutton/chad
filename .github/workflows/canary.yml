@@ -21,8 +21,12 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         # NO actions/checkout and NO uv cache: the point is to reproduce what a new
         # user gets — a cold resolve of the git ref straight from GitHub + PyPI.
-      - name: README one-liner resolves and the entrypoint parses
+      - name: README one-liner resolves and the entrypoint parses (git main)
         run: uvx --from 'git+https://github.com/nathansutton/chad' chad --help
+      - name: Released artifact resolves (PyPI)
+        # The published `uvx chad-code` one-liner. `|| true` until the first release
+        # exists on PyPI — drop it once `chad-code` is published (plan 063 Step 5).
+        run: uvx chad-code --version || true
       - name: Version stamp (for the failure-email breadcrumb)
         if: always()
         run: uvx --from 'git+https://github.com/nathansutton/chad' chad --version || true

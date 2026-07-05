@@ -114,17 +114,24 @@ pass-rate near-equal (the harness carries it), with wall-clock/TTFT materially w
 ## Quickstart
 
 Apple Silicon + [uv](https://docs.astral.sh/uv/). No clone, no model build — install and
-run in one line; the model downloads itself on first use:
+run in one line; the model downloads itself on first use. The PyPI distribution is
+**`chad-code`** (bare `chad` is a squatted, unrelated package); the command is still `chad`:
 
 ```bash
-uvx --from git+https://github.com/nathansutton/chad chad     # run chad anywhere, no clone
+uvx chad-code     # run chad anywhere, no clone — the command is still `chad`
 ```
 
 Or install it for good — then it's just `chad`:
 
 ```bash
-uv tool install --from git+https://github.com/nathansutton/chad chad   # install to ~/.local/bin
-chad                                                                    # then it's just `chad`
+uv tool install chad-code   # install to ~/.local/bin
+chad                        # then it's just `chad`
+```
+
+To run the very latest **unreleased `main`** instead of the last release, use the git URL:
+
+```bash
+uvx --from git+https://github.com/nathansutton/chad chad   # bleeding edge, no clone
 ```
 
 Or, working from a clone (the dev path):
@@ -142,9 +149,9 @@ To measure throughput on your own machine, `uv run chad-bench` (see
 [Throughput & performance](docs/benchmarks.md)).
 
 **Optional: precise refs/rename.** LSP-precise cross-file find-references and
-scope-correct rename need `uv sync --extra lsp`; without
-it chad uses the tree-sitter fallback automatically (see
-[the symbolic stack](docs/design.md)).
+scope-correct rename need the `lsp` extra — `uv tool install 'chad-code[lsp]'` (installed)
+or `uv sync --extra lsp` (from a clone); without it chad uses the tree-sitter fallback
+automatically (see [the symbolic stack](docs/design.md)).
 
 **The model.** chad picks one model for you and downloads it once into the shared Hugging
 Face cache (`~/.cache/huggingface`, reused across every project):
@@ -170,15 +177,15 @@ directory into context at startup.
 
 ### Upgrading
 
-chad tracks the latest `main` — there's no release cadence to wait on. How you refresh
-depends on how you installed it (verified locally against uv 0.7.3):
+How you refresh depends on how you installed it:
 
-- **`uv tool install` users**: `uv tool upgrade chad` re-resolves and installs the latest
-  `main`. (If chad isn't a uv tool, uv tells you so — install it with the `uv tool
+- **`uv tool install` users**: `uv tool upgrade chad-code` re-resolves and installs the
+  latest release. (If chad isn't a uv tool, uv tells you so — install it with the `uv tool
   install` line above.)
 - **`uvx` users**: `uvx` caches the resolved environment, so a plain re-run can stay
-  pinned to an old git resolve. Force the latest with
-  `uvx --refresh --from git+https://github.com/nathansutton/chad chad`.
+  pinned to an older resolve. Force the latest release with `uvx --refresh chad-code`.
+- **Bleeding-edge (`main`)**: to jump ahead of the last release, re-run the git-URL form
+  with `--refresh`: `uvx --refresh --from git+https://github.com/nathansutton/chad chad`.
 - **Dev clones**: `git pull && uv sync`.
 
 What changed lands in [`CHANGELOG.md`](CHANGELOG.md). Model weights are versioned

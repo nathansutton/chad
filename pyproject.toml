@@ -1,9 +1,30 @@
 [project]
-name = "chad"
+# Distribution name is `chad-code` (bare `chad` on PyPI is a squatted 2014 package).
+# The IMPORT package (src/chad/) and the `chad` command are unchanged — dist name,
+# import name, and command name are independent. `uvx chad-code` runs the alias
+# script added under [project.scripts]. See private/plans/063.
+name = "chad-code"
 version = "0.1.0"
 description = "Local MLX-backed, Claude-Code-style coding agent (Apple Silicon, Ornith 35B/9B)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
+keywords = ["mlx", "coding-agent", "apple-silicon", "local-llm", "tui"]
+# No License classifier: the SPDX `license` field above is authoritative (setuptools
+# rejects declaring both). Platforms are honest — the wheel is pure-python but the
+# mlx/mlx-lm dep tree resolves only on Apple Silicon macOS (cli._preflight hard-stops
+# elsewhere), so no cross-platform OS classifier is claimed.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+]
 dependencies = [
     # Upper-bounded on purpose: chad's model loading rides on mlx-lm's qwen3_5/qwen3_5_moe
     # loader (expert-weight stacking + vision-tower strip). A minor bump could refactor it
@@ -42,9 +63,16 @@ highlight = ["pygments>=2.17"]
 lsp = ["serena-agent>=1.5"]
 
 # The one entrypoint: `uv run chad`. (`chad-bench` reproduces docs/benchmarks.md.)
+# `chad-code` is an alias so `uvx chad-code` (which runs the console script matching
+# the DISTRIBUTION name) just works; the command you actually type stays `chad`.
 [project.scripts]
 chad = "chad.cli:main"
+chad-code = "chad.cli:main"
 chad-bench = "chad.bench:main"
+
+[project.urls]
+Repository = "https://github.com/nathansutton/chad"
+Issues = "https://github.com/nathansutton/chad/issues"
 
 [dependency-groups]
 # types-pyyaml: skills.py imports yaml directly; mypy 1.x refuses to honor

@@ -1,0 +1,42 @@
+name: publish
+
+# PyPI trusted publishing (OIDC): no API tokens are stored in the repo. The publisher
+# must be configured on PyPI for project chad-code, owner nathansutton, repo chad,
+# workflow publish.yml, environment pypi (operator step — see private/plans/063).
+# Triggered by version tags only, so a release is always a deliberate `git tag` push.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest   # pure-python wheel; no MLX import happens during build
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv build
+      - run: uvx twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi        # gate: environment protection = the manual-approval knob
+    permissions:
+      id-token: write        # OIDC for trusted publishing (this job only)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      # @release/v1 is pypa's supported floating tag for this action (they keep the
+      # major stable and document it as the recommended pin); it reads the OIDC token
+      # minted by `id-token: write` above and needs no stored credentials.
+      - uses: pypa/gh-action-pypi-publish@release/v1
