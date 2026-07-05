@@ -1,0 +1,55 @@
+name: Bug report
+description: Something chad did wrong — a crash, a bad edit, a loop, a wrong answer.
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. chad's behavior is RAM-dependent (a 35B MoE on ≥24 GB,
+        a 9B dense on 16/18 GB), so the version and hardware fields below are what make
+        a report triageable — please fill them in.
+  - type: input
+    id: version
+    attributes:
+      label: chad version
+      description: Output of `chad --version` (e.g. `chad 0.1.0 (5242907)`).
+      placeholder: chad 0.1.0 (5242907)
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Mac + RAM + macOS
+      description: Chip, total RAM, and macOS version — this decides which model ran.
+      placeholder: M4 Pro 24 GB, macOS 15.5
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed chad
+      options:
+        - uvx one-liner
+        - uv tool install
+        - dev clone
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What you asked, what happened instead
+      description: What you asked chad to do, what you expected, and what it actually did.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: >-
+        `~/.chad/session.log` contains plaintext previews of your commands and file
+        contents. Paste only the few lines around the failure, and redact anything
+        private — do not attach the whole file.
+      render: text
+    validations:
+      required: false

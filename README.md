@@ -291,3 +291,5 @@ behavior — in the [Configuration reference](docs/configuration.md).
   levers.
 - **[Configuration reference](docs/configuration.md)** — Agent Skills, MCP servers, the
   context window, every environment variable, and the safety opt-outs.
+- **[Contributing](CONTRIBUTING.md)** — what lands easily, and what needs a conversation
+  first (behavior changes are eval-gated on a private rig).
