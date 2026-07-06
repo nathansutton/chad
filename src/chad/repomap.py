@@ -13,8 +13,10 @@ This is the aider "repo map" idea, built in-process on tree-sitter:
   AND the `tags.scm` queries that mark every definition/reference — so symbol
   extraction is **language-agnostic** with no language-server subprocess to install
   (that precision layer comes later, behind this same surface, via solidlsp).
-* `repo_map()` ranks definitions with PageRank over the file→symbol reference graph
-  and renders the most central ones as elided signatures within a token budget.
+* `repo_map()` ranks definitions with personalized PageRank (rustworkx) over the
+  file→symbol reference graph and renders the most central ones as elided signatures
+  within a token budget. Whole-repo tag extraction is mtime-cached on disk per repo
+  and sharded across subprocess workers on a cold scan (see `_extract_all`).
 * `overview` / `find_symbol` / `view_symbol` / `find_refs` are the per-symbol read
   tools, now multi-language (they replace the Python-only jedi backend in
   `symbols.py`; jedi remains the editor for `replace_symbol`/`insert_symbol`).
@@ -22,22 +24,74 @@ This is the aider "repo map" idea, built in-process on tree-sitter:
 API mirrors `symbols.SymbolService` so `tools.py` can route to either backend.
 """
 
-import glob as _glob
+import hashlib
+import logging
 import os
-from collections import defaultdict, namedtuple
+import pickle
+import subprocess
+import sys
+import threading
+import time
+from collections import Counter, defaultdict, namedtuple
 
+import rustworkx as rx
 import tree_sitter_language_pack as tlp
 from tree_sitter import Parser, Query, QueryCursor
 
-from .ignore import IGNORE_DIRS, REPOMAP_EXTRA, slash_wrapped
+from . import config
+from .ignore import IGNORE_DIRS, REPOMAP_EXTRA
+
+log = logging.getLogger("chad")
 
 # repomap indexes the whole repo, so it skips the base set PLUS model weights, installed
 # packages, and caches (REPOMAP_EXTRA) — a symbol editor doesn't need those exclusions.
-_SKIP = slash_wrapped(IGNORE_DIRS + REPOMAP_EXTRA)
+_SKIP_NAMES = frozenset(IGNORE_DIRS + REPOMAP_EXTRA)
 
 _MAX_FILE_BYTES = 1_000_000   # skip anything bigger than ~1MB (generated/minified)
 _MAX_FILES = 20000
 _CHARS_PER_TOK = 4            # rough token estimate without coupling to the tokenizer
+
+# Total wall-clock allowed for the decorative "used by …" annotations in one
+# disambiguation listing; candidates past the deadline render un-annotated.
+_DISAMBIG_BUDGET_S = 3.0
+
+# An identifier defined in more files than this (__init__, get, main, forward, …) says
+# nothing about which file matters, so it's excluded from the rank graph. Without the
+# cutoff a generic name fans out definers × referencers: on a 11k-file repo `__init__`
+# alone produced 11M edges of a 32M-edge/10GB graph — enough to stall the tool for
+# minutes and push a machine already holding model weights into Metal OOM.
+_MAX_DEFINERS = 16
+
+# -- whole-repo extraction scaling -----------------------------------------------
+# The tree-sitter parse loop is the dominant cost of a cold scan (measured 17.5s of a
+# 19s repo_map on an 11k-file repo) and py-tree-sitter never releases the GIL, so
+# threads don't help (measured 1.0x). Two levers instead:
+#   1. a per-repo on-disk tags cache keyed by mtime, so a warm scan parses only what
+#      changed (measured 0.34s to load 11k files' tags vs 17.5s to re-parse), and
+#   2. subprocess workers for cold scans (measured 5.5x on 8 workers). Workers run
+#      `python -c` importing ONLY chad.repomap (0.02s, no mlx) — never fork, and never
+#      re-import chad's entry point, which would drag the whole MLX engine into each.
+_PARALLEL_MIN_FILES = 200   # below this, worker startup costs more than it saves
+_CACHE_SAVE_MIN = 32        # don't persist a cache for tiny repos (or tiny test fixtures)
+_CACHE_VERSION = 1          # bump when the entry shape or tags queries change
+_CACHE_DIR = os.path.expanduser("~/.chad/cache/repomap")
+
+_WORKER_SRC = """\
+import pickle, sys
+from chad.repomap import RepoMap
+root, paths = pickle.load(sys.stdin.buffer)
+rm = RepoMap(root)
+for p in paths:
+    rm._extract(p)
+sys.stdout.buffer.write(pickle.dumps(rm._cache, protocol=pickle.HIGHEST_PROTOCOL))
+"""
+
+
+def _worker_count() -> int:
+    n = config.env_int("CHAD_REPOMAP_WORKERS", 0) or 0
+    if n > 0:
+        return n
+    return max(1, min(8, (os.cpu_count() or 4) - 2))
 
 # A definition discovered by tree-sitter. `kind` is the tag suffix (function,
 # class, method, constant, ...); `sig` is the collapsed header line(s). `name_row`
@@ -50,63 +104,37 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // _CHARS_PER_TOK)
 
 
-class _Graph:
-    """Minimal weighted multigraph: just what _pagerank reads (nodes + weighted
-    edges), kept in insertion order so iteration matches the construction loop."""
-    def __init__(self):
-        self._nodes = []
-        self._edges = []  # (u, v, {"weight": w})
-    def add_nodes_from(self, ns):
-        self._nodes.extend(ns)
-    def add_edge(self, u, v, weight=1.0):
-        self._edges.append((u, v, {"weight": weight}))
-    def nodes(self):
-        return self._nodes
-    def edges(self, data=False):
-        return self._edges if data else [(u, v) for u, v, _ in self._edges]
+def _build_edges(defines, references):
+    """The rank graph's edge weights: {(referencer rel, definer rel): weight}, ONE
+    aggregated edge per file pair. The naive form (an edge object per raw reference)
+    is definers × references per ident — measured 32M edges / 10 GB on an 11k-file
+    repo, which OOMs the machine out from under the model. sqrt damps mega-callers
+    so one hub file doesn't drown the ranking, and idents defined in more than
+    _MAX_DEFINERS files are excluded (no ranking signal, all of the blowup)."""
+    edge_w = defaultdict(float)
+    for ident, definers in defines.items():
+        refcounts = references.get(ident)
+        if not refcounts or len(definers) > _MAX_DEFINERS:
+            continue
+        for referencer, cnt in refcounts.items():
+            w = cnt ** 0.5
+            for definer in definers:
+                if referencer != definer:
+                    edge_w[(referencer, definer)] += w
+    return edge_w
 
 
-def _pagerank(g, personalization=None, damping=0.85, iters=50, tol=1.0e-6):
-    """Personalized PageRank over a weighted MultiDiGraph, pure-Python power iteration.
-
-    A library pagerank would pull in scipy, which isn't installed here — so the prior
-    library call always raised and the repo map silently fell back to ranking by
-    definition count. This self-contained version actually ranks by reference centrality
-    (and honors the personalization seeds), with no extra dependency."""
-    nodes = list(g.nodes())
-    n = len(nodes)
-    if n == 0:
-        return {}
-    out = defaultdict(float)
-    adj = defaultdict(list)
-    for u, v, data in g.edges(data=True):
-        w = data.get("weight", 1.0)
-        out[u] += w
-        adj[u].append((v, w))
-    if personalization:
-        s = float(sum(personalization.get(u, 0.0) for u in nodes)) or 1.0
-        p = {u: personalization.get(u, 0.0) / s for u in nodes}
-    else:
-        p = {u: 1.0 / n for u in nodes}
-    rank = {u: 1.0 / n for u in nodes}
-    dangling = [u for u in nodes if out[u] == 0.0]
-    for _ in range(iters):
-        nxt = {u: (1.0 - damping) * p[u] for u in nodes}
-        dmass = damping * sum(rank[u] for u in dangling)
-        for u in nodes:
-            if out[u] == 0.0:
-                continue
-            share = damping * rank[u] / out[u]
-            for v, w in adj[u]:
-                nxt[v] += share * w
-        if dmass:
-            for u in nodes:
-                nxt[u] += dmass * p[u]
-        err = sum(abs(nxt[u] - rank[u]) for u in nodes)
-        rank = nxt
-        if err < tol:
-            break
-    return rank
+def _rank_files(rels, edge_w, seeds):
+    """Personalized PageRank over the file graph via rustworkx — a native, maintained
+    implementation in place of the hand-rolled power iteration it replaced (validated
+    on a real 421k-edge graph: identical top-50, spearman 0.999, 0.79s -> 0.04s)."""
+    g = rx.PyDiGraph()
+    idx = dict(zip(rels, g.add_nodes_from(list(rels))))
+    g.add_edges_from([(idx[u], idx[v], w) for (u, v), w in edge_w.items()])
+    pers = {idx[r]: w for r, w in seeds.items()} if seeds else None
+    ranks = rx.pagerank(g, alpha=0.85, weight_fn=float, personalization=pers,
+                        tol=1.0e-6, max_iter=100)
+    return {rel: ranks[i] for rel, i in idx.items()}
 
 
 class RepoMap:
@@ -117,6 +145,130 @@ class RepoMap:
         self._tooling = {}   # lang -> (Parser, Query) | None
         self._cache = {}     # path -> (mtime, [defs], [(refname, rel, line)])
         self._files = None   # memoized completed _code_files() result; None = uncomputed
+        self._disk_checked = False  # the on-disk tags cache is loaded at most once
+        self._agg = None     # incremental rank-graph tables; see _aggregates()
+        self._refsum_cache = {}  # (path, row, col, mtime) -> disambig note
+
+    # -- persistent tags cache ---------------------------------------------
+    # Parsing is the dominant cost of a whole-repo scan and the in-memory cache dies
+    # with the process, so every new session used to re-pay it in full. Entries are
+    # mtime-validated per file on use (`_extract`'s existing contract), so a stale
+    # disk entry is re-parsed, never trusted. Pickle is fine here trust-wise: the
+    # cache lives under ~/.chad (0700/0600) — the same trust domain as sessions.
+
+    def _cache_file(self) -> str:
+        return os.path.join(
+            _CACHE_DIR, hashlib.sha256(self.root.encode()).hexdigest()[:16] + ".pkl")
+
+    def _load_disk_cache(self):
+        if self._disk_checked:
+            return
+        self._disk_checked = True
+        try:
+            with open(self._cache_file(), "rb") as f:
+                data = pickle.load(f)
+            if (data.get("v") == _CACHE_VERSION
+                    and data.get("tag_fields") == list(Tag._fields)
+                    and data.get("root") == self.root):
+                # in-memory (this session, freshest) entries win over disk ones
+                self._cache = {**data["files"], **self._cache}
+        except Exception:  # noqa: BLE001 - absent/corrupt/foreign cache: parse fresh
+            pass
+
+    def _save_disk_cache(self, keep):
+        keep = set(keep)
+        try:
+            os.makedirs(_CACHE_DIR, mode=0o700, exist_ok=True)
+            blob = pickle.dumps(
+                {"v": _CACHE_VERSION, "tag_fields": list(Tag._fields), "root": self.root,
+                 "files": {p: e for p, e in self._cache.items() if p in keep}},
+                protocol=pickle.HIGHEST_PROTOCOL)
+            tmp = self._cache_file() + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(blob)
+            os.replace(tmp, self._cache_file())
+        except Exception:  # noqa: BLE001 - cache is an optimization, never a failure
+            pass
+
+    # -- whole-repo extraction ---------------------------------------------
+
+    def _extract_all(self, files, should_stop=None):
+        """Ensure every file's tags are cached: disk cache first, then subprocess
+        workers for a large cold miss set, else the plain serial loop. Callers keep
+        their per-file `_extract` loops — after this they're cache hits, and any
+        shard a failed/killed worker didn't return degrades to a serial parse there."""
+        self._load_disk_cache()
+        misses = []
+        for f in files:
+            c = self._cache.get(f)
+            try:
+                if not c or c[0] != os.path.getmtime(f):
+                    misses.append(f)
+            except OSError:
+                continue
+        if not misses:
+            return
+        if len(misses) >= _PARALLEL_MIN_FILES and _worker_count() > 1:
+            self._extract_parallel(misses, should_stop)
+        else:
+            for f in misses:
+                if should_stop and should_stop():
+                    return
+                self._extract(f)
+        parsed = sum(1 for f in misses if f in self._cache)
+        if parsed >= _CACHE_SAVE_MIN and not (should_stop and should_stop()):
+            self._save_disk_cache(files)
+
+    def _extract_parallel(self, misses, should_stop=None):
+        """Shard `misses` across `python -c` workers (size-sorted round-robin for
+        balance) and merge their tag caches. Workers import only chad.repomap —
+        never chad's entry point, which would pull the MLX engine into each. One
+        reader thread per worker (communicate) so a big result can't deadlock the
+        pipe; should_stop kills the lot."""
+        def size_of(f):
+            try:
+                return os.path.getsize(f)
+            except OSError:
+                return 0
+        nw = min(_worker_count(), max(1, len(misses) // 50))
+        by_size = sorted(misses, key=size_of, reverse=True)
+        shards = [by_size[i::nw] for i in range(nw)]
+        procs, results, threads = [], [b""] * nw, []
+        try:
+            for i, shard in enumerate(shards):
+                p = subprocess.Popen([sys.executable, "-c", _WORKER_SRC],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL)
+                procs.append(p)
+
+                def pump(p=p, i=i, payload=pickle.dumps((self.root, shard))):
+                    try:
+                        results[i] = p.communicate(payload)[0]
+                    except Exception:  # noqa: BLE001 - a dead worker just loses its shard
+                        results[i] = b""
+                t = threading.Thread(target=pump, daemon=True)
+                t.start()
+                threads.append(t)
+            while any(t.is_alive() for t in threads):
+                if should_stop and should_stop():
+                    for p in procs:
+                        p.kill()
+                for t in threads:
+                    t.join(timeout=0.05)
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+        allowed = set(misses)
+        for blob in results:
+            if not blob:
+                continue
+            try:
+                part = pickle.loads(blob)
+            except Exception:  # noqa: BLE001 - partial write from a killed worker
+                continue
+            self._cache.update({p: e for p, e in part.items() if p in allowed})
 
     # -- tree-sitter plumbing --------------------------------------------
 
@@ -150,27 +302,32 @@ class RepoMap:
     def _code_files(self, should_stop=None):
         # Memoized on the instance: service() is a cwd-cached singleton living for the
         # whole session, so once the tree is walked every later symbol lookup reuses the
-        # list instead of re-globbing the repo mid-turn. A scan interrupted by should_stop
+        # list instead of re-walking the repo mid-turn. A scan interrupted by should_stop
         # is returned but NOT cached — caching a partial walk would hide real files.
         if self._files is not None:
             return self._files
-        files = _glob.glob(os.path.join(self.root, "**", "*"), recursive=True)
         out = []
         interrupted = False
-        for f in files:
+        # os.walk with in-place pruning: an ignored or hidden directory is never even
+        # entered, where the old glob("**") enumerated every path under node_modules/
+        # models/ before filtering (and followed symlinked dirs, risking cycles).
+        for dirpath, dirnames, filenames in os.walk(self.root):
             if should_stop and should_stop():
                 interrupted = True
                 break
-            p = "/" + f.replace(os.sep, "/")
-            if any(d in p for d in _SKIP):
-                continue
-            try:
-                if not os.path.isfile(f) or os.path.getsize(f) > _MAX_FILE_BYTES:
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".") and d not in _SKIP_NAMES]
+            for name in filenames:
+                if name.startswith("."):
                     continue
-            except OSError:
-                continue
-            if self.lang_for(f):
-                out.append(f)
+                f = os.path.join(dirpath, name)
+                try:
+                    if not os.path.isfile(f) or os.path.getsize(f) > _MAX_FILE_BYTES:
+                        continue
+                except OSError:
+                    continue
+                if self.lang_for(f):
+                    out.append(f)
         result = sorted(out)[:_MAX_FILES]
         if not interrupted:        # never cache a partial scan
             self._files = result
@@ -197,6 +354,9 @@ class RepoMap:
         try:
             mtime = os.path.getmtime(path)
         except OSError:
+            # gone/unreadable: drop the stale entry so _aggregates unfolds its old
+            # contribution instead of keeping a deleted file's symbols in the map
+            self._cache.pop(path, None)
             return [], []
         cached = self._cache.get(path)
         if cached and cached[0] == mtime:
@@ -236,6 +396,54 @@ class RepoMap:
 
     # -- repo map (ranked skeleton) --------------------------------------
 
+    def _aggregates(self, files, should_stop=None):
+        """(file_defs, defines, references) for the rank graph, maintained
+        incrementally: only files whose cached tags changed since the last call are
+        re-folded. Rebuilding from scratch was the warm-path majority (measured
+        0.39s per repo_map over 1.2M raw references on an 11k-file repo) and it
+        re-ran on every call even when nothing had changed. Interruption is safe:
+        contributions fold per file, so a stopped pass just leaves the remaining
+        files for the next call."""
+        if self._agg is None:
+            # contrib: path -> (mtime folded in, [def names], {name: ref count})
+            self._agg = ({}, {}, defaultdict(set), defaultdict(Counter))
+        contrib, file_defs, defines, references = self._agg
+        for f in files:
+            if should_stop and should_stop():
+                break
+            defs, refs = self._extract(f)
+            mtime = self._cache.get(f, (None,))[0]
+            old = contrib.get(f)
+            if old and old[0] == mtime:
+                continue
+            rel = self._rel(f)
+            if old:  # subtract the file's previous contribution before re-folding
+                for name in old[1]:
+                    s = defines.get(name)
+                    if s:
+                        s.discard(rel)
+                        if not s:
+                            del defines[name]
+                for name in old[2]:
+                    c = references.get(name)
+                    if c:
+                        c.pop(rel, None)
+                        if not c:
+                            del references[name]
+            def_names = []
+            for d in defs:
+                if d.name:
+                    defines[d.name].add(rel)
+                    def_names.append(d.name)
+            ref_counts = Counter()
+            for name, _rrel, _ln in refs:  # every ref in `refs` is from this file
+                ref_counts[name] += 1
+            for name, cnt in ref_counts.items():
+                references[name][rel] += cnt
+            file_defs[rel] = defs
+            contrib[f] = (mtime, def_names, ref_counts)
+        return file_defs, defines, references
+
     def repo_map(self, budget_tokens: int = 1500, focus=None, should_stop=None) -> str:
         """A PageRank-ranked, signature-only map of the codebase within a token
         budget. `focus` (list of path substrings) personalizes the ranking toward
@@ -243,29 +451,10 @@ class RepoMap:
         files = self._code_files(should_stop)
         if not files:
             return "[no source files found]"
-        file_defs = {}
-        defines = defaultdict(set)      # name -> {rel that define it}
-        references = defaultdict(list)  # name -> [rel that reference it]
-        for f in files:
-            if should_stop and should_stop():
-                return "[interrupted]"
-            defs, refs = self._extract(f)
-            rel = self._rel(f)
-            file_defs[rel] = defs
-            for d in defs:
-                if d.name:
-                    defines[d.name].add(rel)
-            for name, rrel, _ln in refs:
-                references[name].append(rrel)
-
-        # Graph: edge referencer -> definer for every cross-file symbol use.
-        g = _Graph()
-        g.add_nodes_from(file_defs)
-        for ident, definers in defines.items():
-            for referencer in references.get(ident, ()):
-                for definer in definers:
-                    if referencer != definer:
-                        g.add_edge(referencer, definer, weight=1.0)
+        self._extract_all(files, should_stop)
+        file_defs, defines, references = self._aggregates(files, should_stop)
+        if should_stop and should_stop():
+            return "[interrupted]"
 
         # Personalize ranking toward the files the agent is working on (focus) and, by
         # default, likely entrypoints (check.py / main / conftest / app). Tasks usually
@@ -280,10 +469,9 @@ class RepoMap:
             for rel in file_defs:
                 if any(fp in rel for fp in focus):
                     seeds[rel] = 1.0
-        personalization = seeds or None
         try:
-            ranks = _pagerank(g, personalization=personalization)
-        except Exception:
+            ranks = _rank_files(file_defs, _build_edges(defines, references), seeds)
+        except Exception:  # noqa: BLE001 - rank failure degrades to def-count order
             ranks = {}
         # Files with no edges still deserve a spot; rank them by definition count.
         ordered = sorted(file_defs,
@@ -325,6 +513,8 @@ class RepoMap:
         target = name.replace(".", "/").split("/")[-1]
         files = [os.path.join(self.root, path)] if path and not os.path.isabs(path) \
             else ([path] if path else self._code_files(should_stop))
+        if not path:
+            self._extract_all(files, should_stop)
         hits = []
         for f in files:
             if should_stop and should_stop():
@@ -335,34 +525,62 @@ class RepoMap:
                     hits.append(d)
         return hits
 
-    def _ref_summary(self, h):
+    def _refsum_key(self, h):
+        return (h.path, h.name_row, h.name_col, self._cache.get(h.path, (None,))[0])
+
+    def _ref_summary(self, h, timeout=None):
         """A short 'used by …' hint for one definition, so the model can tell same-named
         candidates apart by who calls them (e.g. the validate on the signup path vs the
         widely-used schema validator). Precise via the language server; silent if it's
-        unavailable (we don't want to imply precision we don't have)."""
+        unavailable (we don't want to imply precision we don't have). Decorative, so it
+        goes through `references_decorative` (never starts a non-Python server) and is
+        cached per (definition site, file mtime) — a repeated view_symbol on the same
+        ambiguous name used to re-pay every LSP lookup (measured 79s on a repeat)."""
+        key = self._refsum_key(h)
+        cached = self._refsum_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             from . import lsp
-            locs = lsp.service().references(h.rel, h.name_row, h.name_col)
+            locs = lsp.service().references_decorative(h.rel, h.name_row, h.name_col,
+                                                       timeout=timeout)
         except Exception:
             locs = None
         if not locs:
-            return ""
-        files = []
-        for rel, _ln, _col in locs:
-            if rel != h.rel and rel not in files:
-                files.append(rel)
-        if not files:
-            return "  — no external refs"
-        more = f" (+{len(files) - 1} more)" if len(files) > 1 else ""
-        return f"  — used by {files[0]}{more}"
+            note = ""
+        else:
+            files = []
+            for rel, _ln, _col in locs:
+                if rel != h.rel and rel not in files:
+                    files.append(rel)
+            if not files:
+                note = "  — no external refs"
+            else:
+                more = f" (+{len(files) - 1} more)" if len(files) > 1 else ""
+                note = f"  — used by {files[0]}{more}"
+        if len(self._refsum_cache) > 512:  # bound a very long session's cache
+            self._refsum_cache.clear()
+        self._refsum_cache[key] = note
+        return note
 
     def _disambig(self, name, hits):
-        # Annotate the first few candidates with who references them (bounded: the
-        # per-candidate LSP lookups are cheap for a handful but we don't want to fire
-        # dozens on a very common name).
+        # Annotate the first few candidates with who references them, under a shared
+        # wall-clock budget: per-candidate LSP lookups are cheap warm, but a cold or
+        # slow server must not turn a disambiguation list into a minutes-long stall
+        # (measured 86s on an 11k-file mixed-language repo before the budget). Each
+        # lookup gets only the budget's remaining time, and candidates the budget
+        # never reached are cached blank for this mtime generation — otherwise a
+        # repeated lookup re-pays the slow pass one candidate at a time.
         rows = []
+        deadline = time.monotonic() + _DISAMBIG_BUDGET_S
         for i, h in enumerate(hits[:50]):
-            note = self._ref_summary(h) if i < 8 else ""
+            note = ""
+            if i < 8:
+                remaining = deadline - time.monotonic()
+                if remaining > 0.25:
+                    note = self._ref_summary(h, timeout=remaining)
+                else:
+                    self._refsum_cache.setdefault(self._refsum_key(h), "")
             rows.append(f"  {h.rel}:{h.line}  {h.kind} {h.sig}{note}")
         return (f"[{len(hits)} symbols named '{name}'; pass path= to disambiguate "
                 f"(pick by who uses each):]\n" + "\n".join(rows))
@@ -430,6 +648,7 @@ class RepoMap:
     def _find_refs_treesitter(self, name: str, should_stop=None) -> str:
         target = name.replace(".", "/").split("/")[-1]
         out = []
+        self._extract_all(self._code_files(should_stop), should_stop)
         for f in self._code_files(should_stop):
             if should_stop and should_stop():
                 return "[interrupted by user]"

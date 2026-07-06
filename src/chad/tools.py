@@ -6,7 +6,9 @@ deliberately conservative: reads are unrestricted, writes/bash are real but the 
 gates them behind a confirmation unless --yolo is set.
 """
 
+import fnmatch
 import glob as _glob
+import io
 import os
 import re
 import signal
@@ -342,8 +344,42 @@ def tool_write_todos(todos) -> str:
     return "Plan updated:\n" + "\n".join(lines)
 
 
+def _walk_glob(path: str, pattern: str):
+    """Pruned-walk equivalent of `glob(os.path.join(path, pattern), recursive=True)`
+    for basename-only patterns — "**/*" or "**/<name-glob>" — which is what the model
+    actually sends. glob materializes the ENTIRE tree (weights dirs, node_modules, VCS
+    caches included) and only then lets `_skip` filter; the walk prunes those dirs
+    before descending, keeps glob's hidden-file rule, and doesn't follow dir symlinks.
+    Returns None for structured patterns (a "/" or "**" past the leading "**/") so
+    callers fall back to glob. Yields dirs too, matching glob("**/*")."""
+    if pattern in ("**", "**/*"):
+        base = "*"
+    elif pattern.startswith("**/") and "/" not in pattern[3:] and "**" not in pattern[3:]:
+        base = pattern[3:]
+    else:
+        return None
+
+    def walk():
+        for dirpath, dirnames, filenames in os.walk(path):
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".") and d not in IGNORE_DIRS]
+            for d in dirnames:
+                if fnmatch.fnmatch(d, base):
+                    yield os.path.join(dirpath, d)
+            for fn in filenames:
+                if not fn.startswith(".") and fnmatch.fnmatch(fn, base):
+                    yield os.path.join(dirpath, fn)
+
+    return walk()
+
+
 def tool_glob(pattern: str, should_stop=None) -> str:
-    hits = [h for h in sorted(_glob.glob(pattern, recursive=True)) if not _skip(h)]
+    it = _walk_glob(".", pattern)
+    if it is None:
+        hits = [h for h in sorted(_glob.glob(pattern, recursive=True)) if not _skip(h)]
+    else:
+        # walk yields "./x/y" but glob(pattern) yields "x/y" — keep the output stable
+        hits = sorted(h[2:] if h.startswith("./") else h for h in it)
     return "\n".join(hits[:200]) or "[no matches]"
 
 
@@ -362,12 +398,35 @@ def _grep_clip(s: str) -> str:
     return s if len(s) <= GREP_LINE_CHARS else s[:GREP_LINE_CHARS] + "…[line clipped]"
 
 
+# Files up to this size are read whole and prescreened with one C-speed regex pass;
+# only files that contain a match pay the (slow) per-line Python loop. Bigger files
+# keep the old streaming scan.
+GREP_FULLREAD_MAX = 4 * 1024 * 1024
+
+
+def _grep_prescreen_rx(pattern: str, flags: int):
+    """A whole-file version of the per-line search: re.MULTILINE makes ^/$ anchor per
+    line, so any line the per-line loop would match, this finds somewhere in the full
+    text (a superset — false positives just run the line loop and emit nothing). The
+    exceptions where a full-text search could MISS a per-line match: \\A/\\Z (different
+    meaning across the two scans) and negative lookarounds (can see past the line's
+    \\n and reject). Those patterns return None: no prescreen, stream as before."""
+    if any(tok in pattern for tok in (r"\A", r"\Z", "(?!", "(?<!")):
+        return None
+    try:
+        return re.compile(pattern, flags | re.MULTILINE)
+    except re.error:
+        return None
+
+
 def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bool = False,
               context: int = 0, should_stop=None) -> str:
+    flags = re.IGNORECASE if ignore_case else 0
     try:
-        rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+        rx = re.compile(pattern, flags)
     except re.error as rx_err:
         return f"[bad regex: {rx_err}]"
+    rx_pre = _grep_prescreen_rx(pattern, flags)
     ctx = max(0, min(int(context or 0), 5))
     out: list[str] = []
     matches = 0        # total match lines seen (may exceed what we emit once capped)
@@ -380,19 +439,41 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
         else:
             capped = True
 
-    files = _glob.glob(os.path.join(path, glob), recursive=True)
-    files_truncated = len(files) > GREP_MAX_FILES
-    for fp in files[:GREP_MAX_FILES]:
+    fast = _walk_glob(path, glob)
+    if fast is None:
+        files = _glob.glob(os.path.join(path, glob), recursive=True)
+        files_truncated = len(files) > GREP_MAX_FILES
+        files = files[:GREP_MAX_FILES]
+    else:
+        files, files_truncated = [], False
+        for fp in fast:
+            if len(files) >= GREP_MAX_FILES:
+                files_truncated = True
+                break
+            files.append(fp)
+    for fp in files:
         if should_stop and should_stop():
             return "[interrupted by user]"
         if _skip(fp) or not os.path.isfile(fp):
             continue
         try:
+            # Prescreen: one full-text regex pass (C speed) decides whether the file
+            # is worth the per-line Python loop at all. io.StringIO(text) then feeds
+            # that loop the exact same lines an open file would, so match/emit
+            # semantics are unchanged.
+            text = None
+            if rx_pre is not None and os.path.getsize(fp) <= GREP_FULLREAD_MAX:
+                with open(fp, errors="ignore") as f:
+                    text = f.read()
+                if not rx_pre.search(text):
+                    continue
+            src: io.TextIOBase = (io.StringIO(text) if text is not None
+                                  else open(fp, errors="ignore"))
             if ctx:
                 # context mode needs surrounding lines, so read the whole file and
                 # emit `--`-separated groups (merging overlapping windows), like grep -C.
-                with open(fp, errors="ignore") as f:
-                    flines = [ln.rstrip("\n") for ln in f]
+                with src as fh:
+                    flines = [ln.rstrip("\n") for ln in fh]
                 idxs = [i for i, ln in enumerate(flines) if rx.search(ln)]
                 if not idxs:
                     continue
@@ -411,8 +492,8 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
                         sep = ":" if rx.search(flines[j]) else "-"
                         emit(f"{fp}:{j+1}{sep} {_grep_clip(flines[j])}")
             else:
-                with open(fp, errors="ignore") as f:
-                    for i, ln in enumerate(f, 1):
+                with src as fh:
+                    for i, ln in enumerate(fh, 1):
                         if rx.search(ln):
                             matches += 1
                             emit(f"{fp}:{i}: {_grep_clip(ln.rstrip())}")

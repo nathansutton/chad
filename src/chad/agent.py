@@ -310,6 +310,10 @@ class Agent:
         # is chronological). Only updated when CHAD_PREFILL_TRACE is set.
         self._prefill_trace_prev = 0
         self._prefill_trace_seq = 0
+        # Tool executions since the last traced row: (name, wall_s) pairs. The tools a
+        # step runs produce the *next* step's appended prompt, so they're recorded on
+        # that next row (field `prev_tools`). Only populated when tracing is on.
+        self._trace_tools_pending: list = []
 
     @property
     def yolo(self) -> bool:
@@ -598,9 +602,13 @@ class Agent:
             # The engine diffs this full render against its live KV cache and prefills
             # only the appended tokens, so a plain re-render IS the cache-extension path
             # (truncated-turn divergence is handled inside engine._sync_to, not here).
+            _t0 = time.perf_counter()
             prompt_ids = self._render()
+            _render_s = time.perf_counter() - _t0
             _pre_compact_len = len(prompt_ids)
+            _t0 = time.perf_counter()
             prompt_ids = self._compact_if_needed(prompt_ids)
+            _compact_s = time.perf_counter() - _t0
             # Did compaction materially shrink the render this step? Derived from the
             # length delta at the call site (not compaction internals — see plan 034),
             # so a big next-prefill can be named as a re-prefill rather than a mystery.
@@ -744,7 +752,14 @@ class Agent:
                     "gen_s": round(stats.gen_s, 4),
                     "compacted": compacted, "sync_kind": sync_kind,
                     "peak_ctx": len(prompt_ids),
+                    # Loop overhead outside the engine: chat-template re-tokenization
+                    # and compaction wall time this step, plus the tools the *previous*
+                    # step ran (they produced the transcript this step prefilled).
+                    "render_s": round(_render_s, 4),
+                    "compact_s": round(_compact_s, 4),
+                    "prev_tools": self._trace_tools_pending,
                 })
+                self._trace_tools_pending = []
                 self._prefill_trace_prev = (
                     common + stats.prompt_tokens + stats.generated_tokens)
             # Cache divergence: a mid-session step that re-prefills everything (0 cached)
@@ -942,6 +957,7 @@ class Agent:
                 # tool (bash, symbol edits) and any write outside ./plans/ is blocked.
                 plan_write = (self.mode == "plan" and name in ("write", "edit")
                               and _under_plans(args.get("path", "")))
+                _tool_s = 0.0  # stays 0 when the tool is blocked/denied (fn never ran)
                 if self.mode == "plan" and is_mutating(name) and not plan_write:
                     result = ("[plan mode: only writing the plan file under ./plans/ is "
                               "allowed. Do not edit project files or run commands. "
@@ -952,15 +968,19 @@ class Agent:
                     # confirm prompt; everything else still goes through _confirm.
                     result = "[denied by user]"
                 else:
+                    _t0 = time.perf_counter()
                     try:
                         result = fn(args, self._should_stop)
                         if plan_write and result.startswith("[wrote"):
                             self.last_plan_path = os.path.abspath(args["path"])
                     except Exception as e:  # noqa: BLE001 - surface tool errors to model
                         result = f"[tool error: {type(e).__name__}: {e}]"
+                    _tool_s = time.perf_counter() - _t0
+                    if _PREFILL_TRACE:
+                        self._trace_tools_pending.append([name, round(_tool_s, 4)])
                 render_tool_result(self._emit, name, args, result)
-                log.info("TOOL %s(%s) -> %s", name, args_preview(args),
-                         result_preview(result))
+                log.info("TOOL %s(%s) -> %s [%.2fs]", name, args_preview(args),
+                         result_preview(result), _tool_s)
                 self.messages.append({"role": "tool", "name": name, "content": result})
                 # Update the guardrail bookkeeping flags (did_work / made_edit /
                 # unverified_edit) for this tool result — see guardrails.update_work_flags.

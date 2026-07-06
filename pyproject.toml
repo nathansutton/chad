@@ -43,6 +43,11 @@ dependencies = [
     "prompt_toolkit>=3.0.43",
     "tree-sitter>=0.25.2",
     "tree-sitter-language-pack>=1.11.0",
+    # repomap's personalized PageRank. Native and battle-tested where the previous
+    # hand-rolled power iteration was ours to maintain; single self-contained Rust
+    # wheel, zero transitive deps. Benchmarked vs scipy/networkx/igraph on a real
+    # 421k-edge graph: identical top-50 ranking, 0.79s -> 0.04s.
+    "rustworkx>=0.15",
     # Floor lowered from 1.28.1: serena-agent (the `lsp` extra) hard-pins mcp==1.27.0, and
     # chad's mcp surface (ClientSession, stdio/streamable-http clients, OAuthClientProvider)
     # is stable across 1.27+. The 1.27->1.28 delta is only deprecations chad doesn't touch.

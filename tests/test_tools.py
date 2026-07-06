@@ -10,6 +10,7 @@ focuses on the plan's grep/glob/write tables plus the core edit truth table.
 Run: `.venv/bin/python test_tools.py`
 """
 
+import glob as _glob
 import os
 import sys
 import tempfile
@@ -250,6 +251,58 @@ def test_glob():
 
         # no matches
         check("glob: no matches", tools.tool_glob("*.nosuchext") == "[no matches]")
+    finally:
+        os.chdir(cwd)
+
+
+def test_walk_fast_path_matches_glob():
+    """The pruned-walk fast path (plan: profiling pass) must return the same set as
+    glob for the basename-only patterns it claims, dirs included, dotfiles excluded;
+    structured patterns must decline (None) so callers fall back."""
+    cwd = os.getcwd()
+    try:
+        _seed({
+            "a.py": "x\n", "sub/b.py": "x\n", "sub/deep/c.txt": "x\n",
+            ".hidden/d.py": "x\n", ".dotfile.py": "x\n",
+            "node_modules/e.py": "x\n",
+        })
+        for pat in ("**/*", "**/*.py", "**/b.py"):
+            fast = sorted(tools._walk_glob(".", pat))
+            # one deliberate difference: glob+_skip kept the ignored dir ITSELF as an
+            # entry ("./node_modules" has no trailing slash for _skip to see); the
+            # walker prunes it entirely, so drop those from the parity expectation
+            slow = sorted(h for h in _glob.glob(os.path.join(".", pat), recursive=True)
+                          if not tools._skip(h)
+                          and os.path.basename(h) not in tools.IGNORE_DIRS)
+            check(f"walk fast path == glob for {pat}", fast == slow, (pat, fast, slow))
+        for pat in ("*.py", "sub/*.py", "sub/**/*.py", "**/deep/*.txt"):
+            check(f"structured pattern {pat} falls back", tools._walk_glob(".", pat) is None)
+    finally:
+        os.chdir(cwd)
+
+
+def test_grep_prescreen_edge_patterns():
+    """Patterns the whole-file prescreen can't mirror (lookarounds, \\A/\\Z) must skip
+    it and still match per-line; anchored patterns must survive the MULTILINE probe."""
+    cwd = os.getcwd()
+    try:
+        _seed({"a.py": "foo here\nbar\nfoo\n"})
+        check("negative lookahead still matches",
+              "a.py:3:" in tools.tool_grep(r"foo(?! here)"), tools.tool_grep(r"foo(?! here)"))
+        check("^ anchor matches mid-file", "a.py:2:" in tools.tool_grep(r"^bar$"))
+        check(r"\A pattern skips prescreen, matches line 1",
+              "a.py:1:" in tools.tool_grep(r"\Afoo"))
+    finally:
+        os.chdir(cwd)
+
+
+def test_grep_big_file_streams():
+    """Files over GREP_FULLREAD_MAX skip the prescreen read and stream line-by-line."""
+    cwd = os.getcwd()
+    try:
+        _seed({"big.txt": "pad\n" * (tools.GREP_FULLREAD_MAX // 4) + "NEEDLE end\n"})
+        out = tools.tool_grep("NEEDLE")
+        check("grep: match found past the full-read cap", "NEEDLE end" in out, out[:120])
     finally:
         os.chdir(cwd)
 

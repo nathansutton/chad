@@ -281,7 +281,10 @@ CHAD_TURN_BUDGET_S=600        uv run chad  # wall-clock variant (seconds); off b
 
 > **`CHAD_PREFILL_TRACE=path.jsonl`** is a dev/instrumentation knob, **not** supported
 > config: it captures one JSON row per engine prefill to the given path for measurement
-> spikes. Leave it unset in normal use.
+> spikes. Each row also carries the loop overhead outside the engine — `render_s`
+> (chat-template re-tokenization), `compact_s`, and `prev_tools` (the prior step's tool
+> executions as `[name, seconds]` pairs) — so a slow step can be attributed to prefill,
+> tokenization, compaction, or a tool without guessing. Leave it unset in normal use.
 
 ### Safety & A/B opt-outs
 
@@ -327,6 +330,29 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
   (`guardrails.py`) even in `--yolo`/auto mode. With it set, an injected `rm -rf ~`,
   `mkfs`, `dd of=/dev/…`, fork bomb, or `curl … | sh` is **not** screened before running.
   It is a seatbelt, not a security boundary (a sandbox is) — recommend leaving it unset.
+
+### Symbolic code intel (repo map & language server)
+
+Defaults are tuned for a big repo on a memory-tight machine (measured on an 11k-file
+checkout); you rarely need to touch these.
+
+```bash
+CHAD_REPOMAP_WORKERS=4   uv run chad  # subprocess workers for a cold repo scan (1 = serial)
+CHAD_LSP_TIMEOUT=10      uv run chad  # per-request language-server timeout, seconds (default 5)
+CHAD_LSP_MAX_RSS_MB=2048 uv run chad  # recycle a language server past this process-tree RSS (default 1536)
+```
+
+- **`CHAD_REPOMAP_WORKERS`** — how many `python -c` subprocess workers a cold whole-repo
+  tag scan shards across (`repomap.py`; default: cores−2, capped at 8). Workers import
+  only `chad.repomap` — never the MLX engine. Tags persist per repo under
+  `~/.chad/cache/repomap/` (mtime-validated per file), so warm sessions skip the scan.
+- **`CHAD_LSP_TIMEOUT`** — deadline for each language-server request (`lsp.py`). On
+  timeout the caller falls back to the tree-sitter backend, which labels its results
+  NAME-MATCH ONLY rather than implying precision.
+- **`CHAD_LSP_MAX_RSS_MB`** — after each request the server's process tree is measured;
+  past this cap it is stopped and restarts fresh on the next request. Guards against an
+  analysis server (pyright hit 4 GB on hot symbols) starving the GPU allocator that holds
+  the model weights.
 
 ### Session log & privacy
 
