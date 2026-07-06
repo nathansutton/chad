@@ -21,3 +21,19 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: deps
+    # These carry deliberate upper bounds in pyproject.toml, so a bump across the cap
+    # can't resolve — Dependabot would otherwise reopen a red group PR every week.
+    # Patch bumps within the pinned line still flow; widen the cap by hand (after
+    # reviewing the loader / ABI) when you actually want the next minor.
+    ignore:
+      # mlx / mlx-lm: <0.32 — the model loader rides on the 0.31 minor line.
+      - dependency-name: "mlx"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "mlx-lm"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # transformers: <5.13 — 5.13 regressed AutoTokenizer.register (import crash).
+      - dependency-name: "transformers"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # numpy: <2 — the 2.0 ABI break isn't supported by the mlx dep tree yet.
+      - dependency-name: "numpy"
+        update-types: ["version-update:semver-major"]
