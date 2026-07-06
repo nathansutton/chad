@@ -36,13 +36,13 @@ dependencies = [
     # it now does `key.__module__.startswith("transformers.")` with no hasattr guard, and
     # mlx-lm's tokenizer_utils passes the *string* "NewlineTokenizer" as config_class →
     # AttributeError at import. Cap below 5.13 until mlx-lm or transformers fixes it.
-    "transformers>=5.0,<5.13",
-    "numpy>=1.26,<2",
-    "huggingface-hub>=0.34", # first-run model download (cli.py/engine.py); imported directly, not just transitively
+    "transformers>=5.13.0,<5.14",
+    "numpy>=2.4.6,<3",
+    "huggingface-hub>=1.22.0", # first-run model download (cli.py/engine.py); imported directly, not just transitively
     "jedi>=0.19.2", # in-process symbolic code intelligence (read/search/edit)
     "prompt_toolkit>=3.0.43",
-    "tree-sitter>=0.25.2",
-    "tree-sitter-language-pack>=1.11.0",
+    "tree-sitter>=0.26.0",
+    "tree-sitter-language-pack>=1.12.2",
     # repomap's personalized PageRank. Native and battle-tested where the previous
     # hand-rolled power iteration was ours to maintain; single self-contained Rust
     # wheel, zero transitive deps. Benchmarked vs scipy/networkx/igraph on a real
@@ -86,7 +86,7 @@ Issues = "https://github.com/nathansutton/chad/issues"
 dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "types-pyyaml>=6"]
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=83.0.0"]
 build-backend = "setuptools.build_meta"
 
 # Standard src layout: the importable package lives at src/chad/. setuptools
