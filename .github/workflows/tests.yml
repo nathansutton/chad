@@ -50,6 +50,13 @@ jobs:
       - name: Sync dependencies (python ${{ matrix.python }})
         run: uv sync --python ${{ matrix.python }}
       - name: Fast test gate (no model)
+        # CHAD_FAST_TESTS=1 keeps this gate model-free (its documented contract): the
+        # tier-2 cache tests in test_engine.py self-skip instead of downloading a 4-bit
+        # proxy model. Those byte-exact warm-vs-fresh equality checks flip on quantized
+        # argmax near-ties across runner hardware (a numerical tie, not a cache bug — see
+        # the sibling quantization-tie skip), and are meant to run locally on real weights.
+        env:
+          CHAD_FAST_TESTS: "1"
         run: uv run --python ${{ matrix.python }} pytest -q
       - name: CLI smoke (entrypoint imports + parses, no model)
         run: uv run --python ${{ matrix.python }} chad --help

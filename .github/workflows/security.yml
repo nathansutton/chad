@@ -31,7 +31,31 @@ jobs:
           enable-cache: true
       - run: uv sync
       - name: pip-audit (known CVEs in dependencies)
-        run: uv run --with pip-audit python -m pip_audit
+        # The ignored advisories all live in transitive deps (starlette, python-multipart,
+        # cryptography) pulled ONLY through `mcp` / the optional `serena-agent` (lsp extra).
+        # serena-agent 1.5.3 — the latest — hard-pins `mcp==1.27.0`, which in turn pins
+        # starlette==1.0.0 / python-multipart==0.0.27, so the whole subtree is frozen: no
+        # upstream upgrade exists to resolve to. Reachability review, per advisory:
+        #   • starlette (PYSEC-2026-{161,248,249}, CVE-2026-48817/48818) and
+        #     python-multipart (CVE-2026-53538/53539/53540) are ASGI SERVER request-handling
+        #     / multipart-parsing bugs. chad uses mcp as a CLIENT (ClientSession + stdio/http
+        #     client transports) — it never runs a Starlette server or parses uploads.
+        #   • cryptography GHSA-537c-gmf6-5ccf is an OpenSSL out-of-bounds-read DoS in the
+        #     bundled libssl; chad's only crypto use is JWT handling in the mcp OAuth path,
+        #     which doesn't drive the affected TLS/X.509 parsing.
+        # Each is pinned by ID (not whole-package) so a NEW advisory still fails the gate.
+        # Drop these when serena-agent unpins mcp and the tree can move to patched versions.
+        run: >-
+          uv run --with pip-audit python -m pip_audit
+          --ignore-vuln GHSA-537c-gmf6-5ccf
+          --ignore-vuln PYSEC-2026-161
+          --ignore-vuln PYSEC-2026-248
+          --ignore-vuln PYSEC-2026-249
+          --ignore-vuln CVE-2026-48817
+          --ignore-vuln CVE-2026-48818
+          --ignore-vuln CVE-2026-53538
+          --ignore-vuln CVE-2026-53539
+          --ignore-vuln CVE-2026-53540
 
   secrets:
     # Scans the entire history (fetch-depth: 0) for committed credentials. No license

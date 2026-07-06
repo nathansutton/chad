@@ -336,9 +336,9 @@ def _build_engine(model_id=TIER2_MODEL, enable_pld_hybrid=False):
 
 
 def test_pld_equals_greedy():
-    # The aggregate runner (run_tests.py) sets CHAD_FAST_TESTS=1 for its fast default
-    # gate; this tier loads a real model (seconds–minutes when cached) so skip it there.
-    # It still runs under `run_tests.py --evals` (which does NOT set the var).
+    # CI's fast gate (.github/workflows/tests.yml) sets CHAD_FAST_TESTS=1 to stay
+    # model-free; this tier loads a real model (seconds–minutes when cached) so skip it
+    # there. Run it locally by invoking pytest WITHOUT that var (weights on disk).
     if os.environ.get("CHAD_FAST_TESTS"):
         return skip("pld_equals_greedy", "CHAD_FAST_TESTS set (fast gate; skips model load)")
     eng = _build_engine()
