@@ -160,10 +160,27 @@ def test_render_real_error_uses_error_style():
           events == [("error", "  ⎿ no such file: /x/y.py")], repr(events))
 
 
+def test_render_glob_no_matches_is_zero_files():
+    # "[no matches]" is one line of text but zero files — it used to render "1 file".
+    events = _emits("glob", {}, "[no matches]")
+    check("glob no-matches shows 0 files", events == [("muted", "  ⎿ 0 files")], repr(events))
+
+
+def test_render_grep_notice_lines_not_counted():
+    # The truncation notice contains a ":" but is not a match; only path:line: hits count.
+    result = ("./a.py:1: NEEDLE\n./a.py:2: NEEDLE\n"
+              "[results truncated: 2/500 lines — narrow the pattern or add a path]")
+    events = _emits("grep", {}, result)
+    check("grep summary excludes notices",
+          events == [("muted", "  ⎿ 2 matches in 1 file")], repr(events))
+
+
 if __name__ == "__main__":
     test_is_err_flags_real_diagnostics()
     test_is_err_ignores_legitimate_output()
     test_render_read_of_bracket_content_is_not_error()
     test_render_real_error_uses_error_style()
+    test_render_glob_no_matches_is_zero_files()
+    test_render_grep_notice_lines_not_counted()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

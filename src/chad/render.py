@@ -368,12 +368,13 @@ def render_tool_result(emit, name: str, args: dict, result: str):
         emit("muted", f"  ⎿ sub-agent returned {n} line{'s' * (n != 1)}")
         _indent_block(emit, result, max_lines=4)
     elif name == "grep":
-        lines = [l for l in result.splitlines() if ":" in l]
+        # `[`-leading lines are notices ("[results truncated: …]"), not path:line: hits.
+        lines = [l for l in result.splitlines() if ":" in l and not l.startswith("[")]
         files = len({l.split(":", 1)[0] for l in lines})
         n = len(lines)
         emit("muted", f"  ⎿ {n} match{'es' * (n != 1)} in {files} file{'s' * (files != 1)}")
     elif name == "glob":
-        n = _nlines(result)
+        n = 0 if result == "[no matches]" else _nlines(result)
         emit("muted", f"  ⎿ {n} file{'s' * (n != 1)}")
     elif name == "write_todos":
         for line in result.splitlines()[1:]:  # drop the "Plan updated:" header

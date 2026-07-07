@@ -23,12 +23,15 @@ Run: `uv run python test_agent_guards.py`
 from chad.guardrails import (
     GOV_HARD_FRAC,
     GOV_SOFT_FRAC,
+    STEP_CAP_CEILING,
     advance_governor,
     bash_result_verifies,
     bash_thrash_nudge,
     budget_band,
     budget_fraction,
+    degenerate_tail,
     done_rejection,
+    extend_step_cap,
     is_destructive_bash,
     is_repeat_loop,
     landing_nudge,
@@ -36,6 +39,7 @@ from chad.guardrails import (
     loop_signature,
     nudge_for_no_calls,
     progress_note,
+    repeat_stop_abort,
     think_budget,
     turn_governor,
     update_thrash,
@@ -232,6 +236,27 @@ def test_landing_nudge():
                         unverified_edit=False, landing_nudges=1) is None)
 
 
+def test_extend_step_cap():
+    MAX = 40
+    CEIL = MAX * STEP_CAP_CEILING
+    # A window that landed+verified a change earns another half-window.
+    check("extends on landed+verified progress",
+          extend_step_cap(MAX, MAX, landed_in_window=True, hard_ceiling=CEIL) == 60)
+    # A window with no landed+verified change ends the turn (governor philosophy:
+    # the cap only kills turns that stopped making real progress).
+    check("no extension without progress",
+          extend_step_cap(MAX, MAX, landed_in_window=False, hard_ceiling=CEIL) is None)
+    # Repeated extensions clamp to the absolute ceiling...
+    check("extension clamps at the ceiling",
+          extend_step_cap(150, MAX, landed_in_window=True, hard_ceiling=CEIL) == CEIL)
+    # ...and AT the ceiling there is nothing left to grant, progress or not.
+    check("ceiling is hard even with progress",
+          extend_step_cap(CEIL, MAX, landed_in_window=True, hard_ceiling=CEIL) is None)
+    # Degenerate window size still moves forward rather than granting +0.
+    check("tiny base cap still extends by at least 1",
+          extend_step_cap(1, 1, landed_in_window=True, hard_ceiling=4) == 2)
+
+
 def test_thrash_guard():
     # A run of failing bash with no edit accumulates; the loop guard would miss it
     # because each command string differs (the demonstrated import-probing tail).
@@ -307,6 +332,42 @@ def test_think_budget():
           think_budget(1, base=800) == 1024, think_budget(1, 800))
     check("large base never undercut by ramp",
           think_budget(2, base=5000) == 5000, think_budget(2, 5000))
+
+
+def test_degenerate_tail():
+    """The repetition detector must catch the observed decode-loop signature (a short
+    unit repeated end-to-end) without ever tripping on legitimate long output."""
+    # The real failure from the dogfood trace: good answer, then one unit repeated to
+    # the token cap.
+    runaway = "The config file centralizes reads. Names: " + "`CHAD_NO_TASK`, " * 200
+    check("real decode loop detected", degenerate_tail(runaway))
+    # A pure whitespace run is degenerate too (period 1).
+    check("whitespace run detected", degenerate_tail("intro text" + "\n" * 3000))
+    # Longer repeating unit, still within the max period.
+    unit = "the same sentence keeps coming back again and again in this output. "
+    check("paragraph-scale loop detected", degenerate_tail("preamble " + unit * 60))
+    # Negatives: legitimate output must never trip it.
+    check("short text never fires", not degenerate_tail("CHAD_NO_TASK, " * 20))
+    prose = " ".join(f"Sentence number {i} explains a different part of the pipeline."
+                     for i in range(60))
+    check("varying prose ok", not degenerate_tail(prose))
+    # Repetition the model has already MOVED ON from must not fire either — the
+    # detector keys on the tail being stuck right now.
+    unit40 = ("The dispatcher hands the call to the tool table for execution. ") * 40
+    check("past repetition with a fresh tail ok",
+          not degenerate_tail(unit40 + "x" * 300 + " and now a completely new thought."))
+    code = "\n".join(f"def helper_{i}(x):\n    return x + {i}\n" for i in range(120))
+    check("templated code ok", not degenerate_tail(code))
+    # A unit longer than REPEAT_MAX_PERIOD is out of scope by design (needs the cap).
+    big_unit = ("x" * 300 + " different filler words here ") * 20
+    check("over-long unit out of scope", not degenerate_tail(big_unit))
+
+
+def test_repeat_stop_abort():
+    # Two cut-offs get nudged; the 3rd aborts the turn (mirrors loop_should_abort).
+    check("first stop nudges", not repeat_stop_abort(1))
+    check("second stop nudges", not repeat_stop_abort(2))
+    check("third stop aborts", repeat_stop_abort(3))
 
 
 def test_budget_fraction_and_band():
@@ -467,9 +528,12 @@ if __name__ == "__main__":
     test_loop_guard()
     test_nudge_for_no_calls()
     test_landing_nudge()
+    test_extend_step_cap()
     test_thrash_guard()
     test_destructive_bash_guard()
     test_think_budget()
+    test_degenerate_tail()
+    test_repeat_stop_abort()
     test_budget_fraction_and_band()
     test_turn_governor()
     test_governor_two_band_jump_credits_progress()

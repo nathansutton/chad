@@ -634,11 +634,99 @@ def test_push_pop_bit_exact():
           f"\n--- QUARANTINE ---\n{quar!r}\n--- CONTROL ---\n{control!r}")
 
 
+# --- plan 064: on-disk KV cache bounding (no model, pure filesystem) ---------
+
+def _touch(path, size, age_s=0.0):
+    """Create a file of `size` bytes whose mtime is `age_s` seconds in the past."""
+    import time
+    with open(path, "wb") as f:
+        f.write(b"\0" * size)
+    t = time.time() - age_s
+    os.utime(path, (t, t))
+    return path
+
+
+def test_sweep_orphan_spills_removes_only_old_push_files():
+    import tempfile
+
+    from chad.engine import sweep_orphan_spills
+    with tempfile.TemporaryDirectory() as d:
+        old_push = _touch(os.path.join(d, "push-aaa.safetensors"), 100, age_s=10 * 3600)
+        new_push = _touch(os.path.join(d, "push-bbb.safetensors"), 100, age_s=0)
+        old_warm = _touch(os.path.join(d, "warm-ccc.safetensors"), 100, age_s=10 * 3600)
+        freed = sweep_orphan_spills(d, max_age_s=6 * 3600)
+        check("old push-spill removed", not os.path.exists(old_push))
+        check("fresh push-spill kept", os.path.exists(new_push))
+        check("old warm file untouched by sweep", os.path.exists(old_warm))
+        check("sweep reports bytes freed", freed == 100, f"freed={freed}")
+    check("sweep of a missing dir is a no-op",
+          sweep_orphan_spills("/nonexistent/nope", max_age_s=1) == 0)
+
+
+def test_enforce_cache_budget_evicts_lru_first():
+    import tempfile
+
+    from chad.engine import enforce_cache_budget
+    with tempfile.TemporaryDirectory() as d:
+        # 4 x 100B, oldest first; budget 250B -> the two oldest must go.
+        paths = [_touch(os.path.join(d, f"warm-{i}.safetensors"), 100,
+                        age_s=(4 - i) * 3600) for i in range(4)]
+        freed = enforce_cache_budget(d, max_bytes=250, protect=set())
+        check("evicted down to budget", freed == 200, f"freed={freed}")
+        check("oldest two evicted",
+              [os.path.exists(p) for p in paths] == [False, False, True, True],
+              str([os.path.exists(p) for p in paths]))
+
+
+def test_enforce_cache_budget_protects_paths():
+    import tempfile
+
+    from chad.engine import enforce_cache_budget
+    with tempfile.TemporaryDirectory() as d:
+        oldest = _touch(os.path.join(d, "warm-old.safetensors"), 100, age_s=2 * 3600)
+        newest = _touch(os.path.join(d, "warm-new.safetensors"), 100, age_s=0)
+        # Budget forces one eviction; the LRU candidate is protected, so the next
+        # oldest goes instead — protection wins even if the dir stays over budget.
+        enforce_cache_budget(d, max_bytes=100, protect={oldest})
+        check("protected LRU file survives", os.path.exists(oldest))
+        check("unprotected newer file evicted instead", not os.path.exists(newest))
+
+
+def test_enforce_cache_budget_disabled_when_zero():
+    import tempfile
+
+    from chad.engine import enforce_cache_budget
+    with tempfile.TemporaryDirectory() as d:
+        p = _touch(os.path.join(d, "warm-x.safetensors"), 100, age_s=3600)
+        check("zero budget is disabled", enforce_cache_budget(d, 0, set()) == 0)
+        check("zero budget removes nothing", os.path.exists(p))
+
+
+def test_ckpt_path_filenames_are_kind_tagged():
+    import tempfile
+
+    from chad.engine import Engine
+    with tempfile.TemporaryDirectory() as d:
+        eng = object.__new__(Engine)  # bypass __init__ (no weights to load)
+        eng.model_id = "test-model"
+        eng.cache_dir = d
+        warm = os.path.basename(eng._ckpt_path([1, 2, 3]))
+        push = os.path.basename(eng._ckpt_path([1, 2, 3], tag="push"))
+        check("warm checkpoint basename tagged", warm.startswith("warm-"), warm)
+        check("push checkpoint basename tagged", push.startswith("push-"), push)
+        check("kinds hash differently", warm.split("-", 1)[1] != push.split("-", 1)[1])
+
+
 if __name__ == "__main__":
     tier1 = (test_longest_match_wins, test_recency_tie_break, test_no_match,
              test_guards, test_draft_length, test_prefill_progress_callback,
              test_interrupted_prefill_records_only_fed_tokens,
-             test_stop_condition_soft_close)
+             test_stop_condition_soft_close,
+             test_sweep_orphan_spills_removes_only_old_push_files,
+             test_enforce_cache_budget_evicts_lru_first,
+             test_enforce_cache_budget_protects_paths,
+             test_enforce_cache_budget_disabled_when_zero,
+             test_ckpt_path_filenames_are_kind_tagged)
     tier2 = (test_pld_equals_greedy,
              test_pld_hybrid_equals_greedy,
              test_degenerate_reprefill_matches_fresh,

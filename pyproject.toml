@@ -97,8 +97,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# The model-backed eval tiers self-skip without weights; the fast unit gate stays green.
-addopts = "-q"
+# No "-q" here: CI/docs/agents all invoke `pytest -q` explicitly, and stacking the two
+# (verbosity -2) suppresses the final "N passed" summary line entirely — an agent
+# running the gate then gets output with no verdict in it.
 
 [tool.ruff]
 line-length = 100

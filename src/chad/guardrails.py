@@ -173,6 +173,24 @@ def landing_nudge(step, max_steps, made_edit, unverified_edit, landing_nudges):
             "if it fails, then call done — do not start any new exploration.]")
 
 
+STEP_CAP_CEILING = 4  # absolute per-turn step ceiling = STEP_CAP_CEILING * max_steps
+
+
+def extend_step_cap(step_cap, base_max_steps, landed_in_window, hard_ceiling):
+    """At the step cap with the turn still landing AND verifying changes, grant another
+    window instead of killing productive work (the demonstrated failure: a plan-
+    implementation turn with steady verified edits force-stopped dead at step 40, an
+    edit half-applied). Mirrors the governor's philosophy — never interrupt landed+
+    verified progress — which the fixed cap used to override. Extends by half the base
+    cap, never past hard_ceiling; a window that landed nothing verified does NOT extend
+    (the turn ends and banks a progress note). The governor's token/wall budget remains
+    the runaway backstop. Returns the new cap, or None to stop. Pure/testable."""
+    if not landed_in_window:
+        return None
+    new_cap = min(step_cap + max(1, base_max_steps // 2), hard_ceiling)
+    return new_cap if new_cap > step_cap else None
+
+
 def update_thrash(name, result, consecutive_failed_bash):
     """Track a run of bash commands that errored back-to-back with no edit between them
     — the environment-thrash / flailing-probe signature (repeatedly guessing the test
@@ -220,6 +238,56 @@ def think_budget(stuck_level: int, base: int = 512) -> int:
     if stuck_level <= 0:
         return base
     return max(base, THINK_CAP_RAMP[min(stuck_level - 1, len(THINK_CAP_RAMP) - 1)])
+
+
+# --- degenerate-repetition stop ------------------------------------------------------
+# Greedy decode on a small quantized model can fall into a literal repetition loop: the
+# dogfood traces caught a step that wrote a complete, correct answer in ~600 chars and
+# then repeated "`CHAD_NO_TASK`, " ~1,300 times until the 8192-token cap — 225s of dead
+# generation, twice in one task (blowing its timeout). Unlike the think-budget (an
+# opt-in capability trade, plan 039), this guard only fires on output that is already
+# garbage, so it is ON by default (CHAD_NO_REPEAT_GUARD=1 disables). run_turn checks the
+# generation's tail every few tokens; on a hit it stops the step (prefix-safe — the
+# generated tokens are already in the KV cache) and nudges the model out of the loop.
+REPEAT_TAIL_CHARS = 2048    # window that must be fully periodic — long enough that no
+                            # legitimate prose/code run trips it, short enough to fire
+                            # a few hundred tokens into a runaway, not 8k tokens in
+REPEAT_MAX_PERIOD = 256     # unit ≤ this ⇒ the window holds ≥ 8 repeats
+
+
+def degenerate_tail(text: str, tail: int = REPEAT_TAIL_CHARS,
+                    max_period: int = REPEAT_MAX_PERIOD) -> bool:
+    """True when the last `tail` chars of `text` are one short unit repeated end-to-end
+    — the degenerate-decode signature. The smallest period comes from the KMP prefix
+    function (p = len - f[-1] ⇒ s[i] == s[i-p] for all i ≥ p, regardless of where the
+    window cuts into the unit — a plain `(s+s).find(s)` doubling test would only catch
+    periods that divide the window exactly). ~0.5ms of pure Python over a 2KB window;
+    run_turn calls it every 16 tokens, i.e. a few times per second against a ~25ms/token
+    decode, so the cost is noise."""
+    if len(text) < tail:
+        return False
+    s = text[-tail:]
+    f = [0] * len(s)  # KMP prefix function (longest proper border of s[:i+1])
+    k = 0
+    for i in range(1, len(s)):
+        while k and s[i] != s[k]:
+            k = f[k - 1]
+        if s[i] == s[k]:
+            k += 1
+        f[i] = k
+    return len(s) - f[-1] <= max_period
+
+
+REPEAT_STOP_NUDGE = (
+    "[your output degenerated into repeating the same text over and over; it was cut "
+    "off. Do not continue that repetition. Give your final answer concisely, or make "
+    "the next tool call, now.]")
+
+
+def repeat_stop_abort(repeat_stops: int) -> bool:
+    """Abort the turn after the 3rd repetition cut-off — the nudge isn't breaking the
+    decode loop, and each retry costs another stall. Mirrors loop_should_abort."""
+    return repeat_stops >= 3
 
 
 # --- runaway-turn governor (plan 040) ----------------------------------------------

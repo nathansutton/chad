@@ -40,6 +40,11 @@ from . import config
 from .base_engine import GenStats
 from .diag import log
 
+# checkpoint filename kinds (prefix on the basename) — lets cleanup target the
+# ephemeral push-spills without touching durable warm-prefix files.
+_CKPT_WARM = "warm"
+_CKPT_PUSH = "push"
+
 
 def _local_path(model_id: str) -> str:
     """Resolve a cached HF repo id to its on-disk snapshot dir so `mlx_lm.load` (and
@@ -116,6 +121,70 @@ def prompt_lookup_draft(context, num_draft, ngram_max=3, ngram_min=1):
     return []
 
 
+def sweep_orphan_spills(cache_dir: str, max_age_s: float) -> int:
+    """Delete push-spill checkpoints older than max_age_s. A push-spill lives only
+    for the duration of an active sub-agent (seconds–minutes) and is removed by
+    pop_cache on the clean path; anything older was orphaned by a killed/crashed
+    process and is dead weight. Returns bytes freed. Never raises."""
+    freed = 0
+    try:
+        deadline = time.time() - max_age_s
+        for name in os.listdir(cache_dir):
+            if not name.startswith(_CKPT_PUSH + "-") or not name.endswith(".safetensors"):
+                continue
+            path = os.path.join(cache_dir, name)
+            try:
+                st = os.stat(path)
+                if st.st_mtime < deadline:
+                    os.remove(path)
+                    freed += st.st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return freed
+
+
+def enforce_cache_budget(cache_dir: str, max_bytes: int, protect: set) -> int:
+    """Keep the checkpoint dir under max_bytes by deleting least-recently-modified
+    files first. Files in `protect` (absolute paths currently referenced by a live
+    session) are never deleted. max_bytes <= 0 disables the cap. Returns bytes freed.
+    Never raises."""
+    if max_bytes <= 0:
+        return 0
+    freed = 0
+    try:
+        entries = []
+        total = 0
+        for name in os.listdir(cache_dir):
+            if not name.endswith(".safetensors"):
+                continue
+            path = os.path.join(cache_dir, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, path))
+            total += st.st_size
+        if total <= max_bytes:
+            return 0
+        entries.sort()  # oldest st_mtime first
+        for _mtime, size, path in entries:
+            if total <= max_bytes:
+                break
+            if path in protect:
+                continue
+            try:
+                os.remove(path)
+                total -= size
+                freed += size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return freed
+
+
 @dataclass
 class Engine:
     model_id: str = "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"
@@ -135,6 +204,7 @@ class Engine:
     # Opt in for that workload; the default standard path is faster for general use.
     enable_pld_hybrid: bool = False
     cache_dir: Optional[str] = None # ds4-style on-disk KV checkpoints; None disables
+    kv_cache_max_bytes: int = 8 * 1024**3  # LRU-evict the on-disk KV cache above this; 0 disables
 
     # mlx model/tokenizer/cache are loaded dynamically (mlx_lm has no stubs); annotate
     # as Any so the gate doesn't chase attributes/calls on objects mypy can't see.
@@ -311,7 +381,8 @@ class Engine:
         h.update(np.asarray(ids, dtype=np.uint32).tobytes())
         # cache_dir is Optional on the dataclass but is always set when checkpointing
         # is enabled, which is the only path that reaches _ckpt_path.
-        return os.path.join(self.cache_dir, h.hexdigest() + ".safetensors")  # type: ignore[arg-type]
+        kind = _CKPT_PUSH if tag == _CKPT_PUSH else _CKPT_WARM
+        return os.path.join(self.cache_dir, f"{kind}-{h.hexdigest()}.safetensors")  # type: ignore[arg-type]
 
     def warm_prefix(self, prefix_ids: list, should_stop=None):
         """Make a cold session start warm. If a disk checkpoint for exactly these
@@ -347,6 +418,7 @@ class Engine:
         try:
             os.makedirs(self.cache_dir, exist_ok=True)
             cache_utils.save_prompt_cache(path, self._cache)
+            self._enforce_kv_budget(path)
         except Exception:
             pass                           # disk full / read-only -> just skip persist
         return ("miss", len(prefix_ids))
@@ -477,12 +549,13 @@ class Engine:
             "spill_path": None,
         }
         if self._should_spill(self._cached_ids):
-            path = self._ckpt_path(self._cached_ids, tag="push")
+            path = self._ckpt_path(self._cached_ids, tag=_CKPT_PUSH)
             try:
                 os.makedirs(self.cache_dir, exist_ok=True)
                 cache_utils.save_prompt_cache(path, self._cache)
                 frame["spill_path"] = path
                 frame["cache"] = None  # drop the RAM reference; reclaimed on pop
+                self._enforce_kv_budget(path)
             except Exception:  # noqa: BLE001 — disk full/read-only -> just hold in RAM
                 pass
         self._cache_stack.append(frame)
@@ -527,6 +600,17 @@ class Engine:
         self._pld_hybrid = frame["pld_hybrid"]
         self._warm_prefix_ids = frame["warm_prefix_ids"]
         mx.clear_cache()
+
+    def _enforce_kv_budget(self, just_written: str) -> None:
+        """LRU-evict the on-disk KV cache dir down to `kv_cache_max_bytes`, protecting
+        the file just written and the current live warm-prefix file. Best-effort: never
+        raises into the hot path."""
+        if not self.cache_dir:
+            return
+        protect = {just_written}
+        if self._warm_prefix_ids:
+            protect.add(self._ckpt_path(self._warm_prefix_ids))
+        enforce_cache_budget(self.cache_dir, self.kv_cache_max_bytes, protect)
 
     # -- generation -------------------------------------------------------
 

@@ -120,7 +120,13 @@ def _bash_headtail(s: str) -> str:
 # pathological long lines (minified/data files).
 READ_DEFAULT_LIMIT = 400
 READ_MAX_LIMIT = 800
-READ_MAX_CHARS = 24000
+# Hard cap on the chars any single read appends to the transcript. This is the one
+# uncapped path for NON-code files: skeleton mode (below) shrinks big parseable code,
+# but a large README/markdown/doc has no skeleton and would otherwise dump its whole
+# body. Dogfooding showed a ~24k-char read = ~8k tokens = a ~25s prefill stall before
+# the next turn speaks. Cap at ~10k chars (≈3k tokens): still a generous view, ~10s
+# worst case; the note tells the model to page (offset=) or grep for the rest.
+READ_MAX_CHARS = 10000
 # Above this many lines, a default (un-paged) read of a parseable code file returns
 # its SKELETON (signatures) instead of the body. The eval data showed the model
 # defaults to `read` even when view_symbol is cheaper, so the harness — not the
@@ -392,6 +398,12 @@ def tool_glob(pattern: str, should_stop=None) -> str:
 GREP_MAX_LINES = 200
 GREP_MAX_FILES = 5000
 GREP_LINE_CHARS = 500
+# Total output cap (mirrors READ_MAX_CHARS). The line cap alone isn't enough: 200 lines
+# × 500 chars = ~100k chars ≈ 28k tokens of prefill. Dogfooding a "find every CHAD_ use"
+# grep returned 84 long match lines = ~6k tokens = a ~19s stall before the next turn.
+# ~10k chars (≈3k tokens) keeps a wide grep responsive; the truncation notice already
+# tells the model to narrow the pattern or add a path for the rest.
+GREP_MAX_CHARS = 10000
 
 
 def _grep_clip(s: str) -> str:
@@ -429,32 +441,43 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
     rx_pre = _grep_prescreen_rx(pattern, flags)
     ctx = max(0, min(int(context or 0), 5))
     out: list[str] = []
+    out_chars = 0      # running total of emitted chars (bounds prefill; see GREP_MAX_CHARS)
     matches = 0        # total match lines seen (may exceed what we emit once capped)
-    capped = False     # hit the GREP_MAX_LINES output cap
+    capped = False     # hit the line- or char-count output cap
 
     def emit(s: str):
-        nonlocal capped
-        if len(out) < GREP_MAX_LINES:
+        nonlocal capped, out_chars
+        if len(out) < GREP_MAX_LINES and out_chars < GREP_MAX_CHARS:
             out.append(s)
+            out_chars += len(s) + 1  # +1 for the join newline
         else:
             capped = True
 
-    fast = _walk_glob(path, glob)
-    if fast is None:
-        files = _glob.glob(os.path.join(path, glob), recursive=True)
-        files_truncated = len(files) > GREP_MAX_FILES
-        files = files[:GREP_MAX_FILES]
+    # The model routinely passes a file as `path` (the schema says directory); walking
+    # a file yields nothing, which used to read as a clean "[no matches]". Search the
+    # named file instead — explicit naming also overrides the skip list, like `read`.
+    explicit_file = os.path.isfile(path)
+    if explicit_file:
+        files, files_truncated = [path], False
+    elif not os.path.isdir(path):
+        return f"[path not found: {path}]"
     else:
-        files, files_truncated = [], False
-        for fp in fast:
-            if len(files) >= GREP_MAX_FILES:
-                files_truncated = True
-                break
-            files.append(fp)
+        fast = _walk_glob(path, glob)
+        if fast is None:
+            files = _glob.glob(os.path.join(path, glob), recursive=True)
+            files_truncated = len(files) > GREP_MAX_FILES
+            files = files[:GREP_MAX_FILES]
+        else:
+            files, files_truncated = [], False
+            for fp in fast:
+                if len(files) >= GREP_MAX_FILES:
+                    files_truncated = True
+                    break
+                files.append(fp)
     for fp in files:
         if should_stop and should_stop():
             return "[interrupted by user]"
-        if _skip(fp) or not os.path.isfile(fp):
+        if not explicit_file and (_skip(fp) or not os.path.isfile(fp)):
             continue
         try:
             # Prescreen: one full-text regex pass (C speed) decides whether the file
@@ -722,7 +745,8 @@ SCHEMAS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string"},
-                    "path": {"type": "string", "description": "Directory to search (default '.')."},
+                    "path": {"type": "string",
+                             "description": "Directory or file to search (default '.')."},
                     "glob": {"type": "string", "description": "File glob (default '**/*')."},
                     "ignore_case": {"type": "boolean",
                                     "description": "Case-insensitive match (default false)."},

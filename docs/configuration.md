@@ -296,6 +296,7 @@ CHAD_NO_SYMBOLS=1            uv run chad  # A/B knob: hide the tree-sitter symbo
 CHAD_NO_TASK=1              uv run chad  # A/B knob: hide the subagent/Task delegation tool
 CHAD_NO_VALIDATE=1          uv run chad  # A/B knob: DISABLE arg coercion + schema validation
 CHAD_NO_GOVERNOR=1          uv run chad  # A/B knob: DISABLE the runaway-turn governor
+CHAD_NO_REPEAT_GUARD=1      uv run chad  # A/B knob: DISABLE the degenerate-repetition stop
 CHAD_NO_SYNTAX_GATE=1       uv run chad  # A/B knob: DISABLE the post-edit syntax gate
 CHAD_NO_PREFIX_CACHE=1      uv run chad  # measurement knob: drop the persistent prefix KV cache
 CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbelt (unsafe)
@@ -320,6 +321,13 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
   think-cap](#turn-budgets--think-cap)), so a turn is never force-ended on its
   prefill/wall-clock budget. An A/B knob for measuring what the governor buys; the turn
   runs until the model stops on its own.
+- **`CHAD_NO_REPEAT_GUARD`** — **disables** the degenerate-repetition stop (`guardrails.py`).
+  Greedy decode on a small quantized model can lock into repeating one short string until
+  the per-step token cap — minutes of dead generation per occurrence. By default chad
+  watches the generation's tail, cuts the step off as soon as it turns fully periodic, and
+  nudges the model out of the loop (aborting the turn after 3 cut-offs). Unlike the
+  think-cap this never trades capability — it only fires on output that is already garbage
+  — so it is on by default; this knob is the A/B arm.
 - **`CHAD_NO_SYNTAX_GATE`** — **disables** the post-edit syntax gate (`syntaxgate.py`),
   which normally warns when an edit *introduces* a new syntax error (it never flags a
   pre-existing one). An A/B arm for `run_evals --ab`; leave unset in normal use.

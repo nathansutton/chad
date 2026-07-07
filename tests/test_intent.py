@@ -182,11 +182,70 @@ def test_non_utf8_project_docs_dont_crash():
         os.chdir(cwd)
 
 
+def test_plan_prefix():
+    """Plan mode must ANSWER a question in prose, not manufacture a plan file (the
+    '84-line plan for a 3-sentence tour' regression); a real change request still gets
+    the plan-file mandate. _plan_prefix is the intent->preamble selector."""
+    from chad.agent import _PLAN_PREFIX, _PLAN_PREFIX_CONCEPTUAL, _plan_prefix
+    for q in ["give me a 3-sentence tour of this project",
+              "how does the cache eviction work?",
+              "what is the single most important file and why"]:
+        pre = _plan_prefix(classify_intent(q))
+        check(f"plan mode answers question in prose: {q[:34]!r}",
+              pre is _PLAN_PREFIX_CONCEPTUAL, f"got {pre[:48]!r}")
+    for a in ["add a --json flag to the cli",
+              "refactor the engine cache eviction",
+              "fix the off-by-one in inclusive_range"]:
+        pre = _plan_prefix(classify_intent(a))
+        check(f"plan mode writes a plan for a change: {a[:34]!r}",
+              pre is _PLAN_PREFIX, f"got {pre[:48]!r}")
+
+
+def test_clip_tool_result():
+    """No single tool result should blow up the next turn's prefill: oversized output is
+    truncated with a note (keeping the head); small output passes through untouched."""
+    from chad.agent import _MAX_TOOL_RESULT_CHARS, _clip_tool_result
+    small = "x" * 100
+    check("small tool result passes through unchanged", _clip_tool_result(small) == small)
+    big = "y" * (_MAX_TOOL_RESULT_CHARS + 5000)
+    clipped = _clip_tool_result(big)
+    check("oversized tool result is bounded + annotated",
+          len(clipped) < len(big) and "truncated" in clipped, f"len={len(clipped)}")
+    check("clip keeps the head", clipped.startswith("y" * 1000))
+    tight = _clip_tool_result(big, cap=2000)
+    check("explicit cap clips harder than the default",
+          tight.startswith("y" * 2000) and not tight.startswith("y" * 2001)
+          and "truncated" in tight)
+
+
+def test_step_tool_cap():
+    """A step's SEVERAL tool results must not stack into one giant prefill: the first
+    call may use the whole per-step budget, later calls get only what's left, and every
+    call keeps at least a floor-sized head (an edit/bash outcome is never swallowed)."""
+    from chad.agent import (
+        _MAX_TOOL_RESULT_CHARS,
+        _STEP_TOOL_BUDGET_CHARS,
+        _STEP_TOOL_FLOOR_CHARS,
+        _step_tool_cap,
+    )
+    check("first call of a step gets the full single-call cap",
+          _step_tool_cap(0) == _MAX_TOOL_RESULT_CHARS)
+    check("later calls get the remaining step budget",
+          _step_tool_cap(10000) == _STEP_TOOL_BUDGET_CHARS - 10000)
+    check("a spent budget still leaves the floor",
+          _step_tool_cap(_STEP_TOOL_BUDGET_CHARS) == _STEP_TOOL_FLOOR_CHARS)
+    check("an overspent budget (floor overruns) still leaves the floor",
+          _step_tool_cap(_STEP_TOOL_BUDGET_CHARS + 5000) == _STEP_TOOL_FLOOR_CHARS)
+
+
 if __name__ == "__main__":
     test_intent()
     test_open_tool_call()
     test_mentions()
     test_detect_test_command()
     test_non_utf8_project_docs_dont_crash()
+    test_plan_prefix()
+    test_clip_tool_result()
+    test_step_tool_cap()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

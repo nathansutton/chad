@@ -39,9 +39,11 @@ _HF_9B = "nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX"     # low-RAM fallback, ~5 
 _LOCAL_35B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-35B-dyn2-q2-awq")
 _LOCAL_9B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-9B-4bit-awq")
 # The 35B (2-bit experts / 6-bit backbone) is ~12 GB resident + KV + runtime ≈ 14 GB
-# peak. Comfortable at ≥24 GB; on 16/18 GB MacBook Pros the default Metal wired limit
-# (~2/3 RAM) sits below that, so we fall back to the 9B (fits easily) automatically.
-_BIG_RAM_GB = 23.5
+# peak, and the KV grows across a long agentic turn. On a 24 GB Mac the Metal wired
+# limit (~2/3 RAM ≈ 16 GB) minus the OS and whatever else is open leaves too little
+# headroom — dogfooding SIGKILLed the 35B mid-turn there. So the floor for the 35B is
+# 32 GB; 24 GB (and the 16/18 GB MacBook Pros) fall back to the 9B, which fits easily.
+_BIG_RAM_GB = 31.5
 
 
 # These are the STRICT siblings of config.env_int/env_float: a non-numeric value raises
@@ -289,19 +291,27 @@ def main():
                     help="on a one-shot run, if the governor hard-stops a turn, relaunch a "
                          "FRESH turn (cleared context) seeded with the progress note, up to N "
                          "times (default 0 = off). Sheds the ramble and the huge prefill.")
-    # Backend selection (plan 046 spike). Default 'mlx' is the in-process engine and the
-    # whole point of chad; 'openai' drives the SAME harness against an OpenAI-compatible
-    # endpoint to separate harness-value from engine-value (honest degradations apply —
-    # see openai_engine.py). The MLX path below is untouched when --backend is unset.
-    ap.add_argument("--backend", choices=("mlx", "openai"), default="mlx",
-                    help="inference backend: 'mlx' (default, in-process KV cache) or "
-                         "'openai' (spike: run the chad harness against an OpenAI-compatible "
-                         "/v1/chat/completions endpoint; requires --base-url).")
+    # Backend selection (plan 046/047 spikes). Default 'mlx' is the in-process engine and
+    # the whole point of chad; 'openai' drives the SAME harness against an OpenAI-compatible
+    # endpoint (honest degradations apply — see openai_engine.py); 'llama' drives a
+    # llama.cpp server's raw /completion with token-id prompts + real cache telemetry
+    # (see completion_engine.py). The MLX path below is untouched when --backend is unset.
+    ap.add_argument("--backend", choices=("mlx", "openai", "llama"), default="mlx",
+                    help="inference backend: 'mlx' (default, in-process KV cache), "
+                         "'openai' (spike: OpenAI-compatible /v1/chat/completions), or "
+                         "'llama' (spike: llama.cpp raw /completion, token-id prompts). "
+                         "The remote backends require --base-url.")
     ap.add_argument("--base-url", dest="base_url", default=None,
-                    help="OpenAI-compatible base URL for --backend openai (e.g. "
-                         "http://localhost:8080/v1). Also CHAD_OPENAI_BASE_URL.")
+                    help="remote-backend base URL: for --backend openai an OpenAI-compatible "
+                         "base (e.g. http://localhost:8080/v1, also CHAD_OPENAI_BASE_URL); "
+                         "for --backend llama the llama-server origin (e.g. "
+                         "http://192.168.87.25:8081, also CHAD_LLAMA_BASE_URL).")
+    ap.add_argument("--tokenizer", dest="tokenizer", default=None,
+                    help="HF repo/dir whose tokenizer to load for a remote backend, when the "
+                         "served model id has no tokenizer files (e.g. a GGUF repo). Must "
+                         "share the served model's vocab. Also CHAD_TOKENIZER.")
     ap.add_argument("--api-key-env", dest="api_key_env", default=None,
-                    help="name of the env var holding the API key for --backend openai; the "
+                    help="name of the env var holding the API key for a remote backend; the "
                          "key is read from that var, never passed on the command line.")
     ap.add_argument("--repl", action="store_true",
                     help="plain line REPL instead of the full-screen TUI")
@@ -325,30 +335,53 @@ def main():
     model_id, why = _pick_model()
 
     # Advanced, rarely-touched knobs live in env vars to keep the CLI sane:
-    #   CHAD_MAX_CONTEXT  YaRN-extend the window (e.g. 131072 for 128k)
-    #   CHAD_CTX_LIMIT    prompt-token budget before old tool outputs compact
-    #   CHAD_KV_BITS      quantize the KV cache (e.g. 8) to save RAM on long runs
+    #   CHAD_MAX_CONTEXT       YaRN-extend the window (e.g. 131072 for 128k)
+    #   CHAD_CTX_LIMIT         prompt-token budget before old tool outputs compact
+    #   CHAD_KV_BITS           quantize the KV cache (e.g. 8) to save RAM on long runs
+    #   CHAD_KV_CACHE_MAX_GB   cap the on-disk KV cache (LRU-evict above it); 0 = unlimited
     max_context = _env_int("CHAD_MAX_CONTEXT")
     kv_bits = _env_int("CHAD_KV_BITS")
 
     # ds4-style on-disk KV warm-start of the stable system+tools prefix.
     cache_dir = os.path.expanduser("~/.cache/chad/kv")
+    kv_cache_max_gb = _env_int("CHAD_KV_CACHE_MAX_GB")
+    kv_cache_max_bytes = (kv_cache_max_gb if kv_cache_max_gb is not None else 8) * 1024**3
+    # Clean up push-spills orphaned by a prior killed/crashed session (see engine.py) —
+    # runs for every backend: the dir is shared, and a remote-backend run should still
+    # reclaim what a dead MLX session leaked.
+    from .engine import sweep_orphan_spills
+    sweep_orphan_spills(cache_dir, max_age_s=6 * 3600)
 
-    if args.backend == "openai":
-        # Plan 046 spike: drive the chad harness against an OpenAI-compatible endpoint
-        # instead of the in-process MLX engine. Only a tokenizer is loaded locally (to
-        # render/decode prompts); generation is proxied over HTTP. Weights are NOT
-        # downloaded (we don't run them here). The MLX default path is untouched.
-        from .openai_engine import OpenAIEngine
-        base_url = args.base_url or config.env_str("CHAD_OPENAI_BASE_URL")
-        if not base_url:
-            sys.stderr.write("chad --backend openai needs --base-url (or CHAD_OPENAI_BASE_URL), "
-                             "e.g. http://localhost:8080/v1\n")
-            sys.exit(1)
+    if args.backend in ("openai", "llama"):
+        # Plan 046/047 spikes: drive the chad harness against a remote endpoint instead
+        # of the in-process MLX engine. Only a tokenizer is loaded locally (to render
+        # prompts); generation is proxied over HTTP. Weights are NOT downloaded (we
+        # don't run them here). The MLX default path is untouched.
+        tokenizer_id = args.tokenizer or config.env_str("CHAD_TOKENIZER")
         api_key = os.environ.get(args.api_key_env, "") if args.api_key_env else ""
-        eng = OpenAIEngine(model_id=model_id, base_url=base_url, api_key=api_key,
-                           effective_ctx=max_context or 32768)
-        sys.stderr.write(f"backend=openai · base_url={base_url} · model={model_id} "
+        if args.backend == "openai":
+            from .openai_engine import OpenAIEngine
+            base_url = args.base_url or config.env_str("CHAD_OPENAI_BASE_URL")
+            if not base_url:
+                sys.stderr.write("chad --backend openai needs --base-url (or "
+                                 "CHAD_OPENAI_BASE_URL), e.g. http://localhost:8080/v1\n")
+                sys.exit(1)
+            eng = OpenAIEngine(model_id=model_id, base_url=base_url, api_key=api_key,
+                               tokenizer_id=tokenizer_id,
+                               effective_ctx=max_context or 32768)
+        else:
+            from .completion_engine import CompletionEngine
+            base_url = args.base_url or config.env_str("CHAD_LLAMA_BASE_URL")
+            if not base_url:
+                sys.stderr.write("chad --backend llama needs --base-url (or "
+                                 "CHAD_LLAMA_BASE_URL), e.g. http://192.168.87.25:8081\n")
+                sys.exit(1)
+            # effective_ctx 0 = auto: load() reads the server's /props n_ctx so chad's
+            # window matches the wall the server actually enforces.
+            eng = CompletionEngine(model_id=model_id, base_url=base_url, api_key=api_key,
+                                   tokenizer_id=tokenizer_id,
+                                   effective_ctx=max_context or 0)
+        sys.stderr.write(f"backend={args.backend} · base_url={base_url} · model={model_id} "
                          f"(tokenizer local, generation proxied) ...\n")
     else:
         _ensure_model(model_id)  # first-run download-on-consent if it's an uncached HF repo
@@ -358,19 +391,20 @@ def main():
             kv_bits=kv_bits,
             max_context=max_context,
             cache_dir=cache_dir,
+            kv_cache_max_bytes=kv_cache_max_bytes,
         )
 
     # The full-screen TUI loads the 11 GB of weights on a BACKGROUND thread so the banner
     # + input come up in ~0.6 s and you can read/queue while it loads (the load itself is
     # disk-bound and can't be made faster). Headless one-shot and the plain --repl still
     # load synchronously — there's nothing to interact with until the model answers, and
-    # a background download prompt would be worse than a blocking one. `--backend openai`
-    # only loads a tokenizer (cheap), so it stays synchronous too.
-    background = args.backend != "openai" and not task and not args.repl
+    # a background download prompt would be worse than a blocking one. The remote
+    # backends only load a tokenizer (cheap), so they stay synchronous too.
+    background = args.backend == "mlx" and not task and not args.repl
 
     ctx_limit = None
     if not background:
-        if args.backend != "openai":
+        if args.backend == "mlx":
             sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} [{why}] ...\n")
         try:
             load_s = eng.load()
@@ -427,15 +461,16 @@ def main():
                       turn_budget_tokens=args.turn_budget_tokens,
                       turn_budget_s=args.turn_budget_s)
         agent.run_turn(task)
-        # Plan 040: if the governor hard-stopped the turn on budget, optionally relaunch a
-        # FRESH turn (new context + reset KV cache) seeded with the deterministic progress
-        # note — shedding both the ramble and the huge prefill the stuck model dragged.
+        # Plan 040: if the turn hard-stopped on a budget (governor token/wall budget, or
+        # the step cap's final window landing nothing), optionally relaunch a FRESH turn
+        # (new context + reset KV cache) seeded with the deterministic progress note —
+        # shedding both the ramble and the huge prefill the stuck model dragged.
         continues = args.auto_continue
         while agent.budget_note and continues > 0:
             note = agent.budget_note
             continues -= 1
-            sys.stderr.write("[governor] previous turn ran out of budget; continuing fresh "
-                             "with a progress note\n")
+            sys.stderr.write("[governor] previous turn ran out of budget/steps; continuing "
+                             "fresh with a progress note\n")
             eng.reset()
             agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
                           mode=run_mode, thinking=thinking, persist=True,

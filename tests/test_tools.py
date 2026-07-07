@@ -196,6 +196,36 @@ def test_grep_truncation_notices():
         os.chdir(cwd)
 
 
+def test_grep_path_is_file():
+    """A file passed as `path` is searched directly — the old dir-walk treatment made
+    it silently match nothing, and the model passes file paths constantly."""
+    cwd = os.getcwd()
+    try:
+        _seed({"a.py": "NEEDLE here\n", "b.py": "NEEDLE too\n"})
+        out = tools.tool_grep("NEEDLE", path="a.py")
+        check("grep: file path searches the file", "a.py:1:" in out, out)
+        check("grep: file path scoped to that file", "b.py" not in out, out)
+
+        # naming the file explicitly overrides the skip list, like `read` does
+        _seed({"__pycache__/c.py": "NEEDLE in a skip dir\n"})
+        out = tools.tool_grep("NEEDLE", path="__pycache__/c.py")
+        check("grep: explicit file beats skip list", "c.py:1:" in out, out)
+    finally:
+        os.chdir(cwd)
+
+
+def test_grep_path_not_found():
+    """A nonexistent `path` announces itself instead of reading as a clean no-match."""
+    cwd = os.getcwd()
+    try:
+        _seed({"a.py": "NEEDLE\n"})
+        out = tools.tool_grep("NEEDLE", path="no/such/dir")
+        check("grep: missing path is loud",
+              out == "[path not found: no/such/dir]", out)
+    finally:
+        os.chdir(cwd)
+
+
 def test_grep_ignore_case_and_context():
     cwd = os.getcwd()
     try:
@@ -329,6 +359,8 @@ if __name__ == "__main__":
     test_grep_default_byte_identical()
     test_grep_line_cap()
     test_grep_truncation_notices()
+    test_grep_path_is_file()
+    test_grep_path_not_found()
     test_grep_ignore_case_and_context()
     test_glob()
     test_write()

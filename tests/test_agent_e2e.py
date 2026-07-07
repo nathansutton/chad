@@ -114,6 +114,21 @@ def test_scripted_agent_constructs_without_weights_or_network():
     assert agent.engine.model_id == "scripted-test"
 
 
+def test_template_ids_unwraps_batchencoding():
+    # Regression: some HF tokenizers return a dict-like BatchEncoding from
+    # apply_chat_template. `list()` of that yields its keys, which the --backend llama
+    # path shipped as the prompt (garbage → model degeneration). Coerce to input_ids.
+    class _BatchEncodingLike(dict):
+        @property
+        def input_ids(self):
+            return self["input_ids"]
+
+    be = _BatchEncodingLike(input_ids=[1, 2, 3], attention_mask=[1, 1, 1])
+    assert Agent._template_ids(be) == [1, 2, 3]
+    # A plain int list (the MLX path) passes through untouched.
+    assert Agent._template_ids([4, 5, 6]) == [4, 5, 6]
+
+
 # --- Step 3: drive a multi-step task end to end ------------------------------
 
 def test_agent_loop_writes_file_reads_it_back_then_terminates(tmp_path):
@@ -182,3 +197,92 @@ def test_agent_loop_surfaces_a_real_dispatch_failure(tmp_path):
     assert write_turn["content"].startswith("[tool error")
     # made_edit never got set, so the loop can't have mistaken the failure for a landed edit
     assert "[wrote" not in write_turn["content"]
+
+
+class _TokenizingEngine(ScriptedEngine):
+    """ScriptedEngine that honors `stop_condition` the way the real engine does: feed
+    the scripted text in ~token-sized chunks, consult stop_condition(text_so_far, n)
+    after each, and on a hit truncate the turn and set stats.stop_condition_fired —
+    the exact contract of engine.generate's decode loop. Lets the run_turn branches
+    that react to a mid-generation stop be driven without a model."""
+
+    def generate(self, prompt_ids, max_tokens=2048, on_token=None, stop_texts=None,
+                 should_stop=None, on_prefill=None, on_prefill_progress=None,
+                 stop_condition=None):
+        if self._i >= len(self.script):
+            raise AssertionError("scripted engine ran dry — the agent loop did not "
+                                 "terminate within the provided turns")
+        full = self.script[self._i]
+        self._i += 1
+        text, n, fired = "", 0, False
+        for i in range(0, len(full), 4):        # ~4 chars per "token"
+            text += full[i:i + 4]
+            n += 1
+            if stop_condition is not None and stop_condition(text, n):
+                fired = True
+                break
+        stats = GenStats(prompt_tokens=len(prompt_ids), cached_tokens=0,
+                         generated_tokens=n, approximate=True)
+        stats.stop_condition_fired = fired
+        return text, stats
+
+
+def test_agent_loop_cuts_off_degenerate_repetition():
+    """A step whose output locks into repeating one short string must be cut off early
+    (not ground to the token cap), nudged, and the turn must still end with the model's
+    NEXT (healthy) answer — the dogfood-trace runaway, replayed without a model."""
+    runaway = "The answer starts well " + "`CHAD_NO_TASK`, " * 400   # ~6.4k chars of loop
+    script = [runaway, "The flags live in config.py."]
+    agent = Agent(_TokenizingEngine(script), mode="auto", thinking=False, max_steps=10)
+
+    result = agent.run_turn("which file centralizes the CHAD_ flags?")
+
+    # the healthy second turn is the final answer — the loop recovered
+    assert result == "The flags live in config.py."
+    # the degenerate turn was stopped a fraction of the way in, not stored whole
+    degen = next(m for m in agent.messages if m.get("role") == "assistant")
+    assert len(degen["content"]) < len(runaway) / 2
+    # the model was told why before its next step
+    assert any("degenerated into repeating" in m.get("content", "")
+               for m in agent.messages if m.get("role") == "tool")
+
+
+# --- Progress-aware step cap: productive turns extend, stalled ones bank a note ------
+
+def test_step_cap_extends_while_turn_lands_verified_changes(tmp_path):
+    """A turn that keeps landing AND verifying edits must survive past max_steps (the
+    plan-064 trace: a productive plan-implementation turn was force-stopped dead at the
+    fixed cap, an edit half-applied). With max_steps=4 this script needs 7 steps — each
+    window re-earns its extension with an edit+verify, so the loop reaches `done`."""
+    f = tmp_path / "f.py"
+    # Distinct args per step — identical repeated calls would (correctly) trip the
+    # repeat-loop guard instead of exercising the cap.
+    script = []
+    for i in range(3):
+        script += [_tool_call("write", path=str(f), content=f"x = {i}\n"),
+                   _tool_call("bash", command=f"echo ok{i}")]
+    script.append(_tool_call("done", summary="finished the long task"))
+    agent = _agent(script, max_steps=4)
+
+    result = agent.run_turn("keep landing verified changes")
+
+    assert result == "finished the long task"
+    assert agent.engine._i == len(script)   # ran past the base cap of 4, to completion
+    assert agent.budget_note is None        # clean finish — nothing banked
+
+
+def test_step_cap_stops_and_banks_note_without_progress(tmp_path):
+    """A turn that reaches the cap with no landed+verified change in the window must
+    stop (no extension) and bank a progress note — same contract as a governor hard
+    stop — so the caller can resume instead of silently dropping the task."""
+    target = tmp_path / "data.txt"
+    target.write_text("42\n")
+    script = [_tool_call("read", path=str(target)),
+              _tool_call("read", path=str(target))]
+    agent = _agent(script, max_steps=2)
+
+    result = agent.run_turn("read things forever")
+
+    assert "step cap" in result             # explicit stop, not a silent death
+    assert agent.budget_note                # note banked for continue/--auto-continue
+    assert agent.engine._i == len(script)   # stopped exactly at the cap, no extension

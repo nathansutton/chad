@@ -191,6 +191,61 @@ _PLAN_PREFIX = (
     "conventions, and explicit out-of-scope. After writing the file, call done. "
     "Writing the plan file is your only allowed change.]\n\n"
 )
+# Plan mode on a QUESTION (no change requested) should answer it, not manufacture a
+# plan file — a "give me a 3-sentence tour" must not become an 84-line plans/ doc.
+# Still fully read-only: research, then reply in prose.
+_PLAN_PREFIX_CONCEPTUAL = (
+    "[PLAN MODE. This is a question, not a change request — do NOT edit project files, "
+    "run commands, or write a plan file. Research as needed "
+    "(read/grep/glob/repo_map/overview), then ANSWER the question directly in prose and "
+    "call done.]\n\n"
+)
+
+
+def _plan_prefix(intent: dict) -> str:
+    """The plan-mode preamble for a turn, chosen by intent: a real change request gets
+    the plan-FILE mandate; a bare question gets answered in prose (no plans/ doc — the
+    "84-line plan for a 3-sentence tour" regression). Split out to be unit-testable."""
+    return _PLAN_PREFIX if intent["action"] else _PLAN_PREFIX_CONCEPTUAL
+
+
+# Backstop cap on any single tool result appended to the transcript. Each big char is
+# prefill on a bandwidth-bound local model, and dogfooding showed a single tool call can
+# stall the next turn for tens of seconds: a whole-file read (fixed by READ_MAX_CHARS), a
+# wide grep (GREP_MAX_CHARS), and — the case those per-tool caps miss — the symbolic map
+# tools (overview/repo_map/view_symbol), whose output scales with a file's symbol count
+# (a 9,864-token `overview` = a 32s stall). This bounds EVERY tool uniformly so no one
+# call blows up prefill; it sits just above the per-tool caps so it only bites the
+# otherwise-uncapped tools. ~14k chars ≈ 4k tokens ≈ a ~14s worst-case prefill on the 9B.
+_MAX_TOOL_RESULT_CHARS = 14000
+# Per-STEP budget on the total tool-output chars appended before the next prefill. The
+# per-result cap above bounds each call, but a step that emits SEVERAL calls stacks
+# them into one prefill (two 10k greps = ~5.7k tokens = a ~20s stall the per-result cap
+# never sees). Budget == the single-call cap, so a step is never worse than its worst
+# single call: the first result can use the whole budget, later ones get what's left,
+# and every result keeps at least a FLOOR-sized head (an edit/bash outcome must never
+# be swallowed whole). Worst case ≈ 14k + 1k per extra call.
+_STEP_TOOL_BUDGET_CHARS = _MAX_TOOL_RESULT_CHARS
+_STEP_TOOL_FLOOR_CHARS = 1000
+
+
+def _step_tool_cap(spent: int) -> int:
+    """Char cap for the next tool result of a step whose earlier results already
+    appended `spent` chars. Pure and testable."""
+    return max(_STEP_TOOL_FLOOR_CHARS,
+               min(_MAX_TOOL_RESULT_CHARS, _STEP_TOOL_BUDGET_CHARS - spent))
+
+
+def _clip_tool_result(result: str, cap: int = _MAX_TOOL_RESULT_CHARS) -> str:
+    """Bound a tool result's size so no single call blows up the next turn's prefill.
+    Keeps the head (usually the most relevant) and notes how to fetch the rest."""
+    if not isinstance(result, str) or len(result) <= cap:
+        return result
+    omitted = len(result) - cap
+    return (result[:cap]
+            + f"\n[… {omitted} chars truncated to keep the turn responsive — narrow the "
+            f"query (grep a pattern, view_symbol(name), or read(path, offset=N)), or "
+            f"re-run this call by itself, to pull just what you need.]")
 
 # Canned task behind the /init slash command (Claude-Code parity): scaffold a CLAUDE.md
 # the way `claude /init` does. Runs through the normal agentic loop (repo_map → read the
@@ -232,6 +287,8 @@ class Agent:
             mcp.reset_session()
         self.mode = mode or ("auto" if yolo else "normal")
         self.thinking = thinking  # Ornith is a reasoning model; toggles <think> blocks
+        # Steps per WINDOW, not a hard kill: a window that landed+verified a change
+        # earns an extension (see guardrails.extend_step_cap; absolute ceiling 4x).
         self.max_steps = max_steps
         # Session persistence (cli.py --continue): when `persist`, the conversation is
         # saved to disk (keyed by cwd) after each turn; `resume` seeds it from a prior
@@ -258,6 +315,10 @@ class Agent:
         if think_budget is None:
             think_budget = config.env_int("CHAD_THINK_BUDGET")
         self.think_budget = think_budget
+        # Degenerate-repetition stop (see guardrails.degenerate_tail): default ON —
+        # it only fires on output that is already garbage (a literal decode loop), so
+        # unlike the think-budget there is no capability trade. A/B off via env.
+        self._no_repeat_guard = config.flag("CHAD_NO_REPEAT_GUARD")
         self.ctx_limit = ctx_limit  # prompt-token budget before compaction kicks in
         # Runaway-turn governor (plan 040): a per-turn budget on cumulative prefill tokens
         # (and optional wall-clock) that ends a turn which has burned through a checkpoint
@@ -386,11 +447,20 @@ class Agent:
             out.append(s)
         return out
 
+    @staticmethod
+    def _template_ids(rendered):
+        """Coerce `apply_chat_template`'s return to a plain list of token ids. Some
+        HF tokenizers return a dict-like `BatchEncoding` (not an int list); `list()`
+        of that yields its string keys (`['input_ids', 'attention_mask']`), which the
+        `--backend llama` path would then ship verbatim as the prompt (garbage). The
+        MLX path returns a plain list already — untouched by this guard."""
+        return rendered["input_ids"] if hasattr(rendered, "input_ids") else rendered
+
     def _render(self):
-        return self.engine.tok.apply_chat_template(
+        return self._template_ids(self.engine.tok.apply_chat_template(
             self.messages, tools=self._active_schemas(), add_generation_prompt=True,
             enable_thinking=self.thinking,
-        )
+        ))
 
     def _stable_prefix_ids(self):
         """The byte-identical head of every session: system prompt + tool schemas,
@@ -401,9 +471,9 @@ class Agent:
         message alone — it raises 'No user query found' — hence the diff trick)."""
         sysm = self.messages[0]
         def render1(u):
-            return self.engine.tok.apply_chat_template(
+            return self._template_ids(self.engine.tok.apply_chat_template(
                 [sysm, {"role": "user", "content": u}], tools=self._active_schemas(),
-                add_generation_prompt=True, enable_thinking=self.thinking)
+                add_generation_prompt=True, enable_thinking=self.thinking))
         a, b = render1("a"), render1("the quick brown fox jumps")
         n = 0
         for x, y in zip(a, b):
@@ -521,7 +591,13 @@ class Agent:
         expanded, attached = expand_mentions(user_text)
         for p in attached:
             self._emit("info", f"  [attached @{_disp_path(p)}]")
-        prompt = (_PLAN_PREFIX + expanded) if self.mode == "plan" else expanded
+        # Intent (see classify_intent) drives both the plan-mode prefix here and the
+        # answer-on-paper nudge below; compute once on the ORIGINAL text. In plan mode a
+        # non-action ask (a question) gets the conceptual prefix so it's answered in
+        # prose instead of forced into a plan file; only a real change request keeps the
+        # plan-file mandate.
+        _intent = classify_intent(user_text)
+        prompt = (_plan_prefix(_intent) + expanded) if self.mode == "plan" else expanded
         self.messages.append({"role": "user", "content": prompt})
         log.info("TURN start | cwd=%s | mode=%s | attached=%s | query=%r",
                  os.getcwd(), self.mode, attached, redact(user_text[:200]))
@@ -541,6 +617,7 @@ class Agent:
         consecutive_failed_bash = 0  # back-to-back errored bash with no edit (thrash)
         thrash_nudges = 0
         think_cap_hits = 0  # soft think-cap firings this turn (plan 039; drives escalation)
+        repeat_stops = 0  # degenerate-repetition cut-offs this turn (3rd aborts the turn)
         # Runaway-turn governor state (plan 040). turn_start drives the optional wall
         # budget; gov_band is the highest budget checkpoint already evaluated; gov_progress
         # tracks whether a change landed+verified within the CURRENT band (resets each time
@@ -555,11 +632,31 @@ class Agent:
         # should END in an applied edit, not a prose explanation. Telemetry caught the
         # model navigating to the right function then "answering on paper" without
         # applying the fix; action_task arms the nudge that pushes it to actually edit,
-        # and read_only_intent exempts genuine explain-only asks.
-        _intent = classify_intent(user_text)
+        # and read_only_intent exempts genuine explain-only asks. (_intent computed above,
+        # where it also selects the plan-mode prefix.)
         action_task = self.mode != "plan" and _intent["action"]
         read_only_intent = _intent["read_only"]
-        for step in range(self.max_steps):
+        # Progress-aware step cap (see guardrails.extend_step_cap): max_steps is the
+        # WINDOW size, not a hard kill. A window that landed+verified a change earns
+        # another window (warm cache — no re-prefill, unlike a governor rollover); a
+        # window that didn't ends the turn with a progress note banked. The absolute
+        # ceiling bounds a turn that keeps "progressing" without ever finishing.
+        step_cap = self.max_steps
+        hard_ceiling = self.max_steps * guardrails.STEP_CAP_CEILING
+        landed_in_window = False  # a change landed AND verified since this window began
+        for step in range(hard_ceiling):
+            if step >= step_cap:
+                new_cap = guardrails.extend_step_cap(
+                    step_cap, self.max_steps, landed_in_window, hard_ceiling)
+                if new_cap is None:
+                    break
+                log.info("STEP-CAP extended at step %d: %d -> %d (landed+verified "
+                         "progress in the last window)", step, step_cap, new_cap)
+                self._emit("info", "  [still landing verified changes — extending the "
+                                   f"turn to {new_cap} steps]")
+                step_cap = new_cap
+                landed_in_window = False
+                landing_nudges = 0  # the new window gets its own forced-landing nudge
             # Runaway-turn governor (plan 040): watch the GLOBAL trajectory — cumulative
             # prefill tokens (+ optional wall clock) vs progress made. It fires only when a
             # budget checkpoint is CROSSED, evaluating the just-completed band's progress:
@@ -592,11 +689,11 @@ class Agent:
             # tell the model to stop exploring and commit its edit before the hard cap —
             # otherwise the loop just dies at max_steps with the task untouched.
             land = guardrails.landing_nudge(
-                step, self.max_steps, made_edit, unverified_edit, landing_nudges)
+                step, step_cap, made_edit, unverified_edit, landing_nudges)
             if land:
                 landing_nudges += 1
                 log.info("LANDING nudge at step %d (remaining=%d, made_edit=%s, "
-                         "unverified_edit=%s)", step, self.max_steps - step,
+                         "unverified_edit=%s)", step, step_cap - step,
                          made_edit, unverified_edit)
                 self.messages.append({"role": "tool", "name": "edit", "content": land})
             # The engine diffs this full render against its live KV cache and prefills
@@ -624,17 +721,35 @@ class Agent:
             # (prior caps this turn + loop/thrash/verify nudges) so a genuinely hard step
             # gets more room instead of being chunked repeatedly. None => generation is
             # byte-identical to before (the mechanism is off by default).
-            stop_condition = None
+            think_stop = None
             think_cap = None
             if self.think_budget and self.thinking:
                 stuck = (think_cap_hits + self._loop_nudges + thrash_nudges
                          + verify_nudges)
                 think_cap = guardrails.think_budget(stuck, base=self.think_budget)
 
-                def stop_condition(text_so_far, n, _cap=think_cap):
+                def think_stop(text_so_far, n, _cap=think_cap):
                     # Still inside <think> (no close emitted) and over budget -> stop; the
                     # turn is then force-closed by close_unclosed_think, a prefix-safe append.
                     return n >= _cap and "</think>" not in text_so_far
+
+            # Degenerate-repetition stop (default ON): greedy decode can lock into
+            # repeating one short string until the 8192-token cap — ~4 minutes of dead
+            # generation per occurrence at 9B decode speed. Checked every 16 tokens on
+            # the generation's tail; a hit stops the step (rep_fired tells this stopper
+            # apart from the think-cap, which shares stats.stop_condition_fired) and the
+            # branch below nudges the model out of the loop instead of grinding on.
+            rep_fired = [False]
+            stop_condition = None
+            if think_stop is not None or not self._no_repeat_guard:
+                def stop_condition(text_so_far, n):
+                    if think_stop is not None and think_stop(text_so_far, n):
+                        return True
+                    if (not self._no_repeat_guard and n % 16 == 0
+                            and guardrails.degenerate_tail(text_so_far)):
+                        rep_fired[0] = True
+                        return True
+                    return False
 
             view = _StreamView(self._emit, started_in_think=self.thinking) if stream else None
             gen_count = [0]  # decoded chunks this step (~tokens); fed to the live ↓ counter
@@ -717,7 +832,9 @@ class Agent:
             # A soft-cap stop (plan 039) fires only while still inside <think>, so ALL of
             # this step's tokens are reasoning — count them so think-token telemetry (the
             # metric the budget is measured against) doesn't under-report the capped runs.
-            if stats.stop_condition_fired:
+            # (A repetition stop can also land inside think — same accounting; one that
+            # fired after </think> falls to the fraction path below like any other turn.)
+            if stats.stop_condition_fired and "</think>" not in text:
                 self.think_tokens += stats.generated_tokens
             elif "</think>" in text and len(text):
                 frac = len(text.split("</think>", 1)[0]) / len(text)
@@ -770,6 +887,28 @@ class Agent:
                 log.warning("CACHE DIVERGENCE at step %d: full re-prefill of %d tokens "
                             "(non-trimmable cache reset — see prior turn for a truncated "
                             "generation)", step, stats.prompt_tokens)
+
+            # Degenerate-repetition stop fired: the step's output locked into repeating
+            # one short string (see guardrails.degenerate_tail) and was cut off early —
+            # a truncation of garbage, never a final answer, so don't parse it. The
+            # stored turn is prefix-safe (generated tokens are already in the KV cache;
+            # close_unclosed_think handled a mid-think cut). Nudge the model out of the
+            # loop and continue; if the nudge can't break the decode loop, abort rather
+            # than crawl to max_steps one stall at a time.
+            if stats.stop_condition_fired and rep_fired[0]:
+                repeat_stops += 1
+                self._emit("info", "  [output degenerated into repetition — cut off]")
+                log.info("REPEAT-STOP at step %d after %d tok (stops=%d this turn)",
+                         step, stats.generated_tokens, repeat_stops)
+                if guardrails.repeat_stop_abort(repeat_stops):
+                    log.info("END step %d: REPEAT ABORT (nudges not breaking the loop)",
+                             step)
+                    return ("[stopped: the model keeps degenerating into repetitive "
+                            "output. Try rephrasing the request or breaking it into "
+                            "smaller steps.]")
+                self.messages.append({"role": "tool", "name": "edit",
+                                      "content": guardrails.REPEAT_STOP_NUDGE})
+                continue
 
             # Plan 039: the soft think-cap fired — generation was stopped while still
             # inside <think> (the reasoning run exceeded this step's budget). The assistant
@@ -895,6 +1034,7 @@ class Agent:
             # budget checkpoint (vs mere reads/greps, which don't count as progress).
             _gov_prev_made = made_edit
             _gov_prev_unverified = unverified_edit
+            step_tool_chars = 0  # tool-output chars appended this step (see _step_tool_cap)
             for name, args in calls:
                 render_tool_start(self._emit, name, args)
                 # typia stages 2+3: coerce loosely-typed args toward the schema
@@ -976,6 +1116,11 @@ class Agent:
                     except Exception as e:  # noqa: BLE001 - surface tool errors to model
                         result = f"[tool error: {type(e).__name__}: {e}]"
                     _tool_s = time.perf_counter() - _t0
+                    # Backstop: bound the prefill from any tool, AND from the step as a
+                    # whole — several calls in one step stack into one prefill, so later
+                    # results only get what's left of the step budget (floor-protected).
+                    result = _clip_tool_result(result, cap=_step_tool_cap(step_tool_chars))
+                    step_tool_chars += len(result)
                     if _PREFILL_TRACE:
                         self._trace_tools_pending.append([name, round(_tool_s, 4)])
                 render_tool_result(self._emit, name, args, result)
@@ -996,6 +1141,7 @@ class Agent:
             # checkpoint that would otherwise fire the governor).
             if (made_edit and not _gov_prev_made) or (_gov_prev_unverified and not unverified_edit):
                 gov_progress = True
+                landed_in_window = True  # also earns a step-cap extension (same signal)
 
             # Break a flailing-probe run (e.g. guessing the test runner, repeated
             # `python -c import` checks) that the exact-call loop guard can't see because
@@ -1012,9 +1158,16 @@ class Agent:
                 log.info("END step %d: INTERRUPTED by user", step)
                 self._emit("info", "  [interrupted]")
                 return "[interrupted]"
-        log.info("END: hit max tool steps (%d) | did_work=%s unverified_edit=%s",
-                 self.max_steps, did_work, unverified_edit)
-        return "[stopped: hit max tool steps]"
+        # Step cap reached with no landed+verified change in the final window (or the
+        # absolute ceiling hit). Bank a progress note — same contract as the governor
+        # hard-stop — so the TUI's "continue" and one-shot --auto-continue can resume
+        # instead of silently dropping the half-done task at the prompt.
+        self.budget_note = guardrails.progress_note(self.messages)
+        log.info("END: hit step cap (%d, ceiling %d) | did_work=%s unverified_edit=%s",
+                 step_cap, hard_ceiling, did_work, unverified_edit)
+        self._emit("info", "  [turn stopped at its step cap — progress note banked; "
+                           "say 'continue' to resume]")
+        return "[stopped: hit the step cap before finishing — say 'continue' to resume]"
 
 
 def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = None,
