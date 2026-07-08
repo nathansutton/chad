@@ -31,7 +31,10 @@ from chad.guardrails import (
     budget_fraction,
     degenerate_tail,
     done_rejection,
+    edit_failed_to_land,
+    edit_loop_break,
     extend_step_cap,
+    investigation_gate,
     is_destructive_bash,
     is_repeat_loop,
     landing_nudge,
@@ -208,6 +211,34 @@ def test_nudge_for_no_calls():
     b7 = dict(base); b7["truncation_nudges"] = 2; b7["action_task"] = True
     kind7, _ = nudge_for_no_calls("```code```", hit_cap=True, **b7)
     check("truncation cap falls through to no-edit", kind7 == "no-edit")
+
+    # Bare stall — model thought then stopped with EMPTY content after </think>, no tool
+    # call (the llama.cpp early-EOS bail; action_task False, as SWE-bench issue prose
+    # often classifies). Must be pushed to act, not accepted as an empty final answer.
+    bail = "<think>Let me find where execute_sql_flush is defined.</think>\n\n"
+    kind8, nudge8 = nudge_for_no_calls(bail, hit_cap=False, **base)
+    check("empty-after-think bail -> no-edit nudge", kind8 == "no-edit")
+    check("bail nudge text", "without taking any action" in nudge8)
+
+    # Bare stall — dangling intent preamble in CONTENT (no think, no code, no tool call).
+    kind9, _ = nudge_for_no_calls("Let me look at the failing test first.",
+                                  hit_cap=False, **base)
+    check("dangling-intent preamble -> no-edit nudge", kind9 == "no-edit")
+
+    # read_only intent exempts the bare-stall nudge (an explain-only ask may answer briefly).
+    b10 = dict(base); b10["read_only_intent"] = True
+    kind10, nudge10 = nudge_for_no_calls("<think>hm</think>\n", hit_cap=False, **b10)
+    check("read_only exempts bare-stall nudge", kind10 is None and nudge10 is None)
+
+    # Bounded: after two answer nudges the bail falls through (turn can end).
+    b11 = dict(base); b11["answer_nudges"] = 2
+    kind11, _ = nudge_for_no_calls("<think>x</think>\n", hit_cap=False, **b11)
+    check("bare-stall nudge is bounded by answer_nudges", kind11 is None)
+
+    # A genuine final answer that merely mentions the user is NOT a bail ("let me know").
+    kind12, nudge12 = nudge_for_no_calls("The bug is a missing None check; let me know "
+                                         "if you want the patch.", hit_cap=False, **base)
+    check("'let me know' answer is not a bail", kind12 is None and nudge12 is None)
 
 
 def test_landing_nudge():
@@ -492,6 +523,82 @@ def test_progress_note():
           "nothing" in empty.lower() or "no edits" in empty.lower(), empty)
 
 
+def test_bash_result_verifies_ignores_trivial_checks():
+    # A real test run clears unverified_edit.
+    check("real test run verifies", bash_result_verifies("5 passed", "pytest tests/"))
+    check("clean no-output run verifies", bash_result_verifies("[no output]", "python repro.py"))
+    # Error sentinels never verify.
+    check("nonzero exit does not verify", not bash_result_verifies("[exit 1]", "pytest"))
+    check("timeout does not verify", not bash_result_verifies("[timed out]", "pytest"))
+    # Trivial syntax/compile/version probes must NOT verify — the 14559 fake-verify hole.
+    check("compile() check does not verify",
+          not bash_result_verifies("Syntax OK", "python -c \"compile(open('f').read(),'f','exec')\""))
+    check("py_compile does not verify",
+          not bash_result_verifies("[no output]", "python -m py_compile foo.py"))
+    check("--version does not verify",
+          not bash_result_verifies("Python 3.11", "python --version"))
+    # No command passed (back-compat) still verifies on a clean result.
+    check("no command arg still verifies clean", bash_result_verifies("ok"))
+
+
+def test_bash_result_verifies_requires_executing_command():
+    """Iter-2 (plan 066): only a command that plausibly RUNS code can clear
+    unverified_edit. The sphinx-7440 false-green: `sed -n '307,308p' std.py | cat -A`
+    exited 0 with output and 'verified' an edit that didn't even parse — disarming
+    the verify nudge, the done rejection AND the landing nudge at once."""
+    # Display/plumbing commands never verify, however cleanly they exit.
+    check("sed|cat display does not verify",
+          not bash_result_verifies("std = cast(...)", "sed -n '307,308p' std.py | cat -A"))
+    check("ls does not verify", not bash_result_verifies("f.py", "ls -la"))
+    check("grep does not verify", not bash_result_verifies("x: hit", "grep -rn foo ."))
+    check("git diff does not verify", not bash_result_verifies("diff --git", "git diff"))
+    check("echo does not verify", not bash_result_verifies("ok", "echo ok"))
+    # Executing commands verify.
+    check("pytest verifies", bash_result_verifies("1 passed", "python -m pytest -q tests/"))
+    check("script run verifies", bash_result_verifies("ok", "./runtests.sh --all"))
+    check("make verifies", bash_result_verifies("ok", "make test"))
+    check("chained executing command verifies",
+          bash_result_verifies("ok", "cd /tmp && python repro.py"))
+    check("piped-out executing command verifies",
+          bash_result_verifies("ok", "python -m pytest tests/ 2>&1 | tail -20"))
+    # Installs are env repair, not verification.
+    check("pip install does not verify",
+          not bash_result_verifies("Successfully installed", "pip install -e ."))
+    check("python -m pip install does not verify",
+          not bash_result_verifies("Successfully installed", "python -m pip install pytest"))
+
+
+def test_investigation_gate():
+    # Below threshold: no nudge.
+    check("no gate below threshold", investigation_gate(3, made_edit=False, gate_nudges=0) is None)
+    # At/over threshold with no edit yet: fires and tells the model to edit.
+    g = investigation_gate(6, made_edit=False, gate_nudges=0)
+    check("gate fires at threshold with no edit", g is not None and "no edit" in g)
+    check("gate says stop searching", "STOP searching" in g)
+    # An edit already landed -> suppressed (it's acting, not stalling).
+    check("gate suppressed once edit landed",
+          investigation_gate(20, made_edit=True, gate_nudges=0) is None)
+    # Bounded.
+    check("gate bounded by gate_nudges", investigation_gate(20, made_edit=False, gate_nudges=2) is None)
+
+
+def test_edit_failed_to_land():
+    check("no-op edit failed to land", edit_failed_to_land("[no-op edit: old and new are identical]"))
+    check("not-found failed to land", edit_failed_to_land("[old string not found; no change made.]"))
+    check("ambiguous match failed to land", edit_failed_to_land("[old string appears 3 times]"))
+    check("landed edit did not fail", not edit_failed_to_land("[edited foo.py]"))
+    check("landed write did not fail", not edit_failed_to_land("[wrote foo.py]"))
+    check("landed symbol replace did not fail", not edit_failed_to_land("[replaced foo]"))
+
+
+def test_edit_loop_break():
+    check("no break below 2", edit_loop_break(1, 0) is None)
+    b = edit_loop_break(2, 0)
+    check("break fires at streak 2", b is not None and "changed nothing" in b)
+    check("break suggests read + replace_symbol", "replace_symbol" in b and "read" in b)
+    check("break bounded", edit_loop_break(5, 2) is None)
+
+
 def test_reject_escalation():
     # Loop breaker: appended when the SAME call is rejected twice back-to-back. Must tell
     # the model to stop re-emitting AND forbid fabricating the tool's result.
@@ -523,6 +630,11 @@ if __name__ == "__main__":
     test_reject_escalation()
     test_reject_loop_signature_resets_on_change()
     test_bash_result_verifies()
+    test_bash_result_verifies_ignores_trivial_checks()
+    test_bash_result_verifies_requires_executing_command()
+    test_investigation_gate()
+    test_edit_failed_to_land()
+    test_edit_loop_break()
     test_done_rejection()
     test_update_work_flags()
     test_loop_guard()

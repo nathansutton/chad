@@ -121,7 +121,36 @@ def test_parse():
     )
 
 
+def test_salvage_garbled_tool_name():
+    """Iter-2 (plan 066): quantized greedy decode garbles the CLOSE of a call
+    (observed: `grep</argstr`, `grep"`). The leading identifier is salvaged when it
+    names a known tool, so the call dispatches instead of bouncing off 'unknown
+    tool' until the loop guard kills the turn (the pytest-6202 death spiral)."""
+    from chad.toolcall_parse import salvage_tool_name
+
+    # Pure helper.
+    eq("s1 xml garble", salvage_tool_name("grep</argstr"), "grep")
+    eq("s2 trailing quote", salvage_tool_name('edit"'), "edit")
+    eq("s3 known name untouched", salvage_tool_name("replace_symbol"), "replace_symbol")
+    eq("s4 unknown garbage untouched", salvage_tool_name("zzz</argstr"), "zzz</argstr")
+
+    # Through the XML dialect (the observed pytest-6202 shape).
+    eq(
+        "s5 xml call salvaged",
+        _parse_xml_calls("<function=grep</argstr><parameter=pattern>foo</parameter></function>"),
+        [("grep", {"pattern": "foo"})],
+    )
+
+    # Through the JSON dialect.
+    eq(
+        "s6 json call salvaged",
+        parse_tool_calls('<tool_call>{"name": "grep\\"", "arguments": {"pattern": "x"}}</tool_call>'),
+        [("grep", {"pattern": "x"})],
+    )
+
+
 if __name__ == "__main__":
     test_parse()
+    test_salvage_garbled_tool_name()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

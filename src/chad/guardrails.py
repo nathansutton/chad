@@ -16,6 +16,35 @@ nudge text are byte-identical to the old inline code.
 import json
 import re
 
+from .toolcall_parse import strip_think
+
+# First-person, forward-looking leads that ANNOUNCE a next step ("Let me find where
+# this is defined…") — used to detect a turn that stated intent to act but emitted no
+# tool call. "let me know" is excluded below (a question to the user, not a self-directed
+# action).
+_INTENT_LEADS = (
+    "let me ", "let's ", "let us ", "i'll ", "i will ", "i need to ", "i'm going to ",
+    "i am going to ", "i should ", "i want to ", "i plan to ", "next, i", "first, i",
+    "now i", "now, i",
+)
+
+
+def _announces_unfulfilled_action(stripped: str) -> bool:
+    """True when the model's (think-stripped) content is a bare preamble that ANNOUNCES a
+    next step but takes none — no tool call, no code. Keyed off an intent lead in the
+    FINAL sentence so it doesn't fire on a genuine answer that merely mentions next steps.
+    Conservative companion to the empty-content check in `nudge_for_no_calls`."""
+    t = stripped.strip().lower().replace("\n", " ")
+    if not t:
+        return False
+    for sep in (". ", "! ", "? "):
+        if sep in t:
+            t = t.rsplit(sep, 1)[-1]
+    tail = t[-200:]
+    if "let me know" in tail or "let us know" in tail:
+        return False
+    return any(lead in tail for lead in _INTENT_LEADS)
+
 # Catastrophic, near-never-intentional shell shapes. chad runs bash on the user's
 # machine and reads UNTRUSTED repo files (`read`, `@mentions`) whose contents can
 # drive a tool call — so in --yolo/auto mode a prompt-injected `rm -rf ~` would
@@ -44,16 +73,62 @@ def is_destructive_bash(command: str) -> bool:
     return any(p.search(command) for p in _DESTRUCTIVE_BASH)
 
 
-def bash_result_verifies(result: str) -> bool:
-    """A bash tool result clears the unverified-edit flag only on a clean run.
+# A shell command that proves NOTHING about runtime behavior — a syntax/compile check,
+# a byte-compile, or a --version/--help probe. These must NOT clear unverified_edit: the
+# demonstrated failure is a model that "verifies" a real Django bug-fix with
+# `python -c "compile(open('f').read(),'f','exec')"` → exit 0 "Syntax OK", then ships a
+# patch whose FAIL_TO_PASS test (`None != 0`) still fails. Verifying means *running the
+# code/tests*, not proving it parses.
+_TRIVIAL_CHECK_RE = re.compile(
+    r"py_compile|compileall|compile\s*\(|ast\.parse\s*\(|--version\b|--help\b"
+    r"|pip[0-9.]*\s+(?:install|download|uninstall)", re.I)
 
-    A clean exit-0 command (including one with no output, `[no output]`) or any
-    real stdout counts as a verification. The four `[`-prefixed sentinels below
-    all mean the check did NOT actually pass, so they must NOT clear the flag:
-    a non-zero exit, a timeout, a user interrupt (ctrl-c), or a launch failure.
-    """
-    return not result.startswith(
-        ("[exit", "[timed out", "[interrupted", "[failed to launch"))
+
+def _is_trivial_check(command: str) -> bool:
+    """True when a bash command is only a syntax/compile/version probe (see above)."""
+    return bool(command) and bool(_TRIVIAL_CHECK_RE.search(command))
+
+
+# Commands that plausibly EXECUTE the project — a test runner, an interpreter, a build
+# that runs code, a script. Only these can clear unverified_edit. The demonstrated
+# failure (sphinx-7440): after an edit broke the file, `sed -n '307,308p' … | cat -A`
+# exited 0 with output and "verified" the edit — disarming the verify nudge, the done
+# rejection AND the landing nudge at once; the patch shipped with an IndentationError.
+# Display/plumbing commands (sed/cat/ls/grep/echo/find/git…) prove nothing about
+# runtime behavior no matter how cleanly they exit.
+_EXECUTES_RE = re.compile(
+    r"(?:^|[;&|(]\s*|\bsudo\s+|\benv\s+(?:\w+=\S+\s+)*)"
+    r"(?:python[0-9.]*|pytest|py\.test|tox|nox|unittest|make|cmake|ctest|cargo|go"
+    r"|node|npm|npx|yarn|pnpm|deno|bun|mvn|gradlew?|ant|rake|rspec|ruby|phpunit|php"
+    r"|dotnet|swift|julia|Rscript|perl|lua|java|sbt|stack|sh|bash|zsh|\./\S+)\b")
+
+
+def _is_executing_command(command: str) -> bool:
+    """True when a bash command plausibly runs code (see `_EXECUTES_RE`). An empty
+    command (legacy callers) is trusted, preserving the old behavior for them."""
+    if not command:
+        return True
+    return bool(_EXECUTES_RE.search(command))
+
+
+def bash_result_verifies(result: str, command: str = "") -> bool:
+    """A bash tool result clears the unverified-edit flag only on a clean run that
+    actually exercised the code.
+
+    Three gates, all required: (1) the result is not an error sentinel — the four
+    `[`-prefixed prefixes below mean the check did NOT pass (non-zero exit, timeout,
+    ctrl-c, launch failure); (2) the command is not a trivial syntax/compile/version
+    probe (`_is_trivial_check`) — parsing clean is not the tests passing; (3) the
+    command actually EXECUTES something (`_is_executing_command`) — a display command
+    like `sed -n | cat -A` or `ls` exiting 0 is not verification (the sphinx-7440
+    false-green: it disarmed every guard while the file didn't even parse)."""
+    if result.startswith(("[exit", "[timed out", "[interrupted", "[failed to launch")):
+        return False
+    if _is_trivial_check(command):
+        return False
+    if not _is_executing_command(command):
+        return False
+    return True
 
 
 # Tools that count as real work (did_work) — includes the symbolic read/search/edit
@@ -87,7 +162,7 @@ def update_work_flags(name, args, result, did_work, made_edit, unverified_edit):
             (".md", ".markdown", ".rst", ".txt"))
         if not is_doc:
             unverified_edit = True
-    elif name == "bash" and bash_result_verifies(result):
+    elif name == "bash" and bash_result_verifies(result, str(args.get("command", ""))):
         unverified_edit = False
     return did_work, made_edit, unverified_edit
 
@@ -131,6 +206,23 @@ def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_inte
                      "Take the next single concrete action now as a real "
                      "<tool_call> — e.g. write the file — one tool at a time.]")
         return "truncated", nudge
+    # Bare stall: the turn produced no tool call and no real content — the model
+    # reasoned (or not) and then STOPPED, either with empty content after </think> or
+    # with a preamble that only announces a next step ("Let me find where this is
+    # defined…"). That is never a valid final answer. Observed on the llama.cpp backend,
+    # where the served quant emits EOS right after the think-block close, before the tool
+    # call the MLX path would go on to produce — but the check is backend-agnostic (a
+    # premature stop from any engine lands here). Bounded by answer_nudges so a model
+    # that keeps stalling still terminates. read_only intent is exempt (an explain-only
+    # ask is allowed to answer briefly), matching the answered-on-paper branch below.
+    stripped = strip_think(text).strip()
+    if (not read_only_intent) and not made_edit and answer_nudges < 2 \
+            and ((not stripped) or _announces_unfulfilled_action(stripped)):
+        nudge = ("[you stopped after thinking without taking any action — no tool call "
+                 "and no answer. Do not stop here. Emit your next concrete step now as a "
+                 "real <tool_call>: grep/read to locate the code, then edit/write to "
+                 "change it, then run the check. One tool call at a time.]")
+        return "no-edit", nudge
     if (not read_only_intent) and (action_task or has_code) \
             and not made_edit and answer_nudges < 2:
         nudge = ("[you described the change but did not apply it — markdown code "
@@ -171,6 +263,49 @@ def landing_nudge(step, max_steps, made_edit, unverified_edit, landing_nudges):
     return (f"[only {remaining} step(s) left before this turn is force-stopped. You "
             "edited but never ran the check. Run the project's tests now, fix the code "
             "if it fails, then call done — do not start any new exploration.]")
+
+
+def investigation_gate(readonly_streak, made_edit, gate_nudges, threshold=6):
+    """Fire a one-shot steering nudge when the model has spent a run of purely read-only
+    steps (grep/read/search — no edit landed) and clearly has enough context to act. The
+    demonstrated failure: it named the exact one-line fix at step 0, then grep-looped for
+    "a better fix" into the step cap and shipped an EMPTY patch; and, separately, it
+    delegated the same read-only sub-agent twice, both capping out, without ever editing.
+    This converts investigation into an edit before the loop-abort / step-cap kills the
+    turn with nothing applied. Returns nudge text or None. Bounded by gate_nudges."""
+    if made_edit or gate_nudges >= 2 or readonly_streak < threshold:
+        return None
+    return (f"[you've spent {readonly_streak} steps investigating and applied no edit — "
+            "you have enough context now. STOP searching. Make your single highest-value "
+            "edit with edit/write/replace_symbol, then run the project's real test to "
+            "verify it. If you already know the fix, apply it this step.]")
+
+
+def edit_failed_to_land(result: str) -> bool:
+    """True when an edit/symbolic-edit tool result means the change did NOT apply — a
+    no-op (old==new / replacement leaves file unchanged), an unmatched `old` string, or
+    an ambiguous match. Used to count consecutive dead edits so the harness can escalate
+    instead of letting the model re-emit near-identical edits until it burns out (the
+    demonstrated failure: it had the correct fix, reverted it, then looped on a no-op edit
+    for its remaining steps and never called done)."""
+    return result.startswith((
+        "[no-op edit", "[old string not found", "[old string appears",
+        "[old string matches", "[no such file"))
+
+
+def edit_loop_break(noop_edit_streak, break_nudges):
+    """After ~2 consecutive edits that failed to land (see `edit_failed_to_land`), stop
+    the model re-trying variations of a broken edit: tell it its `old` text doesn't match
+    the file, and to re-read the exact current lines and either paste them verbatim or
+    replace the whole enclosing function with `replace_symbol`. One-shot-ish (bounded by
+    break_nudges). Returns nudge text or None."""
+    if noop_edit_streak < 2 or break_nudges >= 2:
+        return None
+    return ("[your last edits changed nothing — your `old`/target text does not match "
+            "the file as it is now. Do NOT re-try more variations. First `read` the exact "
+            "current lines (or `view_symbol`), then either copy that text verbatim into "
+            "`old`, or replace the entire enclosing function with `replace_symbol`. Land "
+            "one real change, then run the test.]")
 
 
 STEP_CAP_CEILING = 4  # absolute per-turn step ceiling = STEP_CAP_CEILING * max_steps

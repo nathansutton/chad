@@ -132,14 +132,20 @@ def _compute_ctx_limit(eng):
     return ctx_limit
 
 
-def _preflight():
-    """chad runs only on Apple Silicon — MLX has no CPU/CUDA build. Hard-stop with a
-    human message instead of letting `uv sync`/import fail cryptically elsewhere."""
+def _preflight(backend="mlx"):
+    """chad's default in-process engine runs only on Apple Silicon — MLX has no CPU/CUDA
+    build. Hard-stop with a human message instead of letting `uv sync`/import fail
+    cryptically elsewhere. The remote backends (`--backend llama/openai`) load NO MLX —
+    only a tokenizer plus HTTP — so they run anywhere (e.g. inside a Linux benchmark
+    container reaching a remote server); skip the Apple-Silicon gate for them."""
+    if backend in ("openai", "llama"):
+        return
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         sys.stderr.write(
             "chad: requires an Apple Silicon Mac (arm64 macOS).\n"
             f"  detected: {platform.system()} {platform.machine() or '?'}\n"
-            "  MLX ships no CPU/CUDA build — there is no supported non-Apple path.\n")
+            "  MLX ships no CPU/CUDA build — there is no supported non-Apple path.\n"
+            "  (For a remote engine on this host, use --backend llama/openai.)\n")
         sys.exit(1)
 
 
@@ -287,10 +293,11 @@ def main():
                     help="wall-clock variant of --turn-budget-tokens (seconds); off by "
                          "default (interactive: the human is the wall clock). Also "
                          "CHAD_TURN_BUDGET_S.")
-    ap.add_argument("--auto-continue", type=int, default=0, dest="auto_continue",
-                    help="on a one-shot run, if the governor hard-stops a turn, relaunch a "
-                         "FRESH turn (cleared context) seeded with the progress note, up to N "
-                         "times (default 0 = off). Sheds the ramble and the huge prefill.")
+    ap.add_argument("--auto-continue", type=int, default=None, dest="auto_continue",
+                    help="on a one-shot run, if the governor or a guardrail hard-stops a "
+                         "turn, relaunch a FRESH turn (cleared context) seeded with the "
+                         "progress note, up to N times. Default: 2 on an unattended "
+                         "(auto-approve) run, 0 otherwise; pass 0 to disable.")
     # Backend selection (plan 046/047 spikes). Default 'mlx' is the in-process engine and
     # the whole point of chad; 'openai' drives the SAME harness against an OpenAI-compatible
     # endpoint (honest degradations apply — see openai_engine.py); 'llama' drives a
@@ -319,7 +326,7 @@ def main():
     ap.add_argument("-p", "--prompt", dest="prompt_flag", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
-    _preflight()  # Apple Silicon only — fail clearly before importing/loading MLX
+    _preflight(args.backend)  # Apple Silicon only for MLX; remote backends run anywhere
     # --think-budget (plan 039) reaches the TUI/REPL Agents through the same env knob
     # their __init__ reads, so the flag works on every entrypoint, not just headless.
     if args.think_budget is not None:
@@ -394,6 +401,19 @@ def main():
             kv_cache_max_bytes=kv_cache_max_bytes,
         )
 
+    # CHAD_TEMP: sampling temperature override, all backends. The default stays 0.0
+    # (greedy — reproducible, and the MLX prompt-lookup fast path requires it), but
+    # greedy has a failure mode measured in NIGHT-7: a stall/garbled call replays
+    # itself byte-identically on every retry and across "independent" bench reps.
+    # Benchmarks and unattended runs should set e.g. CHAD_TEMP=0.7 (what the field
+    # harnesses run) so retries can take a different path.
+    _temp = config.env_str("CHAD_TEMP")
+    if _temp:
+        try:
+            eng.temp = float(_temp)
+        except ValueError:
+            sys.stderr.write(f"[ignoring CHAD_TEMP={_temp!r}: not a number]\n")
+
     # The full-screen TUI loads the 11 GB of weights on a BACKGROUND thread so the banner
     # + input come up in ~0.6 s and you can read/queue while it loads (the load itself is
     # disk-bound and can't be made faster). Headless one-shot and the plain --repl still
@@ -461,16 +481,25 @@ def main():
                       turn_budget_tokens=args.turn_budget_tokens,
                       turn_budget_s=args.turn_budget_s)
         agent.run_turn(task)
-        # Plan 040: if the turn hard-stopped on a budget (governor token/wall budget, or
-        # the step cap's final window landing nothing), optionally relaunch a FRESH turn
-        # (new context + reset KV cache) seeded with the deterministic progress note —
-        # shedding both the ramble and the huge prefill the stuck model dragged.
-        continues = args.auto_continue
+        # Plan 040: if the turn hard-stopped on a budget (governor token/wall budget, the
+        # step cap's final window landing nothing, or the iter-2 no-empty-diff gate),
+        # optionally relaunch a FRESH turn (new context + reset KV cache) seeded with the
+        # deterministic progress note — shedding both the ramble and the huge prefill the
+        # stuck model dragged. Unattended runs default to 2 relaunches: headless is
+        # exactly where nobody can say 'continue', and a banked half-done task otherwise
+        # ships as an empty diff (the NIGHT-7 bail signature).
+        continues = args.auto_continue if args.auto_continue is not None \
+            else (2 if run_mode == "auto" else 0)
         while agent.budget_note and continues > 0:
             note = agent.budget_note
             continues -= 1
             sys.stderr.write("[governor] previous turn ran out of budget/steps; continuing "
                              "fresh with a progress note\n")
+            # A deterministic (temp-0) stall replays itself verbatim on retry — the
+            # NIGHT-7 evidence: 3/3 byte-identical failing reps. Give the relaunch a
+            # sampling distribution so it can take a different path.
+            if getattr(eng, "temp", None) is not None:
+                eng.temp = max(eng.temp, 0.6)
             eng.reset()
             agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
                           mode=run_mode, thinking=thinking, persist=True,

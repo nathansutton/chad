@@ -150,7 +150,7 @@ def test_grep():
 
         # no matches
         check("grep: no matches",
-              tools.tool_grep("ZZZ_no_such_token") == "[no matches]")
+              tools.tool_grep("ZZZ_no_such_token").startswith("[no matches for"))
     finally:
         os.chdir(cwd)
 
@@ -235,7 +235,7 @@ def test_grep_ignore_case_and_context():
         ci = tools.tool_grep("beta", ignore_case=True)
         check("grep: ignore_case hits", "a.py:2:" in ci and "BETA match" in ci, ci)
         check("grep: case-sensitive misses",
-              tools.tool_grep("beta") == "[no matches]")
+              tools.tool_grep("beta").startswith("[no matches for"))
 
         # context: N lines before/after, match uses ':' and context uses '-'
         c1 = tools.tool_grep("BETA", context=1)

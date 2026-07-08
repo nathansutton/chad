@@ -16,7 +16,11 @@ working unchanged.
 import json
 import re
 
-from .validate import VALIDATE, repair_json  # VALIDATE: single source of truth in validate.py
+from .validate import (  # VALIDATE: single source of truth in validate.py
+    VALIDATE,
+    _known_tools,
+    repair_json,
+)
 
 _TAG_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _FENCE_RE = re.compile(r"```(?:json|tool_call)?\s*(\{.*?\})\s*```", re.DOTALL)
@@ -37,10 +41,30 @@ def strip_think(text: str) -> str:
     return _THINK_RE.sub("", text)
 
 
+_IDENT_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+
+
+def salvage_tool_name(name: str) -> str:
+    """Recover a tool name from trailing garbage. Quantized local models garble the
+    CLOSE of a call — observed on the llama backend as `grep</argstr` and `grep"` —
+    and the raw string then validates as an 'unknown tool', which tells a model with
+    a *syntax* problem that it has a *naming* problem (it retried the same garbage
+    to the loop-abort; pytest-6202 died exactly this way). If the name as given is
+    not a known tool but its leading identifier run is, use that. Names that are
+    already valid (including MCP names with dots/dashes) pass through untouched."""
+    known = _known_tools()
+    if name in known:
+        return name
+    m = _IDENT_RE.match(name)
+    if m and m.group(0) in known:
+        return m.group(0)
+    return name
+
+
 def _parse_xml_calls(text: str):
     calls = []
     for fm in _XML_FUNC_RE.finditer(text):
-        name = fm.group(1).strip()
+        name = salvage_tool_name(fm.group(1).strip())
         args = {}
         for pm in _XML_PARAM_RE.finditer(fm.group(2)):
             key = pm.group(1).strip()
@@ -111,5 +135,5 @@ def parse_tool_calls(text: str):
             args = repair_json(args) or args
         if not isinstance(args, dict):
             args = {}
-        calls.append((name, args))
+        calls.append((salvage_tool_name(str(name)), args))
     return calls

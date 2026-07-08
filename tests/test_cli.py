@@ -156,6 +156,19 @@ def test_version_flag(monkeypatch, capsys):
     check("--version prints chad 0.1.0", out.startswith("chad 0.1.0"), out)
 
 
+def test_preflight_skips_apple_gate_for_remote_backends(monkeypatch):
+    # The remote backends load no MLX, so _preflight must NOT hard-stop on a non-Apple
+    # host — that's what lets chad run inside a Linux benchmark container against a remote
+    # server. Simulate a Linux/x86 box and assert llama/openai pass while mlx would exit.
+    monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(cli.platform, "machine", lambda: "x86_64")
+    cli._preflight("llama")   # must return, not exit
+    cli._preflight("openai")  # must return, not exit
+    with pytest.raises(SystemExit) as exc:
+        cli._preflight("mlx")
+    check("mlx backend still gated off Apple Silicon", exc.value.code == 1)
+
+
 def test_version_string_never_raises(monkeypatch):
     # The commit detail is best-effort: if distribution metadata is unreadable the
     # helper must still return a plain "chad <version>" string, never propagate.

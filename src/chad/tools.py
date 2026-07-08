@@ -157,9 +157,11 @@ def tool_read(path: str, offset: int = 0, limit: int = READ_DEFAULT_LIMIT) -> st
     if offset == 0 and limit == READ_DEFAULT_LIMIT and total > READ_SKELETON_LINES:
         skel = repomap.service().overview(path)
         if skel and not skel.startswith("["):  # had real functions/classes
-            return (f"[{_rel(path)} is {total} lines — showing structure only to keep "
-                    f"context small. Use view_symbol(name) for one symbol's body, or "
-                    f"read(path, offset=N) to page raw lines.]\n{skel}")
+            return (f"[NOT an error — this is the STRUCTURE of {_rel(path)} "
+                    f"({total} lines): every function/class signature with line "
+                    f"numbers, bodies omitted to keep context small. The read worked. "
+                    f"To see a body: view_symbol(name), or read(path, offset=N, "
+                    f"limit=M) with the line numbers below.]\n{skel}")
 
     # Paging a big code file with offset= defeats the skeleton guard above and racks up
     # prefill page by page. Nudge toward symbol-targeted reads (the bigfile tasks show
@@ -243,16 +245,37 @@ def _ws_flexible_spans(data: str, old: str):
     return spans
 
 
-def _reindent(new: str, target_indent: str) -> str:
+def _reindent(new: str, target_indent: str, span_text: str | None = None) -> str:
     """Shift `new` so its first non-blank line carries target_indent, preserving the
-    relative indentation of the rest (so a recovered block lands at the file's indent)."""
+    relative indentation of the rest (so a recovered block lands at the file's indent).
+
+    When `span_text` (the file text being replaced) is given, prefer the FILE's own
+    indentation over the model's: a same-line-count replacement takes each span
+    line's indent positionally, and any line whose stripped content matches a span
+    line takes that line's indent. On the whitespace-flexible recovery path the
+    model's relative indents are the least trustworthy part of the edit — the
+    demonstrated failure (sphinx-7440): a semantically correct one-line fix landed
+    with the model's broken 10-space indent, shipped an IndentationError, and the
+    resulting file was unrepairable through this same path."""
+    def _ind(s: str) -> str:
+        return s[: len(s) - len(s.lstrip())]
     lines = new.split("\n")
+    span_lines = span_text.split("\n") if span_text is not None else []
+    positional = len(span_lines) == len(lines) and bool(span_lines)
+    strip_map: dict[str, str] = {}
+    for sl in span_lines:
+        if sl.strip():
+            strip_map.setdefault(sl.strip(), _ind(sl))
     first = next((l for l in lines if l.strip()), "")
-    src = first[: len(first) - len(first.lstrip())]
+    src = _ind(first)
     out = []
-    for ln in lines:
+    for i, ln in enumerate(lines):
         if not ln.strip():
             out.append("")
+        elif positional and span_lines[i].strip():
+            out.append(_ind(span_lines[i]) + ln.strip())
+        elif ln.strip() in strip_map:
+            out.append(strip_map[ln.strip()] + ln.strip())
         elif ln.startswith(src):
             out.append(target_indent + ln[len(src):])
         else:
@@ -323,7 +346,18 @@ def tool_edit(path: str, old: str, new: str) -> str:
         head = data[s:e].split("\n")[0]
         indent = head[: len(head) - len(head.lstrip())]
         used_unew = uold != old  # this path only unescapes `new` when `old` was unescaped
-        repl = _reindent((unew if used_unew else new).strip("\n"), indent)
+        raw = (unew if used_unew else new).strip("\n")
+        repl = _reindent(raw, indent, data[s:e])
+        if data[:s] + repl + data[e:] == data and raw != data[s:e]:
+            # Reindenting reproduced the file byte-for-byte, yet the model's `new`
+            # differs from the span — the edit IS a whitespace change (an
+            # indentation fix). Normalizing it away made a broken indent literally
+            # unrepairable through this tool (sphinx-7440: every fix attempt
+            # returned "[no-op edit]" and the model fell back to blind sed). Trust
+            # the model's whitespace verbatim.
+            return _apply_edit(path, data, data[:s] + raw + data[e:],
+                               " (applied verbatim: whitespace-only change)"
+                               + (note_new if used_unew else ""))
         return _apply_edit(path, data, data[:s] + repl + data[e:],
                            " (recovered: matched ignoring indentation/whitespace)"
                            + (note_new if used_unew else ""))
@@ -524,7 +558,19 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
             continue
 
     if not out:
-        return "[no matches]"
+        # State the searched scope, and NEVER hide truncation on the zero-match path:
+        # a capped walk that returns a bare "[no matches]" is a confident lie — the
+        # demonstrated failure (django-14007): the tree exceeded GREP_MAX_FILES, the
+        # issue's own symbol lived in an unsearched file, and the model stalled out
+        # trusting the empty result.
+        scope = path if path not in (".", "") else "the current directory"
+        msg = f"[no matches for {pattern!r} in {scope}]"
+        if files_truncated:
+            msg += (f"\n[WARNING: only the first {GREP_MAX_FILES} files were searched — "
+                    "this tree is larger, so the pattern may exist in files that were "
+                    "not searched. Re-run with a narrower path= (e.g. the package "
+                    "subdirectory).]")
+        return msg
     notices = []
     if capped:
         notices.append(f"[results truncated: {len(out)}/{matches} lines — narrow the "

@@ -199,6 +199,13 @@ def discover(cwd: str = None, home: str = None):
     `order` is the de-duplicated catalog order (stable: discovery order); `warnings`
     collects per-skill diagnostics plus shadow/collision notes for surfacing in /skills.
     """
+    # CHAD_NO_SKILLS=1 disables all skill discovery (no `# Skills` prompt section, no
+    # `activate_skill` tool). For controlled/benchmark runs where the host's personal
+    # `~/.claude/skills` must not leak into the prompt and skew results — a measured
+    # confound: ~50 user skills were injected into every prompt, differing from a clean
+    # environment and shifting a small model's greedy trajectory.
+    if os.environ.get("CHAD_NO_SKILLS", "").strip().lower() in ("1", "true", "yes", "on"):
+        return {}, [], []
     cwd = cwd or os.getcwd()
     home = home or os.path.expanduser("~")
     by_name = {}

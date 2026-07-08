@@ -101,7 +101,37 @@ def test_edit():
     check("no-op rejected", "no-op" in res and after == GEO, res)
 
 
+def test_ws_recovery_prefers_file_indentation():
+    """Iter-2 (plan 066, sphinx-7440): on the whitespace-flexible path the model's
+    RELATIVE indents are the least trustworthy part of the edit. A same-line-count
+    replacement takes each replaced line's indent from the FILE, so a garbled-indent
+    `new` can no longer land a SyntaxError."""
+    before = "def f():\n    a = 1\n    b = compute(a.lower(), x)\n"
+    # `old` drifts in indentation (ws-flex match); `new` carries broken relative
+    # indents (2 then 10) — exactly the 7440 corruption. File indents must win.
+    res, after = run(before,
+                     "  a = 1\n        b = compute(a.lower(), x)",
+                     "  a = 1\n          b = compute(a, x)")
+    check("ws-recovery: edit landed", res.startswith("[edited"), res)
+    check("ws-recovery: file indentation kept",
+          after == "def f():\n    a = 1\n    b = compute(a, x)\n", repr(after))
+
+
+def test_ws_only_edit_applies_verbatim():
+    """Iter-2 (plan 066, sphinx-7440): an indentation-ONLY fix used to normalize to
+    '[no-op edit]' — a broken indent was literally unrepairable through this tool
+    and the model fell back to blind sed. When reindenting reproduces the file
+    byte-for-byte but the model's `new` differs, trust its whitespace verbatim."""
+    before = "def f():\n    a = 1\n          b = 2\n"   # broken indent on b
+    res, after = run(before, "a = 1\n b = 2", "    a = 1\n    b = 2")
+    check("ws-only: applied verbatim", "verbatim" in res, res)
+    check("ws-only: indent repaired",
+          after == "def f():\n    a = 1\n    b = 2\n", repr(after))
+
+
 if __name__ == "__main__":
     test_edit()
+    test_ws_recovery_prefers_file_indentation()
+    test_ws_only_edit_applies_verbatim()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

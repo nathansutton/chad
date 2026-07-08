@@ -115,6 +115,16 @@ def test_render():
                          coerce_and_validate("frobnicate", {"x": 1})[1])
     check("render unknown tool lists available", "Available" in msg2)
 
+    # Iter-2 (plan 066): a garbled NAME ('grep</argstr') is a SYNTAX failure, not a
+    # naming one — the message must show a worked call example, not a name list
+    # (which sent the pytest-6202 model re-emitting the same garble to loop-abort).
+    msg3 = render_repair("grep</argstr", {},
+                         coerce_and_validate("grep</argstr", {})[1])
+    check("render malformed name says malformed", "malformed tool call" in msg3)
+    check("render malformed name shows exemplar",
+          '<tool_call>{"name": "grep"' in msg3, f"msg={msg3!r}")
+    check("render malformed name does not list tools", "Available tools" not in msg3)
+
 
 def test_legacy_validate():
     # The CHAD_NO_VALIDATE A/B baseline: terse unknown/non-object/missing checks,

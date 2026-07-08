@@ -259,8 +259,10 @@ def test_step_cap_extends_while_turn_lands_verified_changes(tmp_path):
     # repeat-loop guard instead of exercising the cap.
     script = []
     for i in range(3):
+        # The verify step must be an EXECUTING command (python …) — a display command
+        # like `echo` no longer clears unverified_edit (bash_result_verifies).
         script += [_tool_call("write", path=str(f), content=f"x = {i}\n"),
-                   _tool_call("bash", command=f"echo ok{i}")]
+                   _tool_call("bash", command=f"python {f} && echo ok{i}")]
     script.append(_tool_call("done", summary="finished the long task"))
     agent = _agent(script, max_steps=4)
 
@@ -286,3 +288,82 @@ def test_step_cap_stops_and_banks_note_without_progress(tmp_path):
     assert "step cap" in result             # explicit stop, not a silent death
     assert agent.budget_note                # note banked for continue/--auto-continue
     assert agent.engine._i == len(script)   # stopped exactly at the cap, no extension
+
+
+# --- Iter-2 (plan 066): no-empty-diff terminal gates --------------------------------
+
+def test_no_empty_diff_gate_blocks_prose_end_on_action_task():
+    """An ACTION task whose model stalls into prose 'final answers' (the NIGHT-7 bail
+    signature: django-14007/sphinx-9230 accepted a 'Let me search…' sentence as the
+    final answer with an EMPTY diff and 97% of budget unused) must end as a resumable
+    hard stop with a progress note — never as a silent success."""
+    script = [
+        "Let me find where the bug is defined.",   # bail 1 -> nudge
+        "Let me search for the relevant code.",    # bail 2 -> nudge (budget exhausted)
+        "The fix should go in utils.py.",          # would have been accepted before
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn("fix the crash in utils.py")
+
+    assert result.startswith("[stopped:")
+    assert "verified change" in result
+    assert agent.budget_note                # relaunch seed for --auto-continue
+
+
+def test_no_empty_diff_gate_blocks_done_with_unverified_edit(tmp_path):
+    """`done` after the verify nudges are exhausted, with an edit in tree and no
+    successful run since (matplotlib-25332 r3: done at 84s, zero post-edit commands
+    succeeded, no guard fired) becomes a resumable hard stop."""
+    f = tmp_path / "m.py"
+    f.write_text("x = 1\n")
+    script = [
+        _tool_call("edit", path=str(f), old="x = 1", new="x = 2"),
+        _tool_call("done", summary="changed it"),    # -> verify nudge 1
+        _tool_call("done", summary="changed it."),   # -> verify nudge 2
+        _tool_call("done", summary="changed it!"),   # nudges exhausted -> gate
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn("change x to 2 in m.py")
+
+    assert result.startswith("[stopped:")
+    assert agent.budget_note
+    assert f.read_text() == "x = 2\n"       # the edit itself stays on disk
+
+
+def test_prose_answer_still_ends_read_only_turns(tmp_path):
+    """Negative control for the gate: an explain-only ask still ends normally on a
+    prose answer — the gate must key on action intent, not fire universally."""
+    target = tmp_path / "data.txt"
+    target.write_text("42\n")
+    script = [_tool_call("read", path=str(target)),
+              "It contains the number 42."]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn("what does data.txt contain?")
+
+    assert result == "It contains the number 42."
+    assert agent.budget_note is None
+
+
+def test_bash_mutation_triggers_syntax_recheck(tmp_path):
+    """Iter-2 (plan 066, sphinx-7440): bash can rewrite files (sed -i and friends)
+    but used to bypass the edit-tool syntax gate — a file survived 9 blind 'fixes'
+    unparseable and nothing said so. A bash step that mutates a file edited this
+    turn must get a parse warning appended to its result."""
+    f = tmp_path / "m.py"
+    f.write_text("x = 1\n")
+    breaker = f"python -c \"open(r'{f}','w').write('def f(:\\n')\""
+    script = [
+        _tool_call("edit", path=str(f), old="x = 1", new="x = 2"),
+        _tool_call("bash", command=breaker),      # bash breaks the watched file
+        _tool_call("bash", command=f"python {f}"),  # (fails; keeps turn alive)
+        _tool_call("done", summary="attempted"),
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("change x to 2 in m.py")
+
+    bash_msgs = [m["content"] for m in agent.messages
+                 if m.get("role") == "tool" and m.get("name") == "bash"]
+    assert any("no longer parses" in c for c in bash_msgs)

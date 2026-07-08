@@ -342,6 +342,17 @@ def coerce_and_validate(name: str, args: Any) -> Tuple[Any, List[Err]]:
 
 def render_repair(name: str, args: Any, errors: List[Err]) -> str:
     if _param_schema(name) is None:
+        # A name with non-identifier characters ('grep</argstr') is not a naming
+        # mistake — the model's call SYNTAX was garbled. Saying "unknown tool, pick
+        # from this list" misdiagnoses it (the model re-emits the same garble; the
+        # pytest-6202 death spiral). Show a worked example of the one format we
+        # most reliably parse instead.
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(name)):
+            return (f"[malformed tool call — the tool name parsed as {name!r}, which "
+                    "means your call syntax was garbled. Do not retry the same text. "
+                    "Re-emit the call as ONE json object in this exact shape: "
+                    '<tool_call>{"name": "grep", "arguments": {"pattern": "..."}}'
+                    "</tool_call> — substituting your intended tool and arguments.]")
         return (f"[unknown tool {name!r}. Available tools: {', '.join(_known_tools())}. "
                 "Re-emit the call using one of these names.]")
     lines = [f"[invalid arguments for `{name}` — fix ONLY the fields marked ✗ below, "

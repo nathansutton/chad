@@ -14,7 +14,7 @@ import re
 import sys
 import time
 
-from . import compaction, config, guardrails, session
+from . import compaction, config, guardrails, session, syntaxgate
 from .base_engine import BaseEngine
 from .diag import args_preview, log, redact, result_preview
 from .prompt import build_subagent_prompt, build_system_prompt, classify_intent
@@ -92,6 +92,10 @@ def _trace_prefill(row: dict) -> None:
 # or after whitespace so an email (foo@bar.com) or decorator never matches; trailing
 # sentence punctuation is trimmed off the path.
 _MENTION_RE = re.compile(r"(?:^|\s)@([A-Za-z0-9_.~/-]+)")
+
+# Chat-template special-token literals (<|im_end|>, <|mask_end|>, …) leaked into
+# generated TEXT. They are never legitimate content; see the scrub site in run_turn.
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[A-Za-z0-9_]+\|>")
 
 
 def expand_mentions(text: str):
@@ -457,10 +461,21 @@ class Agent:
         return rendered["input_ids"] if hasattr(rendered, "input_ids") else rendered
 
     def _render(self):
-        return self._template_ids(self.engine.tok.apply_chat_template(
+        ids = self._template_ids(self.engine.tok.apply_chat_template(
             self.messages, tools=self._active_schemas(), add_generation_prompt=True,
             enable_thinking=self.thinking,
         ))
+        # Debug hook (env-gated, off by default): dump the first decoded render so a
+        # rendered-prompt difference across environments can be diffed. Best-effort.
+        dump = os.environ.get("CHAD_DUMP_RENDER")
+        if dump and not getattr(self, "_dumped_render", False):
+            try:
+                with open(dump, "w") as f:
+                    f.write(self.engine.tok.decode(list(ids)))
+                self._dumped_render = True
+            except Exception:  # noqa: BLE001 — a debug dump must never break a turn
+                pass
+        return ids
 
     def _stable_prefix_ids(self):
         """The byte-identical head of every session: system prompt + tool schemas,
@@ -570,6 +585,15 @@ class Agent:
             self.forwards += sub.forwards
             if sub.interrupted:
                 return "[task interrupted]"
+            # A sub-agent that dies at its step cap returns only the boilerplate
+            # "[stopped: hit the step cap…]" while its banked progress note (files
+            # read, symbols located) was silently discarded — the demonstrated
+            # failure (django-14007/sphinx-9230): the sub-agent read the gold file,
+            # then "returned 1 line" and the parent restarted localization from
+            # zero. Hand the parent everything the sub-agent learned.
+            if sub.budget_note and (not result or result.startswith("[stopped:")):
+                result = ((result or "").rstrip() + "\n[sub-agent progress before it "
+                          f"stopped: {sub.budget_note}]").strip()
         return result or "[task returned nothing]"
 
     def run_turn(self, user_text: str, stream=True):
@@ -612,10 +636,20 @@ class Agent:
         empty_done_nudges = 0
         made_edit = False  # an edit/write/replace/insert actually landed this turn
         answer_nudges = 0
+        noop_edit_streak = 0  # consecutive edits that failed to land (plan 047 loop-break)
+        break_nudges = 0      # times we escalated a stuck edit this turn
+        readonly_streak = 0   # consecutive steps with substantive tools but no landed edit
+        gate_nudges = 0       # times the investigation->edit gate fired this turn
+        subagent_sigs = set() # (description, prompt) of sub-agents already spawned this turn
         truncation_nudges = 0  # times we pushed past a token-cap truncation this turn
         landing_nudges = 0  # one-shot "you're out of steps, land the edit" near the cap
         consecutive_failed_bash = 0  # back-to-back errored bash with no edit (thrash)
         thrash_nudges = 0
+        # Files edited this turn -> mtime at last syntax check. Bash can mutate files
+        # too (sed -i, python rewrites) but bypasses the write/edit syntax gate; watch
+        # edited files and re-check them after any bash that touched them (iter-2:
+        # sphinx-7440's file survived 9 blind `sed -i` "fixes" unparseable, unflagged).
+        edited_syntax_watch: dict = {}
         think_cap_hits = 0  # soft think-cap firings this turn (plan 039; drives escalation)
         repeat_stops = 0  # degenerate-repetition cut-offs this turn (3rd aborts the turn)
         # Runaway-turn governor state (plan 040). turn_start drives the optional wall
@@ -808,8 +842,14 @@ class Agent:
                 view.close()
                 if view.saw_prose:
                     self._emit("stream", "\n")
-            # strip any trailing special tokens the template will re-add
-            text = text.replace("<|im_end|>", "").rstrip()
+            # strip any trailing special tokens the template will re-add — and any
+            # LEAKED special-token literal anywhere in the text. A quantized model
+            # can emit a stray marker like <|mask_end|> mid-turn (NIGHT-7
+            # django-14404 r3: one leaked at step 12 and the turn read as a clean
+            # final answer, ending the run rc=0 with an unverified edit); scrubbed
+            # here so it can neither pollute the transcript nor masquerade as
+            # content.
+            text = _SPECIAL_TOKEN_RE.sub("", text).rstrip()
 
             # Interrupted (often mid-prefill, so text is empty): stop cleanly without
             # appending an empty assistant turn.
@@ -956,6 +996,24 @@ class Agent:
                              "action_task=%s)", step, kind, hit_cap, has_code, action_task)
                     self.messages.append({"role": "tool", "name": "edit", "content": nudge})
                     continue
+                if action_task and not read_only_intent \
+                        and (not made_edit or unverified_edit):
+                    # Iter-2 no-empty-diff gate: an action task may not END on a prose
+                    # "final answer" while no change landed (or the change is
+                    # unverified) — the demonstrated failures (django-14007,
+                    # sphinx-9230): 49–97s bails accepted as final answers with an
+                    # empty diff and 97% of the budget unused. Bank a progress note
+                    # and end as a hard stop, so --auto-continue (headless) or the
+                    # user's 'continue' (TUI) relaunches a fresh attempt with the
+                    # note instead of silently shipping nothing.
+                    self.budget_note = guardrails.progress_note(self.messages)
+                    log.info("END step %d: FINAL ANSWER blocked by no-empty-diff gate "
+                             "(made_edit=%s, unverified_edit=%s) — progress note banked",
+                             step, made_edit, unverified_edit)
+                    self._emit("info", "  [turn ended without a landed+verified change "
+                                       "— progress note banked; say 'continue' to retry]")
+                    return ("[stopped: the turn ended without applying a verified "
+                            "change — say 'continue' to resume]")
                 log.info("END step %d: model produced a FINAL ANSWER, no tool calls "
                          "(did_work=%s, made_edit=%s, unverified_edit=%s)",
                          step, did_work, made_edit, unverified_edit)
@@ -1001,6 +1059,21 @@ class Agent:
                                    "fails, fix the code first.]",
                     })
                     continue
+                if action_task and not read_only_intent and self.mode != "plan" \
+                        and (not made_edit or unverified_edit):
+                    # Same no-empty-diff gate as the prose-final-answer path: `done`
+                    # with nothing landed (or landed-unverified after the verify
+                    # nudges ran out) becomes a resumable hard stop, not a success
+                    # (matplotlib-25332 r3: done accepted at 84s with edits in tree
+                    # and zero successful post-edit commands).
+                    self.budget_note = guardrails.progress_note(self.messages)
+                    log.info("END step %d: DONE blocked by no-empty-diff gate "
+                             "(made_edit=%s, unverified_edit=%s) — progress note banked",
+                             step, made_edit, unverified_edit)
+                    self._emit("info", "  [done rejected: no landed+verified change — "
+                                       "progress note banked; say 'continue' to retry]")
+                    return ("[stopped: `done` was called without a landed+verified "
+                            "change — say 'continue' to resume]")
                 log.info("END step %d: DONE accepted | summary=%r", step,
                          terminal.get("summary"))
                 return terminal.get("summary") or text or "Done."
@@ -1081,6 +1154,23 @@ class Agent:
                 # schema, so if one somehow emits it we fall through to the unknown-tool
                 # repair path rather than nesting.
                 if name == "task" and not self._subagent:
+                    # Plan 047 — anti-respawn: a sub-agent is expensive and runs on a
+                    # quarantined cache, so re-spawning the SAME (description, prompt) is
+                    # almost always waste. The demonstrated failure: a localization
+                    # sub-agent hit its step cap returning nothing usable, and the model
+                    # re-ran the identical one, which capped out again — half the turn's
+                    # budget gone. Refuse the duplicate and push the model to act directly.
+                    _sub_sig = (str(args.get("description", "")).strip(),
+                                str(args.get("prompt", "")).strip())
+                    if _sub_sig in subagent_sigs:
+                        result = ("[you already ran this exact sub-agent this turn — do NOT "
+                                  "re-run it. Use what it returned, or do the work yourself "
+                                  "now with grep/read to locate the code and edit to change "
+                                  "it. Re-spawning the same task will not produce more.]")
+                        render_tool_result(self._emit, name, args, result)
+                        self.messages.append({"role": "tool", "name": name, "content": result})
+                        continue
+                    subagent_sigs.add(_sub_sig)
                     result = self._run_subagent(
                         args.get("description", ""), args.get("prompt", ""),
                         args.get("tools", "read-only"))
@@ -1131,6 +1221,33 @@ class Agent:
                 # unverified_edit) for this tool result — see guardrails.update_work_flags.
                 did_work, made_edit, unverified_edit = guardrails.update_work_flags(
                     name, args, result, did_work, made_edit, unverified_edit)
+                # Plan 047: track consecutive edits that DIDN'T land (no-op / unmatched
+                # `old`), so the model gets pushed to read-then-replace instead of looping
+                # on variations of a broken edit. A landed edit of any kind resets it.
+                if name in ("edit", "write", "replace_symbol", "insert_symbol",
+                            "rename_symbol"):
+                    noop_edit_streak = (noop_edit_streak + 1
+                                        if guardrails.edit_failed_to_land(result) else 0)
+                    if not guardrails.edit_failed_to_land(result):
+                        _wp = str(args.get("path", "") or "")
+                        if _wp and os.path.exists(_wp):
+                            try:
+                                edited_syntax_watch[_wp] = os.path.getmtime(_wp)
+                            except OSError:
+                                pass
+                elif name == "bash":
+                    # Re-check syntax of watched files a bash command rewrote — the
+                    # sed -i escape hatch around the edit-tool syntax gate.
+                    for _wp, _wmt in list(edited_syntax_watch.items()):
+                        try:
+                            _cur = os.path.getmtime(_wp)
+                        except OSError:
+                            continue
+                        if _cur != _wmt:
+                            edited_syntax_watch[_wp] = _cur
+                            _warn = syntaxgate.check_syntax(_wp, None)
+                            if _warn:
+                                self.messages[-1]["content"] += _warn
                 # Thrash counter (C): count back-to-back failed bash with no edit between.
                 consecutive_failed_bash = guardrails.update_thrash(
                     name, result, consecutive_failed_bash)
@@ -1142,6 +1259,34 @@ class Agent:
             if (made_edit and not _gov_prev_made) or (_gov_prev_unverified and not unverified_edit):
                 gov_progress = True
                 landed_in_window = True  # also earns a step-cap extension (same signal)
+
+            # Plan 047 — edit loop-break: after ~2 consecutive edits that failed to land,
+            # stop the model re-trying variations and send it to read-then-replace.
+            brk = guardrails.edit_loop_break(noop_edit_streak, break_nudges)
+            if brk:
+                break_nudges += 1
+                noop_edit_streak = 0  # give the escalation a clean slate
+                log.info("EDIT-LOOP-BREAK at step %d (streak reset) -> nudge #%d",
+                         step, break_nudges)
+                self.messages.append({"role": "tool", "name": "edit", "content": brk})
+
+            # Plan 047 — investigation->edit gate: a step that ran substantive tools but
+            # landed no edit is investigation; a long run of it on an action task means the
+            # model is exploring instead of acting (it named the fix but grep-looped into an
+            # empty patch). Steer it to edit before the loop-abort/step-cap kills the turn.
+            # read_only/explain asks are exempt (nothing to edit).
+            if made_edit and not _gov_prev_made:
+                readonly_streak = 0
+            elif did_work and not made_edit:
+                readonly_streak += 1
+            if not read_only_intent:
+                gate = guardrails.investigation_gate(readonly_streak, made_edit, gate_nudges)
+                if gate:
+                    gate_nudges += 1
+                    readonly_streak = 0
+                    log.info("INVESTIGATION-GATE at step %d (streak, no edit) -> nudge #%d",
+                             step, gate_nudges)
+                    self.messages.append({"role": "tool", "name": "edit", "content": gate})
 
             # Break a flailing-probe run (e.g. guessing the test runner, repeated
             # `python -c import` checks) that the exact-call loop guard can't see because

@@ -27,11 +27,25 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-import mlx.core as mx
 import numpy as np
-from mlx_lm import load, stream_generate
-from mlx_lm.models import cache as cache_utils
-from mlx_lm.sample_utils import make_sampler
+
+# MLX is Apple-only (no CPU/CUDA build), and the whole `Engine` class below rides on it.
+# But two module-level helpers here — `sweep_orphan_spills` and `peek_context_window` —
+# are MLX-free and ARE needed on the remote `--backend llama/openai` path, which loads no
+# MLX at all. Guard the imports so `import chad.engine` succeeds on a non-Apple host (e.g.
+# inside a Linux benchmark container that runs chad against a remote server). `Engine`
+# itself is only ever CONSTRUCTED on the default MLX path, where these are present; if a
+# remote-only host somehow builds one, it fails fast on the first `mx.` use.
+try:
+    import mlx.core as mx
+    from mlx_lm import load, stream_generate
+    from mlx_lm.models import cache as cache_utils
+    from mlx_lm.sample_utils import make_sampler
+    _HAS_MLX = True
+except ImportError:  # non-Apple host: remote backend only
+    mx = None  # type: ignore[assignment]
+    load = stream_generate = cache_utils = make_sampler = None  # type: ignore[assignment]
+    _HAS_MLX = False
 
 # GenStats moved to base_engine.py (plan 046) so a non-MLX backend can build one without
 # importing mlx.core. Re-exported here so existing `from .engine import GenStats` keeps

@@ -35,9 +35,9 @@ running free on your own machine is still worth having around. 🗿
 
 ![chad fixing a failing test end to end — reason, read, edit, rerun pytest, all on a local 35B](docs/demo.gif)
 
-> Real session, unedited: the default local 35B reasons through the failure, edits the
-> file, reruns the tests, and confirms green. The cold model load is cut; everything after
-> is real time.
+> Real session, unedited: a local 35B (the ≥32 GB tier) reasons through the failure, edits
+> the file, reruns the tests, and confirms green. The cold model load is cut; everything
+> after is real time.
 
 A single-user agentic coding backend that runs **entirely locally on Apple Silicon**
 via [MLX](https://github.com/ml-explore/mlx). It gives you Claude-Code-style tool use
@@ -46,10 +46,10 @@ Claude-Code-style **feel**: a full-screen TUI with shift-tab plan mode, a type-a
 message queue, mid-turn interrupt, and live throughput/context status.
 
 It targets the machine most developers actually have — a **24 GB Apple Silicon
-MacBook** — and the whole design follows from one constraint that machine imposes:
-**prefill is the dominant cost** in an agentic loop, so a persistent prefix KV cache that
-never re-reads the transcript is the core engineering. The full story is in
-[Design & internals](docs/design.md).
+MacBook** (where it runs the 9B; the 35B is the 32 GB+ tier) — and the whole design
+follows from one constraint that machine imposes: **prefill is the dominant cost** in an
+agentic loop, so a persistent prefix KV cache that never re-reads the transcript is the
+core engineering. The full story is in [Design & internals](docs/design.md).
 
 ## The bet: at this end of the report card, the harness beats the model
 
@@ -158,10 +158,13 @@ Face cache (`~/.cache/huggingface`, reused across every project):
 
 | Your Mac | Model | Footprint |
 |---|---|---|
-| **≥ 24 GB** (default) | [Ornith-1.0-35B `UD-Q2_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX) — 35B MoE, 2-bit experts | ~12 GB |
-| **16 / 18 GB** (auto-fallback) | [Ornith-1.0-9B `UD-Q4_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX) — 4-bit AWQ | ~5 GB |
+| **≥ 32 GB** | [Ornith-1.0-35B `UD-Q2_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX) — 35B MoE, 2-bit experts | ~12 GB resident (~14 GB with KV + runtime) |
+| **16 / 18 / 24 GB** (default) | [Ornith-1.0-9B `UD-Q4_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX) — 4-bit AWQ | ~5 GB |
 
-chad detects your RAM and chooses; the first run asks before downloading (~12 GB / ~5 GB —
+The 35B's ~14 GB working set needs headroom the 24 GB machine doesn't have — dogfooding
+SIGKILLed it mid-turn there — so the floor for the 35B is **32 GB**; a 24 GB Mac (and the
+16/18 GB MacBook Pros) runs the 9B, which fits easily. chad detects your RAM and chooses;
+the first run asks before downloading (~12 GB / ~5 GB —
 2-4 minutes on gigabit fiber, 15-25 on a 100 Mbit line; the download is resumable, so a
 killed first run picks up where it left off), or auto-downloads when headless. No model
 picker, no flags. Override with `CHAD_MODEL=<repo
