@@ -10,12 +10,13 @@ One model (Ornith — 35B on big Macs, 9B on small), one entrypoint, run with uv
 Rare long-session knobs live in env vars — see README "Advanced".
 """
 import argparse
+import json
 import os
 import platform
 import subprocess
 import sys
 
-from . import config
+from . import config, levers
 from .agent import Agent, repl
 from .engine import Engine
 
@@ -324,8 +325,25 @@ def main():
                     help="plain line REPL instead of the full-screen TUI")
     # Back-compat: -p/--prompt was the old one-shot spelling, now the positional task.
     ap.add_argument("-p", "--prompt", dest="prompt_flag", help=argparse.SUPPRESS)
+    ap.add_argument("--levers", action="store_true",
+                    help="print the harness lever registry as JSON and exit (the "
+                         "ablation driver enumerates this instead of hardcoding names)")
     args = ap.parse_args()
 
+    # Before _preflight: an ablation driver enumerating levers should not need an
+    # Apple-Silicon box or a loadable model just to read the registry.
+    if args.levers:
+        print(json.dumps({"levers": levers.as_dict(), "groups": levers.groups(),
+                          "active": levers.active()}, indent=2))
+        return
+
+    # Fail fast on a typo'd CHAD_DISABLE, not mid-run: an unrecognized lever means the
+    # harness would run unmodified while an ablation reports the delta as "no effect".
+    try:
+        levers.validate_env()
+    except levers.UnknownLever as e:
+        sys.stderr.write(f"chad: {e}\n")
+        sys.exit(1)
     _preflight(args.backend)  # Apple Silicon only for MLX; remote backends run anywhere
     # --think-budget (plan 039) reaches the TUI/REPL Agents through the same env knob
     # their __init__ reads, so the flag works on every entrypoint, not just headless.

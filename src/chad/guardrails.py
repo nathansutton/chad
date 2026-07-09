@@ -16,6 +16,7 @@ nudge text are byte-identical to the old inline code.
 import json
 import re
 
+from . import levers
 from .toolcall_parse import strip_think
 
 # First-person, forward-looking leads that ANNOUNCE a next step ("Let me find where
@@ -124,6 +125,10 @@ def bash_result_verifies(result: str, command: str = "") -> bool:
     false-green: it disarmed every guard while the file didn't even parse)."""
     if result.startswith(("[exit", "[timed out", "[interrupted", "[failed to launch")):
         return False
+    # Gates (2) and (3) together ARE the iter-2 anti-spoof fix; ablating it means
+    # accepting any clean exit as verification, which is the pre-fix behavior.
+    if not levers.enabled("verify_requires_execution"):
+        return True
     if _is_trivial_check(command):
         return False
     if not _is_executing_command(command):
@@ -193,7 +198,8 @@ def update_work_flags(name, args, result, did_work, made_edit, unverified_edit):
         cmd = str(args.get("command", ""))
         errored = result.startswith(
             ("[exit", "[timed out", "[interrupted", "[failed to launch"))
-        if reverts_working_tree(cmd) and not errored:
+        if (levers.enabled("revert_rearm_gate")
+                and reverts_working_tree(cmd) and not errored):
             made_edit = False
             unverified_edit = False
         elif bash_result_verifies(result, cmd):
@@ -250,7 +256,8 @@ def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_inte
     # that keeps stalling still terminates. read_only intent is exempt (an explain-only
     # ask is allowed to answer briefly), matching the answered-on-paper branch below.
     stripped = strip_think(text).strip()
-    if (not read_only_intent) and not made_edit and answer_nudges < 2 \
+    if levers.enabled("bail_nudge") \
+            and (not read_only_intent) and not made_edit and answer_nudges < 2 \
             and ((not stripped) or _announces_unfulfilled_action(stripped)):
         nudge = ("[you stopped after thinking without taking any action — no tool call "
                  "and no answer. Do not stop here. Emit your next concrete step now as a "
@@ -307,6 +314,8 @@ def investigation_gate(readonly_streak, made_edit, gate_nudges, threshold=6):
     delegated the same read-only sub-agent twice, both capping out, without ever editing.
     This converts investigation into an edit before the loop-abort / step-cap kills the
     turn with nothing applied. Returns nudge text or None. Bounded by gate_nudges."""
+    if not levers.enabled("investigation_gate"):
+        return None
     if made_edit or gate_nudges >= 2 or readonly_streak < threshold:
         return None
     return (f"[you've spent {readonly_streak} steps investigating and applied no edit — "
@@ -364,8 +373,15 @@ def edit_loop_break(noop_edit_streak, break_nudges, kind=None):
     `new` actually differ; anything else → the `old` text doesn't match, tell it to
     re-read and paste verbatim / use `replace_symbol`. One-shot-ish (bounded by
     break_nudges). Returns nudge text or None."""
+    if not levers.enabled("edit_loop_break"):
+        return None
     if noop_edit_streak < 2 or break_nudges >= 2:
         return None
+    # Ablating the classifier means every failure gets the nomatch remedy, which is the
+    # pre-iter-3 conflation: a model that pasted `old == new` is told to go re-read and
+    # paste verbatim — precisely what it just did.
+    if not levers.enabled("edit_fail_kind"):
+        kind = None
     return _NOOP_BREAK if kind == "noop" else _NOMATCH_BREAK
 
 
@@ -487,8 +503,11 @@ def degenerate_tail(text: str, tail: int = REPEAT_TAIL_CHARS,
     loop case the fine tier is blind to). ~0.5ms for the fine window, ~3ms for the coarse
     one, of pure Python; run_turn calls it every 16 tokens, i.e. a few times per second
     against a ~25ms/token decode, so the cost is noise."""
-    return (_is_periodic_tail(text, tail, max_period)
-            or _is_periodic_tail(text, REPEAT_COARSE_TAIL_CHARS, REPEAT_COARSE_MAX_PERIOD))
+    if _is_periodic_tail(text, tail, max_period):
+        return True
+    if not levers.enabled("repeat_coarse_tier"):
+        return False
+    return _is_periodic_tail(text, REPEAT_COARSE_TAIL_CHARS, REPEAT_COARSE_MAX_PERIOD)
 
 
 REPEAT_STOP_NUDGE = (
@@ -658,20 +677,25 @@ def progress_note(messages, max_lines: int = 24) -> str:
         elif role == "tool":
             if content.startswith(_ERROR_PREFIXES) or "Traceback" in content:
                 last_error = content
+    # Ablating `progress_note_rich` reverts to the pre-iter-3 note: file names and
+    # commands only. Everything the executor cannot reconstruct from a clean context —
+    # the diagnosis, the failing signature, what was already looked at — is what the
+    # lever adds, and therefore what its delta measures.
+    rich = levers.enabled("progress_note_rich")
     lines = ["Progress so far (auto-summarized — the previous attempt ran out of budget):"]
-    if hypothesis:
+    if rich and hypothesis:
         # The single most valuable thing to carry: the diagnosis the stuck attempt
         # reached. Keep the tail (the conclusion), clipped so it can't blow the budget.
         lines.append("Working hypothesis from the previous attempt (verify, don't assume):")
         lines += ["  " + ln[:160] for ln in hypothesis.splitlines()[-4:] if ln.strip()]
     if edited:
         lines.append("Files already edited: " + ", ".join(edited[-8:]))
-    if last_error:
+    if rich and last_error:
         lines.append("Last failing check — make THIS pass:")
         err_lines = last_error.strip().splitlines()
         sig = [ln for ln in err_lines if _FAILURE_RE.match(ln.strip())][-3:]
         lines += ["  " + ln[:140] for ln in (sig or err_lines[-3:])]
-    if examined:
+    if rich and examined:
         lines.append("Already examined (don't re-explore): " + ", ".join(examined[-8:]))
     if commands:
         lines.append("Commands already tried (do not blindly repeat):")

@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Any
 
-from . import config, repomap, symbols, syntaxgate
+from . import config, levers, repomap, symbols, syntaxgate
 from .ignore import IGNORE_DIRS, slash_wrapped
 
 # Directories never worth walking: huge, generated, or VCS internals. The canonical set
@@ -552,13 +552,16 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
         if fast is None:
             fast = _glob.glob(os.path.join(path, glob), recursive=True)
         files, files_truncated = [], False
+        filter_first = levers.enabled("grep_filter_before_cap")
         for fp in fast:
-            if _skip(fp) or not os.path.isfile(fp):
+            if filter_first and (_skip(fp) or not os.path.isfile(fp)):
                 continue
             if len(files) >= GREP_MAX_FILES:
                 files_truncated = True
                 break
             files.append(fp)
+        if not filter_first:  # pre-iter-3: dirs/skipped blobs consumed the budget
+            files = [fp for fp in files if not _skip(fp) and os.path.isfile(fp)]
     for fp in files:
         if should_stop and should_stop():
             return "[interrupted by user]"
@@ -614,6 +617,8 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
         # demonstrated failure (django-14007): the tree exceeded GREP_MAX_FILES, the
         # issue's own symbol lived in an unsearched file, and the model stalled out
         # trusting the empty result.
+        if not levers.enabled("grep_zero_match_notice"):
+            return "[no matches]"  # pre-iter-2: the confident lie, for the ablation arm
         scope = path if path not in (".", "") else "the current directory"
         msg = f"[no matches for {pattern!r} in {scope}]"
         if files_truncated:

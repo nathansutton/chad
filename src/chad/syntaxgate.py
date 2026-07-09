@@ -15,7 +15,7 @@ never warn on a pre-existing one). Gated by CHAD_NO_SYNTAX_GATE for run_evals --
 import ast
 import os
 
-from . import config, repomap
+from . import config, levers, repomap
 
 _MAX_BYTES = 1_000_000  # skip pathologically large files — the parse cost isn't worth it
 _PARSERS: dict = {}     # lang -> tree_sitter.Parser | None (grammar download cached by tlp)
@@ -120,6 +120,10 @@ def indent_reject(path: str, before: str, after: str) -> str | None:
     passes through a transiently-still-broken state) is never stranded.
     """
     if config.flag("CHAD_NO_SYNTAX_GATE"):
+        return None
+    # Ablating this reverts to warn-only: the indent break LANDS, which is the
+    # precondition for the whitespace-surgery death loop this fix exists to stop.
+    if not levers.enabled("syntaxgate_revert"):
         return None
     if len(after) > _MAX_BYTES:
         return None

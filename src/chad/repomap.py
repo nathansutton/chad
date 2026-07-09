@@ -35,8 +35,20 @@ import time
 from collections import Counter, defaultdict, namedtuple
 
 import rustworkx as rx
-import tree_sitter_language_pack as tlp
-from tree_sitter import Parser, Query, QueryCursor
+
+# tree-sitter-language-pack ships native (maturin/pyo3) wheels. On a platform with no
+# matching wheel — e.g. a Terminal-Bench container running emulated amd64 — uv falls back
+# to a Rust source build that can fail, and this module-level import used to take ALL of
+# chad down with it: `tools.py` imports `repomap`, so a missing parser killed bash/read/
+# edit too, and the benchmark trial errored before the agent ran a single step. Symbol
+# ranking is the only thing that actually needs it; `lang_for` and `_lang_tools` already
+# return None on any failure, so the rest of the toolset degrades cleanly instead.
+try:
+    import tree_sitter_language_pack as tlp
+    from tree_sitter import Parser, Query, QueryCursor
+except ImportError:  # pragma: no cover — exercised only on wheel-less platforms
+    tlp = None                              # type: ignore[assignment]
+    Parser = Query = QueryCursor = None     # type: ignore[assignment,misc]
 
 from . import config
 from .ignore import IGNORE_DIRS, REPOMAP_EXTRA

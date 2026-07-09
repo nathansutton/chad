@@ -17,6 +17,22 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 
+class BackendError(RuntimeError):
+    """A generation backend refused or failed a request.
+
+    `transient` marks the failures worth re-issuing: 5xx from a remote server, or a
+    mid-stream error chunk. llama.cpp returns 500 "The model produced output that does
+    not match the expected Content-only format" when its chat parser can't reconcile a
+    completion — a *sampling*-dependent fault, so at temp>0 a re-roll usually clears it.
+    Retrying is only safe because chad rebuilds the prompt from `messages` each step and
+    never appends a failed generation.
+    """
+
+    def __init__(self, message: str, transient: bool = False):
+        super().__init__(message)
+        self.transient = transient
+
+
 @dataclass
 class GenStats:
     prompt_tokens: int = 0          # tokens actually prefilled this turn

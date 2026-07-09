@@ -401,3 +401,81 @@ if __name__ == "__main__":
             print(f"  ERROR in {fn.__name__}: {type(e).__name__}: {e}")
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
+
+
+# === Fail-safe return =========================================================
+# A sub-agent that ends early must never hand the parent a bare sentinel. Its findings
+# live in its own transcript, which is discarded when _run_subagent returns; if the
+# return is "[task interrupted]" / "[task failed: ...]" / "[stopped: ...]" / nothing,
+# the parent restarts localization from zero AND the anti-respawn guard refuses the
+# retry — so the turn dies with the answer sitting in a dead sub-agent. Salvage a
+# deterministic progress_note (no model call) in every one of those exits.
+
+def _sub_agent_ending(monkeypatch, ending):
+    """Drive Agent._run_subagent with a sub whose run_turn ends the given way, after
+    recording real work (a read) in its transcript. Returns the task tool result."""
+    from chad.agent import Agent
+
+    def fake_run_turn(self, prompt, stream=True):
+        self.messages.append({"role": "user", "content": prompt})
+        self.messages.append({"role": "assistant", "content":
+            '<think>retry lives in engine.py</think>\n'
+            '<tool_call>{"name": "read", "arguments": {"path": "src/chad/engine.py"}}</tool_call>'})
+        if ending == "raise":
+            raise RuntimeError("mlx blew up")
+        if ending == "interrupt":
+            self.interrupted = True
+            return "[interrupted]"
+        if ending == "stepcap":
+            return "[stopped: hit the step cap before finishing — say 'continue' to resume]"
+        if ending == "empty":
+            return ""
+        raise AssertionError(ending)
+
+    monkeypatch.setattr(Agent, "run_turn", fake_run_turn)
+    _no_mx(monkeypatch)
+    parent = object.__new__(Agent)          # bypass __init__; set only what the path reads
+    parent.engine = _fake_engine()
+    parent.mode = "auto"
+    parent.ctx_limit, parent.thinking, parent.max_gen_tokens = 24000, False, 512
+    parent.think_budget, parent._subagent = None, False
+    parent.gen_tokens = parent.gen_time = parent.prefill_tokens = 0
+    parent.think_tokens = parent.forwards = 0
+    parent._emit = lambda kind, text: None
+    parent._should_stop = lambda: False
+    return parent._run_subagent("find retry handling", "Where is retry handled?")
+
+
+@pytest.mark.parametrize("ending", ["raise", "interrupt", "stepcap", "empty"])
+def test_subagent_failsafe_returns_progress(monkeypatch, ending):
+    """Every early exit salvages what the sub-agent learned instead of a bare sentinel."""
+    out = _sub_agent_ending(monkeypatch, ending)
+    check(f"{ending}: returns something substantive", len(out) > 40, repr(out))
+    check(f"{ending}: carries a salvaged progress note",
+          "sub-agent progress before it stopped" in out, repr(out))
+    check(f"{ending}: names the file the sub-agent actually examined",
+          "src/chad/engine.py" in out, repr(out))
+    check(f"{ending}: never a bare sentinel", out.strip() not in (
+        "[task returned nothing]", "[task interrupted]", ""), repr(out))
+
+
+def test_subagent_failsafe_restores_cache_on_crash(monkeypatch):
+    """The salvage path must not disturb the quarantine: pop_cache still runs (finally)."""
+    from chad.agent import Agent
+    monkeypatch.setattr(Agent, "run_turn",
+                        lambda self, p, stream=True: (_ for _ in ()).throw(RuntimeError("boom")))
+    _no_mx(monkeypatch)
+    parent = object.__new__(Agent)
+    eng = _fake_engine()
+    parent.engine = eng
+    parent.mode = "auto"
+    parent.ctx_limit, parent.thinking, parent.max_gen_tokens = 24000, False, 512
+    parent.think_budget, parent._subagent = None, False
+    parent.gen_tokens = parent.gen_time = parent.prefill_tokens = 0
+    parent.think_tokens = parent.forwards = 0
+    parent._emit = lambda kind, text: None
+    parent._should_stop = lambda: False
+    out = parent._run_subagent("d", "p")
+    check("crash still surfaces the failure to the parent", "task failed" in out, out)
+    check("crash restored the main cache", eng._cache == ["MAIN-CACHE"], eng._cache)
+    check("crash left no dangling stack frame", eng._cache_stack == [], eng._cache_stack)

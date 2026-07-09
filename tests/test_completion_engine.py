@@ -182,6 +182,53 @@ def test_generate_raises_on_server_error_chunk():
         ad.generate([1])
 
 
+def test_client_error_chunk_is_not_transient():
+    """A 4xx is the prompt's fault — re-rolling it would just fail again."""
+    import pytest
+
+    from chad.base_engine import BackendError
+    lines = list(_sse({"error": {"code": 400, "message": "exceeds the available context size"}}))
+    with pytest.raises(BackendError) as ei:
+        _adapter_with_stream(lines).generate([1])
+    assert ei.value.transient is False
+
+
+def test_server_error_chunk_is_transient():
+    """llama.cpp answers 500 'does not match the expected Content-only format' when its
+    chat parser can't reconcile a completion. That is sampling-dependent, so the agent is
+    allowed to re-roll it (TB2 make-mips-interpreter died on exactly this)."""
+    import pytest
+
+    from chad.base_engine import BackendError
+    lines = list(_sse({"error": {"code": 500, "message": "The model produced output that "
+                                                        "does not match the expected "
+                                                        "Content-only format"}}))
+    with pytest.raises(BackendError) as ei:
+        _adapter_with_stream(lines).generate([1])
+    assert ei.value.transient is True
+
+
+def test_http_5xx_is_transient_and_4xx_is_not(monkeypatch):
+    """Exercises the real `_stream_completion` HTTPError->BackendError conversion by
+    stubbing urlopen (stubbing _stream_completion itself would skip the code under test)."""
+    import io
+    import urllib.error
+    import urllib.request
+
+    import pytest
+
+    from chad.base_engine import BackendError
+
+    for code, transient in ((503, True), (422, False)):
+        def _urlopen(req, timeout=None, _code=code):
+            raise urllib.error.HTTPError("http://x", _code, "boom", {}, io.BytesIO(b"detail"))
+        monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+        ad = CompletionEngine(model_id="ornith", base_url="http://x:8081")
+        with pytest.raises(BackendError) as ei:
+            ad.generate([1])
+        assert ei.value.transient is transient, code
+
+
 def test_reset_clears_the_cache_mirror():
     ad = CompletionEngine(model_id="ornith", base_url="http://x:8081")
     ad._cached_ids = [1, 2]

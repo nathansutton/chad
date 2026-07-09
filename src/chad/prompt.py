@@ -12,6 +12,8 @@ import os
 import platform
 import re
 
+from . import profiles
+
 # Synthesized from OpenHarness's base prompt (structure, tone, read-before-edit,
 # don't-over-engineer, dedicated tools over bash) and opencode's "beast" prompt
 # (persistence + verify-by-running) — the two failure modes a small local model has.
@@ -32,7 +34,6 @@ chatbot — you act.
 - After editing, verify: run the tests or the code with `bash`. Then call `done`.
 - For any task with 2+ steps, FIRST call `write_todos` to lay out a short plan, then work the plan, marking each item `in_progress` before you start it and `completed` right after.
 - A typical refactor/bugfix turn is: write_todos → grep → read → edit → bash (run tests) → done. Do not skip straight to a final text answer.
-- Tool arguments must be literal values, never template tags. When you `write` or `edit`, the `content`/`new` field is the actual file text — never the string "<tool_response>" or "<tool_call>".
 - When refactoring a function, `read` the WHOLE function first, then replace its ENTIRE body in one `edit` (old = the full original function text, new = the full new version). Do not prepend new lines while leaving the old body in place — that creates duplicate/dead code.
 - To verify, run the project's actual check: if there's a script like `check.py`/`run.py`, run it directly (`python3 check.py`); if the project uses pytest, run `python3 -m pytest -q`. Look at what's present before choosing. Do NOT install packages (no `pip install`) unless the user asks.
 - Only answer purely in prose (no tools) when the user asks a conceptual question that involves no file in their project.
@@ -190,20 +191,22 @@ def _dynamic_context() -> list:
     return dynamic
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(model_id: str | None = None) -> str:
     # Cache-boundary trick (from the Claude Code teardown): everything above the
     # boundary is static behavioral text that stays identical across sessions, so the
     # prefix KV cache reuses it. Volatile per-session context (cwd, project docs) goes
-    # below, where re-prefilling a few hundred tokens is cheap.
-    return _BASE_PROMPT + "\n".join(_dynamic_context())
+    # below, where re-prefilling a few hundred tokens is cheap. The profile block is
+    # static for a given model, so it sits above the boundary with the base prompt.
+    return _BASE_PROMPT + profiles.prompt_block(model_id) + "\n".join(_dynamic_context())
 
 
-def build_subagent_prompt() -> str:
+def build_subagent_prompt(model_id: str | None = None) -> str:
     """The system prompt for a spawned sub-agent: the tight sub-agent preamble + the
     same per-session project context the main agent gets. Its own stable head means the
     sub-agent warm-prefixes to its OWN disk checkpoint (plan 041), so repeated tasks in a
-    session skip re-prefilling this prefix."""
-    return _SUBAGENT_BASE + "\n".join(_dynamic_context())
+    session skip re-prefilling this prefix. A sub-agent runs the same weights, so it
+    inherits the same profile — an accommodation the parent needs, it needs too."""
+    return _SUBAGENT_BASE + profiles.prompt_block(model_id) + "\n".join(_dynamic_context())
 
 
 # A test-runner invocation we can lift verbatim from CI / Make config. Anchored at the

@@ -286,6 +286,42 @@ CHAD_TURN_BUDGET_S=600        uv run chad  # wall-clock variant (seconds); off b
 > executions as `[name, seconds]` pairs) — so a slow step can be attributed to prefill,
 > tokenization, compaction, or a tool without guessing. Leave it unset in normal use.
 
+### Harness levers & model profiles
+
+A harness change that ships hardcoded can only be measured by reverting it. Behavioral
+levers are therefore named and switchable, so a bundle of fixes can be attributed with
+leave-one-out ablation instead of a revert per fix. `chad --levers` prints the registry
+(it loads no model). A name that isn't registered is a startup error, not a warning: a
+typo would otherwise run the unmodified harness and report the lever as having no effect.
+
+Each lever carries a `group` (the harness iteration that introduced it, so one bundle can
+be priced without paying for the others) and a `kind`:
+
+- **`behavior`** — the change adds a behavior; without it the agent is merely less helped.
+- **`regression-guard`** — the change fixes a demonstrated bug, and **OFF restores that
+  bug**. A grep that reports `[no matches]` for a tree it never finished walking is a lie,
+  not a configuration. These exist to be *measured*, never shipped off.
+
+`tests/test_lever_bite.py` asserts every registered lever actually changes behavior when
+disabled, so a "no measured effect" verdict from an ablation means the fix does nothing —
+not that its guard was misplaced.
+
+```bash
+uv run chad --levers                              # inventory: every lever + what's active
+CHAD_DISABLE=compact_notice uv run chad           # switch one behavior off
+CHAD_DISABLE=plan_review,compact_offload uv run chad
+CHAD_PROFILE=generic uv run chad                  # drop the Ornith-specific accommodations
+CHAD_OFFLOAD_DIR=/tmp/off uv run chad             # where compaction spills untrimmed text
+```
+
+- **`CHAD_DISABLE`** — comma-separated lever names to turn off. All levers default **on**.
+- **`CHAD_PROFILE`** — `ornith` (default) or `generic`. A profile block is strictly
+  additive: the `<tool_call>` contract stays in the base prompt, so `generic` can still
+  call tools. Resolved from the model id when unset, so an `--backend openai` run against
+  a non-Ornith endpoint drops the accommodations automatically.
+- **`CHAD_OFFLOAD_DIR`** — where the `compact_offload` lever writes the untrimmed
+  transcript (default `~/.chad/offload`, capped at 32 MB, never inside the project).
+
 ### Safety & A/B opt-outs
 
 These flip behavior off rather than tune it. The two safety opt-outs **weaken** chad's

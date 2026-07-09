@@ -183,7 +183,104 @@ def test_compaction():
 
 
 
+def test_subagent_compaction():
+    """A sub-agent's transcript has exactly ONE user message — the task prompt at index
+    1, since run_turn appends the prompt once and every nudge lands as a `tool` message.
+
+    That shape used to disable pass 3 entirely: its deletable range was
+    `range(1, last_user_idx)` == `range(1, 1)` == empty, so a sub-agent fell straight
+    through to pass 4, which ran with keep_recent=0 and truncated *every* tool result —
+    including the one that had just arrived. Compaction runs at the top of a step, before
+    generation, so the sub-agent lost each grep's hits before it could read them: it would
+    search, compact, search again, and hit its step cap with nothing to return.
+
+    Both invariants are asserted below against the real compact_if_needed."""
+
+    def sub_transcript(n_searches, hits=140):
+        """system + task prompt + n rounds of (assistant, big grep result)."""
+        msgs = [{"role": "system", "content": "S" * 3000},
+                {"role": "user", "content": "Find where retry/backoff is handled."}]
+        for i in range(n_searches):
+            msgs.append({"role": "assistant", "content": f"<think>reason {i}</think>\ngrep"})
+            msgs.append({"role": "tool", "name": "grep", "content": "\n".join(
+                f"src/mod{i}/file{j}.py:{j}: def handle_retry_{j}() " + "x" * 55
+                for j in range(hits))})
+        return msgs
+
+    # --- pass 3 must actually shed old churn in a sub-agent ----------------------
+    msgs = sub_transcript(6)
+    n_before = len(msgs)
+    render = make_render(msgs)
+    ctx = len(render()) // 2
+    compact_if_needed(msgs, render, noop_emit, ctx_limit=ctx, prompt_ids=render())
+    check("sub-agent: pass 3 drops oldest messages (not dead code)",
+          len(msgs) < n_before, f"msgs stayed at {len(msgs)}")
+    check("sub-agent: reclaims to under ctx_limit", len(render()) <= ctx,
+          f"{len(render())} > {ctx}")
+    check("sub-agent: system prompt survives", msgs[0]["role"] == "system")
+    check("sub-agent: task prompt survives (chat template needs a user query)",
+          any(m["role"] == "user" for m in msgs))
+
+    # --- the newest tool result is never shredded before the model reads it -------
+    # Hold the message OBJECT, not its index: pass 3 now deletes, so indices shift.
+    msgs = sub_transcript(5)
+    freshest = msgs[-1]
+    render = make_render(msgs)
+    compact_if_needed(msgs, render, noop_emit,
+                      ctx_limit=len(render()) // 2, prompt_ids=render())
+    check("sub-agent: freshest tool result survives compaction intact",
+          _COLLAPSED not in freshest["content"],
+          "the result the model is about to read was truncated unread")
+    check("sub-agent: freshest tool result is still in the transcript",
+          any(m is freshest for m in msgs))
+
+    # --- a sustained search loop keeps every fresh result, over many compactions --
+    # The dogfooding symptom: "searches, compacts 3-4 times, returns nothing."
+    msgs = sub_transcript(0)
+    render = make_render(msgs)
+    ctx, compactions, shredded = 16000 * 4, 0, 0  # *4: this render is chars-per-token
+    for step in range(12):  # SUBAGENT_MAX_STEPS-scale run
+        msgs.append({"role": "assistant", "content": f"<think>t{step}</think>\ngrep"})
+        fresh = {"role": "tool", "name": "grep", "content": "\n".join(
+            f"src/s{step}/f{j}.py:{j}: hit {j} " + "x" * 55 for j in range(140))}
+        msgs.append(fresh)
+        pre = len(render())
+        compact_if_needed(msgs, render, noop_emit, ctx_limit=ctx, prompt_ids=render())
+        if len(render()) < pre:
+            compactions += 1
+        if _COLLAPSED in fresh["content"]:
+            shredded += 1
+        check(f"sub-agent loop step {step}: stays under ctx_limit", len(render()) <= ctx)
+    check("sub-agent loop: compaction actually fired", compactions >= 2,
+          f"only {compactions} compactions — test no longer exercises the path")
+    check("sub-agent loop: no fresh search result was ever shredded unread",
+          shredded == 0, f"{shredded} of 12 steps lost their freshest result")
+
+    # --- sparing the newest result must never cost convergence --------------------
+    # Caught by a live sub-agent run, not by the synthetic loop above: when one fresh
+    # read is itself larger than target, no amount of shedding older context gets under
+    # the limit. Staying under ctx_limit is mandatory (an over-limit return just grows
+    # the context every step); sparing the newest result is only a heuristic. The hard
+    # ceiling wins, and the newest result gets clipped head/tail like any other.
+    msgs = sub_transcript(1)
+    msgs.append({"role": "assistant", "content": "reading the whole file"})
+    msgs.append({"role": "tool", "name": "read",
+                 "content": "\n".join(f"{i}: line of a very large file " + "y" * 70
+                                      for i in range(4000))})
+    render = make_render(msgs)
+    # Hold the OBJECT, not the index: compaction now appends an in-band notice after the
+    # passes run, so the big read is no longer the tail message.
+    big_read = msgs[-1]
+    ctx = len(big_read["content"]) // 2   # newest message alone exceeds the limit
+    compact_if_needed(msgs, render, noop_emit, ctx_limit=ctx, prompt_ids=render())
+    check("oversized newest result: still converges under ctx_limit",
+          len(render()) <= ctx, f"{len(render())} > {ctx} — compaction did not converge")
+    check("oversized newest result: clipped head/tail, not dropped",
+          _COLLAPSED in big_read["content"] and big_read["content"].startswith("0: line"))
+
+
 if __name__ == "__main__":
     test_compaction()
+    test_subagent_compaction()
     print(f"\n{passed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)

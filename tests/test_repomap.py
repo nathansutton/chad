@@ -360,3 +360,48 @@ if __name__ == "__main__":
     test_disambig_budget_and_cache()
     print(f"\n{passed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)
+
+
+# --- wheel-less platforms (plan 068) ------------------------------------------
+# tree-sitter-language-pack is a native wheel. On a TB2 container (emulated amd64) uv
+# fell back to a Rust source build, it failed, and the module-level import took ALL of
+# chad down -- the qemu-startup trial errored before the agent ran one step.
+
+def test_repomap_degrades_when_tree_sitter_is_absent(monkeypatch, tmp_path):
+    """With tlp unavailable, symbol ranking yields nothing but nothing raises."""
+    from chad import repomap
+    monkeypatch.setattr(repomap, "tlp", None)
+    monkeypatch.setattr(repomap, "Parser", None)
+    monkeypatch.setattr(repomap, "Query", None)
+    monkeypatch.setattr(repomap, "QueryCursor", None)
+
+    rm = repomap.RepoMap(str(tmp_path))
+    assert rm.lang_for(str(tmp_path / "a.py")) is None
+    assert rm._lang_tools("python") is None
+
+
+def test_repomap_and_tools_import_without_the_tree_sitter_wheel(monkeypatch):
+    """The regression that matters: `tools` (bash/read/edit) imports `repomap` at module
+    scope, so a missing tree-sitter wheel used to make ALL of chad unimportable."""
+    import builtins
+    import importlib
+
+    real_import = builtins.__import__
+
+    def _no_tree_sitter(name, *a, **kw):
+        if name.startswith("tree_sitter"):
+            raise ImportError(f"no wheel for {name} on this platform")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _no_tree_sitter)
+    import chad.repomap
+    import chad.tools
+    try:
+        reloaded = importlib.reload(chad.repomap)
+        assert reloaded.tlp is None, "import guard did not engage"
+        assert reloaded.Parser is None
+        importlib.reload(chad.tools)      # the chain that actually broke the trial
+    finally:
+        monkeypatch.setattr(builtins, "__import__", real_import)
+        importlib.reload(chad.repomap)    # restore for the rest of the session
+        importlib.reload(chad.tools)

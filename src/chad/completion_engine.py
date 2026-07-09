@@ -44,7 +44,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Iterator, Optional
 
-from .base_engine import GenStats
+from .base_engine import BackendError, GenStats
 from .openai_engine import parse_sse_chunk  # same SSE framing; reuse the parser
 
 
@@ -180,7 +180,8 @@ class CompletionEngine:
                     yield raw.decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:2000]
-            raise RuntimeError(f"llama-server HTTP {e.code}: {detail}") from e
+            raise BackendError(f"llama-server HTTP {e.code}: {detail}",
+                               transient=e.code >= 500) from e
 
     # -- generation -------------------------------------------------------
 
@@ -228,7 +229,10 @@ class CompletionEngine:
                     if chunk is None:
                         continue
                     if chunk.get("error"):
-                        raise RuntimeError(f"llama-server error: {chunk['error']}")
+                        err = chunk["error"]
+                        code = err.get("code", 0) if isinstance(err, dict) else 0
+                        raise BackendError(f"llama-server error: {err}",
+                                           transient=code >= 500)
                     if chunk.get("timings"):   # final stop-chunk carries real telemetry
                         timings = chunk["timings"]
                     gen_ids.extend(chunk.get("tokens") or [])

@@ -367,3 +367,73 @@ def test_bash_mutation_triggers_syntax_recheck(tmp_path):
     bash_msgs = [m["content"] for m in agent.messages
                  if m.get("role") == "tool" and m.get("name") == "bash"]
     assert any("no longer parses" in c for c in bash_msgs)
+
+
+# --- backend-error resilience (plan 068) -------------------------------------
+# A transient llama.cpp fault used to escape run_turn and kill the process from
+# cli.main, forfeiting the rest of an unattended task's budget: TB2's
+# make-mips-interpreter died at 721s of a 1770s budget on a single 500
+# ("The model produced output that does not match the expected Content-only format").
+
+class _FlakyEngine(ScriptedEngine):
+    """Raises `BackendError(transient=...)` on the first `n_fail` generate calls, then
+    replays the script. Records how many times generate was entered."""
+
+    def __init__(self, script, n_fail=1, transient=True, **kw):
+        super().__init__(script, **kw)
+        self.n_fail = n_fail
+        self.transient = transient
+        self.calls = 0
+
+    def generate(self, prompt_ids, **kw):
+        self.calls += 1
+        if self.calls <= self.n_fail:
+            from chad.base_engine import BackendError
+            raise BackendError("llama-server error: {'code': 500}", transient=self.transient)
+        return super().generate(prompt_ids, **kw)
+
+
+def test_transient_backend_error_is_retried_and_the_turn_completes(monkeypatch):
+    monkeypatch.setattr("chad.agent.time.sleep", lambda *_: None)   # no backoff in tests
+    eng = _FlakyEngine(["all done"], n_fail=1, transient=True)
+    agent = Agent(eng, mode="auto", thinking=False)
+    agent.run_turn("do the thing")
+    assert eng.calls == 2, "the failed step should have been re-issued exactly once"
+    assert agent.messages[-1]["content"] == "all done"
+
+
+def test_transient_backend_errors_give_up_after_the_retry_budget(monkeypatch):
+    monkeypatch.setattr("chad.agent.time.sleep", lambda *_: None)
+    import pytest
+
+    from chad.base_engine import BackendError
+    eng = _FlakyEngine(["unreachable"], n_fail=99, transient=True)
+    agent = Agent(eng, mode="auto", thinking=False)
+    with pytest.raises(BackendError):
+        agent.run_turn("do the thing")
+    # 3 retries + the original attempt: a server that is genuinely down must surface,
+    # not silently eat the task's whole budget.
+    assert eng.calls == 4
+
+
+def test_non_transient_backend_error_is_not_retried(monkeypatch):
+    monkeypatch.setattr("chad.agent.time.sleep", lambda *_: None)
+    import pytest
+
+    from chad.base_engine import BackendError
+    eng = _FlakyEngine(["unreachable"], n_fail=99, transient=False)
+    agent = Agent(eng, mode="auto", thinking=False)
+    with pytest.raises(BackendError):
+        agent.run_turn("do the thing")
+    assert eng.calls == 1, "a 4xx is the prompt's fault; re-rolling it is wasted budget"
+
+
+def test_backend_retry_budget_resets_per_turn(monkeypatch):
+    monkeypatch.setattr("chad.agent.time.sleep", lambda *_: None)
+    eng = _FlakyEngine(["first", "second"], n_fail=1, transient=True)
+    agent = Agent(eng, mode="auto", thinking=False)
+    agent.run_turn("one")
+    eng.n_fail, eng.calls = 3, 0      # a fresh transient fault on the next turn
+    eng._i = 1                        # replay from "second"
+    agent.run_turn("two")
+    assert eng.calls == 4             # 3 failures re-rolled, 4th succeeds

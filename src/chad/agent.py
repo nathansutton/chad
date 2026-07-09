@@ -14,8 +14,8 @@ import re
 import sys
 import time
 
-from . import compaction, config, guardrails, session, syntaxgate
-from .base_engine import BaseEngine
+from . import atif, compaction, config, guardrails, levers, session, syntaxgate
+from .base_engine import BackendError, BaseEngine
 from .diag import args_preview, log, redact, result_preview
 from .prompt import build_subagent_prompt, build_system_prompt, classify_intent
 from .render import (
@@ -39,8 +39,12 @@ from .tools import IGNORE_DIRS, TERMINAL, _under_plans, active_schemas, dispatch
 # a read-only toolset, so it can spelunk without mutating anything or bloating the main
 # context. The read-only set is exploration + planning + the terminal tools; bash, write,
 # edit and the symbol editors are excluded (they land only under tools="all").
-SUBAGENT_MAX_STEPS = 12
-SUBAGENT_CTX_LIMIT = 16000
+# Spelunking is step-hungry (grep → read → grep → read) and its whole value is bringing
+# back a condensed answer, so starve it and it returns nothing. These are ceilings, not
+# targets: a sub-agent that finds its answer calls `done` on step 3. ctx_limit is further
+# clamped to the parent's by min() at the spawn site.
+SUBAGENT_MAX_STEPS = 24
+SUBAGENT_CTX_LIMIT = 32000
 SUBAGENT_READ_ONLY = {
     "read", "grep", "glob", "repo_map", "overview", "view_symbol",
     "find_symbol", "find_refs", "done", "finish", "stop",
@@ -221,6 +225,11 @@ def _plan_prefix(intent: dict) -> str:
 # (a 9,864-token `overview` = a 32s stall). This bounds EVERY tool uniformly so no one
 # call blows up prefill; it sits just above the per-tool caps so it only bites the
 # otherwise-uncapped tools. ~14k chars ≈ 4k tokens ≈ a ~14s worst-case prefill on the 9B.
+# Transient backend faults (llama.cpp 5xx / mid-stream error chunks) are re-rolled rather
+# than allowed to kill an unattended turn. Bounded so a server that is genuinely down
+# surfaces as an error instead of burning the task's whole budget on retries.
+_MAX_BACKEND_RETRIES = 3
+
 _MAX_TOOL_RESULT_CHARS = 14000
 # Per-STEP budget on the total tool-output chars appended before the next prefill. The
 # per-result cap above bounds each call, but a step that emits SEVERAL calls stacks
@@ -344,14 +353,27 @@ class Agent:
         # note so the caller (TUI / one-shot / evals) can relaunch a fresh turn seeded
         # with it. Reset at the start of every run_turn.
         self.budget_note: str | None = None
+        # The profile is keyed off the served model id, so an `--backend openai` run
+        # against a non-Ornith endpoint drops the Ornith accommodations automatically
+        # instead of silently carrying them into a cross-model comparison.
+        _mid = getattr(engine, "model_id", None)
         self.messages = [{"role": "system",
-                          "content": build_subagent_prompt() if subagent
-                          else build_system_prompt()}]
+                          "content": build_subagent_prompt(_mid) if subagent
+                          else build_system_prompt(_mid)}]
         if resume:
             self.messages += [m for m in resume if m.get("role") != "system"]
         self._emit = emit or _default_emit
         self._confirm_cb = confirm  # callable(name, args)->bool; None => input() prompt
         self._should_stop = should_stop or (lambda: False)
+        self._backend_retries = 0   # reset per turn; see _MAX_BACKEND_RETRIES
+        # ATIF trajectory capture (plan 068), off unless CHAD_TRAJECTORY_JSON is set. A
+        # sub-agent runs on the parent's engine inside one of the parent's steps; recording
+        # it as a sibling segment would interleave two transcripts into one step sequence.
+        self._atif = None if subagent else atif.recorder()
+        self._atif_seg = self._atif.new_segment() if self._atif else None
+        self._atif_stats: list = []   # one entry per successful generate, in step order
+        if self._atif and self._atif.model_name is None:
+            self._atif.model_name = getattr(engine, "model_id", None)
         self.interrupted = False
         # Absolute path of the plan file written during a plan-mode turn (consumed by
         # the TUI to offer the steer/accept handoff); reset each time it's read.
@@ -424,8 +446,12 @@ class Agent:
                   if m.get("role") == "assistant" and "</think>" in m["content"]][:-2]:
             c = self.messages[i]["content"]
             self.messages[i]["content"] = c.split("</think>", 1)[1].lstrip("\n")
+        # A compaction notice is guidance, not output: head/tail-clipping one would leave
+        # the model a mangled instruction, and it must not consume one of the four spared
+        # slots either. Same exemption the skill messages get in compact_if_needed.
         idxs = [i for i, m in enumerate(self.messages)
-                if m.get("role") == "tool" and self._COLLAPSED not in m["content"]]
+                if m.get("role") == "tool" and self._COLLAPSED not in m["content"]
+                and compaction._NOTICE_TAG not in m["content"]]
         for i in idxs[:max(0, len(idxs) - 4)]:  # keep the last 4 tool outputs verbatim
             if len(self.messages[i]["content"]) > 400:
                 self.messages[i]["content"] = self._headtail(self.messages[i]["content"])
@@ -551,7 +577,10 @@ class Agent:
         if requested == "all" and tools == "read-only":
             self._emit("muted", "   ⌊ sub-agent clamped to read-only (parent mode is not auto)")
         self._emit("muted", f"   ⌊ delegating to sub-agent: {description}")
+        log.info("TASK start | desc=%r | tools=%s | prompt=%r",
+                 description, tools, redact(prompt[:300]))
         sub = None
+        _t0 = time.perf_counter()
         self.engine.push_cache()
         try:
             sub = Agent(
@@ -583,21 +612,65 @@ class Agent:
             self.prefill_tokens += sub.prefill_tokens
             self.think_tokens += sub.think_tokens
             self.forwards += sub.forwards
+            # Fail-safe: a sub-agent that ends early — step cap, crash, interrupt — or
+            # that returns nothing at all must still hand back where it got to. Never
+            # surface a bare sentinel: the parent then restarts the localization from
+            # zero (the django-14007/sphinx-9230 failure), and the anti-respawn guard
+            # above refuses the retry, so the turn dies with the findings still in the
+            # dead sub-agent's transcript. progress_note is deterministic and model-free,
+            # so it works even from a crashed turn: it re-reads the sub-agent's own tool
+            # calls for the files it examined, the commands it ran, and the last
+            # hypothesis it stated.
+            def _salvage(res: str) -> str:
+                if not levers.enabled("subagent_budget_note"):
+                    return res   # pre-iter-2: the capped sub-agent's findings are discarded
+                note = sub.budget_note or guardrails.progress_note(sub.messages)
+                if not note:
+                    return res
+                return (res.rstrip() + "\n[sub-agent progress before it "
+                        f"stopped: {note}]").strip()
             if sub.interrupted:
-                return "[task interrupted]"
-            # A sub-agent that dies at its step cap returns only the boilerplate
-            # "[stopped: hit the step cap…]" while its banked progress note (files
-            # read, symbols located) was silently discarded — the demonstrated
-            # failure (django-14007/sphinx-9230): the sub-agent read the gold file,
-            # then "returned 1 line" and the parent restarted localization from
-            # zero. Hand the parent everything the sub-agent learned.
-            if sub.budget_note and (not result or result.startswith("[stopped:")):
-                result = ((result or "").rstrip() + "\n[sub-agent progress before it "
-                          f"stopped: {sub.budget_note}]").strip()
+                result = _salvage("[task interrupted]")
+            elif (not result or result.startswith("[stopped:")
+                    or result.startswith("[task failed:")):
+                result = _salvage(result or "[task returned nothing]")
+        # tool_calls (not `forwards`, a speculative-decoding counter that is 0 on the
+        # normal path) is the number that diagnoses a sub-agent returning nothing: it
+        # separates "never got to search" from "searched and lost its findings".
+        log.info("TASK end | desc=%r | %.1fs | tool_calls=%d gen=%d prefill=%d | -> %s",
+                 description, time.perf_counter() - _t0,
+                 sum(1 for m in sub.messages if m.get("role") == "tool") if sub else 0,
+                 sub.gen_tokens if sub else 0,
+                 sub.prefill_tokens if sub else 0, result_preview(result or ""))
         return result or "[task returned nothing]"
 
+    def _atif_sync(self) -> None:
+        """Rebuild this Agent's ATIF segment from `messages` and rewrite the document.
+        Cheap (the transcript is small) and idempotent; a no-op unless capture is on."""
+        if self._atif is None or self._atif_seg is None:
+            return
+        try:
+            self._atif.set_segment(
+                self._atif_seg,
+                atif.steps_from_messages(self.messages, self._atif.model_name,
+                                         self._atif_stats))
+            self._atif.dump()
+        except Exception as e:      # never let telemetry break a turn
+            log.warning("atif: sync failed: %s", e)
+
     def run_turn(self, user_text: str, stream=True):
+        """Thin wrapper so the trajectory is flushed on EVERY exit from the turn —
+        normal return, interrupt, or an exception escaping the loop. Harbor SIGKILLs chad
+        at the task timeout, so the per-step dump inside `_run_turn` is what actually saves
+        a long trial; this `finally` covers the clean paths."""
+        try:
+            return self._run_turn(user_text, stream)
+        finally:
+            self._atif_sync()
+
+    def _run_turn(self, user_text: str, stream=True):
         self.interrupted = False
+        self._backend_retries = 0   # per-turn allowance; see _MAX_BACKEND_RETRIES
         # ds4-style warm start: on a cold cache, load the system+tools KV from disk
         # (or prefill+persist it once) so the first turn doesn't re-prefill the
         # ~3.2k-token stable prefix every session. Cheap no-op on a warm cache.
@@ -646,6 +719,7 @@ class Agent:
         landing_nudges = 0  # one-shot "you're out of steps, land the edit" near the cap
         consecutive_failed_bash = 0  # back-to-back errored bash with no edit (thrash)
         thrash_nudges = 0
+        plan_reviews = 0    # one-shot "re-read the plan you just wrote" (levers.plan_review)
         # Files edited this turn -> mtime at last syntax check. Bash can mutate files
         # too (sed -i, python rewrites) but bypasses the write/edit syntax gate; watch
         # edited files and re-check them after any bash that touched them (iter-2:
@@ -680,6 +754,10 @@ class Agent:
         hard_ceiling = self.max_steps * guardrails.STEP_CAP_CEILING
         landed_in_window = False  # a change landed AND verified since this window began
         for step in range(hard_ceiling):
+            # Flush at the TOP of each step: the previous step's tool results are now in
+            # `messages`, and a harness SIGKILL at the task timeout lands mid-step. A
+            # trajectory written only at exit would be lost on exactly the long trials.
+            self._atif_sync()
             if step >= step_cap:
                 new_cap = guardrails.extend_step_cap(
                     step_cap, self.max_steps, landed_in_window, hard_ceiling)
@@ -820,10 +898,31 @@ class Agent:
                     last_pct[0] = pct
                     self._emit("prefill", f"{done}/{total}")
 
-            text, stats = self.engine.generate(
-                prompt_ids, max_tokens=self.max_gen_tokens, on_token=on_token,
-                should_stop=self._should_stop, on_prefill=on_prefill,
-                on_prefill_progress=on_prefill_progress, stop_condition=stop_condition)
+            try:
+                text, stats = self.engine.generate(
+                    prompt_ids, max_tokens=self.max_gen_tokens, on_token=on_token,
+                    should_stop=self._should_stop, on_prefill=on_prefill,
+                    on_prefill_progress=on_prefill_progress, stop_condition=stop_condition)
+            except BackendError as e:
+                # A transient backend fault (5xx / mid-stream error chunk) used to escape
+                # run_turn and kill the process from cli.main — forfeiting the rest of an
+                # unattended task's budget (TB2 make-mips-interpreter died at 721s of a
+                # 1770s budget on a single llama.cpp 500). Re-issue the step instead: the
+                # prompt is rebuilt from `messages` each iteration and the failed
+                # generation was never appended, so a retry is a clean re-roll — and at
+                # temp>0 a resample usually clears a parser-rejected completion.
+                if view:            # the retry skips the normal close() below
+                    view.close()
+                if (not levers.enabled("backend_retry") or not e.transient
+                        or self._backend_retries >= _MAX_BACKEND_RETRIES):
+                    raise
+                self._backend_retries += 1
+                log.warning("backend error (retry %d/%d): %s",
+                            self._backend_retries, _MAX_BACKEND_RETRIES, e)
+                self._emit("status", f"Backend error; retrying "
+                                     f"({self._backend_retries}/{_MAX_BACKEND_RETRIES})")
+                time.sleep(min(2 ** self._backend_retries, 8))
+                continue
             if gen_count[0] % 16:  # flush the final (un-throttled) count for the ↓ readout
                 self._emit("gen", str(gen_count[0]))
             # The generation ran to the token cap: the turn was cut off, not finished.
@@ -831,6 +930,12 @@ class Agent:
             # non-trimmable cache its decoded text won't re-tokenize identically, so it
             # also forces the next-step re-prefill). Tracked so the no-call branch can
             # tell "truncated mid-thought" apart from "deliberately answered."
+            if self._atif:   # one entry per SUCCESSFUL generate — a retried step appends
+                             # nothing, keeping this list aligned with assistant messages
+                self._atif_stats.append(
+                    {"prompt_tokens": stats.prompt_tokens,
+                     "cached_tokens": stats.cached_tokens,
+                     "generated_tokens": stats.generated_tokens})
             hit_cap = stats.generated_tokens >= self.max_gen_tokens
             self.gen_tokens += stats.generated_tokens
             self.gen_time += stats.gen_s
@@ -1163,7 +1268,7 @@ class Agent:
                     # budget gone. Refuse the duplicate and push the model to act directly.
                     _sub_sig = (str(args.get("description", "")).strip(),
                                 str(args.get("prompt", "")).strip())
-                    if _sub_sig in subagent_sigs:
+                    if _sub_sig in subagent_sigs and levers.enabled("subagent_no_respawn"):
                         result = ("[you already ran this exact sub-agent this turn — do NOT "
                                   "re-run it. Use what it returned, or do the work yourself "
                                   "now with grep/read to locate the code and edit to change "
@@ -1176,6 +1281,9 @@ class Agent:
                         args.get("description", ""), args.get("prompt", ""),
                         args.get("tools", "read-only"))
                     render_tool_result(self._emit, name, args, result)
+                    # This branch `continue`s past the shared TOOL log below, so log here
+                    # too — otherwise the whole sub-agent path is invisible in session.log.
+                    log.info("TOOL task(%s) -> %s", args_preview(args), result_preview(result))
                     self.messages.append({"role": "tool", "name": name, "content": result})
                     did_work = True  # exploration counts as work (like a read), not an edit
                     if self._should_stop():
@@ -1218,6 +1326,27 @@ class Agent:
                 log.info("TOOL %s(%s) -> %s [%.2fs]", name, args_preview(args),
                          result_preview(result), _tool_s)
                 self.messages.append({"role": "tool", "name": name, "content": result})
+                # Plan-then-review, delivered as two messages instead of one instruction.
+                # The plan-mode preamble already demands a Context section, exact paths,
+                # numbered steps and verify commands, and the model still ships plans that
+                # skip half of it — a standing rule in the preamble washes out by the time
+                # the plan is being written. Asking for the review AFTER the artifact
+                # exists puts the ask next to the thing it is about, which is the same
+                # placement lesson as the keep-reading notice in `read`'s return value.
+                if (plan_write and result.startswith("[wrote") and not plan_reviews
+                        and levers.enabled("plan_review")):
+                    plan_reviews += 1
+                    log.info("PLAN REVIEW nudge for %s", self.last_plan_path)
+                    self.messages.append({"role": "tool", "name": "read", "content": (
+                        f"[plan written to {self.last_plan_path}. Before you call `done`, "
+                        f"review it: `read` the file back and check it has (1) a Context "
+                        f"section saying why, (2) exact file paths with current-state code "
+                        f"excerpts, (3) numbered step-by-step changes, (4) the exact verify "
+                        f"commands to run, (5) repo conventions, (6) explicit out-of-scope. "
+                        f"An executor will follow this file WITHOUT access to this "
+                        f"conversation, so anything only you know must be on the page. If "
+                        f"any item is missing or vague, fix the file now with `edit`. Then "
+                        f"call `done`.]")})
                 # Update the guardrail bookkeeping flags (did_work / made_edit /
                 # unverified_edit) for this tool result — see guardrails.update_work_flags.
                 did_work, made_edit, unverified_edit = guardrails.update_work_flags(
