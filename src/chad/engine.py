@@ -43,8 +43,11 @@ try:
     from mlx_lm.sample_utils import make_sampler
     _HAS_MLX = True
 except ImportError:  # non-Apple host: remote backend only
-    mx = None  # type: ignore[assignment]
-    load = stream_generate = cache_utils = make_sampler = None  # type: ignore[assignment]
+    # `unused-ignore` because the `assignment` ignore is only *needed* where mlx is
+    # installed (mac). On the Linux lint runner mlx is absent, `ignore_missing_imports`
+    # types these as Any, and the bare ignore would trip `warn_unused_ignores`.
+    mx = None  # type: ignore[assignment, unused-ignore]
+    load = stream_generate = cache_utils = make_sampler = None  # type: ignore[assignment, unused-ignore]
     _HAS_MLX = False
 
 # GenStats moved to base_engine.py (plan 046) so a non-MLX backend can build one without
