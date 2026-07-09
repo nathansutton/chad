@@ -637,6 +637,7 @@ class Agent:
         made_edit = False  # an edit/write/replace/insert actually landed this turn
         answer_nudges = 0
         noop_edit_streak = 0  # consecutive edits that failed to land (plan 047 loop-break)
+        last_edit_fail_kind = None  # 'noop'/'nomatch' of the latest dead edit (nudge choice)
         break_nudges = 0      # times we escalated a stuck edit this turn
         readonly_streak = 0   # consecutive steps with substantive tools but no landed edit
         gate_nudges = 0       # times the investigation->edit gate fired this turn
@@ -1228,6 +1229,7 @@ class Agent:
                             "rename_symbol"):
                     noop_edit_streak = (noop_edit_streak + 1
                                         if guardrails.edit_failed_to_land(result) else 0)
+                    last_edit_fail_kind = guardrails.edit_fail_kind(result)
                     if not guardrails.edit_failed_to_land(result):
                         _wp = str(args.get("path", "") or "")
                         if _wp and os.path.exists(_wp):
@@ -1262,7 +1264,8 @@ class Agent:
 
             # Plan 047 — edit loop-break: after ~2 consecutive edits that failed to land,
             # stop the model re-trying variations and send it to read-then-replace.
-            brk = guardrails.edit_loop_break(noop_edit_streak, break_nudges)
+            brk = guardrails.edit_loop_break(noop_edit_streak, break_nudges,
+                                             last_edit_fail_kind)
             if brk:
                 break_nudges += 1
                 noop_edit_streak = 0  # give the escalation a clean slate

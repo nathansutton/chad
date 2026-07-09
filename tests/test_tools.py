@@ -226,6 +226,30 @@ def test_grep_path_not_found():
         os.chdir(cwd)
 
 
+def test_grep_dirs_do_not_starve_file_cap():
+    """The GREP_MAX_FILES budget must count only files we'd actually SEARCH — not the
+    directories (and skipped blobs) the walk passes through. The demonstrated starvation
+    (django-16454): a dir-heavy tree exhausted the cap on directories before the walk
+    reached the file holding the target symbol. Here we seed many empty subdirs ahead of
+    the one real match and shrink the cap below the dir count: the match must still land,
+    and truncation must NOT be reported (no real file was dropped)."""
+    cwd = os.getcwd()
+    saved = tools.GREP_MAX_FILES
+    try:
+        d = _seed({"hit.py": "NEEDLE lives here\n"})
+        # Many EMPTY dirs the walk yields (before files, at each level) but that hold
+        # nothing to search. There is exactly ONE real file, so walk order is irrelevant.
+        for i in range(30):
+            os.makedirs(os.path.join(d, f"empty{i:03d}"), exist_ok=True)
+        tools.GREP_MAX_FILES = 3  # far below the dir count; before the fix, dirs ate it
+        out = tools.tool_grep("NEEDLE")
+        check("grep: dirs don't consume the file budget", "hit.py:1:" in out, out)
+        check("grep: one real file is not reported truncated", "searched first" not in out, out)
+    finally:
+        tools.GREP_MAX_FILES = saved
+        os.chdir(cwd)
+
+
 def test_grep_ignore_case_and_context():
     cwd = os.getcwd()
     try:
@@ -361,6 +385,7 @@ if __name__ == "__main__":
     test_grep_truncation_notices()
     test_grep_path_is_file()
     test_grep_path_not_found()
+    test_grep_dirs_do_not_starve_file_cap()
     test_grep_ignore_case_and_context()
     test_glob()
     test_write()

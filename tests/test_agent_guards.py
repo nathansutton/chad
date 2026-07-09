@@ -31,6 +31,7 @@ from chad.guardrails import (
     budget_fraction,
     degenerate_tail,
     done_rejection,
+    edit_fail_kind,
     edit_failed_to_land,
     edit_loop_break,
     extend_step_cap,
@@ -143,6 +144,26 @@ def test_update_work_flags():
         did_work=False, made_edit=False, unverified_edit=False)
     check("write_todos is not did_work", dw4 is False)
     check("write_todos leaves edit flags clean", me4 is False and ue4 is False)
+
+    # A clean working-tree REVERT un-lands the edit: made_edit AND unverified_edit both
+    # go False so the no-empty-diff gate re-fires (matplotlib-20676 empty-diff hole).
+    for cmd in ("git checkout .", "git checkout -- foo/bar.py", "git restore .",
+                "git reset --hard HEAD", "git stash", "git checkout src/mod/x.py"):
+        _, me_r, ue_r = update_work_flags(
+            "bash", {"command": cmd}, "[no output]",
+            did_work=True, made_edit=True, unverified_edit=False)
+        check(f"revert un-sets made_edit: {cmd}", me_r is False, cmd)
+    # A FAILED revert (nonzero exit) did not touch the tree — the edit still stands.
+    _, me_rf, _ = update_work_flags(
+        "bash", {"command": "git checkout ."}, "[exit 1] error: pathspec",
+        did_work=True, made_edit=True, unverified_edit=False)
+    check("failed revert keeps made_edit", me_rf is True)
+    # Restoring commands (branch switch / stash pop) are NOT reverts of edits.
+    for cmd in ("git checkout -b feature", "git stash pop", "git status"):
+        _, me_n, _ = update_work_flags(
+            "bash", {"command": cmd}, "[no output]",
+            did_work=True, made_edit=True, unverified_edit=False)
+        check(f"non-revert keeps made_edit: {cmd}", me_n is True, cmd)
 
 
 def test_loop_guard():
@@ -389,9 +410,24 @@ def test_degenerate_tail():
           not degenerate_tail(unit40 + "x" * 300 + " and now a completely new thought."))
     code = "\n".join(f"def helper_{i}(x):\n    return x + {i}\n" for i in range(120))
     check("templated code ok", not degenerate_tail(code))
-    # A unit longer than REPEAT_MAX_PERIOD is out of scope by design (needs the cap).
+    # A unit longer than REPEAT_MAX_PERIOD but under the coarse window stays out of scope
+    # (too little text to be sure it's a loop, not legitimate repeated structure).
     big_unit = ("x" * 300 + " different filler words here ") * 20
-    check("over-long unit out of scope", not degenerate_tail(big_unit))
+    check("over-long short-text unit out of scope", not degenerate_tail(big_unit))
+    # Coarse tier: a block whose period is BETWEEN the fine cap (256) and the coarse cap
+    # (3072), repeated to fill the 12KB+ tail, IS caught — the django-14404 reasoning-loop
+    # the fine tier was blind to. The block has no short internal period, so only the
+    # coarse tier can see it.
+    block = " ".join(f"clause {i} of one paragraph with no short internal repeat"
+                     for i in range(24))  # ~1.2KB, period > 256, < 3072
+    check("coarse block-scale loop detected", degenerate_tail(block * 12))
+    check("same block below coarse window does not fire (too little text)",
+          not degenerate_tail(block * 2))
+    # A large body whose blocks all VARY (real long output) never trips either tier, even
+    # well past the coarse window.
+    varied = " ".join(f"Paragraph {i} discusses a genuinely distinct part of the system."
+                      for i in range(400))
+    check("varied long output ok", not degenerate_tail(varied))
 
 
 def test_repeat_stop_abort():
@@ -500,13 +536,18 @@ def test_progress_note():
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "fix the parser"},
         {"role": "assistant",
+         "content": '<tool_call>{"name": "grep", "arguments": {"pattern": "def parse"}}</tool_call>'},
+        {"role": "tool", "name": "grep", "content": "parser.py:10: def parse():"},
+        {"role": "assistant",
          "content": '<tool_call>{"name": "edit", "arguments": {"path": "parser.py"}}</tool_call>'},
         {"role": "tool", "name": "edit", "content": "[edited parser.py]"},
         {"role": "assistant",
          "content": '<tool_call>{"name": "bash", "arguments": {"command": "pytest -q"}}</tool_call>'},
         {"role": "tool", "name": "bash", "content": "[exit 1]\nE   AssertionError: bad parse"},
         {"role": "assistant",
-         "content": '<tool_call>{"name": "write", "arguments": {"path": "util.py"}}</tool_call>'},
+         "content": ("<think>long reasoning</think>The root cause is the tokenizer eats the "
+                     "trailing newline; util.py needs to preserve it before parse() runs.\n"
+                     '<tool_call>{"name": "write", "arguments": {"path": "util.py"}}</tool_call>')},
         {"role": "tool", "name": "write", "content": "[wrote util.py]"},
     ]
     note = progress_note(messages)
@@ -514,13 +555,24 @@ def test_progress_note():
     check("note names second edited file", "util.py" in note, note)
     check("note names the command run", "pytest -q" in note, note)
     check("note surfaces the last error", "AssertionError" in note, note)
-    check("note is bounded to max_lines", len(note.splitlines()) <= 20, note)
+    check("note carries the working hypothesis", "tokenizer eats" in note, note)
+    check("note keeps hypothesis prose but not the think block", "long reasoning" not in note, note)
+    check("note records what was already examined", "def parse" in note, note)
+    check("note is bounded to max_lines", len(note.splitlines()) <= 24, note)
     # An empty/idle transcript yields a note that says nothing was recorded (still safe
     # to seed a retry with).
     empty = progress_note([{"role": "system", "content": "s"},
                            {"role": "user", "content": "do x"}])
     check("empty transcript -> explicit 'nothing recorded'",
           "nothing" in empty.lower() or "no edits" in empty.lower(), empty)
+    # A degenerate (looping) final reasoning is NOT carried forward — it would only
+    # re-seed the loop in the relaunch.
+    loopy = [{"role": "user", "content": "x"},
+             {"role": "assistant",
+              "content": "the same broken thought again. " * 200
+              + '<tool_call>{"name": "read", "arguments": {"path": "z.py"}}</tool_call>'}]
+    ln = progress_note(loopy)
+    check("degenerate reasoning not carried as hypothesis", "hypothesis" not in ln.lower(), ln)
 
 
 def test_bash_result_verifies_ignores_trivial_checks():
@@ -591,12 +643,29 @@ def test_edit_failed_to_land():
     check("landed symbol replace did not fail", not edit_failed_to_land("[replaced foo]"))
 
 
+def test_edit_fail_kind():
+    check("noop classified", edit_fail_kind("[no-op edit: old and new are identical]") == "noop")
+    check("not-found classified nomatch",
+          edit_fail_kind("[old string not found; no change made.]") == "nomatch")
+    check("ambiguous classified nomatch", edit_fail_kind("[old string appears 3 times]") == "nomatch")
+    check("landed edit has no fail kind", edit_fail_kind("[edited foo.py]") is None)
+
+
 def test_edit_loop_break():
     check("no break below 2", edit_loop_break(1, 0) is None)
     b = edit_loop_break(2, 0)
     check("break fires at streak 2", b is not None and "changed nothing" in b)
     check("break suggests read + replace_symbol", "replace_symbol" in b and "read" in b)
     check("break bounded", edit_loop_break(5, 2) is None)
+    # No-op failures get the tailored remedy (make new differ), NOT "re-read and paste" —
+    # that's exactly what already failed (pytest-10356).
+    nb = edit_loop_break(2, 0, kind="noop")
+    check("noop break says old and new are identical", "identical" in nb, nb)
+    check("noop break tells it to make new differ", "must differ" in nb or "MODIFIED" in nb, nb)
+    check("noop break does NOT tell it to paste verbatim", "verbatim" not in nb, nb)
+    # A not-found failure still gets the re-read remedy.
+    mb = edit_loop_break(2, 0, kind="nomatch")
+    check("nomatch break says re-read", "read" in mb and "verbatim" in mb, mb)
 
 
 def test_reject_escalation():

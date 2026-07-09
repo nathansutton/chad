@@ -138,13 +138,40 @@ SUBSTANTIVE_TOOLS = ("grep", "glob", "read", "write", "edit", "bash",
                      "find_refs", "replace_symbol", "insert_symbol", "rename_symbol")
 
 
+# Working-tree DISCARD commands: after one of these runs cleanly, the edits the model
+# made are gone and the tree is clean again. The demonstrated hole (matplotlib-20676):
+# the model edited → ran pytest (clearing unverified_edit) → `git checkout .` reverted
+# the file → answered in prose, and the no-empty-diff done-gate (which keys on made_edit)
+# waved it through with an EMPTY diff — the exact outcome the gate exists to stop. So a
+# clean revert must un-set made_edit, re-arming the gate. High-confidence forms only
+# (whole-tree/path discards, hard reset, stash-save, forced clean) — a branch-creating
+# `git checkout -b` or a `git stash pop`/`apply` (which RESTORE work) do not match.
+_REVERT_PATTERNS = (
+    re.compile(r"\bgit\s+checkout\s+(?:--(?:\s|$)|\.|HEAD\b|-f\b)"),
+    re.compile(r"\bgit\s+checkout\s+\S+\.\w"),        # git checkout path/to/file.py
+    re.compile(r"\bgit\s+restore\b"),
+    re.compile(r"\bgit\s+reset\s+--hard\b"),
+    re.compile(r"\bgit\s+stash\b(?!\s+(?:pop|apply|list|show|drop|branch))"),
+    re.compile(r"\bgit\s+clean\s+-\w*f"),
+)
+
+
+def reverts_working_tree(command: str) -> bool:
+    """True when a bash command DISCARDS working-tree edits (git checkout/restore of
+    paths, reset --hard, stash-save, clean -f). Used to re-arm the no-empty-diff gate:
+    a clean revert un-lands whatever the model had edited (see `update_work_flags`)."""
+    return bool(command) and any(p.search(command) for p in _REVERT_PATTERNS)
+
+
 def update_work_flags(name, args, result, did_work, made_edit, unverified_edit):
     """Update the (did_work, made_edit, unverified_edit) guardrail flags after one
-    tool result; returns the new triple. Byte-identical to run_turn's old inline
-    bookkeeping: a substantive tool counts as real work; a successful edit/write
-    (text or symbolic) sets made_edit and — unless it's a pure prose/doc file —
-    arms unverified_edit; a bash run that didn't error/timeout/interrupt clears it
-    (a failing test keeps it dirty so the model re-runs)."""
+    tool result; returns the new triple. A substantive tool counts as real work; a
+    successful edit/write (text or symbolic) sets made_edit and — unless it's a pure
+    prose/doc file — arms unverified_edit; a bash run that didn't error/timeout/interrupt
+    clears it (a failing test keeps it dirty so the model re-runs). A bash command that
+    cleanly REVERTS the working tree (`reverts_working_tree`) un-sets made_edit AND
+    unverified_edit — the edit is gone, so the done-gate must treat the turn as having
+    landed nothing (matplotlib-20676: revert-then-prose shipped an empty diff)."""
     if name in SUBSTANTIVE_TOOLS:
         did_work = True
     landed_edit = (
@@ -162,8 +189,15 @@ def update_work_flags(name, args, result, did_work, made_edit, unverified_edit):
             (".md", ".markdown", ".rst", ".txt"))
         if not is_doc:
             unverified_edit = True
-    elif name == "bash" and bash_result_verifies(result, str(args.get("command", ""))):
-        unverified_edit = False
+    elif name == "bash":
+        cmd = str(args.get("command", ""))
+        errored = result.startswith(
+            ("[exit", "[timed out", "[interrupted", "[failed to launch"))
+        if reverts_working_tree(cmd) and not errored:
+            made_edit = False
+            unverified_edit = False
+        elif bash_result_verifies(result, cmd):
+            unverified_edit = False
     return did_work, made_edit, unverified_edit
 
 
@@ -293,19 +327,46 @@ def edit_failed_to_land(result: str) -> bool:
         "[old string matches", "[no such file", "[edit rejected"))
 
 
-def edit_loop_break(noop_edit_streak, break_nudges):
+def edit_fail_kind(result: str) -> str | None:
+    """Classify WHY an edit failed to land, so the loop-break nudge can prescribe the
+    right fix. 'noop' = old and new were identical (the model pasted the same code in
+    both fields — it read the code but never changed it; telling it to "re-read and paste
+    verbatim" is exactly wrong, that's what it already did). 'nomatch' = `old` didn't
+    match / was ambiguous (re-read IS the right fix). None = the result isn't a failure.
+    The demonstrated conflation (pytest-10356): 2/3 reps died on repeated old==new no-ops
+    while being told to re-read and paste verbatim."""
+    if result.startswith("[no-op edit"):
+        return "noop"
+    if edit_failed_to_land(result):
+        return "nomatch"
+    return None
+
+
+_NOMATCH_BREAK = (
+    "[your last edits changed nothing — your `old`/target text does not match "
+    "the file as it is now. Do NOT re-try more variations. First `read` the exact "
+    "current lines (or `view_symbol`), then either copy that text verbatim into "
+    "`old`, or replace the entire enclosing function with `replace_symbol`. Land "
+    "one real change, then run the test.]")
+_NOOP_BREAK = (
+    "[your last edits were NO-OPS: your `old` and `new` are identical, so nothing "
+    "changed. Re-reading and pasting the same lines again will not help — that is what "
+    "just failed. Decide the ACTUAL change: `old` = the current lines, `new` = those "
+    "lines MODIFIED to fix the bug (they must differ). If you're unsure what to change, "
+    "state the fix in one sentence first, then make `new` reflect it. Land one real "
+    "change, then run the test.]")
+
+
+def edit_loop_break(noop_edit_streak, break_nudges, kind=None):
     """After ~2 consecutive edits that failed to land (see `edit_failed_to_land`), stop
-    the model re-trying variations of a broken edit: tell it its `old` text doesn't match
-    the file, and to re-read the exact current lines and either paste them verbatim or
-    replace the whole enclosing function with `replace_symbol`. One-shot-ish (bounded by
+    the model re-trying variations of a broken edit. `kind` (from `edit_fail_kind` on the
+    latest failure) tailors the remedy: 'noop' → the change was empty, tell it to make
+    `new` actually differ; anything else → the `old` text doesn't match, tell it to
+    re-read and paste verbatim / use `replace_symbol`. One-shot-ish (bounded by
     break_nudges). Returns nudge text or None."""
     if noop_edit_streak < 2 or break_nudges >= 2:
         return None
-    return ("[your last edits changed nothing — your `old`/target text does not match "
-            "the file as it is now. Do NOT re-try more variations. First `read` the exact "
-            "current lines (or `view_symbol`), then either copy that text verbatim into "
-            "`old`, or replace the entire enclosing function with `replace_symbol`. Land "
-            "one real change, then run the test.]")
+    return _NOOP_BREAK if kind == "noop" else _NOMATCH_BREAK
 
 
 STEP_CAP_CEILING = 4  # absolute per-turn step ceiling = STEP_CAP_CEILING * max_steps
@@ -388,17 +449,22 @@ REPEAT_TAIL_CHARS = 2048    # window that must be fully periodic — long enough
                             # legitimate prose/code run trips it, short enough to fire
                             # a few hundred tokens into a runaway, not 8k tokens in
 REPEAT_MAX_PERIOD = 256     # unit ≤ this ⇒ the window holds ≥ 8 repeats
+# Coarse tier: catches paragraph/block-scale loops the fine tier's 256-char period can't
+# see. The demonstrated miss (django-14404): a ~2–3KB reasoning paragraph repeated ~90×
+# across five dead 8192-token completions — period far over 256, so the fine detector
+# never fired and the loop burned the whole turn's budget. A much larger window with a
+# proportionally larger period demands ≥4 exact repeats before firing, so it stays clear
+# of legitimate long output (which is never 12KB of an identically-repeated block).
+REPEAT_COARSE_TAIL_CHARS = 12288
+REPEAT_COARSE_MAX_PERIOD = 3072
 
 
-def degenerate_tail(text: str, tail: int = REPEAT_TAIL_CHARS,
-                    max_period: int = REPEAT_MAX_PERIOD) -> bool:
-    """True when the last `tail` chars of `text` are one short unit repeated end-to-end
-    — the degenerate-decode signature. The smallest period comes from the KMP prefix
-    function (p = len - f[-1] ⇒ s[i] == s[i-p] for all i ≥ p, regardless of where the
-    window cuts into the unit — a plain `(s+s).find(s)` doubling test would only catch
-    periods that divide the window exactly). ~0.5ms of pure Python over a 2KB window;
-    run_turn calls it every 16 tokens, i.e. a few times per second against a ~25ms/token
-    decode, so the cost is noise."""
+def _is_periodic_tail(text: str, tail: int, max_period: int) -> bool:
+    """True when the last `tail` chars of `text` are one unit of length ≤ `max_period`
+    repeated end-to-end. The smallest period comes from the KMP prefix function
+    (p = len - f[-1] ⇒ s[i] == s[i-p] for all i ≥ p, regardless of where the window cuts
+    into the unit — a plain `(s+s).find(s)` doubling test would only catch periods that
+    divide the window exactly)."""
     if len(text) < tail:
         return False
     s = text[-tail:]
@@ -411,6 +477,18 @@ def degenerate_tail(text: str, tail: int = REPEAT_TAIL_CHARS,
             k += 1
         f[i] = k
     return len(s) - f[-1] <= max_period
+
+
+def degenerate_tail(text: str, tail: int = REPEAT_TAIL_CHARS,
+                    max_period: int = REPEAT_MAX_PERIOD) -> bool:
+    """True when `text`'s tail is one unit repeated end-to-end — the degenerate-decode
+    signature — at either of two scales: a short unit in a 2KB window (the token-loop
+    case) OR a large block (paragraph/tool-call-scale) in a 12KB window (the reasoning-
+    loop case the fine tier is blind to). ~0.5ms for the fine window, ~3ms for the coarse
+    one, of pure Python; run_turn calls it every 16 tokens, i.e. a few times per second
+    against a ~25ms/token decode, so the cost is noise."""
+    return (_is_periodic_tail(text, tail, max_period)
+            or _is_periodic_tail(text, REPEAT_COARSE_TAIL_CHARS, REPEAT_COARSE_MAX_PERIOD))
 
 
 REPEAT_STOP_NUDGE = (
@@ -517,23 +595,52 @@ def advance_governor(gov_band, new_band, progress, soft_fired):
 # Tool results that landed a file change / were run, used to reconstruct a progress note
 # deterministically (no model call) from the transcript.
 _EDIT_TOOLS = ("write", "edit", "replace_symbol", "insert_symbol", "rename_symbol")
+# Read/search tools whose target the note records as "already examined" so a relaunch
+# doesn't re-walk the tree it already mapped (the demonstrated leak: django-14007/-14404
+# reps burned their whole budget re-exploring because the note carried only edited files).
+_READ_TOOLS = ("read", "grep", "glob", "view_symbol", "find_symbol", "find_refs",
+               "repo_map", "overview")
 _ERROR_PREFIXES = ("[exit", "[timed out", "[failed to launch", "[tool error", "[denied")
+# Lines in a tool result worth carrying as the failing-test signature — the concrete
+# assertion/exception the next attempt must make pass, not just "[exit 1]".
+_FAILURE_RE = re.compile(
+    r"^(?:E\s|.*\b(?:Error|Exception|assert|FAILED|AssertionError)\b)", re.I)
+
+_TOOLCALL_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.S)
 
 
-def progress_note(messages, max_lines: int = 20) -> str:
+def _last_hypothesis(content: str) -> str | None:
+    """The model's own prose from one assistant turn, with the <think> block and any
+    <tool_call> blocks stripped — its working diagnosis. Returns None when there's no
+    substantive prose (a pure tool-call turn) or when the prose has degenerated into a
+    repetition loop (carrying that forward would only re-seed the loop)."""
+    prose = _TOOLCALL_BLOCK_RE.sub("", strip_think(content)).strip()
+    if len(prose) < 40 or degenerate_tail(prose):
+        return None
+    return prose
+
+
+def progress_note(messages, max_lines: int = 24) -> str:
     """Synthesize a ≤`max_lines` progress note from the transcript with NO model call, so
     a hard-stopped turn can seed a fresh relaunch (sheds the ramble AND the huge prefill
-    the stuck model was dragging around). Deterministic: pulls files edited and commands
-    run from the assistant turns' own <tool_call> blocks (via parse_tool_calls), plus the
-    last error seen in a tool result. Prefer facts the executor cannot reconstruct from a
-    clean context — what was already tried and what failed last."""
+    the stuck model was dragging around). Deterministic: pulls the model's last working
+    hypothesis, the files edited/examined and commands run (from the assistant turns' own
+    <tool_call> blocks via parse_tool_calls), and the last failing-test signature. Prefer
+    facts the executor CANNOT reconstruct from a clean context — the diagnosis it reached,
+    what it already tried, and what failed last. The old note carried only file names, so
+    a relaunch re-derived the whole investigation and re-spent the budget it was meant to
+    save (django-14007/-14404: the correct fix was stated in prose, then lost)."""
     from .toolcall_parse import parse_tool_calls
-    edited, commands = [], []
+    edited, commands, examined = [], [], []
     last_error = None
+    hypothesis = None
     for m in messages:
         role = m.get("role")
         content = m.get("content", "") or ""
         if role == "assistant":
+            h = _last_hypothesis(content)
+            if h:
+                hypothesis = h  # keep the most recent substantive reasoning
             for name, args in parse_tool_calls(content):
                 if name == "bash":
                     cmd = str(args.get("command", "")).strip()
@@ -543,18 +650,32 @@ def progress_note(messages, max_lines: int = 20) -> str:
                     p = str(args.get("path", "")).strip()
                     if p and p not in edited:
                         edited.append(p)
+                elif name in _READ_TOOLS:
+                    tgt = str(args.get("path") or args.get("pattern")
+                              or args.get("name") or args.get("symbol") or "").strip()
+                    if tgt and tgt not in examined:
+                        examined.append(tgt)
         elif role == "tool":
             if content.startswith(_ERROR_PREFIXES) or "Traceback" in content:
                 last_error = content
     lines = ["Progress so far (auto-summarized — the previous attempt ran out of budget):"]
+    if hypothesis:
+        # The single most valuable thing to carry: the diagnosis the stuck attempt
+        # reached. Keep the tail (the conclusion), clipped so it can't blow the budget.
+        lines.append("Working hypothesis from the previous attempt (verify, don't assume):")
+        lines += ["  " + ln[:160] for ln in hypothesis.splitlines()[-4:] if ln.strip()]
     if edited:
         lines.append("Files already edited: " + ", ".join(edited[-8:]))
+    if last_error:
+        lines.append("Last failing check — make THIS pass:")
+        err_lines = last_error.strip().splitlines()
+        sig = [ln for ln in err_lines if _FAILURE_RE.match(ln.strip())][-3:]
+        lines += ["  " + ln[:140] for ln in (sig or err_lines[-3:])]
+    if examined:
+        lines.append("Already examined (don't re-explore): " + ", ".join(examined[-8:]))
     if commands:
         lines.append("Commands already tried (do not blindly repeat):")
         lines += [f"  $ {c[:120]}" for c in commands[-4:]]
-    if last_error:
-        lines.append("Last error seen:")
-        lines += ["  " + ln[:120] for ln in last_error.strip().splitlines()[-4:]]
     if len(lines) == 1:
         lines.append("(no edits, commands, or errors were recorded before the budget ran out)")
     return "\n".join(lines[:max_lines])

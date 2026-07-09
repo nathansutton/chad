@@ -541,18 +541,24 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
     elif not os.path.isdir(path):
         return f"[path not found: {path}]"
     else:
+        # Count only files we would actually SEARCH against GREP_MAX_FILES — apply the
+        # dir/skip filter BEFORE the cap, not after. The demonstrated starvation
+        # (django-16454): _walk_glob yields directories too, and Django's locale tree is
+        # mostly dirs + skipped blobs, so the 5000-slot budget was exhausted on entries
+        # that can never match before the walk ever reached django/core/, and the target
+        # symbol (position ~3,195 among real files) sat in an unsearched file. Filtering
+        # first roughly doubles the effective reach on a dir-heavy tree.
         fast = _walk_glob(path, glob)
         if fast is None:
-            files = _glob.glob(os.path.join(path, glob), recursive=True)
-            files_truncated = len(files) > GREP_MAX_FILES
-            files = files[:GREP_MAX_FILES]
-        else:
-            files, files_truncated = [], False
-            for fp in fast:
-                if len(files) >= GREP_MAX_FILES:
-                    files_truncated = True
-                    break
-                files.append(fp)
+            fast = _glob.glob(os.path.join(path, glob), recursive=True)
+        files, files_truncated = [], False
+        for fp in fast:
+            if _skip(fp) or not os.path.isfile(fp):
+                continue
+            if len(files) >= GREP_MAX_FILES:
+                files_truncated = True
+                break
+            files.append(fp)
     for fp in files:
         if should_stop and should_stop():
             return "[interrupted by user]"
