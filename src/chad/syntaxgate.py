@@ -103,3 +103,41 @@ def check_syntax(path: str, before: str | None) -> str | None:
         return ("\n[warning: this edit introduced a syntax error — the file no longer "
                 "parses cleanly. Re-check the change before moving on.]")
     return None
+
+
+def indent_reject(path: str, before: str, after: str) -> str | None:
+    """A rejection message when an *edit* would newly introduce a Python indentation
+    error (IndentationError, which subsumes TabError), else None — the edit path uses
+    this to REVERT rather than let the break land.
+
+    check_syntax only warns and lets the edit stand (a transient parse break during a
+    multi-edit refactor is legitimate). But a landed indent/tab break is the precondition
+    for the whitespace-surgery death loop: the model can't reliably re-transcribe
+    indentation from a numbered read, so it spins on no-op edits hand-patching a file it
+    never should have broken (the recurring dogfood failure). We reject ONLY when `before`
+    parses cleanly and `after` raises IndentationError — a generic SyntaxError stays
+    warn-only, and a file that was ALREADY broken is left editable so a real fix (which
+    passes through a transiently-still-broken state) is never stranded.
+    """
+    if config.flag("CHAD_NO_SYNTAX_GATE"):
+        return None
+    if len(after) > _MAX_BYTES:
+        return None
+    if repomap.service().lang_for(path) != "python":
+        return None
+    try:
+        ast.parse(before)
+    except SyntaxError:
+        return None            # before wasn't clean — don't strand a fix-in-progress
+    try:
+        ast.parse(after)
+    except IndentationError as e:  # catch before SyntaxError — it is a subclass
+        lines = after.splitlines()
+        line = lines[e.lineno - 1] if e.lineno and e.lineno <= len(lines) else ""
+        return (f"[edit rejected: it would break {os.path.basename(path)} — {e.msg} at "
+                f"line {e.lineno}: {line.strip()!r}. The file was left unchanged. "
+                f"Re-send the edit with indentation matching the surrounding lines "
+                f"(copy their exact leading whitespace).]")
+    except SyntaxError:
+        return None            # non-indent break: let check_syntax warn, don't revert
+    return None

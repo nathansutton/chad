@@ -129,9 +129,60 @@ def test_ws_only_edit_applies_verbatim():
           after == "def f():\n    a = 1\n    b = 2\n", repr(after))
 
 
+def test_indent_break_is_rejected_and_reverted():
+    """Prong 1 (plan 067): an edit that would newly introduce a Python IndentationError
+    (or TabError) to a CLEAN file is rejected and the file left untouched — so the model
+    re-sends the edit instead of looping on whitespace surgery to un-break a landed file."""
+    before = "def f():\n    a = 1\n    b = 2\n"
+
+    # over-indent mid-block -> IndentationError ("unexpected indent")
+    res, after = run(before, "    b = 2", "      b = 2")
+    check("indent-break rejected", res.startswith("[edit rejected"), res)
+    check("indent-break file untouched", after == before, repr(after))
+
+    # spaces -> tab in a space-indented block -> TabError (a subclass of IndentationError)
+    res, after = run(before, "    b = 2", "\tb = 2")
+    check("tab-break rejected", res.startswith("[edit rejected"), res)
+    check("tab-break file untouched", after == before, repr(after))
+
+
+def test_non_indent_break_still_lands_with_warning():
+    """Prong 1 scope: a NON-indentation syntax break (unclosed paren) is NOT reverted —
+    it stays warn-only (check_syntax), preserving transient breaks during a refactor."""
+    res, after = run("x = 1\n", "x = 1", "x = (1")
+    check("non-indent break lands", res.startswith("[edited") and "x = (1" in after, res)
+    check("non-indent break warns", "no longer parses" in res, res)
+
+
+def test_already_broken_file_stays_editable():
+    """Prong 1 boundary: when `before` is ALREADY broken, indent_reject stays out of the
+    way (parse of `before` fails), so a fix that passes through a still-broken state is
+    never stranded — the sphinx-7440 repair path keeps working."""
+    before = "def f():\n    a = 1\n      b = 2\n"      # b over-indented: already broken
+    res, after = run(before, "    a = 1", "    a = 111")  # edit unrelated line
+    check("broken-file edit lands", res.startswith("[edited") and "a = 111" in after, res)
+
+
+def test_failed_edit_shows_visible_whitespace():
+    """Prong 2 (plan 067): a no-op / not-found edit hands back the target lines with
+    leading whitespace made visible (· space, → tab), so the model copies the exact
+    indentation instead of re-guessing the column count."""
+    # no-op (old == new): still echo the current line with visible indentation
+    res, _ = run(GEO, "    return w * h", "    return w * h")
+    check("no-op shows visible ws", "·" in res and "no-op" in res, res)
+
+    # not-found close match: show the closest line's real indentation
+    res, _ = run(GEO, "return w / h", "return w // h")
+    check("not-found shows visible ws", "·" in res, res)
+
+
 if __name__ == "__main__":
     test_edit()
     test_ws_recovery_prefers_file_indentation()
     test_ws_only_edit_applies_verbatim()
+    test_indent_break_is_rejected_and_reverted()
+    test_non_indent_break_still_lands_with_warning()
+    test_already_broken_file_stays_editable()
+    test_failed_edit_shows_visible_whitespace()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

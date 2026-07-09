@@ -294,9 +294,52 @@ def _closest_hint(data: str, old: str) -> str:
             f"indentation), or use replace_symbol to rewrite the whole function.") if best else ""
 
 
+def _show_ws(line: str) -> str:
+    """Render a file line with its leading whitespace made visible (· = space, → = tab)
+    so the model copies the exact indentation instead of re-guessing the column count —
+    the space-miscount that drives the no-op edit loop when it hand-patches indentation."""
+    stripped = line.lstrip(" \t")
+    indent = line[: len(line) - len(stripped)]
+    return indent.replace("\t", "→").replace(" ", "·") + stripped
+
+
+def _indent_hint(data: str, old: str) -> str:
+    """Echo the run of file lines that `old` was trying to match, with leading whitespace
+    made visible, so a failed/no-op edit hands back the exact current indentation to copy.
+    Empty when no plausible location is found."""
+    olines = old.strip("\n").split("\n")
+    key = next((l.strip() for l in olines if l.strip()), "")
+    if not key:
+        return ""
+    dlines = data.split("\n")
+    idx = next((i for i, l in enumerate(dlines) if l.strip() == key), None)
+    if idx is None:
+        import difflib
+        near = difflib.get_close_matches(
+            key, [l.strip() for l in dlines if l.strip()], n=1, cutoff=0.6)
+        if not near:
+            return ""
+        idx = next((i for i, l in enumerate(dlines) if l.strip() == near[0]), None)
+        if idx is None:
+            return ""
+    region = dlines[idx: idx + max(1, len(olines))]
+    shown = "\n".join(_show_ws(l) for l in region)
+    if len(shown) > 800:
+        shown = shown[:800] + "…"
+    return ("\n[current lines in the file (· = one space, → = one tab) — copy this "
+            f"indentation exactly:\n{shown}\n]")
+
+
 def _apply_edit(path: str, before: str, after: str, note: str) -> str:
     if after == before:
         return "[no-op edit: the replacement leaves the file unchanged]"
+    # Prong 1 (plan 067): never LAND an edit that newly breaks Python indentation —
+    # revert and make the model re-send. A landed indent/tab break is the precondition
+    # for the whitespace-surgery loop it can't win. Scoped to IndentationError; a clean
+    # file only (an already-broken file stays editable so real fixes aren't stranded).
+    reject = syntaxgate.indent_reject(path, before, after)
+    if reject:
+        return reject
     with open(path, "w") as f:
         f.write(after)
     result = f"[edited {_rel(path)}{note}]"
@@ -307,10 +350,11 @@ def _apply_edit(path: str, before: str, after: str, note: str) -> str:
 def tool_edit(path: str, old: str, new: str) -> str:
     if not os.path.exists(path):
         return f"[no such file: {path}]"
-    if old == new:
-        return "[no-op edit: old and new are identical; change the content or stop]"
     with open(path) as f:
         data = f.read()
+    if old == new:
+        return ("[no-op edit: old and new are identical; change the content or stop]"
+                + _indent_hint(data, old))
 
     # (1) exact match — the common, fast path.
     n = data.count(old)
@@ -365,7 +409,8 @@ def tool_edit(path: str, old: str, new: str) -> str:
         return (f"[old string matches {len(spans)} places ignoring whitespace; include "
                 f"more surrounding lines to make it unique]")
 
-    return f"[old string not found; no change made.{_closest_hint(data, old)}]"
+    return (f"[old string not found; no change made.{_closest_hint(data, old)}]"
+            + _indent_hint(data, old))
 
 
 # Planning tool (deepagents' write_todos): a scaffold that keeps the model on track

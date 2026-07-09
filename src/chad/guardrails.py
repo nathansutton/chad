@@ -290,7 +290,7 @@ def edit_failed_to_land(result: str) -> bool:
     for its remaining steps and never called done)."""
     return result.startswith((
         "[no-op edit", "[old string not found", "[old string appears",
-        "[old string matches", "[no such file"))
+        "[old string matches", "[no such file", "[edit rejected"))
 
 
 def edit_loop_break(noop_edit_streak, break_nudges):
