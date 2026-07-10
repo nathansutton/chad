@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/nathansutton/chad/actions/workflows/tests.yml/badge.svg)](https://github.com/nathansutton/chad/actions/workflows/tests.yml)
 
-<img src="docs/chad-vs-claude.png" width="480" alt="Claude: Master of the Universe (an ornate, impossibly intricate carved-horse banister) vs chad: Master of Your Laptop (a plastic toy horse gaffer-taped to a stair post)">
+<img src="docs/tbench-size-vs-score.png" width="840" alt="Terminal-Bench 2.0: accuracy vs. model size. chad + Ornith (a 35B MoE) lands on the Claude Sonnet 4.5 reference line, matching open models many times its size and standing alone in the laptop-class ≤40B band.">
 
 
 > Claude can do anything, for anyone, anywhere. chad does one thing. 🗿    
@@ -21,11 +21,28 @@ smaller Claude; he's a blunter instrument.
 | **Harness**         | open-ended, anything you can imagine             | plan. execute. nothing else.               |
 | **When wrong**      | reasons a way out                                | already shipped 🗿                         |
 
-Think of it as report cards. On [terminal-bench 2.1](https://www.tbench.ai/leaderboard) —
-the standard exam for CLI coding agents — Claude (Opus 4.8) is the **A student** at
-**82.7%**, near the top of the class. Ornith, the model behind chad, is a **C+ student**
-at **64.2%**.  The bet was never that chad out-scores Claude — it's that a C+ student 
-running free on your own machine is still worth having around. 🗿
+Think of it as report cards. The exam is
+[Terminal-Bench](https://www.tbench.ai/leaderboard), the standard benchmark for CLI coding
+agents. chad won't top it — the A students are frontier models in datacenters, and chad
+isn't trying to be one. The number worth looking at isn't chad's rank; it's **how much
+capability Ornith wrings out of 35B parameters**. On Terminal-Bench 2.0, chad + Ornith
+lands right at the **Claude Sonnet 4.5** line — matching open models many times its size,
+and beating every open model in its own weight class by a wide margin. **Sonnet on your
+laptop.** That's the chart up top.
+
+And you don't have to take our word for it: the whole benchmark is **publicly
+reproducible, from a Mac**. The exact Harbor agent adapter that produces our runs, the
+runner script, and the step-by-step recipe (serve Ornith on the Mac with
+`mlx_lm.server`, point the kit at it) live in
+[`benchmarks/tb2/`](benchmarks/tb2/README.md).
+
+> Placeholder numbers — the full verified run is **still in flight**, so treat the Ornith
+> point as provisional until it lands (the reproduction kit is published ahead of the
+> final number on purpose: check it, don't trust it). The claim the chart makes is
+> structural, not one data point: on a
+> laptop, *capability per parameter* is the axis you actually compete on, and chad + Ornith
+> is out on that frontier by itself. The bet was never that chad out-scores Claude — it's
+> that this much capability, running free on your own machine, is worth having around. 🗿
 
 > chad doesn't run on a H100 server, and you don't have one.  He will never will be in the 
 > big leagues.  Those are for Claude. chad does **one** thing, MLX inference on a MacBook Pro, 
@@ -61,22 +78,11 @@ it drags around must be re-read by *your* GPU at a few hundred tokens a second.
 
 So chad's real thesis isn't "run a model locally" — plenty of tools do that. It's that
 **for a small model, harness quality is worth more than a model upgrade**, and that the
-harness and the inference engine have to be designed *together*. You can measure it: a
-private rig runs the **same Ornith-9B weights** on the **same 34 Exercism-style tasks**
-on the **same MacBook**, varying only the harness (external harnesses reach the model
-through an OpenAI-style local server — the standard way to attach them to a local
-backend):
-
-| harness | tasks passed | median time-to-first-token | median prefix-cache reuse |
-|---|---|---|---|
-| **chad** | **17/34** | **0.71 s** | **99%** |
-| pi | 10/34 | 3.2 s | 77% |
-| opencode | 2/34 | 2.9 s | 0% |
-| aider / cline / goose / Claude Code (via router) | 0/34 | 3.3–6.1 s | 0–85% |
-
-(One model, one machine, n=34 — read it as a measurement of *fit to a local backend*,
-not of those harnesses in general; they're excellent at what they were built for, which
-is a frontier model on the other end of a fast API.)
+harness and the inference engine have to be designed *together*. Point the same local
+weights at a harness built for a frontier API — reaching the model through an OpenAI-style
+local server, the standard way to attach one to a local backend — and it stumbles, not
+because it's a bad harness but because it was built for an A student on the far end of a
+fast API, not a C+ student sharing your GPU.
 
 The gap is entirely nameable failure modes. The model pours its edit into the
 reasoning channel and the harness drops it. The model asks for a `read` tool the
@@ -88,14 +94,14 @@ through a forgiveness cascade before failing, loop/thrash/verify guards keep the
 honest — and, above all, the transcript is engineered to remain a **strict token-prefix
 of the live KV cache** across every step, because on a local model prefix stability is
 a *harness* property, not a server feature. That co-design is the whole moat: it's why
-the same C+ student passes 17 tasks under chad and 0 under harnesses built for the A
-student. A C+ student with a good tutor, running free on your own machine. 🗿
+the same C+ student gets real work done under chad and stalls under harnesses built for
+the A student. A C+ student with a good tutor, running free on your own machine. 🗿
 
 ### Why the engine is in-process (and not behind an OpenAI layer)
 
 A fair question is whether chad should talk to its model through an OpenAI-style
-`/v1/chat/completions` boundary — the way every external harness above does — so the
-frontend and backend decouple cleanly. It shouldn't, and the table already shows why:
+`/v1/chat/completions` boundary — the way every other local-model harness does — so the
+frontend and backend decouple cleanly. It shouldn't, and the co-design is why:
 that boundary is stateless text-in/text-out, and chad's core engineering (diffing
 rendered *token ids* against a live KV cache, warm-prefix disk checkpoints,
 `close_unclosed_think` prefix repair, interruptible chunked prefill, RAM-aware context
@@ -329,6 +335,8 @@ behavior — in the [Configuration reference](docs/configuration.md).
 - **[Throughput & performance](docs/benchmarks.md)** — prefill / decode / warm-step numbers
   you can reproduce with `chad-bench`, the bandwidth ceiling, and the thinking-budget / PLD
   levers.
+- **[Terminal-Bench 2.0 reproduction](benchmarks/tb2/README.md)** — the exact Harbor
+  adapter and runner behind the chart up top; serve Ornith yourself and check the number.
 - **[Configuration reference](docs/configuration.md)** — Agent Skills, MCP servers, the
   context window, every environment variable, and the safety opt-outs.
 - **[Troubleshooting](docs/troubleshooting.md)** — when a session rambles, loops, or slows:

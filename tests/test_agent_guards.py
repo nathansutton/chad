@@ -234,7 +234,7 @@ def test_nudge_for_no_calls():
     check("truncation cap falls through to no-edit", kind7 == "no-edit")
 
     # Bare stall — model thought then stopped with EMPTY content after </think>, no tool
-    # call (the llama.cpp early-EOS bail; action_task False, as SWE-bench issue prose
+    # call (the llama.cpp early-EOS bail; action_task False, as long bug-report prose
     # often classifies). Must be pushed to act, not accepted as an empty final answer.
     bail = "<think>Let me find where execute_sql_flush is defined.</think>\n\n"
     kind8, nudge8 = nudge_for_no_calls(bail, hit_cap=False, **base)

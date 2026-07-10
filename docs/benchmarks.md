@@ -2,7 +2,8 @@
 
 *The numbers that decide whether a local agent feels responsive — prefill speed, decode
 speed, and the per-step cost once the cache is warm. All of them are reproducible on your
-own Mac with `chad-bench`; none of them are pass-rates from a suite you can't run. For the
+own Mac with `chad-bench`. Task pass-rates (Terminal-Bench 2.0) are reproducible too —
+they have their own kit in [`benchmarks/tb2/`](../benchmarks/tb2/README.md). For the
 engineering behind them, see [Design & internals](design.md).*
 
 ## Reproduce it yourself
@@ -90,6 +91,21 @@ edit-heavy work. The full reason is in
 
 ---
 
-*Correctness and task-completion quality are tracked separately in a private eval suite
-(it seeds repos, runs the agent, and verifies the actual edit). This page stays focused on
-the throughput numbers you can reproduce yourself.*
+## Task pass-rates: Terminal-Bench 2.0 (reproducible)
+
+Capability is measured on [Terminal-Bench 2.0](https://www.tbench.ai/leaderboard), the
+public benchmark behind the chart in the [README](../README.md) — and the whole run is
+reproducible **from a Mac**: the exact Harbor agent adapter, the runner script, and the
+serving recipe live in [`benchmarks/tb2/`](../benchmarks/tb2/README.md). Serve the
+shipped Ornith-35B MLX quant with `mlx_lm.server` on a ≥32 GB Mac (or a GGUF from a GPU
+box if, like our dev machine, yours can't hold the 35B), point the kit at it, and check
+the number yourself. The full verified reference run is still in flight — treat
+published points as provisional until it lands, and mind the kit's caveat that TB2
+pass-rate is **throughput-sensitive** (tasks have wall-clock budgets, so your serving
+speed is part of the score).
+
+---
+
+*Day-to-day correctness is additionally tracked in a private eval suite (it seeds repos,
+runs the agent, and verifies the actual edit). This page stays focused on the numbers you
+can reproduce yourself: throughput via `chad-bench`, pass-rates via `benchmarks/tb2/`.*

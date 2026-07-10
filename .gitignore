@@ -14,3 +14,8 @@ dist/
 
 # plan 035 prefill-tax capture (raw session traces, may contain previews)
 traces/
+
+# TB2 reproduction kit — run artifacts stay local (benchmarks/tb2/README.md)
+benchmarks/tb2/dataset/
+benchmarks/tb2/jobs/
+benchmarks/tb2/*.tsv
