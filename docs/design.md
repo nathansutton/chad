@@ -59,6 +59,38 @@ things fight that, and chad handles both:
 Everything below is how that gets built — and the rest of what it takes to make a small
 model act like a coding agent.
 
+## Why there's no model picker
+
+Every other local-agent harness leads with a model menu — 75-provider matrices,
+Ollama pulls, quant pickers. chad ships exactly one model per RAM tier and no flag to
+change it. That's not a missing feature; it's the design's load-bearing wall, for
+three reasons:
+
+1. **The harness is tuned to the model, and that tuning is the product.** chad's
+   tool-call parsing (four dialects + repair), edit forgiveness cascade, think-budget
+   defaults, loop/thrash guards, and the prefix-stable transcript engineering are all
+   fitted to how Ornith actually misbehaves. Point the same harness at an arbitrary
+   model and every one of those calibrations is wrong in a different direction. A
+   picker doesn't add choice; it silently swaps a tested system for an untested one.
+2. **The engine co-design doesn't survive substitution.** The persistent prefix KV
+   cache diffs *token ids* against a live cache object — it owns the tokenizer, the
+   cache layout, and Ornith's hybrid SSM/attention non-trimmability trade
+   ([above](#why-prefill-is-hard-not-just-expensive)). "Just let me pick a GGUF"
+   means "run through a stateless server boundary instead," and the measured cost of
+   that boundary is the whole moat (see
+   [Why the engine is in-process](../README.md#why-the-engine-is-in-process-and-not-behind-an-openai-layer)).
+3. **Zero decisions is the UX, not a compromise.** The target user comes from Claude
+   Code, which also has no model picker. One command, RAM decides, it works — that's
+   the experience being copied, and every menu before the first task is a place to
+   lose someone.
+
+The escape hatches exist and are honest about what they cost: `CHAD_MODEL=<repo or
+local dir>` forces specific weights through the same in-process engine (you keep the
+cache, you lose the tuning fit), and `--backend openai`/`--backend llama` run the
+harness against any OpenAI-compatible endpoint as a measured ablation arm (you lose
+cache-reuse reporting, prefill progress, and clean interrupts — documented in-code).
+Opinionated defaults, real overrides. 🗿
+
 ## Trimmable vs. append-only: the cache trade chad lives with
 
 The whole prefill story above hinges on reusing the KV cache. There's a second property of

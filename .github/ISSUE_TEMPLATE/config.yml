@@ -1,1 +1,8 @@
 blank_issues_enabled: true
+contact_links:
+  - name: Questions & help
+    url: https://github.com/nathansutton/chad/discussions/categories/q-a
+    about: "Will this run on my Mac? How does X compare? Ask here — issues are for bugs."
+  - name: Show and tell
+    url: https://github.com/nathansutton/chad/discussions/categories/show-and-tell
+    about: Sessions, benchmarks on your hardware, things chad built for you.

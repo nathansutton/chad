@@ -67,6 +67,53 @@ def test_bail_nudge(monkeypatch):
     assert msg2 != msg
 
 
+def test_done_spec_recheck(monkeypatch):
+    """Fires once, only on a real action turn (work done, verified, not explain-only)."""
+    n = bite("done_spec_recheck")
+    on(monkeypatch)
+    assert levers.enabled(n)
+    # Happy path: fires.
+    assert guardrails.done_spec_recheck(
+        did_work=True, unverified_edit=False, recheck_done=False, read_only_intent=False)
+    # Already fired this turn -> don't repeat.
+    assert not guardrails.done_spec_recheck(
+        did_work=True, unverified_edit=False, recheck_done=True, read_only_intent=False)
+    # No work / unverified / explain-only -> other gates own those; recheck stays silent.
+    assert not guardrails.done_spec_recheck(
+        did_work=False, unverified_edit=False, recheck_done=False, read_only_intent=False)
+    assert not guardrails.done_spec_recheck(
+        did_work=True, unverified_edit=True, recheck_done=False, read_only_intent=False)
+    assert not guardrails.done_spec_recheck(
+        did_work=True, unverified_edit=False, recheck_done=False, read_only_intent=True)
+    off(monkeypatch, n)
+    assert not levers.enabled(n)
+
+
+def test_recheck_spiral():
+    """Plan 070: the post-recheck edit cap trips only once landed fix edits exceed
+    RECHECK_MAX_FIX_EDITS — one or two targeted fixes are fine, a run of them is a
+    thrash on already-correct work."""
+    assert not guardrails.recheck_spiral(0)
+    assert not guardrails.recheck_spiral(guardrails.RECHECK_MAX_FIX_EDITS)
+    assert guardrails.recheck_spiral(guardrails.RECHECK_MAX_FIX_EDITS + 1)
+
+
+def test_open_tool_call_nudged_without_cap():
+    """Iter-3: an unbalanced tool-call attempt that parsed to zero calls is never a final
+    answer — even when the token cap was NOT hit (a sampling glitch / premature EOS, e.g.
+    TB2 vulnerable-secret's 28-token `{"name":"bash>` garble). It must be nudged, not
+    accepted, and the message must name the malformed-call cause (not the length limit)."""
+    kind, msg = _nudge('<tool_call>{"name": "bash>', hit_cap=False, open_tool_call=True)
+    assert kind == "truncated" and "malformed" in msg
+    # hit_cap + open call still gets the write-in-parts guidance (length limit).
+    kind2, msg2 = _nudge("<tool_call>{...", hit_cap=True, open_tool_call=True)
+    assert kind2 == "truncated" and "length limit" in msg2
+    # bounded: once truncation_nudges hits 2, stop nudging.
+    kind3, _ = _nudge('<tool_call>{"name": "bash>', hit_cap=False,
+                      open_tool_call=True, truncation_nudges=2)
+    assert kind3 != "truncated"
+
+
 def test_investigation_gate(monkeypatch):
     n = bite("investigation_gate")
     on(monkeypatch)

@@ -4,6 +4,37 @@ Notable, user-visible changes. Started 2026-07; earlier history is summarized co
 
 ## [Unreleased]
 
+- **`chad prove` — a two-minute offline smoke test**: four tiny fix-it tasks from
+  chad's own dev suite (disclosed as such — it's a proof of life, not a
+  benchmark), run through the real agent loop on the validated 9B, mechanically
+  verified with tamper-proof re-seeded checkers, and timed. Scorecard reports
+  time-to-first-token, decode tok/s, and per-task wall; network access is
+  blocked at the library level during task execution; a share snippet is offered
+  only on a full pass. Exit codes: 0 all pass / 1 any fail / 2 preflight stop.
+  The task set survived a 3-condition falsification gate (3/3 reps under 60 s,
+  including memory-constrained) before this shipped.
+- **Disk preflight before the model download**: chad now checks free space at the
+  Hugging Face cache before offering the 5–12 GB download and refuses with the
+  shortfall and the `hf cache rm` pointer instead of dying at 70%; a mid-download
+  disk-full failure is now diagnosed as such. The confirm prompt also gained a
+  while-you-wait tip (cd into a project, think of a scoped first ask).
+- **Unknown-RAM machines get the safe model**: if RAM can't be detected, chad now
+  picks the 9B instead of silently falling through to the 35B's 12 GB download.
+- **Guard stops now say what to do next**: the loop, repetition, and step-cap
+  aborts carry a recovery tip and point at the troubleshooting symptom map
+  instead of ending the turn with only a diagnosis.
+- **README restructured**: the one-line quickstart now sits at the top, the
+  thesis prose after it, and all other install paths under a new
+  "Installing & upgrading" section; new
+  [Why there's no model picker](docs/design.md#why-theres-no-model-picker)
+  section in the design docs.
+- **Troubleshooting**: new symptom row for the silent mid-turn exit (an MLX
+  Metal abort under memory pressure prints nothing by nature — the row says
+  which knob helps and where the crash report lands).
+- **Community & releasing**: GitHub Discussions enabled (Q&A + Show and tell),
+  issue templates point questions there; `RELEASING.md` documents the release
+  checklist; the README demo GIF is regenerated from a checked-in vhs tape
+  (`docs/demo.tape`) so the demo can't rot silently.
 - **Progress-aware step cap**: a turn that keeps landing *and verifying* changes is no
   longer killed dead at 40 tool steps mid-task — it earns +20-step extensions (absolute
   ceiling 4×) on the warm cache, matching the governor's never-interrupt-real-progress

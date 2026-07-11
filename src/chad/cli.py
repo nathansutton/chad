@@ -169,7 +169,13 @@ def _pick_model():
     if env:
         return env, "CHAD_MODEL override"
     ram = _detect_ram_gb()
-    if ram is not None and ram < _BIG_RAM_GB:
+    if ram is None:
+        # RAM unreadable -> the safe (smaller) model: a wrong 9B costs capability, a
+        # wrong 35B costs a 12 GB download and possibly an OOM'd first session.
+        local, repo = _LOCAL_9B, _HF_9B
+        why = "9B (RAM undetectable — choosing the safe smaller model; " \
+              "set CHAD_MODEL to override)"
+    elif ram < _BIG_RAM_GB:
         local, repo = _LOCAL_9B, _HF_9B
         why = f"9B (default; {ram:.0f} GB RAM < {_BIG_RAM_GB:.0f} GB, 35B would be tight)"
     else:
@@ -178,16 +184,53 @@ def _pick_model():
     return (local if os.path.isdir(local) else repo), why
 
 
+def _model_download_gb(model_id):
+    """Approximate download size in GiB for the shipped models (for the disk preflight
+    and the confirm prompt — display honesty, not accounting)."""
+    return 12.0 if "35B" in model_id else 5.0
+
+
+def _free_disk_gb(path):
+    """Free GiB on the filesystem holding `path` (climbing to the nearest existing
+    parent), or None if it can't be read — a preflight must never be the crash."""
+    import shutil
+    p = os.path.expanduser(path)
+    while p and not os.path.exists(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    try:
+        return shutil.disk_usage(p).free / (1024 ** 3)
+    except OSError:
+        return None
+
+
 def _ensure_model(model_id):
     """If model_id is a HF repo id not yet in the local cache, confirm and download it
     into ~/.cache/huggingface (shared, resumable, paid once per machine). Local dirs
-    and already-cached repos return immediately. Headless (no TTY) auto-downloads."""
+    and already-cached repos return immediately. Headless (no TTY) auto-downloads.
+    Preflights free disk BEFORE starting: a 12 GB download that dies at 70% on a full
+    disk is the worst first-run outcome (devex review T2)."""
     if os.path.isdir(model_id):
         return  # a local path — nothing to fetch
     from huggingface_hub import snapshot_download, try_to_load_from_cache
     if isinstance(try_to_load_from_cache(model_id, "config.json"), str):
         return  # already in the HF cache
-    size = "~12 GB" if "35B" in model_id else "~5 GB"
+    need_gb = _model_download_gb(model_id)
+    hf_home = os.environ.get("HF_HOME", "~/.cache/huggingface")
+    free_gb = _free_disk_gb(hf_home)
+    # need + 2 GB headroom: the HF cache writes temp blobs beside the final files.
+    if free_gb is not None and free_gb < need_gb + 2.0:
+        sys.stderr.write(
+            f"\nchad: not enough free disk for the model download\n"
+            f"  cause: '{model_id}' needs ~{need_gb:.0f} GB (+2 GB headroom); "
+            f"{free_gb:.1f} GB free at {hf_home}\n"
+            "  fix:   free up space, or clear old model revisions: `hf cache ls` /\n"
+            "         `hf cache rm` (older CLIs: `huggingface-cli delete-cache`).\n"
+            "         Or point CHAD_MODEL at a local model dir on another volume.\n")
+        sys.exit(1)
+    size = f"~{need_gb:.0f} GB"
     sys.stderr.write(
         f"\nchad needs the model '{model_id}' "
         f"({size} — minutes on fast fiber, ~20 min on 100 Mbit; resumable).\n"
@@ -198,14 +241,21 @@ def _ensure_model(model_id):
             sys.stderr.write(
                 "Aborted. Set CHAD_MODEL to a local model dir to skip the download.\n")
             sys.exit(1)
+        sys.stderr.write(
+            "While you wait: chad works best run from inside a project, on a scoped\n"
+            'ask — "fix the failing test in tests/test_x.py" lands; "improve my\n'
+            'codebase" flails. (More: README → Quickstart.)\n')
     else:
         sys.stderr.write("[headless: downloading automatically]\n")
     try:
         snapshot_download(model_id)  # tqdm progress to stderr
-    except Exception as e:  # noqa: BLE001 — offline / gated / typo'd repo → guidance, not a traceback
+    except Exception as e:  # noqa: BLE001 — offline / gated / typo'd repo / full disk → guidance, not a traceback
+        no_space = isinstance(e, OSError) and getattr(e, "errno", None) == 28
+        extra = ("  note:  the disk filled up mid-download — free space and re-run "
+                 "(it resumes).\n" if no_space or "No space left" in str(e) else "")
         sys.stderr.write(
             f"\nchad: could not download '{model_id}'\n"
-            f"  cause: {type(e).__name__}: {e}\n"
+            f"  cause: {type(e).__name__}: {e}\n" + extra +
             "  fix:   check your connection; if the repo is gated, run `hf auth login`.\n"
             "         Or point CHAD_MODEL at a local model dir you've already built.\n")
         sys.exit(1)
@@ -356,6 +406,12 @@ def main():
     if args.turn_budget_s is not None:
         os.environ["CHAD_TURN_BUDGET_S"] = str(args.turn_budget_s)
     task = args.task or args.prompt_flag
+    # `chad prove` — the bundled smoke test (prove.py). Dispatched on the literal
+    # positional so the CLI stays a single entrypoint; a real task named "prove"
+    # is vanishingly unlikely and can always be phrased longer.
+    if task == "prove":
+        from . import prove
+        sys.exit(prove.run(args))
     # Ornith; no draft, ever. RAM-aware default, local-dir-preferred, HF fallback.
     model_id, why = _pick_model()
 

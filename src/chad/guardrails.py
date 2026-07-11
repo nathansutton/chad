@@ -219,6 +219,52 @@ def done_rejection(did_work, unverified_edit, empty_done_nudges, verify_nudges):
     return None
 
 
+# Injected once before the first `done` is accepted (levers.done_spec_recheck). The
+# hidden verifier scores container end-state, so a model that "finished" but wrote its
+# output to the wrong path or in the wrong shape fails silently with budget to spare —
+# the single largest wrong-done bucket (TB2 sam-cell-seg wrote directories where files
+# were required; bn-fit-modify passed 8/9 on a format mismatch). This asks the model to
+# self-check deliverables against the literal task text before it stops.
+DONE_SPEC_RECHECK = (
+    "[before you finish — one verification pass, read-only. Re-read the ORIGINAL task "
+    "above and list every concrete deliverable it names (each output file, its exact "
+    "path, and the exact format/content it must contain). For EACH one, CHECK it now with "
+    "read-only commands — `ls` the path, `cat`/`head` the contents — and confirm it "
+    "exists, is a file (not a directory), and matches what was asked (a valid answer at "
+    "the wrong path or in the wrong format scores zero). Do NOT edit or rewrite a "
+    "deliverable that already checks out: correct output left alone stays correct, and "
+    "re-editing working files only risks breaking them. Call `done` the moment every "
+    "deliverable verifies. ONLY if a check actually fails — something missing, misplaced, "
+    "or malformed — make the single targeted fix it needs, then call done.]"
+)
+
+
+def done_spec_recheck(did_work, unverified_edit, recheck_done, read_only_intent):
+    """Whether to inject the deliverable recheck before accepting `done`. Fires at most
+    once per turn (recheck_done), only on a real action turn that produced work and is
+    not an explain-only ask, and only after the empty/verify gates have cleared (so it
+    doesn't stack with them). Pure/testable; the lever gate is checked at the call site."""
+    return (not recheck_done and did_work and not unverified_edit
+            and not read_only_intent)
+
+
+# The deliverable recheck (done_spec_recheck) is a verify-then-done pass; a genuine fix
+# it turns up is one or two targeted edits (wrong path -> move, wrong shape -> one
+# rewrite). More landed edits than this means the model is re-editing already-correct
+# output into a thrash instead of finishing — the poly_two_bucket regression: 3 edits /
+# 16k gen tokens / 621s (7x baseline wall) after the recheck fired on an answer that had
+# already passed the verify gate. Cap the post-recheck fix edits and keep the result.
+RECHECK_MAX_FIX_EDITS = 2
+
+
+def recheck_spiral(post_recheck_edits):
+    """Whether the deliverable recheck has driven more landed edits than a real fix
+    should take (> RECHECK_MAX_FIX_EDITS), i.e. the model is thrashing on already-correct
+    work rather than verifying-and-finishing. The caller ends the turn keeping the result
+    that was ship-ready when the recheck fired. Pure/testable."""
+    return post_recheck_edits > RECHECK_MAX_FIX_EDITS
+
+
 def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_intent,
                        action_task, truncation_nudges, answer_nudges, verify_nudges,
                        open_tool_call):
@@ -227,24 +273,35 @@ def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_inte
     (2) ANSWERED ON PAPER — produced/described code but never applied it; (3) UNVERIFIED
     EDIT — edited but never ran the check. Pure: returns (kind, nudge_text) or
     (None, None); the caller bumps the matching counter and appends the nudge. `kind`
-    is one of 'truncated' / 'no-edit' / 'unverified-edit'. Byte-identical to the old
-    inline branch (open_tool_call is run_turn's _has_open_tool_call(text))."""
+    is one of 'truncated' / 'no-edit' / 'unverified-edit'. (open_tool_call is run_turn's
+    _has_open_tool_call(text): an unbalanced <tool_call>/<function> that parsed to nothing.)"""
     has_code = "```" in text
-    if hit_cap and truncation_nudges < 2:
-        if open_tool_call:
-            # Cut off mid tool-call — almost always a `write` whose content
-            # exceeded the token budget. Retrying it whole just truncates
-            # again; guide it to land the file in bounded pieces.
+    # An UNBALANCED tool-call attempt that parsed to zero calls is never a final answer,
+    # whether or not the token cap was hit. Two causes: (a) hit_cap — a `write` whose
+    # content overran the budget (guide it to write in bounded pieces); (b) NOT hit_cap —
+    # the model stopped mid-call for another reason (sampling glitch / premature EOS, e.g.
+    # TB2 vulnerable-secret died at 45s of 900 on a 28-token `{"name":"bash>` garble that
+    # the old code accepted as the final answer). Bounded by truncation_nudges. This fires
+    # before the bare-stall branch so a garbled call isn't misread as an empty stall.
+    if open_tool_call and truncation_nudges < 2:
+        if hit_cap:
             nudge = ("[your tool call was cut off at the length limit — the "
                      "content was too long to emit in one call. Do NOT retry it "
                      "whole. Create the file with `write` using only the FIRST "
                      "portion of the content, then append the rest with one or "
                      "more `edit` calls. Emit one complete tool call at a time.]")
         else:
-            nudge = ("[your reply was cut off at the length limit before you "
-                     "called any tool. Do NOT re-paste what you already wrote. "
-                     "Take the next single concrete action now as a real "
-                     "<tool_call> — e.g. write the file — one tool at a time.]")
+            nudge = ("[your last tool call was malformed and did not run — it opened a "
+                     "<tool_call> (or <function=…>) that was never properly closed, so no "
+                     "tool executed and nothing happened. Re-emit it now as ONE complete, "
+                     "well-formed <tool_call> block with valid JSON arguments.]")
+        return "truncated", nudge
+    if hit_cap and truncation_nudges < 2:
+        # Cap hit but the call (if any) was balanced — a plain mid-thought truncation.
+        nudge = ("[your reply was cut off at the length limit before you "
+                 "called any tool. Do NOT re-paste what you already wrote. "
+                 "Take the next single concrete action now as a real "
+                 "<tool_call> — e.g. write the file — one tool at a time.]")
         return "truncated", nudge
     # Bare stall: the turn produced no tool call and no real content — the model
     # reasoned (or not) and then STOPPED, either with empty content after </think> or

@@ -8,6 +8,38 @@
 > Claude can do anything, for anyone, anywhere. chad does one thing. 🗿    
 > *Coding under supervision.*
 
+> The chart is the leaderboard's story. For your own machine's story:
+> **`uvx chad-code prove`** — a two-minute, offline smoke test where chad fixes
+> four small tasks in front of you, mechanically verified and timed. (It's a
+> proof of life, not a benchmark — the tasks come from chad's own dev suite.)
+
+## Quickstart
+
+Apple Silicon Mac + [uv](https://docs.astral.sh/uv/). One command — no clone, no
+config, no API key, [no model picker](docs/design.md#why-theres-no-model-picker):
+
+```bash
+uvx chad-code     # runs chad anywhere — the command is still `chad`
+```
+
+Then make him prove it — a two-minute smoke test on your own machine, offline:
+
+```bash
+uvx chad-code prove    # 4 tiny fix-it tasks, mechanically verified, timed 🗿
+```
+
+First run only: chad picks the right Ornith model for your RAM (9B under 32 GB,
+35B at 32 GB+), asks, and downloads it once into the shared Hugging Face cache —
+**~5 GB / ~12 GB: minutes on fast fiber, ~20 on a 100 Mbit line, resumable**.
+While it downloads, `cd` into a project you want chad working on and think of a
+scoped first ask — *"fix the failing test in `tests/test_x.py`"* lands; *"improve
+my codebase"* flails. (The PyPI distribution is **`chad-code`**; bare `chad` is a
+squatted, unrelated package.)
+
+Every other way to install — keep it on your PATH, bleeding-edge `main`, the dev
+clone — plus the model table and upgrade commands live in
+[Installing & upgrading](#installing--upgrading).
+
 chad has some of the same moves as Claude — tool use, plan mode, a real TUI — but driven
 by a local model on your laptop instead of a frontier model in a datacenter. He isn't a
 smaller Claude; he's a blunter instrument.  
@@ -117,17 +149,12 @@ in-code. A measured in-process vs. served comparison (the same harness through
 `mlx_lm.server`) is queued on the maintainer's eval rig; the expected result is a
 pass-rate near-equal (the harness carries it), with wall-clock/TTFT materially worse.
 
-## Quickstart
+## Installing & upgrading
 
-Apple Silicon + [uv](https://docs.astral.sh/uv/). No clone, no model build — install and
-run in one line; the model downloads itself on first use. The PyPI distribution is
-**`chad-code`** (bare `chad` is a squatted, unrelated package); the command is still `chad`:
+The one-line quickstart is up top: `uvx chad-code`. The other ways in, when you
+want them:
 
-```bash
-uvx chad-code     # run chad anywhere, no clone — the command is still `chad`
-```
-
-Or install it for good — then it's just `chad`:
+Install it for good — then it's just `chad`:
 
 ```bash
 uv tool install chad-code   # install to ~/.local/bin
@@ -253,6 +280,7 @@ One entrypoint, a handful of flags. `uv run chad --help` is the source of truth:
 ```bash
 uv run chad                  # full-screen TUI (shift-tab for modes, type to queue, ctrl-c to interrupt)
 uv run chad "do the thing"   # one-shot headless task, then exit
+uv run chad prove            # two-minute offline smoke test: 4 tasks, verified, timed
 uv run chad -c               # resume this directory's most recent conversation
 uv run chad -c "now also add the --verbose flag"   # resume and continue headless
 uv run chad --resume         # list this directory's recent sessions, pick one by number
@@ -275,7 +303,9 @@ think-cap and runaway-turn governor — see the [Configuration reference](docs/c
 harness against an OpenAI-compatible endpoint); and `--version` (prints `chad 0.1.0`
 plus the checkout's commit — quote it in bug reports).
 
-No model flag: chad runs Ornith (the RAM-appropriate size — see [Quickstart](#quickstart)).
+No model flag: chad runs Ornith (the RAM-appropriate size — see
+[Installing & upgrading](#installing--upgrading); the reasoning is
+[Why there's no model picker](docs/design.md#why-theres-no-model-picker)).
 A headless task (positional, or piped with no TTY) auto-approves mutating tools — otherwise
 the confirm prompt would EOF and no file could ever change. Use `--plan` for a read-only
 investigation.

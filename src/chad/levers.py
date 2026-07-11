@@ -111,6 +111,14 @@ LEVERS: dict[str, Lever] = {
         "A clean `git checkout/reset --hard/stash/clean -f` un-sets made_edit, re-arming "
         "the no-empty-diff gate. OFF lets edit→test→revert→prose ship an empty diff.",
         "iter3", REGRESSION_GUARD),
+    "done_spec_recheck": Lever(
+        "Before ACCEPTING the first `done` of a task turn, inject one message telling the "
+        "model to re-read the task and confirm every required deliverable exists at the "
+        "exact path/format the task asked for (check with ls/cat/test), fixing anything "
+        "missing or wrong first. Fires once per turn. Targets the 'declared victory with "
+        "budget to spare, wrong output format' losses (TB2 sam-cell-seg wrote directories "
+        "where files were required; bn-fit-modify 8/9). OFF accepts the first done as-is.",
+        "iter3"),
 
     # --- uncommitted at the time of writing; likewise unmeasured. ------------------
     "subagent_compact_window": Lever(

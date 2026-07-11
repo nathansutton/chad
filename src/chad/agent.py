@@ -707,6 +707,8 @@ class Agent:
         verify_nudges = 0
         did_work = False  # a substantive tool (not plan/done) ran this turn
         empty_done_nudges = 0
+        done_recheck_done = False  # the one-shot deliverable recheck fired this turn
+        recheck_fix_edits = 0  # landed edits AFTER the recheck fired (plan 070 spiral cap)
         made_edit = False  # an edit/write/replace/insert actually landed this turn
         answer_nudges = 0
         noop_edit_streak = 0  # consecutive edits that failed to land (plan 047 loop-break)
@@ -1051,7 +1053,8 @@ class Agent:
                              step)
                     return ("[stopped: the model keeps degenerating into repetitive "
                             "output. Try rephrasing the request or breaking it into "
-                            "smaller steps.]")
+                            "smaller steps (docs/troubleshooting.md maps symptom → "
+                            "fix).]")
                 self.messages.append({"role": "tool", "name": "edit",
                                       "content": guardrails.REPEAT_STOP_NUDGE})
                 continue
@@ -1102,8 +1105,16 @@ class Agent:
                              "action_task=%s)", step, kind, hit_cap, has_code, action_task)
                     self.messages.append({"role": "tool", "name": "edit", "content": nudge})
                     continue
-                if action_task and not read_only_intent \
-                        and (not made_edit or unverified_edit):
+                # Iter-3 did-nothing gate: in auto/headless mode (every benchmark run), a
+                # turn that ends having executed ZERO real tools is never a legitimate
+                # completion — the keyword intent classifier misses tasks like "extract the
+                # secret and save it" (no action verb), so action_task is False and the
+                # gate below wouldn't fire (TB2 vulnerable-secret shipped a 28-token garble
+                # as its answer). read_only/explain asks are exempt. Banks a note so
+                # auto-continue relaunches fresh instead of shipping nothing.
+                did_nothing = self.mode == "auto" and not read_only_intent and not did_work
+                if (action_task and not read_only_intent
+                        and (not made_edit or unverified_edit)) or did_nothing:
                     # Iter-2 no-empty-diff gate: an action task may not END on a prose
                     # "final answer" while no change landed (or the change is
                     # unverified) — the demonstrated failures (django-14007,
@@ -1180,6 +1191,19 @@ class Agent:
                                        "progress note banked; say 'continue' to retry]")
                     return ("[stopped: `done` was called without a landed+verified "
                             "change — say 'continue' to resume]")
+                # Iter-3 deliverable recheck (levers.done_spec_recheck): one last self-check
+                # that the required outputs actually exist at the right path/format before
+                # we accept done — the hidden container-end-state verifier gives no second
+                # chance. Fires at most once per turn; a task that re-checks and is genuinely
+                # complete just calls done again next step.
+                if self.mode != "plan" and levers.enabled("done_spec_recheck") \
+                        and guardrails.done_spec_recheck(
+                            did_work, unverified_edit, done_recheck_done, read_only_intent):
+                    done_recheck_done = True
+                    log.info("DONE deferred for deliverable recheck (step %d)", step)
+                    self.messages.append({"role": "tool", "name": "done",
+                                          "content": guardrails.DONE_SPEC_RECHECK})
+                    continue
                 log.info("END step %d: DONE accepted | summary=%r", step,
                          terminal.get("summary"))
                 return terminal.get("summary") or text or "Done."
@@ -1197,7 +1221,9 @@ class Agent:
                 if guardrails.loop_should_abort(self._loop_nudges):
                     log.info("END step %d: LOOP ABORT (nudges exhausted)", step)
                     return ("[stopped: the model is stuck in a loop, repeating the same "
-                            "tool calls without making progress.]")
+                            "tool calls without making progress. Tip: a smaller, scoped "
+                            "ask recovers this — name the exact file you want changed "
+                            "(docs/troubleshooting.md maps symptom → fix).]")
                 self.messages.append({
                     "role": "tool", "name": calls[0][0],
                     "content": "[loop detected: you have made this exact tool call 3 times "
@@ -1366,6 +1392,25 @@ class Agent:
                                 edited_syntax_watch[_wp] = os.path.getmtime(_wp)
                             except OSError:
                                 pass
+                        # Plan 070 — recheck spiral cap: a landed edit AFTER the
+                        # deliverable recheck fired. The recheck is a verify-then-done
+                        # pass; a real fix is one or two targeted edits. A run of them
+                        # is the model re-editing already-correct output into a thrash
+                        # (poly_two_bucket: 3 edits / 16k tok / 621s after the recheck
+                        # on an answer that had already passed the verify gate). Stop
+                        # and keep the result that was ship-ready when the recheck fired.
+                        if done_recheck_done:
+                            recheck_fix_edits += 1
+                            if guardrails.recheck_spiral(recheck_fix_edits):
+                                log.info("END step %d: recheck edit-spiral (%d "
+                                         "post-recheck landed edits) — accepting the "
+                                         "completed work", step, recheck_fix_edits)
+                                self._emit("info", "  [deliverable recheck kept "
+                                           "re-editing already-finished work — stopping "
+                                           "and keeping the result]")
+                                return ("Done (stopped a post-recheck edit spiral; the "
+                                        "deliverable was already complete before the "
+                                        "extra edits).")
                 elif name == "bash":
                     # Re-check syntax of watched files a bash command rewrote — the
                     # sed -i escape hatch around the edit-tool syntax gate.
@@ -1444,7 +1489,8 @@ class Agent:
                  step_cap, hard_ceiling, did_work, unverified_edit)
         self._emit("info", "  [turn stopped at its step cap — progress note banked; "
                            "say 'continue' to resume]")
-        return "[stopped: hit the step cap before finishing — say 'continue' to resume]"
+        return ("[stopped: hit the step cap before finishing — say 'continue' to "
+                "resume, or re-scope the ask smaller (docs/troubleshooting.md)]")
 
 
 def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = None,

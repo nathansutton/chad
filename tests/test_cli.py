@@ -81,10 +81,61 @@ def test_pick_model_ram_thresholds(monkeypatch):
     check("big RAM -> 35B HF repo", model == cli._HF_35B, model)
     check("big RAM reason mentions 35B", "35B" in why, why)
 
-    # RAM unreadable (None) -> falls through to the big/35B branch (does NOT crash).
+    # RAM unreadable (None) -> the SAFE smaller model, never a surprise 12 GB
+    # download on unknown hardware (devex review T3: the old fall-through to the
+    # 35B branch contradicted _detect_ram_gb's "safe (smaller) model" contract).
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: None)
-    model, _ = cli._pick_model()
-    check("unknown RAM -> 35B HF repo", model == cli._HF_35B, model)
+    model, why = cli._pick_model()
+    check("unknown RAM -> safe 9B HF repo", model == cli._HF_9B, model)
+    check("unknown RAM reason says undetectable", "undetectable" in why, why)
+
+
+def test_model_download_gb():
+    check("35B repo -> ~12 GB", cli._model_download_gb(cli._HF_35B) == 12.0)
+    check("9B repo -> ~5 GB", cli._model_download_gb(cli._HF_9B) == 5.0)
+
+
+def test_free_disk_gb():
+    # A real, existing path reports a plausible number.
+    free = cli._free_disk_gb("~")
+    check("home free-disk readable", free is not None and free > 0, free)
+    # A nonexistent deep path climbs to an existing parent instead of crashing.
+    free = cli._free_disk_gb("~/definitely/not/a/real/dir/blobs")
+    check("missing path climbs to parent", free is not None and free > 0, free)
+
+
+def test_ensure_model_disk_preflight(monkeypatch, capsys):
+    """Devex review T2: a machine without room for the download must be refused
+    BEFORE the download starts, with the shortfall and the cache-GC command named."""
+    import huggingface_hub
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_free_disk_gb", lambda path: 1.0)
+    with pytest.raises(SystemExit) as e:
+        cli._ensure_model(cli._HF_9B)
+    check("preflight exits 1", e.value.code == 1, e.value.code)
+    err = capsys.readouterr().err
+    check("names the shortfall", "not enough free disk" in err, err)
+    check("names required space", "~5 GB" in err, err)
+    check("points at cache GC", "hf cache" in err, err)
+
+
+def test_ensure_model_disk_preflight_unreadable(monkeypatch):
+    """If free disk can't be read the preflight must NOT block (it guards, never
+    gates): the flow proceeds to the confirm prompt / download attempt."""
+    import huggingface_hub
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    # Cache hit short-circuits before any prompt — proves we got PAST the preflight.
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_free_disk_gb", lambda path: None)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    with pytest.raises(SystemExit) as e:
+        cli._ensure_model(cli._HF_9B)
+    # Exit came from the user's "n" at the prompt, not the disk preflight.
+    check("unreadable disk does not block", e.value.code == 1, e.value.code)
 
 
 def test_pick_model_prefers_local_dir(monkeypatch):

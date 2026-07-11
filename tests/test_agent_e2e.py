@@ -131,9 +131,12 @@ def test_template_ids_unwraps_batchencoding():
 
 # --- Step 3: drive a multi-step task end to end ------------------------------
 
-def test_agent_loop_writes_file_reads_it_back_then_terminates(tmp_path):
+def test_agent_loop_writes_file_reads_it_back_then_terminates(tmp_path, monkeypatch):
     """write → read → done: two real tool dispatches through a real run_turn, a real
     filesystem effect, and clean termination (no spin to max_steps)."""
+    # This test is about the loop's parse→dispatch→terminate spine, not the iter-3
+    # deliverable recheck (which would defer the first done); disable that lever here.
+    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck")
     target = tmp_path / "note.txt"       # .txt: a doc write, so no verify-before-done nudge
     body = "hello from the scripted loop\n"
     script = [
@@ -156,6 +159,55 @@ def test_agent_loop_writes_file_reads_it_back_then_terminates(tmp_path):
     # the loop terminated on `done` — it did not run out of steps or drain the script
     assert result == "wrote and read back the file"
     assert agent.engine._i == len(script)
+
+
+def test_done_spec_recheck_defers_first_done_then_accepts(tmp_path):
+    """Iter-3: the first `done` of an action turn is deferred once for a deliverable
+    recheck (the hidden container-verifier gives no second chance), then the next `done`
+    is accepted. A real code write makes it an action turn (not read-only)."""
+    f = tmp_path / "out.py"
+    script = [
+        _tool_call("write", path=str(f), content="print('hi')\n"),
+        _tool_call("bash", command=f"python {f}"),          # verify -> clears unverified
+        _tool_call("done", summary="first done"),           # deferred for recheck
+        _tool_call("done", summary="rechecked and complete"),  # accepted
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn("write out.py that prints hi")
+
+    assert result == "rechecked and complete"
+    assert agent.engine._i == len(script)   # the recheck consumed the second done
+    # the recheck message was injected exactly once, as a role:"tool" done turn
+    recheck_turns = [m for m in agent.messages
+                     if m.get("role") == "tool" and m.get("name") == "done"
+                     and "every concrete deliverable" in m.get("content", "")]
+    assert len(recheck_turns) == 1
+
+
+def test_done_spec_recheck_spiral_is_capped(tmp_path):
+    """Plan 070: if the deliverable recheck drives repeated post-recheck edits (the
+    model re-'fixing' already-correct output into a thrash), the turn stops and keeps
+    the result instead of spiralling — the poly_two_bucket regression (3 edits / 16k
+    gen tokens / 621s after the recheck on an answer that already passed the verify
+    gate). With RECHECK_MAX_FIX_EDITS=2, the 3rd post-recheck landed edit ends it."""
+    f = tmp_path / "out.py"
+    script = [
+        _tool_call("write", path=str(f), content="print('hi')\n"),
+        _tool_call("bash", command=f"python {f}"),               # verify -> clears unverified
+        _tool_call("done", summary="first done"),                # deferred for recheck
+        _tool_call("write", path=str(f), content="print('hi')  # 1\n"),  # post-recheck edit 1
+        _tool_call("write", path=str(f), content="print('hi')  # 2\n"),  # edit 2 (allowed)
+        _tool_call("write", path=str(f), content="print('hi')  # 3\n"),  # edit 3 -> spiral cap
+        _tool_call("done", summary="should never be reached"),
+    ]
+    agent = _agent(script, max_steps=20)
+
+    result = agent.run_turn("write out.py that prints hi")
+
+    assert "spiral" in result.lower()
+    # Stopped on the 3rd post-recheck write; the trailing `done` is never consumed.
+    assert agent.engine._i == 6
 
 
 def test_agent_loop_terminates_on_a_plain_final_answer(tmp_path):
@@ -249,11 +301,14 @@ def test_agent_loop_cuts_off_degenerate_repetition():
 
 # --- Progress-aware step cap: productive turns extend, stalled ones bank a note ------
 
-def test_step_cap_extends_while_turn_lands_verified_changes(tmp_path):
+def test_step_cap_extends_while_turn_lands_verified_changes(tmp_path, monkeypatch):
     """A turn that keeps landing AND verifying edits must survive past max_steps (the
     plan-064 trace: a productive plan-implementation turn was force-stopped dead at the
     fixed cap, an edit half-applied). With max_steps=4 this script needs 7 steps — each
     window re-earns its extension with an edit+verify, so the loop reaches `done`."""
+    # Orthogonal to the iter-3 deliverable recheck (it would add a step and skew the cap
+    # accounting this test pins); disable that lever here.
+    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck")
     f = tmp_path / "f.py"
     # Distinct args per step — identical repeated calls would (correctly) trip the
     # repeat-loop guard instead of exercising the cap.
@@ -347,11 +402,13 @@ def test_prose_answer_still_ends_read_only_turns(tmp_path):
     assert agent.budget_note is None
 
 
-def test_bash_mutation_triggers_syntax_recheck(tmp_path):
+def test_bash_mutation_triggers_syntax_recheck(tmp_path, monkeypatch):
     """Iter-2 (plan 066, sphinx-7440): bash can rewrite files (sed -i and friends)
     but used to bypass the edit-tool syntax gate — a file survived 9 blind 'fixes'
     unparseable and nothing said so. A bash step that mutates a file edited this
     turn must get a parse warning appended to its result."""
+    # Not about the iter-3 deliverable recheck (it would defer done here); disable it.
+    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck")
     f = tmp_path / "m.py"
     f.write_text("x = 1\n")
     breaker = f"python -c \"open(r'{f}','w').write('def f(:\\n')\""

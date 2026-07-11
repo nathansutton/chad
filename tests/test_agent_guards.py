@@ -437,6 +437,35 @@ def test_repeat_stop_abort():
     check("third stop aborts", repeat_stop_abort(3))
 
 
+def test_abort_messages_carry_a_fix():
+    """Devex review T5: every turn-ending guard abort ("[stopped: ...") must carry
+    a next action — 'continue' and/or the docs/troubleshooting.md pointer. Problem
+    + cause alone strands the user at the exact moment they need a recovery path
+    (DX principle: fight uncertainty). Parsed from source so a future abort
+    message can't ship fix-less unnoticed."""
+    import ast
+    import inspect
+
+    from chad import agent as agent_mod
+
+    tree = ast.parse(inspect.getsource(agent_mod))
+    # "[stopped: " with the trailing space — the bare "[stopped:" literal is the
+    # startswith() marker used to DETECT these messages, not a message itself.
+    stops = [n.value for n in ast.walk(tree)
+             if isinstance(n, ast.Constant) and isinstance(n.value, str)
+             and n.value.startswith("[stopped: ")]
+    check("found the known abort messages", len(stops) >= 4, len(stops))
+    for s in stops:
+        check("abort carries a recovery path",
+              ("continue" in s) or ("troubleshooting" in s), s)
+    # The abrupt aborts (loop, repetition) specifically point at the symptom map —
+    # 'say continue' is no help there, the turn is unrecoverable in place.
+    loop_msgs = [s for s in stops if "stuck in a loop" in s or "degenerating" in s]
+    check("loop/repeat aborts point at the symptom map",
+          bool(loop_msgs) and all("troubleshooting" in s for s in loop_msgs),
+          loop_msgs)
+
+
 def test_budget_fraction_and_band():
     # Token-budget ratio.
     check("half of token budget", budget_fraction(50, 100) == 0.5)

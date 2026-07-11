@@ -149,8 +149,52 @@ def test_salvage_garbled_tool_name():
     )
 
 
+def test_hybrid_name_parameter_dialect():
+    """Iter-3: quantized Ornith at temp 1.0 emits a HYBRID dialect — a JSON `{"name":"X"}`
+    opener (often with no closing brace) followed by XML `<parameter=…>` blocks. It matches
+    neither the `<function=…>` XML path nor the brace-matched JSON path, so 30 fully-formed
+    calls were dropped silently in one TB2 run. Recover them (see _parse_hybrid_calls)."""
+    from chad.toolcall_parse import _parse_hybrid_calls
+
+    # 1. The exact observed shape: unclosed `{"name": "bash"` + one <parameter>, wrapped in
+    #    <tool_call>/</function>/</tool_call> tag soup.
+    h1 = ('<tool_call>{"name": "bash" <parameter=command> ls / </parameter> '
+          '</function> </tool_call>')
+    eq("h1 unclosed-brace bash", parse_tool_calls(h1), [("bash", {"command": "ls /"})])
+
+    # 2. Closed brace `{"name": "write"}` + two params.
+    h2 = ('<tool_call>{"name": "write"} <parameter=path> /app/f.py </parameter>'
+          '<parameter=content> print(1) </parameter> </function> </tool_call>')
+    eq("h2 write two params", parse_tool_calls(h2),
+       [("write", {"path": "/app/f.py", "content": "print(1)"})])
+
+    # 3. Int coercion still applies on the hybrid path.
+    h3 = '{"name": "read" <parameter=path> a.py </parameter><parameter=offset> 40 </parameter>'
+    res3 = parse_tool_calls(h3)
+    eq("h3 read offset", res3, [("read", {"path": "a.py", "offset": 40})])
+    check("h3 offset is int", isinstance(res3[0][1]["offset"], int))
+
+    # 4. A bare `{"name":"X"}` with NO <parameter> block must NOT be taken by the hybrid
+    #    path — it flows through the JSON path to (glob, {...}), unchanged behavior.
+    eq("4 bare name no params -> json path",
+       parse_tool_calls('{"name":"glob","arguments":{"pattern":"*.py"}}'),
+       [("glob", {"pattern": "*.py"})])
+
+    # 5. Two hybrid calls in one message, each owning its own params (scoped by the next
+    #    name-opener).
+    h5 = ('{"name": "bash" <parameter=command> pwd </parameter> '
+          '{"name": "bash" <parameter=command> ls </parameter>')
+    eq("h5 two hybrid calls scoped", _parse_hybrid_calls(h5),
+       [("bash", {"command": "pwd"}), ("bash", {"command": "ls"})])
+
+    # 6. Garbled tool name on the hybrid path is salvaged too.
+    h6 = '{"name": "grep\\"" <parameter=pattern> foo </parameter>'
+    eq("h6 salvaged name", parse_tool_calls(h6), [("grep", {"pattern": "foo"})])
+
+
 if __name__ == "__main__":
     test_parse()
     test_salvage_garbled_tool_name()
+    test_hybrid_name_parameter_dialect()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

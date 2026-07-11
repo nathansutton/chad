@@ -28,6 +28,15 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _XML_FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
 _XML_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 _INT_PARAMS = {"offset", "limit", "timeout"}
+# Hybrid dialect: a JSON-style `{"name": "bash"` opener followed by XML-style
+# `<parameter=…>…</parameter>` blocks — NOT the `<function=name>` form. Quantized Ornith
+# emits this constantly under temp-1.0 sampling (30 occurrences in one TB2 run), most
+# often as `<tool_call>{"name": "bash" <parameter=command>…</parameter></function>`.
+# Neither the JSON path (the `{…}` never closes, so brace-matching yields nothing) nor the
+# XML path (no `<function=`) matches it, so a fully-specified call — command and all — was
+# being dropped silently, wasting the step and a re-prefill. The opener tolerates a missing
+# closing brace and single or double quotes.
+_HYBRID_NAME_RE = re.compile(r"""\{\s*["']name["']\s*:\s*["']([^"']+)["']""")
 
 
 def strip_think(text: str) -> str:
@@ -61,19 +70,47 @@ def salvage_tool_name(name: str) -> str:
     return name
 
 
+def _parse_params(body: str) -> dict:
+    """Parse `<parameter=key>value</parameter>` blocks out of `body` into an args dict,
+    with the same int-coercion as the XML dialect. Shared by the `<function=…>` and the
+    hybrid `{"name":…}`+`<parameter>` parsers."""
+    args = {}
+    for pm in _XML_PARAM_RE.finditer(body):
+        key = pm.group(1).strip()
+        val = pm.group(2).strip()
+        if key in _INT_PARAMS and val.lstrip("-").isdigit():
+            val = int(val)
+        args[key] = val
+    return args
+
+
 def _parse_xml_calls(text: str):
     calls = []
     for fm in _XML_FUNC_RE.finditer(text):
         name = salvage_tool_name(fm.group(1).strip())
-        args = {}
-        for pm in _XML_PARAM_RE.finditer(fm.group(2)):
-            key = pm.group(1).strip()
-            val = pm.group(2).strip()
-            if key in _INT_PARAMS and val.lstrip("-").isdigit():
-                val = int(val)
-            args[key] = val
         if name:
-            calls.append((name, args))
+            calls.append((name, _parse_params(fm.group(2))))
+    return calls
+
+
+def _parse_hybrid_calls(text: str):
+    """Parse the hybrid `{"name": "X"}` + `<parameter=…>` dialect (see _HYBRID_NAME_RE).
+    Each name-opener owns the `<parameter>` blocks between it and the next opener (the same
+    scoping the `<function=…>` block gives its params). Only emits a call when the scope
+    actually contains a `<parameter>` block — a bare `{"name":"X"}` with no params is left
+    to the JSON path, so this never double-counts a plain JSON call."""
+    opens = list(_HYBRID_NAME_RE.finditer(text))
+    if not opens:
+        return []
+    calls = []
+    for i, m in enumerate(opens):
+        scope_end = opens[i + 1].start() if i + 1 < len(opens) else len(text)
+        body = text[m.end():scope_end]
+        if "<parameter=" not in body:
+            continue
+        name = salvage_tool_name(m.group(1).strip())
+        if name:
+            calls.append((name, _parse_params(body)))
     return calls
 
 
@@ -103,6 +140,14 @@ def parse_tool_calls(text: str):
     xml_calls = _parse_xml_calls(text)
     if xml_calls:
         return xml_calls
+    # Hybrid `{"name":…}`+`<parameter>` dialect: only when real <parameter> blocks exist,
+    # so a plain JSON call still flows through the JSON path below unchanged. Sits above
+    # the JSON fallback because that path would extract just the name (empty args) from the
+    # unclosed `{"name":"bash"` opener and drop every parameter.
+    if "<parameter=" in text:
+        hybrid = _parse_hybrid_calls(text)
+        if hybrid:
+            return hybrid
     calls = []
     seen = set()
     candidates = [m.group(1) for m in _TAG_RE.finditer(text)]
