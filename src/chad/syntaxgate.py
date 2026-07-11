@@ -139,9 +139,10 @@ def indent_reject(path: str, before: str, after: str) -> str | None:
         lines = after.splitlines()
         line = lines[e.lineno - 1] if e.lineno and e.lineno <= len(lines) else ""
         return (f"[edit rejected: it would break {os.path.basename(path)} — {e.msg} at "
-                f"line {e.lineno}: {line.strip()!r}. The file was left unchanged. "
-                f"Re-send the edit with indentation matching the surrounding lines "
-                f"(copy their exact leading whitespace).]")
+                f"line {e.lineno}: {line.strip()!r}. The file was left unchanged. Rather "
+                f"than re-quoting whitespace by hand, use replace_lines(path, start, end, "
+                f"new) with the line numbers from read — it fits the indentation for you — "
+                f"or replace_symbol to rewrite the whole function.]")
     except SyntaxError:
         return None            # non-indent break: let check_syntax warn, don't revert
     return None

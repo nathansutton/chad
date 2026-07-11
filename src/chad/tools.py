@@ -291,7 +291,9 @@ def _closest_hint(data: str, old: str) -> str:
     best = difflib.get_close_matches(
         target, [l.strip() for l in data.split("\n") if l.strip()], n=1, cutoff=0.6)
     return (f" Closest line in the file is {best[0]!r} — copy it exactly (mind "
-            f"indentation), or use replace_symbol to rewrite the whole function.") if best else ""
+            f"indentation), or use replace_lines(path, start, end, new) with the line "
+            f"numbers from read (it fits indentation for you), or replace_symbol to "
+            f"rewrite the whole function.") if best else ""
 
 
 def _show_ws(line: str) -> str:
@@ -411,6 +413,81 @@ def tool_edit(path: str, old: str, new: str) -> str:
 
     return (f"[old string not found; no change made.{_closest_hint(data, old)}]"
             + _indent_hint(data, old))
+
+
+def _fit_indent(new: str, target_indent: str) -> tuple[str, bool]:
+    """Slide the whole `new` block so its first non-blank line carries `target_indent`,
+    preserving every line's indentation RELATIVE to that first line (dedents included).
+
+    This is what lets replace_lines take the indentation burden off the model: it can
+    send the block at any base column — flush left, or copied verbatim from a numbered
+    read — and we shift it to where it lands. Returns (fitted, shifted); shifted is False
+    and `new` is returned untouched when the block is already at the target column or has
+    no non-blank line. Space-indent assumption (a tab/space disaster is caught by the
+    indent-reject in _apply_edit either way)."""
+    lines = new.split("\n")
+    first = next((l for l in lines if l.strip()), None)
+    if first is None:
+        return new, False
+    delta = len(target_indent) - (len(first) - len(first.lstrip()))
+    if delta == 0:
+        return new, False
+    out = []
+    for ln in lines:
+        if not ln.strip():
+            out.append("")
+        else:
+            cur = len(ln) - len(ln.lstrip())
+            out.append(" " * max(0, cur + delta) + ln.lstrip())
+    return "\n".join(out), True
+
+
+def tool_replace_lines(path: str, start: int, end: int, new: str) -> str:
+    """Replace file lines [start, end] (1-based, inclusive — the numbers `read` prints)
+    with `new`, fitting the new block's indentation to the region it lands in. This is
+    the line-addressed alternative to `edit`: the model that already knows the line
+    numbers doesn't re-quote an exact `old` string and doesn't re-transcribe leading
+    whitespace (the two things that drive the string-edit death loop). Empty `new` deletes
+    the range. Goes through _apply_edit, so the same indent-reject + syntax gate apply."""
+    if not os.path.exists(path) and path.startswith("/") and os.path.exists(path.lstrip("/")):
+        path = path.lstrip("/")
+    if not os.path.exists(path):
+        return f"[no such file: {path}]"
+    if isinstance(start, bool) or isinstance(end, bool) \
+            or not isinstance(start, int) or not isinstance(end, int):
+        return "[replace_lines: start and end must be integer line numbers (1-based)]"
+    with open(path, errors="replace") as f:
+        # readlines() (each line keeps its trailing "\n") so our line numbers match the
+        # ones `read` prints — split("\n") would invent a phantom last line for a
+        # newline-terminated file and clamping to it would eat the trailing newline.
+        lines = f.readlines()
+    data = "".join(lines)
+    n = len(lines)
+    if start < 1 or end < start:
+        return (f"[replace_lines: invalid range start={start} end={end}; need "
+                f"1 <= start <= end (1-based, inclusive).]")
+    if start > n:
+        return (f"[replace_lines: start={start} is past the last line ({n}); append with "
+                f"write, or pick a start within the file.]")
+    end = min(end, n)
+    prefix, replaced, suffix = ("".join(lines[:start - 1]),
+                                "".join(lines[start - 1:end]),
+                                "".join(lines[end:]))
+    ended_nl = replaced.endswith("\n")
+    if new == "":
+        block, note = "", f" (deleted lines {start}-{end})"
+    else:
+        anchor = next((ln for ln in replaced.split("\n") if ln.strip()), "")
+        target_indent = anchor[: len(anchor) - len(anchor.lstrip())]
+        block, shifted = _fit_indent(new, target_indent)
+        # Match the region's trailing-newline shape: keep one at a mid-file boundary,
+        # keep none when we replaced the final unterminated line (don't grow the file).
+        if ended_nl and not block.endswith("\n"):
+            block += "\n"
+        elif not ended_nl and block.endswith("\n"):
+            block = block.rstrip("\n")
+        note = f" (replaced lines {start}-{end}{'; fit indentation' if shifted else ''})"
+    return _apply_edit(path, data, prefix + block + suffix, note)
 
 
 # Planning tool (deepagents' write_todos): a scaffold that keeps the model on track
@@ -645,6 +722,8 @@ DISPATCH = {
                                          a.get("limit", READ_DEFAULT_LIMIT)),
     "write": lambda a, ss=None: tool_write(a["path"], a["content"]),
     "edit": lambda a, ss=None: tool_edit(a["path"], a["old"], a["new"]),
+    "replace_lines": lambda a, ss=None: tool_replace_lines(
+        a["path"], a["start"], a["end"], a["new"]),
     "glob": lambda a, ss=None: tool_glob(a["pattern"], should_stop=ss),
     "grep": lambda a, ss=None: tool_grep(a["pattern"], a.get("path", "."),
                                          a.get("glob", "**/*"),
@@ -680,7 +759,8 @@ def _skills():
     return skills
 
 # Tools that mutate state -> CLI asks for confirmation unless --yolo.
-MUTATING = {"bash", "write", "edit", "replace_symbol", "insert_symbol", "rename_symbol"}
+MUTATING = {"bash", "write", "edit", "replace_lines", "replace_symbol", "insert_symbol",
+            "rename_symbol"}
 
 # Terminal tools end the turn cleanly (forge's terminal_tool idea). Small models
 # instinctively try to "stop"/"finish"; giving them a real tool avoids hallucinated
@@ -814,7 +894,10 @@ SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "edit",
-            "description": "Replace a unique substring in a file with new text.",
+            "description": "Replace a unique substring in a file with new text. Requires "
+                           "an EXACT match of `old` including indentation; when you already "
+                           "know the line numbers (from read), prefer replace_lines, which "
+                           "doesn't make you re-quote the text or its whitespace.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -823,6 +906,34 @@ SCHEMAS: list[dict[str, Any]] = [
                     "new": {"type": "string"},
                 },
                 "required": ["path", "old", "new"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_lines",
+            "description": "Replace a RANGE OF LINES, addressed by the line numbers `read` "
+                           "prints, with new text. This is the reliable way to edit a region "
+                           "you've already located: give the 1-based start and end (inclusive) "
+                           "and the replacement — you do NOT need to re-quote the old text or "
+                           "match its exact leading whitespace, because the new block's "
+                           "indentation is fitted to the target automatically. Pass an empty "
+                           "`new` to delete the lines. Prefer this over `edit` whenever you "
+                           "know the line numbers, and over rewriting a whole function when "
+                           "only a few lines change.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start": {"type": "integer",
+                              "description": "First line to replace (1-based, inclusive)."},
+                    "end": {"type": "integer",
+                            "description": "Last line to replace (1-based, inclusive)."},
+                    "new": {"type": "string",
+                            "description": "Replacement text (empty string deletes the range)."},
+                },
+                "required": ["path", "start", "end", "new"],
             },
         },
     },
