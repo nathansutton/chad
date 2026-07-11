@@ -105,6 +105,28 @@ def check_syntax(path: str, before: str | None) -> str | None:
     return None
 
 
+def _enclosing_symbol(tree, line: int) -> str | None:
+    """The `Class/method` (or bare function/class) name whose body encloses `line` in a
+    parsed tree — the unit the model should hand to replace_symbol. Deepest match wins;
+    None when the line is at module level (nothing to rewrite whole)."""
+    chain: list[str] = []
+
+    def visit(node, path):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                start = getattr(child, "lineno", None)
+                end = getattr(child, "end_lineno", start)
+                if start and end and start <= line <= end:
+                    newpath = path + [child.name]
+                    chain[:] = newpath          # deepest containing chain wins (assigned last)
+                    visit(child, newpath)
+            else:
+                visit(child, path)
+
+    visit(tree, [])
+    return "/".join(chain[-2:]) if chain else None
+
+
 def indent_reject(path: str, before: str, after: str) -> str | None:
     """A rejection message when an *edit* would newly introduce a Python indentation
     error (IndentationError, which subsumes TabError), else None — the edit path uses
@@ -130,7 +152,7 @@ def indent_reject(path: str, before: str, after: str) -> str | None:
     if repomap.service().lang_for(path) != "python":
         return None
     try:
-        ast.parse(before)
+        tree = ast.parse(before)
     except SyntaxError:
         return None            # before wasn't clean — don't strand a fix-in-progress
     try:
@@ -138,11 +160,18 @@ def indent_reject(path: str, before: str, after: str) -> str | None:
     except IndentationError as e:  # catch before SyntaxError — it is a subclass
         lines = after.splitlines()
         line = lines[e.lineno - 1] if e.lineno and e.lineno <= len(lines) else ""
+        # B: name the enclosing function so the model can take the STABLE path — rewrite
+        # the whole symbol — instead of re-hand-indenting lines it can't get right. The
+        # error line is in `after`; against `before`'s tree it lands in the same function.
+        before_lines = before.count("\n") + 1
+        sym = _enclosing_symbol(tree, min(e.lineno or 1, before_lines))
+        steer = (f" You're editing inside `{sym}`: the reliable fix is replace_symbol to "
+                 f"rewrite that whole function (you send the complete function and its "
+                 f"indentation is handled)." if sym else "")
         return (f"[edit rejected: it would break {os.path.basename(path)} — {e.msg} at "
-                f"line {e.lineno}: {line.strip()!r}. The file was left unchanged. Rather "
-                f"than re-quoting whitespace by hand, use replace_lines(path, start, end, "
-                f"new) with the line numbers from read — it fits the indentation for you — "
-                f"or replace_symbol to rewrite the whole function.]")
+                f"line {e.lineno}: {line.strip()!r}. The file was left unchanged.{steer} "
+                f"Or use replace_lines / insert_lines with the line numbers from read — they "
+                f"fit indentation for you — instead of hand-quoting whitespace.]")
     except SyntaxError:
         return None            # non-indent break: let check_syntax warn, don't revert
     return None

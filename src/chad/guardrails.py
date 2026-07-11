@@ -403,6 +403,8 @@ def edit_fail_kind(result: str) -> str | None:
     while being told to re-read and paste verbatim."""
     if result.startswith("[no-op edit"):
         return "noop"
+    if result.startswith("[edit rejected"):
+        return "indent"     # syntaxgate reverted an indentation break — re-quoting won't help
     if edit_failed_to_land(result):
         return "nomatch"
     return None
@@ -421,6 +423,13 @@ _NOOP_BREAK = (
     "lines MODIFIED to fix the bug (they must differ). If you're unsure what to change, "
     "state the fix in one sentence first, then make `new` reflect it. Land one real "
     "change, then run the test.]")
+_INDENT_BREAK = (
+    "[STOP hand-indenting: your last edits were REJECTED for breaking indentation, and "
+    "re-sending edit/replace_lines with different whitespace is exactly the loop that keeps "
+    "failing — a small model cannot reliably re-transcribe indentation. Switch tools: use "
+    "`replace_symbol` to rewrite the ENTIRE enclosing function (send the whole function; "
+    "its indentation is handled for you), or `insert_lines` to add a single line at a read "
+    "line-number. Do NOT send another hand-indented edit.]")
 
 
 def edit_loop_break(noop_edit_streak, break_nudges, kind=None):
@@ -439,7 +448,11 @@ def edit_loop_break(noop_edit_streak, break_nudges, kind=None):
     # paste verbatim — precisely what it just did.
     if not levers.enabled("edit_fail_kind"):
         kind = None
-    return _NOOP_BREAK if kind == "noop" else _NOMATCH_BREAK
+    if kind == "noop":
+        return _NOOP_BREAK
+    if kind == "indent":
+        return _INDENT_BREAK
+    return _NOMATCH_BREAK
 
 
 STEP_CAP_CEILING = 4  # absolute per-turn step ceiling = STEP_CAP_CEILING * max_steps

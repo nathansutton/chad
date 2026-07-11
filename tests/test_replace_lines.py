@@ -117,19 +117,62 @@ def test_no_such_file():
     check("missing file", res.startswith("[no such file"), res)
 
 
-def test_snap_recovery_for_inconsistent_relative_indent():
+def test_structural_reindent_multilevel():
+    """A2: the real live failure — a block with TWO levels (a nested `if` guard) that the
+    model mis-indents (comment at col 10, body under-indented). Neither fit (preserves the
+    garbage) nor snap (flattens the nesting) works; structural reindent recomputes both
+    levels from the syntax and lands it."""
+    before = ("class E:\n"
+              "    def load(self):\n"
+              "        self.x = 1\n"
+              "        return self.x\n")
+    # insert a comment + a nested if-guard before `return`, at inconsistent columns
+    new = ('self.x = 1\n'
+           '# note\n'
+           '          if not self.x:\n'
+           '  self.x = 256')
+    res, after = run(before, 3, 3, new)
+    check("reindent: landed", res.startswith("[edited"), res)
+    check("reindent: disclosed", "reindented to structure" in res, res)
+    import ast
+    ast.parse(after)  # raises if the reindent produced broken Python
+    check("reindent: two levels correct",
+          "        if not self.x:\n            self.x = 256\n" in after, repr(after))
+
+
+def test_structural_reindent_preserves_triple_string():
+    """A2 safety: a triple-quoted string in the replacement must survive byte-for-byte —
+    its interior indentation is DATA, not code, and must never be reindented."""
+    before = "def f():\n    x = 1\n    return x\n"
+    new = 'x = 1\n     msg = """\n  keep me\n      and me\n"""'
+    res, after = run(before, 2, 2, new)
+    check("triple-string: landed", res.startswith("[edited"), res)
+    check("triple-string: interior verbatim",
+          '"""\n  keep me\n      and me\n"""' in after, repr(after))
+
+
+def test_tab_indented_file_uses_tabs():
+    """A1: a tab-indented file must be edited with TABS, not spaces (which would TabError).
+    _fit_indent bails on a tab target; the recoveries rebuild in the file's own unit."""
+    before = "def f():\n\tx = 1\n\treturn x\n"
+    res, after = run(before, 2, 2, "x = 2")           # flush-left, target is one tab
+    check("tab: landed", res.startswith("[edited"), res)
+    check("tab: used a tab", after == "def f():\n\tx = 2\n\treturn x\n", repr(after))
+
+
+def test_recovery_for_inconsistent_relative_indent():
     """#1: the observed live failure — the model sends a uniform-level block with
     INCONSISTENT relative indentation (sibling class fields at different columns), which
-    _fit_indent's single-delta shift can't fix. The uniform-snap recovery lands it."""
+    _fit_indent's single-delta shift can't fix. A recovery (structural reindent, which
+    runs first for a no-colon block, else snap) lands both fields at the field level."""
     before = ("class Engine:\n"
               "    a: int = 1\n"
               "    b: int = 2\n")
-    # Replace the two field lines with a block the model wrote at col 0 and col 6 —
-    # a fit-shift would put line 2 at 10 spaces (unexpected indent); snap puts both at 4.
+    # Replace the two field lines with a block the model wrote at col 0 and col 6.
     res, after = run(before, 2, 3, "a: int = 1\n      c: int = 3")
-    check("snap: landed", res.startswith("[edited"), res)
-    check("snap: disclosed", "snapped indentation" in res, res)
-    check("snap: both fields at 4",
+    check("recover: landed", res.startswith("[edited"), res)
+    check("recover: disclosed", ("reindented" in res or "snapped" in res), res)
+    check("recover: both fields at 4",
           after == "class Engine:\n    a: int = 1\n    c: int = 3\n", repr(after))
 
 
@@ -204,7 +247,10 @@ if __name__ == "__main__":
     test_bad_range_rejected()
     test_indent_break_still_rejected()
     test_no_such_file()
-    test_snap_recovery_for_inconsistent_relative_indent()
+    test_structural_reindent_multilevel()
+    test_structural_reindent_preserves_triple_string()
+    test_tab_indented_file_uses_tabs()
+    test_recovery_for_inconsistent_relative_indent()
     test_snap_not_applied_when_it_would_flatten_a_nested_block()
     test_insert_field_inherits_sibling_indent()
     test_insert_at_top_and_eof()

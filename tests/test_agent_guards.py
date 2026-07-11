@@ -678,6 +678,10 @@ def test_edit_fail_kind():
           edit_fail_kind("[old string not found; no change made.]") == "nomatch")
     check("ambiguous classified nomatch", edit_fail_kind("[old string appears 3 times]") == "nomatch")
     check("landed edit has no fail kind", edit_fail_kind("[edited foo.py]") is None)
+    # An indentation revert is its OWN kind: re-quoting whitespace is what keeps failing,
+    # so the remedy must switch tools, not re-read (workstream C).
+    check("indent-reject classified indent",
+          edit_fail_kind("[edit rejected: it would break e.py — unexpected indent...]") == "indent")
 
 
 def test_edit_loop_break():
@@ -695,6 +699,12 @@ def test_edit_loop_break():
     # A not-found failure still gets the re-read remedy.
     mb = edit_loop_break(2, 0, kind="nomatch")
     check("nomatch break says re-read", "read" in mb and "verbatim" in mb, mb)
+    # An indent-reject loop must switch tools (replace_symbol / insert_lines), NOT re-quote.
+    ib = edit_loop_break(2, 0, kind="indent")
+    check("indent break switches to replace_symbol", "replace_symbol" in ib, ib)
+    check("indent break offers insert_lines", "insert_lines" in ib, ib)
+    check("indent break forbids another hand-indented edit",
+          "another hand-indented edit" in ib or "STOP hand-indenting" in ib, ib)
 
 
 def test_reject_escalation():

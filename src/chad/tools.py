@@ -415,6 +415,30 @@ def tool_edit(path: str, old: str, new: str) -> str:
             + _indent_hint(data, old))
 
 
+def _indent_unit(data: str) -> str:
+    """The file's own one-level indent string: a tab when its indented lines lead with
+    tabs, else the smallest positive run of leading spaces seen (clamped to 2/4/8, default
+    4). Lets the indentation recoveries rebuild whitespace in the FILE's unit instead of
+    assuming spaces — a tab-indented file is what turned '_fit_indent' into a tab/space
+    mixer before this."""
+    tab = space = 0
+    widths = []
+    for ln in data.split("\n"):
+        if not ln[:1].isspace():
+            continue
+        lead = ln[: len(ln) - len(ln.lstrip())]
+        if lead[:1] == "\t":
+            tab += 1
+        else:
+            space += 1
+            widths.append(len(lead) - len(lead.lstrip(" ")))
+    if tab > space:
+        return "\t"
+    pos = [w for w in widths if w > 0]
+    step = min(pos) if pos else 4
+    return " " * (step if step in (2, 4, 8) else 4)
+
+
 def _fit_indent(new: str, target_indent: str) -> tuple[str, bool]:
     """Slide the whole `new` block so its first non-blank line carries `target_indent`,
     preserving every line's indentation RELATIVE to that first line (dedents included).
@@ -422,12 +446,12 @@ def _fit_indent(new: str, target_indent: str) -> tuple[str, bool]:
     This is what lets replace_lines take the indentation burden off the model: it can
     send the block at any base column — flush left, or copied verbatim from a numbered
     read — and we shift it to where it lands. Returns (fitted, shifted); shifted is False
-    and `new` is returned untouched when the block is already at the target column or has
-    no non-blank line. Space-indent assumption (a tab/space disaster is caught by the
-    indent-reject in _apply_edit either way)."""
+    and `new` is returned untouched when the block is already at the target column, has no
+    non-blank line, OR the target is tab-indented (a char-delta shift would emit spaces and
+    mix them with tabs — the unit-aware recoveries in _splice handle that case)."""
     lines = new.split("\n")
     first = next((l for l in lines if l.strip()), None)
-    if first is None:
+    if first is None or "\t" in target_indent:
         return new, False
     delta = len(target_indent) - (len(first) - len(first.lstrip()))
     if delta == 0:
@@ -444,22 +468,118 @@ def _fit_indent(new: str, target_indent: str) -> tuple[str, bool]:
 
 def _snap_indent(new: str, target_indent: str) -> str:
     """Force EVERY non-blank line to `target_indent`, dropping the model's own relative
-    indentation. The recovery for when _fit_indent can't help because that relative
-    whitespace was itself inconsistent — e.g. sibling class fields the model wrote at
-    different columns (the observed replace_lines failure). Correct only for a uniform-
-    level block; a genuinely nested block would be flattened, so callers accept the snap
-    ONLY when the result parses clean (else the AST-safe indent-reject stands)."""
+    indentation. The recovery for a UNIFORM-level block the model wrote at inconsistent
+    columns (e.g. sibling class fields). `target_indent` carries the file's own whitespace
+    (tabs or spaces), so this is unit-correct. A genuinely nested block would be flattened,
+    so callers accept the snap ONLY when the result parses (else the indent-reject stands)."""
     return "\n".join((target_indent + ln.lstrip()) if ln.strip() else ""
                      for ln in new.split("\n"))
 
 
+def _scan_py_line(line: str, in_str: str | None, depth: int) -> tuple[str | None, int, bool]:
+    """Scan ONE physical line of Python, starting in the given state, char by char.
+    Returns (in_str_after, bracket_depth_after, opens_block):
+      in_str  — the active triple-quote delimiter (\"\"\" or ''') mid-string, else None;
+      depth   — running (), [], {} nesting depth (continuation when > 0);
+      opens_block — the logical line ended (outside strings/brackets) with ':'.
+    Correct string tracking is the safety-critical part: it keeps _reindent_python from
+    ever touching bytes inside a triple-quoted string."""
+    i, n, last = 0, len(line), ""
+    while i < n:
+        c = line[i]
+        if in_str is not None:
+            if line.startswith(in_str, i):
+                in_str, i = None, i + 3
+            elif c == "\\":
+                i += 2
+            else:
+                i += 1
+            continue
+        if c in "\"'":
+            if line[i:i + 3] in ('"""', "'''"):
+                in_str, i = line[i:i + 3], i + 3
+                continue
+            j = i + 1                              # single-line string: skip to its close
+            while j < n:
+                if line[j] == "\\":
+                    j += 2
+                    continue
+                if line[j] == c:
+                    break
+                j += 1
+            i, last = j + 1, "s"
+            continue
+        if c == "#":
+            break                                  # comment runs to end of line
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth = max(0, depth - 1)
+        if not c.isspace():
+            last = c
+        i += 1
+    return in_str, depth, (in_str is None and depth == 0 and last == ":")
+
+
+_DEDENT_KW = ("else", "elif", "except", "finally")
+
+
+def _reindent_python(new: str, base_indent: str, unit: str) -> str:
+    """Recompute a Python block's indentation from its OWN syntax, ignoring the whitespace
+    the model sent (which a weak model gets wrong in BOTH directions — over-indenting a
+    comment, under-indenting a body). Rules that don't trust the model's columns:
+      • a ':'-terminated line opens a block, and the NEXT logical line is Python's REQUIRED
+        body, so it is forced one level deeper whatever width the model gave it;
+      • a line that starts with else/elif/except/finally closes one block (dedents);
+      • otherwise a line dedents by however many open blocks its model width fell below —
+        the one place the model's RELATIVE width is used, and only to leave blocks.
+    Lines inside a triple-quoted string and bracket-continuation lines are copied VERBATIM
+    (never reindented), so string contents can't be corrupted. Best-effort: the caller
+    applies the result ONLY if the file then parses, so a mis-read block falls through."""
+    out: list[str] = []
+    stack: list[int] = []          # body-ref model widths, one per open block; len == level
+    in_str: str | None = None
+    depth = 0
+    pending_body = False           # previous logical line ended with ':' → this line is its body
+    for ln in new.split("\n"):
+        if in_str is not None:                     # inside a multi-line string → verbatim
+            out.append(ln)
+            in_str, depth, _ = _scan_py_line(ln, in_str, depth)
+            continue
+        stripped = ln.strip()
+        if not stripped:
+            out.append("")
+            continue
+        if depth > 0:                              # bracket continuation → keep, indent past block
+            out.append(base_indent + unit * (len(stack) + 1) + stripped)
+            in_str, depth, _ = _scan_py_line(ln, in_str, depth)
+            continue
+        model_w = len(ln) - len(ln.lstrip())
+        if pending_body:
+            stack.append(model_w)                  # the required body defines this block's level
+            pending_body = False
+        else:
+            while stack and model_w < stack[-1]:   # model shows this line left inner block(s)
+                stack.pop()
+            kw = re.match(r"\w+", stripped)         # else/elif/except/finally close one block
+            if kw and kw.group() in _DEDENT_KW and stack:
+                stack.pop()
+        out.append(base_indent + unit * len(stack) + stripped)
+        in_str, depth, opens = _scan_py_line(ln, in_str, depth)
+        if opens:
+            pending_body = True
+    return "\n".join(out)
+
+
 def _splice(path: str, data: str, prefix: str, suffix: str, new: str,
             target_indent: str, ended_nl: bool, label: str) -> str:
-    """Fit `new` to `target_indent`, splice it between prefix/suffix, and apply via
-    _apply_edit. If the fitted result would newly break Python indentation (the model's
-    relative whitespace was wrong, not just its base column), retry once with a uniform
-    snap and take it only when it parses — otherwise the original indent-reject stands.
-    Shared by replace_lines and insert_lines."""
+    """Fit `new` to `target_indent`, splice between prefix/suffix, apply via _apply_edit.
+    If the fitted result would newly break Python indentation, try two recoveries in order,
+    each accepted only when it stops the indent break: (1) a structural reindent that
+    recomputes levels from the block's syntax (fixes a multi-LEVEL block the model
+    mis-indented), then (2) a uniform snap (fixes a single-level block at inconsistent
+    columns). If neither parses, the fitted attempt lands so the model gets the reject +
+    steer. Shared by replace_lines and insert_lines."""
     def shape(t: str) -> str:
         # Match the boundary's trailing-newline shape: terminate the block mid-file so the
         # following line stays put; leave it unterminated only at a no-newline EOF.
@@ -471,10 +591,20 @@ def _splice(path: str, data: str, prefix: str, suffix: str, new: str,
     fitted, shifted = _fit_indent(new, target_indent)
     after = prefix + shape(fitted) + suffix
     note = f" ({label}{'; fit indentation' if shifted else ''})"
-    if syntaxgate.indent_reject(path, data, after):
-        after_snap = prefix + shape(_snap_indent(new, target_indent)) + suffix
-        if not syntaxgate.indent_reject(path, data, after_snap):
-            after, note = after_snap, f" ({label}; snapped indentation)"
+    if not syntaxgate.indent_reject(path, data, after):
+        return _apply_edit(path, data, after, note)
+    # Fitted breaks indentation — recover. Each candidate is gated by indent_reject, which
+    # only clears when the file parses without a NEW IndentationError, so a bad recovery
+    # can never land; we just fall through to the next.
+    unit = _indent_unit(data)
+    if (levers.enabled("structural_reindent")
+            and repomap.service().lang_for(path) == "python"):
+        cand = prefix + shape(_reindent_python(new, target_indent, unit)) + suffix
+        if not syntaxgate.indent_reject(path, data, cand):
+            return _apply_edit(path, data, cand, f" ({label}; reindented to structure)")
+    cand = prefix + shape(_snap_indent(new, target_indent)) + suffix
+    if not syntaxgate.indent_reject(path, data, cand):
+        return _apply_edit(path, data, cand, f" ({label}; snapped indentation)")
     return _apply_edit(path, data, after, note)
 
 

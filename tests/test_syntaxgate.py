@@ -8,7 +8,7 @@ Pure + fast: no model load. Run: `uv run python test_syntaxgate.py`
 import os
 import tempfile
 
-from chad import tools
+from chad import syntaxgate, tools
 from chad.tools import tool_edit, tool_write
 
 PASS = 0
@@ -89,10 +89,37 @@ def test_symbol_edit():
     check("symbol good replace silent", "warning" not in res, res)
 
 
+def test_indent_reject_names_enclosing_symbol():
+    """B: when an in-function edit is reverted for breaking indentation, the message names
+    the enclosing `Class/method` and points at replace_symbol — the stable path — so the
+    model stops re-hand-indenting."""
+    before = ("class Engine:\n"
+              "    def _prefill(self, ids):\n"
+              "        n = len(ids)\n"
+              "        return n\n")
+    # break indentation inside _prefill (over-indent the `n = len(ids)` line)
+    after = before.replace("        n = len(ids)", "            n = len(ids)")
+    p = _tmp("e.py", before)
+    msg = syntaxgate.indent_reject(p, before, after)
+    check("indent reject fired", msg and msg.startswith("[edit rejected"), msg)
+    check("names enclosing method", "Engine/_prefill" in msg, msg)
+    check("steers to replace_symbol", "replace_symbol" in msg, msg)
+
+    # A module-level break has no enclosing function → no replace_symbol steer, but still
+    # points at the line tools.
+    before2 = "x = 1\ny = 2\n"
+    after2 = "x = 1\n    y = 2\n"     # unexpected indent at module level
+    p2 = _tmp("m.py", before2)
+    msg2 = syntaxgate.indent_reject(p2, before2, after2)
+    check("module-level reject fired", msg2 and msg2.startswith("[edit rejected"), msg2)
+    check("module-level: no enclosing symbol steer", "You're editing inside" not in msg2, msg2)
+
+
 if __name__ == "__main__":
     test_python()
     test_tree_sitter_delta()
     test_opt_out()
     test_symbol_edit()
+    test_indent_reject_names_enclosing_symbol()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

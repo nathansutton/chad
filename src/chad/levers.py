@@ -86,6 +86,13 @@ LEVERS: dict[str, Lever] = {
         "An edit that introduces an indentation/syntax error is REVERTED, not merely "
         "warned about. OFF restores the wrong-indent edit death loop.",
         "iter2", REGRESSION_GUARD),
+    "structural_reindent": Lever(
+        "When a replace_lines/insert_lines splice would break Python indentation, "
+        "recompute the block's indentation from its own syntax (colons/dedents), "
+        "ignoring the model's whitespace, and take it if the file then parses. OFF "
+        "falls back to fit+snap, which can't fix a multi-LEVEL block a weak model "
+        "mis-indents (the observed 9B failure).",
+        "iter5"),
 
     # --- iter-3: implemented straight off the iter-2 traces. NEVER MEASURED. -------
     "progress_note_rich": Lever(

@@ -151,6 +151,23 @@ def test_syntaxgate_revert(monkeypatch, tmp_path):
     assert syntaxgate.indent_reject(p, before, after) is None, "ablated: the break lands"
 
 
+def test_structural_reindent(monkeypatch, tmp_path):
+    n = bite("structural_reindent")
+    p = str(tmp_path / "e.py")
+    before = "def f(self):\n    x = 1\n    return x\n"
+    # A two-LEVEL block the model mis-indents (comment fine, if over-indented, body under):
+    # only the structural reindent can fix it — fit preserves the garbage, snap flattens
+    # the if-body into the if (still broken).
+    new = "x = 1\n# note\n      if x:\n  y = 2"
+    on(monkeypatch)
+    open(p, "w").write(before)
+    assert "reindented to structure" in tools.tool_replace_lines(p, 2, 2, new)
+    off(monkeypatch, n)
+    open(p, "w").write(before)
+    assert tools.tool_replace_lines(p, 2, 2, new).startswith("[edit rejected"), \
+        "ablated: no structural reindent, and fit/snap can't fix a multi-level block"
+
+
 # === iter-3 ================================================================
 
 def test_progress_note_rich(monkeypatch):
