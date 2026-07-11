@@ -230,6 +230,15 @@ class SymbolService:
         text = "\n".join(updated)
         if code.endswith("\n"):
             text += "\n"
+        # Same contract as the line/string edit tools (plan 073): a symbol edit that
+        # takes a parsing file to a SyntaxError is reverted, not landed-with-warning.
+        # Here the placement is ours and correct by construction, so the break can only
+        # come from the model's own `new` code — say so instead of the generic steer.
+        reject = syntaxgate.edit_reject(fp, code, text, (a, b))
+        if reject:
+            return (reject.rstrip("]").rstrip()
+                    + "\n (the syntax error is inside the code you sent — fix it and "
+                    "re-send the complete definition.)]")
         with open(fp, "w") as f:
             f.write(text)
         self._names_cache.pop(fp, None)  # mtime would evict anyway; don't rely on it

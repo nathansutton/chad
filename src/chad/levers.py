@@ -139,6 +139,31 @@ LEVERS: dict[str, Lever] = {
         "chunk). Safe because the prompt is rebuilt from `messages` each step.",
         "iter3"),
 
+    # --- iter-6 (plan 073): line-addressed edits corrupting multi-line structures;
+    #     derived from the measured 9B/35B dogfood (10 ignored parse warnings, LOOP
+    #     ABORT with a severed def signature). ---------------------------------------
+    "syntax_revert": Lever(
+        "An edit that turns a cleanly-parsing Python file into ANY SyntaxError is "
+        "REVERTED (generalizes syntaxgate_revert beyond IndentationError), with the "
+        "reject naming the severed multi-line statement and echoing the current lines. "
+        "Applies to edit/replace_lines/insert_lines/replace_symbol/insert_symbol; write "
+        "stays warn-only as the multi-step escape hatch. OFF restores warn-and-land: "
+        "the 073 dogfood landed ~10 corrupting line edits over ignored parse warnings "
+        "and aborted with the file broken.",
+        "iter6", REGRESSION_GUARD),
+    "edit_result_echo": Lever(
+        "replace_lines/insert_lines results echo the changed region with its POST-edit "
+        "line numbers plus a shift note, so follow-up edits re-anchor on numbers the "
+        "model has actually seen instead of reusing the ones from a pre-edit read (the "
+        "073 stale-number failure that conflated two adjacent defs).",
+        "iter6"),
+    "stale_file_guard": Lever(
+        "replace_lines/insert_lines reject-once, with a fresh numbered view of the "
+        "target region, when the file changed on disk since the model last saw it "
+        "(bash/sed, git checkout, test runs) — line numbers minted against the old "
+        "content are blind. The reject refreshes the anchor, so it never locks out.",
+        "iter6"),
+
     # --- from the LangChain harness-tuning playbook. -------------------------------
     "compact_notice": Lever(
         "After compaction, inject an in-band message telling the model its context was "

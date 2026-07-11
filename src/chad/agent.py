@@ -1380,8 +1380,12 @@ class Agent:
                 # Plan 047: track consecutive edits that DIDN'T land (no-op / unmatched
                 # `old`), so the model gets pushed to read-then-replace instead of looping
                 # on variations of a broken edit. A landed edit of any kind resets it.
-                if name in ("edit", "write", "replace_symbol", "insert_symbol",
-                            "rename_symbol"):
+                # replace_lines/insert_lines were missing from this set until plan 073:
+                # their rejects never fed the streak, so the 073 dogfood burned ~40 steps
+                # of line-edit churn with only the (much slower) identical-call loop
+                # detector escalating.
+                if name in ("edit", "write", "replace_lines", "insert_lines",
+                            "replace_symbol", "insert_symbol", "rename_symbol"):
                     noop_edit_streak = (noop_edit_streak + 1
                                         if guardrails.edit_failed_to_land(result) else 0)
                     last_edit_fail_kind = guardrails.edit_fail_kind(result)

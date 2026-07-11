@@ -404,6 +404,14 @@ def edit_fail_kind(result: str) -> str | None:
     if result.startswith("[no-op edit"):
         return "noop"
     if result.startswith("[edit rejected"):
+        # Three reverted-edit shapes, each with its own remedy (plan 073): a structural
+        # parse break (stop patching fragments → whole statement / replace_symbol), a
+        # stale file (the reject already echoed fresh numbers → just re-send with them),
+        # and an indentation break (stop hand-indenting → switch tools).
+        if "unparseable" in result:
+            return "structure"
+        if "changed on disk" in result:
+            return "stale"
         return "indent"     # syntaxgate reverted an indentation break — re-quoting won't help
     if edit_failed_to_land(result):
         return "nomatch"
@@ -430,6 +438,14 @@ _INDENT_BREAK = (
     "`replace_symbol` to rewrite the ENTIRE enclosing function (send the whole function; "
     "its indentation is handled for you), or `insert_lines` to add a single line at a read "
     "line-number. Do NOT send another hand-indented edit.]")
+_STRUCTURE_BREAK = (
+    "[STOP patching fragments: your last edits were REJECTED because they would leave the "
+    "file unparseable — you are cutting into a multi-line structure (a def signature, "
+    "call, or literal), and re-trying slightly different line ranges is the loop that "
+    "keeps failing. Make ONE whole-unit change instead: `replace_symbol` with the "
+    "complete new function, or a single `replace_lines` covering the ENTIRE statement "
+    "(the reject message printed its exact line span — use those numbers). Never edit "
+    "part of a multi-line statement.]")
 
 
 def edit_loop_break(noop_edit_streak, break_nudges, kind=None):
@@ -452,6 +468,8 @@ def edit_loop_break(noop_edit_streak, break_nudges, kind=None):
         return _NOOP_BREAK
     if kind == "indent":
         return _INDENT_BREAK
+    if kind == "structure":
+        return _STRUCTURE_BREAK
     return _NOMATCH_BREAK
 
 

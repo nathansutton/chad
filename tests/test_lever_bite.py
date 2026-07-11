@@ -163,9 +163,67 @@ def test_structural_reindent(monkeypatch, tmp_path):
     open(p, "w").write(before)
     assert "reindented to structure" in tools.tool_replace_lines(p, 2, 2, new)
     off(monkeypatch, n)
-    open(p, "w").write(before)
-    assert tools.tool_replace_lines(p, 2, 2, new).startswith("[edit rejected"), \
+    p2 = str(tmp_path / "e2.py")   # fresh path: keep the stale-file guard out of this arm
+    open(p2, "w").write(before)
+    assert tools.tool_replace_lines(p2, 2, 2, new).startswith("[edit rejected"), \
         "ablated: no structural reindent, and fit/snap can't fix a multi-level block"
+
+
+# === iter-6 (plan 073) =====================================================
+
+def test_syntax_revert(monkeypatch, tmp_path):
+    """The 073 corruption engine: replacing ONE physical line of a multi-line def
+    signature with a fragment. ON: rejected, file intact. OFF: warn-and-land."""
+    n = bite("syntax_revert")
+    p = str(tmp_path / "s.py")
+    before = "def generate(\n        prompt_ids,\n        max_tokens,\n):\n    return 1\n"
+    on(monkeypatch)
+    open(p, "w").write(before)
+    res = tools.tool_replace_lines(p, 2, 2, "def generate(")
+    assert res.startswith("[edit rejected") and "unparseable" in res
+    assert open(p).read() == before, "reject must leave the file byte-identical"
+    off(monkeypatch, n)
+    p2 = str(tmp_path / "s2.py")   # fresh path: keep the stale-file guard out of this arm
+    open(p2, "w").write(before)
+    res = tools.tool_replace_lines(p2, 2, 2, "def generate(")
+    assert res.startswith("[edited") and "no longer parses" in res, \
+        "ablated: the severing edit lands with only a warning"
+
+
+def test_edit_result_echo(monkeypatch, tmp_path):
+    n = bite("edit_result_echo")
+    p = str(tmp_path / "r.py")
+    before = "a = 1\nb = 2\nc = 3\n"
+    on(monkeypatch)
+    open(p, "w").write(before)
+    res = tools.tool_replace_lines(p, 2, 2, "b = 20\nbb = 21")
+    assert "use THESE numbers" in res and "shifted by +1" in res
+    off(monkeypatch, n)
+    p2 = str(tmp_path / "r2.py")   # fresh path: keep the stale-file guard out of this arm
+    open(p2, "w").write(before)
+    res = tools.tool_replace_lines(p2, 2, 2, "b = 20\nbb = 21")
+    assert res.startswith("[edited") and "use THESE numbers" not in res
+
+
+def test_stale_file_guard(monkeypatch, tmp_path):
+    """Line numbers minted before an out-of-band change are blind: reject once with a
+    fresh view, then allow the re-send (the reject itself refreshes the anchor)."""
+    n = bite("stale_file_guard")
+    p = str(tmp_path / "g.py")
+    on(monkeypatch)
+    open(p, "w").write("a = 1\nb = 2\n")
+    tools.tool_read(p)                                  # the model saw this content
+    open(p, "w").write("# moved\na = 1\nb = 2\n")       # out-of-band change (sed/git)
+    res = tools.tool_replace_lines(p, 2, 2, "b = 20")
+    assert res.startswith("[edit rejected") and "changed on disk" in res
+    res = tools.tool_replace_lines(p, 3, 3, "b = 20")   # re-send with fresh numbers
+    assert res.startswith("[edited")
+    off(monkeypatch, n)
+    open(p, "w").write("a = 1\nb = 2\n")
+    tools.tool_read(p)
+    open(p, "w").write("# moved\na = 1\nb = 2\n")
+    assert tools.tool_replace_lines(p, 3, 3, "b = 20").startswith("[edited"), \
+        "ablated: the stale edit goes straight through"
 
 
 # === iter-3 ================================================================

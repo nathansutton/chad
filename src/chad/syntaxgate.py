@@ -1,10 +1,15 @@
-"""Deterministic post-edit syntax gate (plan 038).
+"""Deterministic post-edit syntax gate (plan 038; hardened by plans 067/073).
 
 After a successful write/edit/replace_symbol/insert_symbol, re-check the mutated
 file; if the edit *introduced* a syntax error, ride a warning along in the SAME tool
-result. It never blocks or rolls the edit back — the edit stands and the warning
-costs no extra round-trip, so the model reacts with the context still hot instead of
-paying a run-tests → parse-failure → re-locate cycle to notice a broken file.
+result (`check_syntax`). For the targeted edit tools there is a stronger contract
+(`edit_reject`): an edit that turns a cleanly-parsing Python file into one that no
+longer parses is REVERTED, not merely warned about. The 073 dogfood showed why the
+warning alone is insufficient for a small model: it ignored ~10 consecutive "no longer
+parses" warnings while line-addressed edits severed a multi-line `def` signature, and
+every later edit was surgery on garbage. A file that was ALREADY broken stays editable
+(a real fix passes through still-broken states), and whole-file `write` stays warn-only
+as the escape hatch for deliberate multi-step rewrites.
 
 Python is checked exactly with `ast.parse` (line-accurate). Other languages use a
 tree-sitter ERROR/MISSING-node delta: warn only when the edit ADDED nodes, since many
@@ -127,25 +132,70 @@ def _enclosing_symbol(tree, line: int) -> str | None:
     return "/".join(chain[-2:]) if chain else None
 
 
-def indent_reject(path: str, before: str, after: str) -> str | None:
-    """A rejection message when an *edit* would newly introduce a Python indentation
-    error (IndentationError, which subsumes TabError), else None — the edit path uses
-    this to REVERT rather than let the break land.
+def _severed_span(tree, start: int, end: int) -> tuple[int, int] | None:
+    """The innermost multi-line region that the edit range [start, end] cuts INTO
+    without covering — the statement (or compound-statement header, e.g. a multi-line
+    `def` signature) whose severing produced the parse failure. `start = end + 1`
+    encodes an insertion boundary between `end` and `start`. Message-quality only:
+    the reject has already been decided by ast.parse, so an approximate span is fine."""
+    best: tuple[int, int] | None = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        a: int | None = getattr(node, "lineno", None)
+        if a is None:
+            continue
+        b: int = getattr(node, "end_lineno", None) or a
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and body and hasattr(body[0], "lineno"):
+            # Compound statement: only its HEADER (def/class/if... line through the
+            # colon) is unsplittable; the body is made of its own statements.
+            b = max(a, body[0].lineno - 1)
+        if b <= a:
+            continue                       # single physical line — can't be severed
+        cut_top = a < start <= b           # range (or insertion point) starts inside
+        cut_bot = a <= end < b             # range ends inside
+        if (cut_top or cut_bot) and (best is None or (b - a) < (best[1] - best[0])):
+            best = (a, b)
+    return best
 
-    check_syntax only warns and lets the edit stand (a transient parse break during a
-    multi-edit refactor is legitimate). But a landed indent/tab break is the precondition
-    for the whitespace-surgery death loop: the model can't reliably re-transcribe
-    indentation from a numbered read, so it spins on no-op edits hand-patching a file it
-    never should have broken (the recurring dogfood failure). We reject ONLY when `before`
-    parses cleanly and `after` raises IndentationError — a generic SyntaxError stays
-    warn-only, and a file that was ALREADY broken is left editable so a real fix (which
-    passes through a transiently-still-broken state) is never stranded.
+
+def _numbered(text: str, first: int, last: int, cap: int = 10) -> str:
+    """Lines [first, last] of `text` with 1-based line numbers, capped at `cap` lines —
+    the re-anchoring echo a reject carries so the model's next call uses numbers it has
+    actually seen (post-revert, `text` is still what is on disk)."""
+    lines = text.splitlines()
+    first, last = max(1, first), min(len(lines), last)
+    shown = lines[first - 1:last]
+    clipped = ""
+    if len(shown) > cap:
+        shown, clipped = shown[:cap], f"\n  … (+{last - first + 1 - cap} more lines to {last})"
+    width = len(str(first + len(shown)))
+    body = "\n".join(f"{first + i:>{width}}  {ln.rstrip()}" for i, ln in enumerate(shown))
+    return body + clipped
+
+
+def edit_reject(path: str, before: str, after: str,
+                edit_range: tuple[int, int] | None = None) -> str | None:
+    """A rejection message when an *edit* would take a cleanly-parsing Python file to
+    one that no longer parses, else None — the edit path uses this to REVERT rather
+    than let the break land.
+
+    check_syntax only warns and lets the edit stand. But the 073 dogfood measured what
+    a landed break costs a small model: it can't reliably repair a file it broke — it
+    ignored ten consecutive parse warnings while stale line-range edits severed a
+    multi-line `def` signature, then LOOP-ABORTed with the file broken. So for the
+    targeted edit tools the contract is: every landed edit leaves the file parsing.
+    A multi-step change that must pass through a broken state has two sanctioned paths:
+    replace_symbol (whole-definition rewrite) or write (whole-file, still warn-only).
+    We reject ONLY when `before` parses cleanly — a file that was ALREADY broken is left
+    editable so a real fix (which passes through a transiently-still-broken state) is
+    never stranded. IndentationError keeps its own lever (`syntaxgate_revert`, plan 067)
+    and message; the generalization to any SyntaxError is levered as `syntax_revert`
+    (plan 073). `edit_range` = the 1-based [start, end] the edit replaced (start = end+1
+    for an insertion boundary), used to name the severed statement and echo the region.
     """
     if config.flag("CHAD_NO_SYNTAX_GATE"):
-        return None
-    # Ablating this reverts to warn-only: the indent break LANDS, which is the
-    # precondition for the whitespace-surgery death loop this fix exists to stop.
-    if not levers.enabled("syntaxgate_revert"):
         return None
     if len(after) > _MAX_BYTES:
         return None
@@ -157,7 +207,12 @@ def indent_reject(path: str, before: str, after: str) -> str | None:
         return None            # before wasn't clean — don't strand a fix-in-progress
     try:
         ast.parse(after)
+        return None
     except IndentationError as e:  # catch before SyntaxError — it is a subclass
+        # Ablating this reverts to warn-only: the indent break LANDS, which is the
+        # precondition for the whitespace-surgery death loop this fix exists to stop.
+        if not levers.enabled("syntaxgate_revert"):
+            return None
         lines = after.splitlines()
         line = lines[e.lineno - 1] if e.lineno and e.lineno <= len(lines) else ""
         # B: name the enclosing function so the model can take the STABLE path — rewrite
@@ -172,6 +227,35 @@ def indent_reject(path: str, before: str, after: str) -> str | None:
                 f"line {e.lineno}: {line.strip()!r}. The file was left unchanged.{steer} "
                 f"Or use replace_lines / insert_lines with the line numbers from read — they "
                 f"fit indentation for you — instead of hand-quoting whitespace.]")
-    except SyntaxError:
-        return None            # non-indent break: let check_syntax warn, don't revert
-    return None
+    except SyntaxError as e:
+        # Ablating this restores warn-and-land for non-indent breaks — the corruption
+        # engine of the 073 dogfood (severed signature landed, then compounded).
+        if not levers.enabled("syntax_revert"):
+            return None
+        lines = after.splitlines()
+        line = lines[e.lineno - 1] if e.lineno and e.lineno <= len(lines) else ""
+        before_lines = before.count("\n") + 1
+        anchor = edit_range[0] if edit_range else (e.lineno or 1)
+        sym = _enclosing_symbol(tree, min(anchor, before_lines))
+        span = _severed_span(tree, *edit_range) if edit_range else None
+        parts = [f"[edit rejected: it would leave {os.path.basename(path)} unparseable — "
+                 f"{e.msg} at line {e.lineno}: {line.strip()!r}. The file was left "
+                 f"unchanged."]
+        if span:
+            parts.append(f" Your range cut into a multi-line statement spanning lines "
+                         f"{span[0]}-{span[1]} — never replace a fragment of it: send "
+                         f"the COMPLETE statement, replacing lines {span[0]}-{span[1]} "
+                         f"in one call.")
+        if sym:
+            parts.append(f" Most reliable: replace_symbol('{sym}') with the complete "
+                         f"new definition.")
+        echo_a, echo_b = (span or edit_range or (e.lineno or 1, e.lineno or 1))
+        parts.append("\n Current lines (unchanged, use THESE numbers):\n"
+                     + _numbered(before, echo_a - 2, echo_b + 2) + "\n]")
+        return "".join(parts)
+
+
+def indent_reject(path: str, before: str, after: str) -> str | None:
+    """Back-compat name for `edit_reject` (plan 067 shipped it as indent-only; plan 073
+    generalized it). Prefer `edit_reject`, which also takes the edit range."""
+    return edit_reject(path, before, after)

@@ -43,11 +43,13 @@ def test_python():
     res = tool_write(p, "def f():\n    return 1\n")
     check("py good write silent", "warning" not in res, res)
 
-    # An edit that breaks the file is flagged; the edit still applies (never rolled back).
+    # An edit that breaks the file is REJECTED and reverted (plan 073): a landed break
+    # is the precondition for the repair-of-garbage loop a small model can't win.
+    # (`write` above stays warn-and-land — the multi-step escape hatch.)
     res = tool_edit(p, "def f():", "def f(:")
-    check("py bad edit warns", "warning" in res, res)
+    check("py bad edit rejected", res.startswith("[edit rejected"), res)
     with open(p) as f:
-        check("py bad edit still applied", "def f(:" in f.read())
+        check("py bad edit reverted", "def f(:" not in f.read())
 
     # A failed edit (target absent) leaves the file unchanged -> no warning.
     p = _tmp("b.py", "def g():\n    return 2\n")
@@ -79,14 +81,18 @@ def test_opt_out():
 
 
 def test_symbol_edit():
-    # A symbol replacement that produces invalid Python is flagged in the same result.
+    # A symbol replacement that produces invalid Python is REJECTED and reverted (plan
+    # 073), and the message says the error is in the model's own code.
     p = _tmp("mod.py", "def area(w, h):\n    return w * h\n")
     res = tools.symbols.service().replace_symbol("area", "def area(w, h):\n    return w *", path=p)
-    check("symbol bad replace warns", "warning" in res, res)
+    check("symbol bad replace rejected", res.startswith("[edit rejected"), res)
+    check("symbol reject blames the sent code", "code you sent" in res, res)
+    with open(p) as f:
+        check("symbol bad replace reverted", "return w *\n" not in f.read())
     # And a valid symbol replacement is silent.
     p = _tmp("mod2.py", "def area(w, h):\n    return w * h\n")
     res = tools.symbols.service().replace_symbol("area", "def area(w, h):\n    return w * h * 2", path=p)
-    check("symbol good replace silent", "warning" not in res, res)
+    check("symbol good replace silent", "warning" not in res and "rejected" not in res, res)
 
 
 def test_indent_reject_names_enclosing_symbol():

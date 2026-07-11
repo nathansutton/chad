@@ -146,12 +146,21 @@ def test_indent_break_is_rejected_and_reverted():
     check("tab-break file untouched", after == before, repr(after))
 
 
-def test_non_indent_break_still_lands_with_warning():
-    """Prong 1 scope: a NON-indentation syntax break (unclosed paren) is NOT reverted —
-    it stays warn-only (check_syntax), preserving transient breaks during a refactor."""
+def test_non_indent_break_rejected(monkeypatch):
+    """Plan 073 (supersedes the plan-067 warn-only scope): a NON-indentation syntax
+    break (unclosed paren) is also REVERTED. The 073 dogfood measured what warn-only
+    costs a small model: ten ignored "no longer parses" warnings while stale line edits
+    compounded on a severed def signature, ending in LOOP ABORT with the file broken.
+    Multi-step changes that must pass through a broken state route through `write`
+    (still warn-only) or replace_symbol. Ablating `syntax_revert` restores warn-and-land."""
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
     res, after = run("x = 1\n", "x = 1", "x = (1")
-    check("non-indent break lands", res.startswith("[edited") and "x = (1" in after, res)
-    check("non-indent break warns", "no longer parses" in res, res)
+    check("non-indent break rejected", res.startswith("[edit rejected"), res)
+    check("file left unchanged", after == "x = 1\n", repr(after))
+    monkeypatch.setenv("CHAD_DISABLE", "syntax_revert")
+    res, after = run("x = 1\n", "x = 1", "x = (1")
+    check("ablated: break lands with warning",
+          res.startswith("[edited") and "no longer parses" in res and "x = (1" in after, res)
 
 
 def test_already_broken_file_stays_editable():
@@ -181,7 +190,6 @@ if __name__ == "__main__":
     test_ws_recovery_prefers_file_indentation()
     test_ws_only_edit_applies_verbatim()
     test_indent_break_is_rejected_and_reverted()
-    test_non_indent_break_still_lands_with_warning()
     test_already_broken_file_stays_editable()
     test_failed_edit_shows_visible_whitespace()
     print(f"\n{PASS} passed, {FAIL} failed")

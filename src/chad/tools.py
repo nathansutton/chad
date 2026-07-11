@@ -8,6 +8,7 @@ gates them behind a confirmation unless --yolo is set.
 
 import fnmatch
 import glob as _glob
+import hashlib
 import io
 import os
 import re
@@ -149,6 +150,7 @@ def tool_read(path: str, offset: int = 0, limit: int = READ_DEFAULT_LIMIT) -> st
             lines = f.readlines()
     except (IsADirectoryError, OSError) as e:
         return f"[cannot read {path}: {e}]"
+    _mark_seen(path, "".join(lines))  # any read view refreshes the line-number anchor
     total = len(lines)
 
     # Skeleton mode: a plain "read this big file" returns structure, not the whole
@@ -200,6 +202,7 @@ def tool_write(path: str, content: str) -> str:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as f:
         f.write(content)
+    _mark_seen(path, content)
     result = f"[wrote {len(content)} bytes to {_rel(path)}]"
     warn = syntaxgate.check_syntax(path, before)
     return result + warn if warn else result
@@ -332,18 +335,58 @@ def _indent_hint(data: str, old: str) -> str:
             f"indentation exactly:\n{shown}\n]")
 
 
-def _apply_edit(path: str, before: str, after: str, note: str) -> str:
+# Per-session freshness bookkeeping (plan 073): the content hash of each file when the
+# model last SAW it (read / write / an edit's result echo). Line numbers are only
+# meaningful against the content they were read from, so the line-addressed tools
+# reject-once with a fresh numbered view when the file changed underneath the model
+# (a bash sed/test run, a git checkout, another tool). The reject itself refreshes the
+# entry — one retry with the echoed numbers, never a lockout.
+_FILE_SEEN: dict[str, str] = {}
+
+
+def _seen_hash(data: str) -> str:
+    return hashlib.sha1(data.encode("utf-8", "replace")).hexdigest()
+
+
+def _mark_seen(path: str, data: str) -> None:
+    _FILE_SEEN[os.path.abspath(path)] = _seen_hash(data)
+
+
+def _stale_check(path: str, data: str, around: tuple[int, int]) -> str | None:
+    """A rejection when `path`'s content no longer matches what the model last saw —
+    its line numbers were minted against a file that has since changed on disk. Echoes
+    the current lines around the target so the retry is anchored, and refreshes the
+    seen-hash so the guard fires at most once per external change. A file the model
+    never saw is allowed through (grep/skeleton/overview also mint valid numbers)."""
+    if not levers.enabled("stale_file_guard"):
+        return None
+    seen = _FILE_SEEN.get(os.path.abspath(path))
+    if seen is None or seen == _seen_hash(data):
+        return None
+    _mark_seen(path, data)
+    total = data.count("\n") + 1
+    a, b = max(1, around[0] - 3), min(total, around[1] + 3)
+    return (f"[edit rejected: {_rel(path)} changed on disk since you last read it — "
+            f"your line numbers may be stale. No change made. Current lines {a}-{b}:\n"
+            f"{syntaxgate._numbered(data, a, b)}\n"
+            f"Re-send using these numbers (or read more of the file first).]")
+
+
+def _apply_edit(path: str, before: str, after: str, note: str,
+                edit_range: tuple[int, int] | None = None) -> str:
     if after == before:
         return "[no-op edit: the replacement leaves the file unchanged]"
-    # Prong 1 (plan 067): never LAND an edit that newly breaks Python indentation —
-    # revert and make the model re-send. A landed indent/tab break is the precondition
-    # for the whitespace-surgery loop it can't win. Scoped to IndentationError; a clean
-    # file only (an already-broken file stays editable so real fixes aren't stranded).
-    reject = syntaxgate.indent_reject(path, before, after)
+    # Never LAND an edit that newly breaks the file's parse — revert and make the model
+    # re-send (plan 067 for indentation, plan 073 for any SyntaxError). A landed break is
+    # the precondition for the repair-of-garbage loop a small model can't win. Clean
+    # files only: an already-broken file stays editable so real fixes aren't stranded.
+    reject = syntaxgate.edit_reject(path, before, after, edit_range)
     if reject:
+        _mark_seen(path, before)   # the reject echoes current content — that's a view
         return reject
     with open(path, "w") as f:
         f.write(after)
+    _mark_seen(path, after)
     result = f"[edited {_rel(path)}{note}]"
     warn = syntaxgate.check_syntax(path, before)
     return result + warn if warn else result
@@ -572,14 +615,17 @@ def _reindent_python(new: str, base_indent: str, unit: str) -> str:
 
 
 def _splice(path: str, data: str, prefix: str, suffix: str, new: str,
-            target_indent: str, ended_nl: bool, label: str) -> str:
+            target_indent: str, ended_nl: bool, label: str,
+            edit_range: tuple[int, int] | None = None) -> str:
     """Fit `new` to `target_indent`, splice between prefix/suffix, apply via _apply_edit.
-    If the fitted result would newly break Python indentation, try two recoveries in order,
-    each accepted only when it stops the indent break: (1) a structural reindent that
+    If the fitted result would newly break the file's parse, try two recoveries in order,
+    each accepted only when the file then parses: (1) a structural reindent that
     recomputes levels from the block's syntax (fixes a multi-LEVEL block the model
     mis-indented), then (2) a uniform snap (fixes a single-level block at inconsistent
     columns). If neither parses, the fitted attempt lands so the model gets the reject +
-    steer. Shared by replace_lines and insert_lines."""
+    steer. Shared by replace_lines and insert_lines. `edit_range` is the 1-based [start,
+    end] being replaced (start = end+1 for an insertion boundary), carried into the
+    reject message so it can name the severed statement and echo current numbers."""
     def shape(t: str) -> str:
         # Match the boundary's trailing-newline shape: terminate the block mid-file so the
         # following line stays put; leave it unterminated only at a no-newline EOF.
@@ -591,21 +637,45 @@ def _splice(path: str, data: str, prefix: str, suffix: str, new: str,
     fitted, shifted = _fit_indent(new, target_indent)
     after = prefix + shape(fitted) + suffix
     note = f" ({label}{'; fit indentation' if shifted else ''})"
-    if not syntaxgate.indent_reject(path, data, after):
-        return _apply_edit(path, data, after, note)
-    # Fitted breaks indentation — recover. Each candidate is gated by indent_reject, which
-    # only clears when the file parses without a NEW IndentationError, so a bad recovery
-    # can never land; we just fall through to the next.
+    if not syntaxgate.edit_reject(path, data, after, edit_range):
+        return _apply_edit(path, data, after, note, edit_range)
+    # Fitted breaks the parse — recover. Each candidate is gated by edit_reject, which
+    # only clears when the file parses cleanly again, so a bad recovery can never land;
+    # we just fall through to the next.
     unit = _indent_unit(data)
     if (levers.enabled("structural_reindent")
             and repomap.service().lang_for(path) == "python"):
         cand = prefix + shape(_reindent_python(new, target_indent, unit)) + suffix
-        if not syntaxgate.indent_reject(path, data, cand):
-            return _apply_edit(path, data, cand, f" ({label}; reindented to structure)")
+        if not syntaxgate.edit_reject(path, data, cand, edit_range):
+            return _apply_edit(path, data, cand, f" ({label}; reindented to structure)",
+                               edit_range)
     cand = prefix + shape(_snap_indent(new, target_indent)) + suffix
-    if not syntaxgate.indent_reject(path, data, cand):
-        return _apply_edit(path, data, cand, f" ({label}; snapped indentation)")
-    return _apply_edit(path, data, after, note)
+    if not syntaxgate.edit_reject(path, data, cand, edit_range):
+        return _apply_edit(path, data, cand, f" ({label}; snapped indentation)", edit_range)
+    return _apply_edit(path, data, after, note, edit_range)
+
+
+def _region_echo(path: str, first: int, last: int, delta: int) -> str:
+    """The post-edit region re-printed with its CURRENT line numbers (plan 073). The
+    stale-number failure was the model reusing line numbers from a read made before its
+    own edits shifted the file; echoing the region it just changed — with the numbers as
+    they are NOW, plus how much the tail shifted — makes the tool result itself the
+    fresh read, so the next call doesn't need (and won't trust) the old ones."""
+    if not levers.enabled("edit_result_echo"):
+        return ""
+    try:
+        with open(path, errors="replace") as f:
+            data = f.read()
+    except OSError:
+        return ""
+    total = data.count("\n") + 1
+    a, b = max(1, min(first, total)), max(1, min(last, total))
+    if b < a:
+        a, b = b, a
+    shift = (f" — lines after {b} shifted by {delta:+d}, so line numbers from earlier "
+             f"reads are stale below that" if delta else "")
+    return (f"\n[the region now reads (use THESE numbers for follow-up edits{shift}):\n"
+            f"{syntaxgate._numbered(data, a, b)}\n]")
 
 
 def tool_replace_lines(path: str, start: int, end: int, new: str) -> str:
@@ -636,15 +706,29 @@ def tool_replace_lines(path: str, start: int, end: int, new: str) -> str:
         return (f"[replace_lines: start={start} is past the last line ({n}); append with "
                 f"write, or pick a start within the file.]")
     end = min(end, n)
+    stale = _stale_check(path, data, (start, end))
+    if stale:
+        return stale
     prefix, replaced, suffix = ("".join(lines[:start - 1]),
                                 "".join(lines[start - 1:end]),
                                 "".join(lines[end:]))
     if new == "":
-        return _apply_edit(path, data, prefix + suffix, f" (deleted lines {start}-{end})")
-    anchor = next((ln for ln in replaced.split("\n") if ln.strip()), "")
-    target_indent = anchor[: len(anchor) - len(anchor.lstrip())]
-    return _splice(path, data, prefix, suffix, new, target_indent,
-                   replaced.endswith("\n"), f"replaced lines {start}-{end}")
+        result = _apply_edit(path, data, prefix + suffix,
+                             f" (deleted lines {start}-{end})", (start, end))
+    else:
+        anchor = next((ln for ln in replaced.split("\n") if ln.strip()), "")
+        target_indent = anchor[: len(anchor) - len(anchor.lstrip())]
+        result = _splice(path, data, prefix, suffix, new, target_indent,
+                         replaced.endswith("\n"), f"replaced lines {start}-{end}",
+                         (start, end))
+    if result.startswith("[edited"):
+        try:
+            with open(path, errors="replace") as f:
+                delta = len(f.readlines()) - n
+        except OSError:
+            delta = 0
+        result += _region_echo(path, start - 1, end + delta + 1, delta)
+    return result
 
 
 def tool_insert_lines(path: str, after_line: int, code: str) -> str:
@@ -668,6 +752,9 @@ def tool_insert_lines(path: str, after_line: int, code: str) -> str:
     if after_line < 0 or after_line > n:
         return (f"[insert_lines: after_line={after_line} out of range; the file has {n} "
                 f"lines (use 0 to insert at the top).]")
+    stale = _stale_check(path, data, (max(1, after_line), min(n, after_line + 1)))
+    if stale:
+        return stale
     anchor = (lines[after_line - 1] if after_line >= 1 else (lines[0] if lines else "")).rstrip("\n")
     target_indent = anchor[: len(anchor) - len(anchor.lstrip())]
     prefix = "".join(lines[:after_line])
@@ -688,8 +775,18 @@ def tool_insert_lines(path: str, after_line: int, code: str) -> str:
         prefix, ended_nl = prefix + "\n", False
     else:
         ended_nl = True
-    return _splice(path, data, prefix, suffix, code, target_indent, ended_nl,
-                   f"inserted after line {after_line}")
+    # The insertion boundary sits between after_line and after_line+1 — encoded as the
+    # inverted range (after_line+1, after_line) for the severed-statement diagnosis.
+    result = _splice(path, data, prefix, suffix, code, target_indent, ended_nl,
+                     f"inserted after line {after_line}", (after_line + 1, after_line))
+    if result.startswith("[edited"):
+        try:
+            with open(path, errors="replace") as f:
+                delta = len(f.readlines()) - n
+        except OSError:
+            delta = 0
+        result += _region_echo(path, after_line, after_line + delta + 1, delta)
+    return result
 
 
 # Planning tool (deepagents' write_todos): a scaffold that keeps the model on track
@@ -1123,9 +1220,15 @@ SCHEMAS: list[dict[str, Any]] = [
                            "and the replacement — you do NOT need to re-quote the old text or "
                            "match its exact leading whitespace, because the new block's "
                            "indentation is fitted to the target automatically. Pass an empty "
-                           "`new` to delete the lines. Prefer this over `edit` whenever you "
-                           "know the line numbers, and over rewriting a whole function when "
-                           "only a few lines change.",
+                           "`new` to delete the lines. The result echoes the region with its "
+                           "NEW line numbers — use those for any follow-up edit (your earlier "
+                           "numbers shift when the line count changes). An edit that would "
+                           "leave the file unparseable is rejected: never replace a fragment "
+                           "of a multi-line statement (a def signature, call, or literal) — "
+                           "send the complete statement, or use replace_symbol for a whole "
+                           "function. Prefer this over `edit` whenever you know the line "
+                           "numbers, and over rewriting a whole function when only a few "
+                           "lines change.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1152,7 +1255,10 @@ SCHEMAS: list[dict[str, Any]] = [
                            "after a line ending in ':'. Use this to ADD a field, statement, "
                            "import, or case next to an existing one (e.g. a new dataclass field "
                            "beside a sibling field). Pass after_line=0 to insert at the very "
-                           "top. For a whole new function/method, insert_symbol is better.",
+                           "top. The result echoes the region with its NEW line numbers — use "
+                           "those for follow-up edits. An insert that would leave the file "
+                           "unparseable (e.g. into the middle of a multi-line statement) is "
+                           "rejected. For a whole new function/method, insert_symbol is better.",
             "parameters": {
                 "type": "object",
                 "properties": {
