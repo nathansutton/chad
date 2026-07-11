@@ -12,7 +12,7 @@ Run: `uv run python tests/test_replace_lines.py`
 import os
 import tempfile
 
-from chad.tools import _fit_indent, tool_replace_lines
+from chad.tools import _fit_indent, tool_insert_lines, tool_replace_lines
 
 PASS = 0
 FAIL = 0
@@ -117,6 +117,83 @@ def test_no_such_file():
     check("missing file", res.startswith("[no such file"), res)
 
 
+def test_snap_recovery_for_inconsistent_relative_indent():
+    """#1: the observed live failure — the model sends a uniform-level block with
+    INCONSISTENT relative indentation (sibling class fields at different columns), which
+    _fit_indent's single-delta shift can't fix. The uniform-snap recovery lands it."""
+    before = ("class Engine:\n"
+              "    a: int = 1\n"
+              "    b: int = 2\n")
+    # Replace the two field lines with a block the model wrote at col 0 and col 6 —
+    # a fit-shift would put line 2 at 10 spaces (unexpected indent); snap puts both at 4.
+    res, after = run(before, 2, 3, "a: int = 1\n      c: int = 3")
+    check("snap: landed", res.startswith("[edited"), res)
+    check("snap: disclosed", "snapped indentation" in res, res)
+    check("snap: both fields at 4",
+          after == "class Engine:\n    a: int = 1\n    c: int = 3\n", repr(after))
+
+
+def test_snap_not_applied_when_it_would_flatten_a_nested_block():
+    """Snap is a fallback, not the default: a genuinely nested block whose fit is already
+    clean must NOT be flattened. Here the fitted result parses, so snap never runs."""
+    before = "def f():\n    pass\n"
+    res, after = run(before, 2, 2, "if x:\n    y = 1")   # nested, sent flush-left
+    check("nested: fitted (not snapped)", "snapped" not in res, res)
+    check("nested: structure kept",
+          after == "def f():\n    if x:\n        y = 1\n", repr(after))
+
+
+# --- insert_lines (#2) -------------------------------------------------------------
+
+def run_ins(before, after_line, code, name="f.py"):
+    d = tempfile.mkdtemp(prefix="ins_")
+    p = os.path.join(d, name)
+    with open(p, "w") as f:
+        f.write(before)
+    res = tool_insert_lines(p, after_line, code)
+    with open(p) as f:
+        after = f.read()
+    return res, after
+
+
+def test_insert_field_inherits_sibling_indent():
+    """#2: add a dataclass field beside a sibling — the case no symbol tool covers. The
+    model sends the field flush-left; insert_lines inherits the anchor line's indent."""
+    before = ("class Engine:\n"
+              "    a: int = 1\n"
+              "    b: int = 2\n")
+    res, after = run_ins(before, 2, "prefill_chunk: int = 256")   # after the `a` field
+    check("insert: edited", res.startswith("[edited"), res)
+    check("insert: field at sibling indent",
+          after == "class Engine:\n    a: int = 1\n    prefill_chunk: int = 256\n    b: int = 2\n",
+          repr(after))
+
+
+def test_insert_at_top_and_eof():
+    res, after = run_ins("import os\n", 0, "import sys")
+    check("insert top", after == "import sys\nimport os\n", repr(after))
+    # EOF with a trailing newline keeps the trailing newline
+    res, after = run_ins("a = 1\n", 1, "b = 2")
+    check("insert eof (nl)", after == "a = 1\nb = 2\n", repr(after))
+    # EOF with NO trailing newline: start the insert on its own line, keep no trailing nl
+    res, after = run_ins("a = 1", 1, "b = 2")
+    check("insert eof (no nl)", after == "a = 1\nb = 2", repr(after))
+
+
+def test_insert_multiline_nested():
+    before = "def f():\n    pass\n"
+    res, after = run_ins(before, 1, "for i in x:\n    do(i)")   # after `def f():`, flush-left
+    check("insert multiline fitted",
+          after == "def f():\n    for i in x:\n        do(i)\n    pass\n", repr(after))
+
+
+def test_insert_guards():
+    check("insert empty code", tool_insert_lines(__file__, 1, "").startswith("[insert_lines: code"),
+          "empty code should be rejected")
+    res, after = run_ins("a = 1\n", 9, "x")
+    check("insert out of range", res.startswith("[insert_lines: after_line=9 out of range"), res)
+
+
 if __name__ == "__main__":
     test_fit_indent_unit()
     test_basic_replace()
@@ -127,5 +204,11 @@ if __name__ == "__main__":
     test_bad_range_rejected()
     test_indent_break_still_rejected()
     test_no_such_file()
+    test_snap_recovery_for_inconsistent_relative_indent()
+    test_snap_not_applied_when_it_would_flatten_a_nested_block()
+    test_insert_field_inherits_sibling_indent()
+    test_insert_at_top_and_eof()
+    test_insert_multiline_nested()
+    test_insert_guards()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

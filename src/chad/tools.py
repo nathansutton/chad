@@ -442,6 +442,42 @@ def _fit_indent(new: str, target_indent: str) -> tuple[str, bool]:
     return "\n".join(out), True
 
 
+def _snap_indent(new: str, target_indent: str) -> str:
+    """Force EVERY non-blank line to `target_indent`, dropping the model's own relative
+    indentation. The recovery for when _fit_indent can't help because that relative
+    whitespace was itself inconsistent — e.g. sibling class fields the model wrote at
+    different columns (the observed replace_lines failure). Correct only for a uniform-
+    level block; a genuinely nested block would be flattened, so callers accept the snap
+    ONLY when the result parses clean (else the AST-safe indent-reject stands)."""
+    return "\n".join((target_indent + ln.lstrip()) if ln.strip() else ""
+                     for ln in new.split("\n"))
+
+
+def _splice(path: str, data: str, prefix: str, suffix: str, new: str,
+            target_indent: str, ended_nl: bool, label: str) -> str:
+    """Fit `new` to `target_indent`, splice it between prefix/suffix, and apply via
+    _apply_edit. If the fitted result would newly break Python indentation (the model's
+    relative whitespace was wrong, not just its base column), retry once with a uniform
+    snap and take it only when it parses — otherwise the original indent-reject stands.
+    Shared by replace_lines and insert_lines."""
+    def shape(t: str) -> str:
+        # Match the boundary's trailing-newline shape: terminate the block mid-file so the
+        # following line stays put; leave it unterminated only at a no-newline EOF.
+        if ended_nl and not t.endswith("\n"):
+            return t + "\n"
+        if not ended_nl and t.endswith("\n"):
+            return t.rstrip("\n")
+        return t
+    fitted, shifted = _fit_indent(new, target_indent)
+    after = prefix + shape(fitted) + suffix
+    note = f" ({label}{'; fit indentation' if shifted else ''})"
+    if syntaxgate.indent_reject(path, data, after):
+        after_snap = prefix + shape(_snap_indent(new, target_indent)) + suffix
+        if not syntaxgate.indent_reject(path, data, after_snap):
+            after, note = after_snap, f" ({label}; snapped indentation)"
+    return _apply_edit(path, data, after, note)
+
+
 def tool_replace_lines(path: str, start: int, end: int, new: str) -> str:
     """Replace file lines [start, end] (1-based, inclusive — the numbers `read` prints)
     with `new`, fitting the new block's indentation to the region it lands in. This is
@@ -473,21 +509,57 @@ def tool_replace_lines(path: str, start: int, end: int, new: str) -> str:
     prefix, replaced, suffix = ("".join(lines[:start - 1]),
                                 "".join(lines[start - 1:end]),
                                 "".join(lines[end:]))
-    ended_nl = replaced.endswith("\n")
     if new == "":
-        block, note = "", f" (deleted lines {start}-{end})"
+        return _apply_edit(path, data, prefix + suffix, f" (deleted lines {start}-{end})")
+    anchor = next((ln for ln in replaced.split("\n") if ln.strip()), "")
+    target_indent = anchor[: len(anchor) - len(anchor.lstrip())]
+    return _splice(path, data, prefix, suffix, new, target_indent,
+                   replaced.endswith("\n"), f"replaced lines {start}-{end}")
+
+
+def tool_insert_lines(path: str, after_line: int, code: str) -> str:
+    """Insert `code` as new line(s) immediately AFTER line `after_line` (1-based; 0 = the
+    very top of the file), inheriting that line's indentation so you never supply a column.
+    The line-addressed complement to replace_lines for ADDING a field/statement beside a
+    sibling — the case no symbol tool covers cleanly (a dataclass field or a bare statement
+    isn't a function/class symbol). Same fit + snap + indent-reject path as replace_lines."""
+    if not os.path.exists(path) and path.startswith("/") and os.path.exists(path.lstrip("/")):
+        path = path.lstrip("/")
+    if not os.path.exists(path):
+        return f"[no such file: {path}]"
+    if isinstance(after_line, bool) or not isinstance(after_line, int):
+        return "[insert_lines: after_line must be an integer line number (1-based; 0 = top)]"
+    if code == "":
+        return "[insert_lines: code is empty; nothing to insert]"
+    with open(path, errors="replace") as f:
+        lines = f.readlines()
+    data = "".join(lines)
+    n = len(lines)
+    if after_line < 0 or after_line > n:
+        return (f"[insert_lines: after_line={after_line} out of range; the file has {n} "
+                f"lines (use 0 to insert at the top).]")
+    anchor = (lines[after_line - 1] if after_line >= 1 else (lines[0] if lines else "")).rstrip("\n")
+    target_indent = anchor[: len(anchor) - len(anchor.lstrip())]
+    prefix = "".join(lines[:after_line])
+    suffix = "".join(lines[after_line:])
+    # Inserting right after a block opener (a line ending in ':') means the new code
+    # belongs to that block's BODY, one level deeper — inherit the existing body's indent
+    # when there is one, else add four spaces to the opener's. Sibling inserts (a field
+    # after a field) don't end in ':', so they keep the anchor's own indent.
+    if anchor.rstrip().endswith(":"):
+        body = next((ln for ln in suffix.split("\n") if ln.strip()), "")
+        body_indent = body[: len(body) - len(body.lstrip())]
+        target_indent = body_indent if len(body_indent) > len(target_indent) \
+            else target_indent + "    "
+    # Start the insert on its own line. prefix lacks a trailing newline only when we insert
+    # after an unterminated final line (after_line == n at a no-newline EOF): add one, and
+    # keep the file's no-trailing-newline shape for the new last line.
+    if prefix and not prefix.endswith("\n"):
+        prefix, ended_nl = prefix + "\n", False
     else:
-        anchor = next((ln for ln in replaced.split("\n") if ln.strip()), "")
-        target_indent = anchor[: len(anchor) - len(anchor.lstrip())]
-        block, shifted = _fit_indent(new, target_indent)
-        # Match the region's trailing-newline shape: keep one at a mid-file boundary,
-        # keep none when we replaced the final unterminated line (don't grow the file).
-        if ended_nl and not block.endswith("\n"):
-            block += "\n"
-        elif not ended_nl and block.endswith("\n"):
-            block = block.rstrip("\n")
-        note = f" (replaced lines {start}-{end}{'; fit indentation' if shifted else ''})"
-    return _apply_edit(path, data, prefix + block + suffix, note)
+        ended_nl = True
+    return _splice(path, data, prefix, suffix, code, target_indent, ended_nl,
+                   f"inserted after line {after_line}")
 
 
 # Planning tool (deepagents' write_todos): a scaffold that keeps the model on track
@@ -724,6 +796,8 @@ DISPATCH = {
     "edit": lambda a, ss=None: tool_edit(a["path"], a["old"], a["new"]),
     "replace_lines": lambda a, ss=None: tool_replace_lines(
         a["path"], a["start"], a["end"], a["new"]),
+    "insert_lines": lambda a, ss=None: tool_insert_lines(
+        a["path"], a["after_line"], a["code"]),
     "glob": lambda a, ss=None: tool_glob(a["pattern"], should_stop=ss),
     "grep": lambda a, ss=None: tool_grep(a["pattern"], a.get("path", "."),
                                          a.get("glob", "**/*"),
@@ -759,8 +833,8 @@ def _skills():
     return skills
 
 # Tools that mutate state -> CLI asks for confirmation unless --yolo.
-MUTATING = {"bash", "write", "edit", "replace_lines", "replace_symbol", "insert_symbol",
-            "rename_symbol"}
+MUTATING = {"bash", "write", "edit", "replace_lines", "insert_lines", "replace_symbol",
+            "insert_symbol", "rename_symbol"}
 
 # Terminal tools end the turn cleanly (forge's terminal_tool idea). Small models
 # instinctively try to "stop"/"finish"; giving them a real tool avoids hallucinated
@@ -934,6 +1008,30 @@ SCHEMAS: list[dict[str, Any]] = [
                             "description": "Replacement text (empty string deletes the range)."},
                 },
                 "required": ["path", "start", "end", "new"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_lines",
+            "description": "Insert new line(s) immediately AFTER a given line number (from "
+                           "read), with the right indentation applied for you — so you do NOT "
+                           "supply leading whitespace: a sibling's indent when you insert after "
+                           "a normal line, or the block body's indent when you insert right "
+                           "after a line ending in ':'. Use this to ADD a field, statement, "
+                           "import, or case next to an existing one (e.g. a new dataclass field "
+                           "beside a sibling field). Pass after_line=0 to insert at the very "
+                           "top. For a whole new function/method, insert_symbol is better.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "after_line": {"type": "integer",
+                                   "description": "Insert after this 1-based line (0 = top of file)."},
+                    "code": {"type": "string", "description": "The line(s) to insert."},
+                },
+                "required": ["path", "after_line", "code"],
             },
         },
     },
