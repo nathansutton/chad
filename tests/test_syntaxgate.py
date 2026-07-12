@@ -33,19 +33,30 @@ def _tmp(name, content):
 
 
 def test_python():
-    # A write that produces invalid Python is flagged, with the offending line number.
+    # A write that would land invalid Python on a clean file is REJECTED with the file
+    # untouched (plan 079) — write was the warn-only escape hatch that delivered 51 of
+    # the 55 landed syntax breaks in the benchmark trace sweep.
     p = _tmp("a.py", "")
     res = tool_write(p, "def f(:\n    pass\n")
-    check("py bad write warns", "warning" in res and "no longer parses" in res, res)
-    check("py warning has line info", "at line 1" in res, res)
+    check("py bad write rejected", res.startswith("[write rejected"), res)
+    check("py write reject has line info", "at line 1" in res, res)
+    with open(p) as f:
+        check("py bad write did not land", f.read() == "")
 
     # A valid write is silent.
     res = tool_write(p, "def f():\n    return 1\n")
-    check("py good write silent", "warning" not in res, res)
+    check("py good write silent", "warning" not in res and "rejected" not in res, res)
+
+    # An ALREADY-broken file stays overwritable with still-broken content — the
+    # whole-file rewrite is the sanctioned repair path and must never be stranded.
+    p = _tmp("w.py", "def broken(:\n")
+    res = tool_write(p, "def broken(:\n    x = 1\n")
+    check("py broken->broken write lands", res.startswith("[wrote"), res)
+    check("py broken->broken write still warns", "no longer parses" in res, res)
 
     # An edit that breaks the file is REJECTED and reverted (plan 073): a landed break
     # is the precondition for the repair-of-garbage loop a small model can't win.
-    # (`write` above stays warn-and-land — the multi-step escape hatch.)
+    p = _tmp("a2.py", "def f():\n    return 1\n")
     res = tool_edit(p, "def f():", "def f(:")
     check("py bad edit rejected", res.startswith("[edit rejected"), res)
     with open(p) as f:
@@ -58,16 +69,39 @@ def test_python():
 
 
 def test_tree_sitter_delta():
-    # A C file that ALREADY has parse errors: an unrelated valid edit must NOT warn
-    # (we only flag errors the edit itself introduced, never pre-existing ones).
+    # A C file that ALREADY has parse errors: an unrelated valid edit must NOT be
+    # flagged or blocked (we only act on errors the edit itself introduced).
     p = _tmp("c1.c", "int main( {  // deliberately broken header\nint x = 1;\n")
     res = tool_edit(p, "int x = 1;", "int x = 2;")
     check("ts pre-existing error not flagged", "warning" not in res, res)
+    check("ts pre-existing error still editable", res.startswith("[edited"), res)
 
-    # A clean C file that an edit breaks IS flagged.
-    p = _tmp("c2.c", "int main(){ return 0; }\n")
+    # A clean C file that an edit would break is REJECTED and reverted (plan 079: the
+    # measured vm.js/ars.R class — non-Python breaks used to land with a warning and
+    # compound through follow-up edits to reward-zero tasks).
+    before = "int main(){ return 0; }\n"
+    p = _tmp("c2.c", before)
     res = tool_edit(p, "return 0;", "return 0")  # drop the semicolon
-    check("ts newly-introduced error warns", "warning" in res, res)
+    check("ts newly-introduced error rejected", res.startswith("[edit rejected"), res)
+    check("ts reject says unparseable", "unparseable" in res, res)
+    with open(p) as f:
+        check("ts bad edit reverted", f.read() == before)
+
+    # A whole-file write that would take a clean ts-lang file to broken is rejected too.
+    p = _tmp("c3.c", before)
+    res = tool_write(p, "int main( { return 0; }\n")
+    check("ts clean->broken write rejected", res.startswith("[write rejected"), res)
+    with open(p) as f:
+        check("ts bad write did not land", f.read() == before)
+
+    # But a brand-NEW ts-lang file is never rejected, only warned — a grammar quirk on
+    # valid code must not block file creation (Python is held to ast.parse exactly;
+    # tree-sitter grammars are not that trustworthy on content they've never seen).
+    d = tempfile.mkdtemp(prefix="syntaxgate_")
+    p = os.path.join(d, "new.c")
+    res = tool_write(p, "int main( {\n")
+    check("ts new-file broken write lands", res.startswith("[wrote"), res)
+    check("ts new-file broken write warns", "warning" in res, res)
 
 
 def test_opt_out():
@@ -75,7 +109,8 @@ def test_opt_out():
     try:
         p = _tmp("c.py", "")
         res = tool_write(p, "def broken(:\n")
-        check("CHAD_NO_SYNTAX_GATE disables gate", "warning" not in res, res)
+        check("CHAD_NO_SYNTAX_GATE disables gate",
+              "warning" not in res and "rejected" not in res, res)
     finally:
         del os.environ["CHAD_NO_SYNTAX_GATE"]
 

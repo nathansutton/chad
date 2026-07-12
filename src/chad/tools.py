@@ -80,15 +80,32 @@ def tool_bash(command: str, timeout: int = 120, should_stop=None) -> str:
     while t.is_alive():
         if should_stop and should_stop():
             _kill_group(p); t.join(2)
-            return "[interrupted by user]"
+            return _bash_killed("[interrupted by user", box.get("out"))
         if time.time() > deadline:
             _kill_group(p); t.join(2)
-            return f"[timed out after {timeout}s]"
+            return _bash_killed(f"[timed out after {timeout}s", box.get("out"))
         t.join(0.1)
     out = (box.get("out") or "").strip()
     if p.returncode not in (0, None):
         out = f"[exit {p.returncode}]\n{out}"
     return _bash_headtail(out) if out else "[no output]"
+
+
+def _bash_killed(reason: str, partial: str | None) -> str:
+    """Result for a bash command chad killed (timeout or interrupt). The output the
+    process wrote before it died is already drained into `partial` by the join above —
+    keeping it is the whole point: a build/train/download that was killed still printed
+    how far it got (progress %, ETA, the last compile line, a hung-on-input prompt), and
+    that partial output is exactly what tells the model whether to raise the timeout,
+    background the command, or narrow the work. Discarding it (the old behavior) left the
+    model to guess blind and re-run from zero — the dominant TB2 timeout-loss mode. Same
+    head/tail clip as a normal result so a long partial can't blow up the prefill."""
+    partial = (partial or "").strip()
+    if not partial:
+        return reason + "; no output before it was killed]"
+    return (reason + f"; showing the {len(partial)} chars it printed before being killed — "
+            "raise the timeout, background it (`cmd & … ; wait`), or narrow the work]\n"
+            + _bash_headtail(partial))
 
 
 # Bash output budget. A plain head-slice is exactly wrong for the thing bash is used
@@ -199,16 +216,50 @@ def tool_write(path: str, content: str) -> str:
                 before = f.read()
         except OSError:
             pass
+    # Same contract as the targeted edit tools (plan 079): content that would newly
+    # break the file's parse never reaches disk. Rejected before makedirs, so a refused
+    # write has zero side effects.
+    reject = syntaxgate.write_reject(path, before, content)
+    if reject:
+        if before is not None:
+            _mark_seen(path, before)
+        return reject
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as f:
         f.write(content)
     _mark_seen(path, content)
-    result = f"[wrote {len(content)} bytes to {_rel(path)}]"
+    result = f"[wrote {len(content)} bytes to {_rel(path)}{_write_delta(before, content)}]"
     warn = syntaxgate.check_syntax(path, before)
     if warn:
         result += warn
     drift = syntaxgate.drift_warn(path, before, content)
     return result + drift if drift else result
+
+
+_WRITE_DELTA_MAX = 400_000   # SequenceMatcher is quadratic-ish; skip the note on huge files
+
+
+def _write_delta(before: str | None, content: str) -> str:
+    """A ' (+a -d lines vs previous)' fragment for an overwrite, so the model can sanity-
+    check the size of the change it just made against the size it intended — the cheap
+    core of lydia's diff-echo idea. The 079 dogfood sweep's no-op/loop episodes were
+    'model lost track of what the file now holds'; a write that claims a one-line tweak
+    but reports -300 lines is the earliest possible tell. Empty for new files, unchanged
+    content, or files too large to diff cheaply."""
+    if not levers.enabled("write_diff_note"):
+        return ""
+    if before is None or before == content \
+            or len(before) + len(content) > _WRITE_DELTA_MAX:
+        return ""
+    import difflib
+    adds = dels = 0
+    for d in difflib.unified_diff(before.splitlines(), content.splitlines(),
+                                  lineterm="", n=0):
+        if d.startswith("+") and not d.startswith("+++"):
+            adds += 1
+        elif d.startswith("-") and not d.startswith("---"):
+            dels += 1
+    return f" (+{adds} -{dels} lines vs previous)"
 
 
 # Edit robustness. Dogfooding logs showed ~1 in 6 `edit` calls failed to apply —

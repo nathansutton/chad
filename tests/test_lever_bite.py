@@ -455,6 +455,85 @@ def test_subagent_budget_note(monkeypatch, tmp_path):
     assert "sub-agent progress" not in cold, "ablated: the findings die with the sub-agent"
 
 
+# === iter-8 (plan 079) =====================================================
+
+def test_ts_edit_revert(monkeypatch, tmp_path):
+    """The vm.js/ars.R class: a targeted edit breaks a clean non-Python file. ON:
+    rejected, file intact. OFF: warn-and-land — the corruption that compounded through
+    6-20 follow-up edits to reward-zero benchmark tasks."""
+    n = bite("ts_edit_revert")
+    before = "int main(){ return 0; }\n"
+    on(monkeypatch)
+    p = tmp_path / "a.c"
+    p.write_text(before)
+    res = tools.tool_edit(str(p), "return 0;", "return 0")   # drop the semicolon
+    assert res.startswith("[edit rejected") and "unparseable" in res
+    assert p.read_text() == before, "reject must leave the file byte-identical"
+    off(monkeypatch, n)
+    p2 = tmp_path / "b.c"
+    p2.write_text(before)
+    res = tools.tool_edit(str(p2), "return 0;", "return 0")
+    assert res.startswith("[edited") and "warning" in res, \
+        "ablated: the non-Python break lands with only a warning"
+
+
+def test_write_gate(monkeypatch, tmp_path):
+    """Whole-file write refusing content that newly breaks the parse. ON: rejected,
+    disk untouched — and an already-broken file stays overwritable (the repair path).
+    OFF: the warn-only write that delivered 51/55 benchmark landed breaks."""
+    n = bite("write_gate")
+    on(monkeypatch)
+    p = tmp_path / "w.py"
+    p.write_text("x = 1\n")
+    res = tools.tool_write(str(p), "def f(:\n")
+    assert res.startswith("[write rejected") and "YOUR content" in res
+    assert p.read_text() == "x = 1\n", "reject must leave the file untouched"
+    broken = tmp_path / "broken.py"
+    broken.write_text("def g(:\n")
+    assert tools.tool_write(str(broken), "def g():\n    return 1\n").startswith("[wrote"), \
+        "an already-broken file must stay overwritable — that IS the repair path"
+    off(monkeypatch, n)
+    p2 = tmp_path / "w2.py"
+    p2.write_text("x = 1\n")
+    res = tools.tool_write(str(p2), "def f(:\n")
+    assert res.startswith("[wrote") and "no longer parses" in res, \
+        "ablated: warn-and-land returns on the write path"
+
+
+def test_broken_streak_steer(monkeypatch, tmp_path):
+    """Two consecutive landings on a still-broken file escalate the warning to a
+    whole-file-rewrite steer (the measured 14-landing streak rode flat per-edit
+    warnings). OFF: every landing gets the same flat warning."""
+    n = bite("broken_streak_steer")
+
+    def land_two(p):
+        p.write_text("def f(:\n")   # broken out-of-band, so edits stay allowed
+        r1 = tools.tool_edit(str(p), "def f(:", "def f(:  # try1")
+        r2 = tools.tool_edit(str(p), "# try1", "# try2")
+        return r1, r2
+
+    on(monkeypatch)
+    r1, r2 = land_two(tmp_path / "s.py")
+    assert "no longer parses" in r1 and "consecutive" not in r1, "first landing: flat warn"
+    assert "consecutive" in r2 and "STOP patching" in r2, "second landing: escalate"
+    off(monkeypatch, n)
+    r1, r2 = land_two(tmp_path / "s2.py")
+    assert "no longer parses" in r2 and "consecutive" not in r2, \
+        "ablated: the streak never escalates"
+
+
+def test_write_diff_note(monkeypatch, tmp_path):
+    n = bite("write_diff_note")
+    p = tmp_path / "d.py"
+    on(monkeypatch)
+    p.write_text("a = 1\nb = 2\n")
+    res = tools.tool_write(str(p), "a = 1\nb = 3\n")
+    assert "(+1 -1 lines vs previous)" in res
+    off(monkeypatch, n)
+    res = tools.tool_write(str(p), "a = 1\nb = 4\n")
+    assert res.startswith("[wrote") and "lines vs previous" not in res
+
+
 # === playbook levers (behavior asserted in their own suites) ===============
 
 def test_playbook_levers_have_dedicated_suites(monkeypatch):

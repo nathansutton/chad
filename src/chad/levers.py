@@ -146,10 +146,11 @@ LEVERS: dict[str, Lever] = {
         "An edit that turns a cleanly-parsing Python file into ANY SyntaxError is "
         "REVERTED (generalizes syntaxgate_revert beyond IndentationError), with the "
         "reject naming the severed multi-line statement and echoing the current lines. "
-        "Applies to edit/replace_lines/insert_lines/replace_symbol/insert_symbol; write "
-        "stays warn-only as the multi-step escape hatch. OFF restores warn-and-land: "
-        "the 073 dogfood landed ~10 corrupting line edits over ignored parse warnings "
-        "and aborted with the file broken.",
+        "Applies to edit/replace_lines/insert_lines/replace_symbol/insert_symbol "
+        "(non-Python languages and whole-file write are gated separately: "
+        "ts_edit_revert / write_gate, iter8). OFF restores warn-and-land: the 073 "
+        "dogfood landed ~10 corrupting line edits over ignored parse warnings and "
+        "aborted with the file broken.",
         "iter6", REGRESSION_GUARD),
     "edit_result_echo": Lever(
         "replace_lines/insert_lines results echo the changed region with its POST-edit "
@@ -176,6 +177,38 @@ LEVERS: dict[str, Lever] = {
         "order-dependent. OFF restores silent drift (the measured --context-tokens "
         "AttributeError shipped without a word).",
         "iter7"),
+
+    # --- iter-8 (plan 079): the validate-before-write choke point, from the lydia
+    #     teardown + the two-corpus trace sweep (320 dogfood sessions / 304 benchmark
+    #     trajectories): broken code LANDED 4x more often than it was rejected, 51/55
+    #     benchmark landings came through warn-only write, and non-Python files had no
+    #     revert at all (vm.js / ars.R compounded to reward-zero tasks). ---------------
+    "ts_edit_revert": Lever(
+        "Extends the 073 edit revert beyond Python: a targeted edit that takes a file "
+        "with zero tree-sitter ERROR/MISSING nodes to one with any is REVERTED. Dirty "
+        "baselines stay editable; no-grammar files are never blocked. OFF restores "
+        "warn-and-land on non-Python code — the measured make-mips-interpreter vm.js "
+        "break that six follow-up edits then compounded to a reward-zero task.",
+        "iter8", REGRESSION_GUARD),
+    "write_gate": Lever(
+        "Whole-file write refuses content that would newly break the parse (existing "
+        "clean file -> broken, or a new Python file that doesn't parse); an "
+        "already-broken file stays overwritable as the repair path, and a new "
+        "tree-sitter-language file only warns (grammar-quirk risk). OFF restores the "
+        "warn-only write that delivered 51 of the 55 landed syntax breaks in the "
+        "benchmark trace sweep.",
+        "iter8", REGRESSION_GUARD),
+    "broken_streak_steer": Lever(
+        "After 2+ consecutive landed mutations that leave a Python file unparseable "
+        "(the sanctioned already-broken path), the parse warning escalates to a "
+        "whole-file-rewrite / restore-known-good steer. The 079 dogfood sweep measured "
+        "a 14-landing broken streak that plain per-edit warnings never interrupted.",
+        "iter8"),
+    "write_diff_note": Lever(
+        "An overwrite's result carries '(+a -d lines vs previous)' so the model can "
+        "check the change's size against its intent — the cheap core of the diff-echo "
+        "idea; targets the lost-track-of-file-state no-op/loop episodes.",
+        "iter8"),
 
     # --- from the LangChain harness-tuning playbook. -------------------------------
     "compact_notice": Lever(

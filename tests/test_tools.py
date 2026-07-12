@@ -104,9 +104,26 @@ def test_bash():
     res = tools.tool_bash("printf oops; exit 3")
     check("bash: exit prefix", res.startswith("[exit 3]\n") and "oops" in res, res)
 
-    # timeout -> sentinel (0s deadline fires immediately)
-    check("bash: timeout", tools.tool_bash("sleep 5", timeout=0)
-          == "[timed out after 0s]")
+    # timeout with no output before the kill -> bare sentinel (0s deadline fires
+    # immediately, before `sleep` prints anything)
+    check("bash: timeout no output", tools.tool_bash("sleep 5", timeout=0)
+          == "[timed out after 0s; no output before it was killed]")
+
+    # timeout WITH partial output -> the output the process printed before the kill is
+    # preserved (the whole point: a killed build/train still printed how far it got).
+    # Print a marker, then sleep past a short deadline so the kill lands mid-run.
+    partial = tools.tool_bash("printf 'PROGRESS_50_PERCENT\\n'; sleep 5", timeout=1)
+    check("bash: timeout keeps partial", "PROGRESS_50_PERCENT" in partial, partial)
+    check("bash: timeout names the kill", partial.startswith("[timed out after 1s;"), partial[:60])
+
+    # interrupt (should_stop) also preserves partial output
+    stop = {"n": 0}
+    def should_stop():
+        stop["n"] += 1
+        return stop["n"] > 3  # let a couple poll cycles pass so the printf lands first
+    intr = tools.tool_bash("printf 'PARTIAL_BEFORE_CTRLC\\n'; sleep 5", should_stop=should_stop)
+    check("bash: interrupt keeps partial", "PARTIAL_BEFORE_CTRLC" in intr, intr)
+    check("bash: interrupt names the stop", intr.startswith("[interrupted by user;"), intr[:60])
 
     # long output keeps HEAD + TAIL + an omission marker, and the tail bias means
     # the last line (a failure summary lives here) survives when a head-only cut

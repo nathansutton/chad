@@ -1,20 +1,28 @@
-"""Deterministic post-edit syntax gate (plan 038; hardened by plans 067/073).
+"""Deterministic mutation syntax gate (plan 038; hardened by plans 067/073/079).
 
-After a successful write/edit/replace_symbol/insert_symbol, re-check the mutated
-file; if the edit *introduced* a syntax error, ride a warning along in the SAME tool
-result (`check_syntax`). For the targeted edit tools there is a stronger contract
-(`edit_reject`): an edit that turns a cleanly-parsing Python file into one that no
-longer parses is REVERTED, not merely warned about. The 073 dogfood showed why the
-warning alone is insufficient for a small model: it ignored ~10 consecutive "no longer
-parses" warnings while line-addressed edits severed a multi-line `def` signature, and
-every later edit was surgery on garbage. A file that was ALREADY broken stays editable
-(a real fix passes through still-broken states), and whole-file `write` stays warn-only
-as the escape hatch for deliberate multi-step rewrites.
+The contract (plan 079 unified it across every mutation tool): no tool call may take a
+file that parses to one that doesn't — a mutation that would newly break the parse is
+REFUSED with the file untouched (`edit_reject` for the targeted edit/symbol tools,
+`write_reject` for whole-file `write`), and only mutations the gate can't judge ride a
+warning along in the SAME tool result instead (`check_syntax`). The 073 dogfood showed
+why warning alone is insufficient for a small model: it ignored ~10 consecutive "no
+longer parses" warnings while line-addressed edits severed a multi-line `def` signature,
+and every later edit was surgery on garbage. The 079 trace sweep (320 dogfood sessions +
+304 benchmark trajectories) then showed the revert's per-tool opt-in was the remaining
+corruption engine: broken code LANDED 4x more often than it was rejected, 51 of 55
+benchmark landings came through warn-only `write`, and non-Python files (no revert at
+all) compounded to reward-zero tasks (vm.js, ars.R).
+
+A file that was ALREADY broken stays mutable (a real fix passes through still-broken
+states) — that, not `write`, is the sanctioned escape hatch; a file that must be
+CREATED with invalid syntax (a fixture for a linter task) goes through bash instead.
 
 Python is checked exactly with `ast.parse` (line-accurate). Other languages use a
-tree-sitter ERROR/MISSING-node delta: warn only when the edit ADDED nodes, since many
+tree-sitter ERROR/MISSING-node delta: act only when the edit ADDED nodes, since many
 real files carry baseline parse errors tree-sitter can't fully recover (and we must
-never warn on a pre-existing one). Gated by CHAD_NO_SYNTAX_GATE for run_evals --ab.
+never flag a pre-existing one) — and for tree-sitter langs a brand-NEW file only warns,
+never rejects, because a grammar quirk on valid code must not block file creation.
+Gated by CHAD_NO_SYNTAX_GATE for run_evals --ab.
 """
 
 import ast
@@ -43,21 +51,12 @@ def _parser(lang):
     return _PARSERS[lang]
 
 
-def _error_nodes(root) -> int:
-    """Count ERROR and MISSING nodes in the tree — tree-sitter's two ways of flagging a
-    fragment it couldn't parse."""
-    n, stack = 0, [root]
-    while stack:
-        node = stack.pop()
-        if node.type == "ERROR" or node.is_missing:
-            n += 1
-        stack.extend(node.children)
-    return n
-
-
-def _ts_error_count(lang, text: str):
-    """ERROR/MISSING count for `text` parsed as `lang`, or None if we can't tell (no
-    grammar / parse blew up) — a None means 'don't warn', never 'clean'."""
+def _ts_errors(lang, text: str) -> tuple[int, int | None] | None:
+    """(count, first_line) of ERROR/MISSING nodes — tree-sitter's two ways of flagging a
+    fragment it couldn't parse — for `text` parsed as `lang`. None if we can't tell (no
+    grammar / parse blew up) — a None means 'don't act', never 'clean'. `first_line` is
+    the 1-based line of the earliest flagged node (None when count is 0), carried into
+    reject messages so the model gets a location, not just a verdict."""
     parser = _parser(lang)
     if parser is None:
         return None
@@ -65,7 +64,45 @@ def _ts_error_count(lang, text: str):
         tree = parser.parse(text.encode("utf-8", "replace"))
     except Exception:
         return None
-    return _error_nodes(tree.root_node)
+    count, first, stack = 0, None, [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type == "ERROR" or node.is_missing:
+            count += 1
+            line = node.start_point[0] + 1
+            if first is None or line < first:
+                first = line
+        stack.extend(node.children)
+    return count, first
+
+
+def _ts_error_count(lang, text: str):
+    """ERROR/MISSING count only (see `_ts_errors`)."""
+    r = _ts_errors(lang, text)
+    return None if r is None else r[0]
+
+
+def _ts_error_loc(text: str, line: int) -> str:
+    """'line N: <fragment>' for a tree-sitter error location — or, when the flagged
+    line is blank (a MISSING node at end-of-input: the signature of a dropped closing
+    brace/paren/terminator), say that instead of quoting an empty string."""
+    lines = text.splitlines()
+    frag = lines[line - 1].strip() if 0 < line <= len(lines) else ""
+    if frag:
+        return f"line {line}: {frag!r}"
+    return (f"line {line} (the parser ran out of input — likely a missing closing "
+            f"brace/paren or block terminator)")
+
+
+# Consecutive landed-while-broken mutations per file (plan 079). With the reject gates
+# holding the clean->broken line, a still-broken file can only keep accumulating landings
+# on the sanctioned already-broken path — and the 079 dogfood sweep measured a model
+# riding that path for 14 consecutive landings without once restoring the parse. After
+# the second consecutive one the warning escalates from "fix this" to "stop patching:
+# rewrite the whole file / restore a good version". Keyed by abspath; reset the moment
+# the file parses again. Python-only: the tree-sitter branch warns on a newly-ADDED
+# error delta, not on every still-broken landing, so a streak there is unobservable.
+_BROKEN_STREAK: dict[str, int] = {}
 
 
 def check_syntax(path: str, before: str | None) -> str | None:
@@ -91,13 +128,23 @@ def check_syntax(path: str, before: str | None) -> str | None:
     lang = repomap.service().lang_for(path)
 
     if lang == "python":
+        ap = os.path.abspath(path)
         try:
             ast.parse(after)
+            _BROKEN_STREAK.pop(ap, None)
         except SyntaxError as e:
+            streak = _BROKEN_STREAK[ap] = _BROKEN_STREAK.get(ap, 0) + 1
             lines = after.splitlines()
             line = lines[e.lineno - 1] if e.lineno and e.lineno <= len(lines) else ""
+            more = ""
+            if streak >= 2 and levers.enabled("broken_streak_steer"):
+                more = (f" You have now landed {streak} consecutive changes while this "
+                        f"file does not parse — STOP patching it line by line. Rewrite "
+                        f"the ENTIRE file with write (send the complete corrected "
+                        f"content), or restore a known-good version (git checkout -- "
+                        f"{os.path.basename(path)}) and re-apply your change whole.")
             return (f"\n[warning: the file no longer parses — {e.msg} at line "
-                    f"{e.lineno}: {line.strip()!r}. Fix this before moving on.]")
+                    f"{e.lineno}: {line.strip()!r}. Fix this before moving on.{more}]")
         return None
 
     if lang:
@@ -189,21 +236,26 @@ def edit_reject(path: str, before: str, after: str,
     ignored ten consecutive parse warnings while stale line-range edits severed a
     multi-line `def` signature, then LOOP-ABORTed with the file broken. So for the
     targeted edit tools the contract is: every landed edit leaves the file parsing.
-    A multi-step change that must pass through a broken state has two sanctioned paths:
-    replace_symbol (whole-definition rewrite) or write (whole-file, still warn-only).
-    We reject ONLY when `before` parses cleanly — a file that was ALREADY broken is left
-    editable so a real fix (which passes through a transiently-still-broken state) is
-    never stranded. IndentationError keeps its own lever (`syntaxgate_revert`, plan 067)
-    and message; the generalization to any SyntaxError is levered as `syntax_revert`
-    (plan 073). `edit_range` = the 1-based [start, end] the edit replaced (start = end+1
-    for an insertion boundary), used to name the severed statement and echo the region.
+    A multi-step change that must pass through a broken state has one sanctioned path:
+    the file being ALREADY broken — we reject ONLY when `before` parses cleanly, so a
+    real fix (which passes through a transiently-still-broken state) is never stranded.
+    IndentationError keeps its own lever (`syntaxgate_revert`, plan 067) and message;
+    the generalization to any SyntaxError is levered as `syntax_revert` (plan 073); the
+    extension beyond Python is levered as `ts_edit_revert` (plan 079 — the measured
+    gap: a landed vm.js/ars.R break compounded through 6-20 follow-up edits to a
+    reward-zero task, because non-Python only ever warned). `edit_range` = the 1-based
+    [start, end] the edit replaced (start = end+1 for an insertion boundary), used to
+    name the severed statement and echo the region.
     """
     if config.flag("CHAD_NO_SYNTAX_GATE"):
         return None
     if len(after) > _MAX_BYTES:
         return None
-    if repomap.service().lang_for(path) != "python":
+    lang = repomap.service().lang_for(path)
+    if not lang:
         return None
+    if lang != "python":
+        return _ts_reject(path, lang, before, after, edit_range)
     try:
         tree = ast.parse(before)
     except SyntaxError:
@@ -256,6 +308,89 @@ def edit_reject(path: str, before: str, after: str,
         parts.append("\n Current lines (unchanged, use THESE numbers):\n"
                      + _numbered(before, echo_a - 2, echo_b + 2) + "\n]")
         return "".join(parts)
+
+
+def _ts_reject(path: str, lang: str, before: str, after: str,
+               edit_range: tuple[int, int] | None) -> str | None:
+    """`edit_reject` for the tree-sitter languages: reject an edit that takes a file
+    with ZERO ERROR/MISSING nodes to one with any. The same don't-strand contract as
+    Python — a dirty baseline (pre-existing errors, common in files tree-sitter can't
+    fully recover) stays editable, and an unjudgeable file (no grammar) is never
+    blocked. Exactness caveat: a grammar quirk could flag valid code, which is why this
+    only guards the clean->broken TRANSITION — content the same grammar just parsed
+    cleanly in `before` is a trustworthy baseline for judging `after`."""
+    if not levers.enabled("ts_edit_revert"):
+        return None
+    before_errs = _ts_errors(lang, before)
+    if before_errs is None or before_errs[0] > 0:
+        return None            # can't tell, or already broken — don't strand a fix
+    after_errs = _ts_errors(lang, after)
+    if after_errs is None or after_errs[0] == 0:
+        return None
+    parts = [f"[edit rejected: it would leave {os.path.basename(path)} unparseable — "
+             f"syntax error near {_ts_error_loc(after, after_errs[1] or 1)}. The file "
+             f"was left unchanged. Re-send the change as a COMPLETE statement/block "
+             f"(never a fragment of a multi-line construct), or rewrite the whole "
+             f"definition with replace_symbol."]
+    if edit_range:
+        a, b = min(edit_range), max(edit_range)
+        parts.append("\n Current lines (unchanged, use THESE numbers):\n"
+                     + _numbered(before, a - 2, b + 2) + "\n]")
+    else:
+        parts.append("]")
+    return "".join(parts)
+
+
+def write_reject(path: str, before: str | None, content: str) -> str | None:
+    """A rejection when a whole-file `write` would newly break the file's parse, else
+    None — `tool_write` refuses the disk write entirely (plan 079). `write` was the
+    warn-only escape hatch of the 073 contract, and the benchmark sweep measured the
+    price: 51 of 55 landed syntax breaks arrived through it. The gate keeps both
+    don't-strand outlets: an ALREADY-broken file may be overwritten with still-broken
+    content (that is the repair path — and the reject text steers there), and for
+    tree-sitter languages a brand-new file is never rejected (a grammar quirk on valid
+    code must not block creation; check_syntax still warns). A new Python file is held
+    to `ast.parse` exactly — its content is entirely model-authored, so a parse failure
+    is a defect in the content, not the file. Deliberately-invalid fixtures go through
+    bash, and the message says so."""
+    if config.flag("CHAD_NO_SYNTAX_GATE"):
+        return None
+    if not levers.enabled("write_gate"):
+        return None
+    if len(content) > _MAX_BYTES or (before is not None and len(before) > _MAX_BYTES):
+        return None
+    lang = repomap.service().lang_for(path)
+    if not lang:
+        return None
+    bash_hint = ("If this file is SUPPOSED to contain invalid syntax (a test fixture), "
+                 "create it with bash (cat > file <<'EOF') instead.")
+    if lang == "python":
+        if before is not None:
+            try:
+                ast.parse(before)
+            except SyntaxError:
+                return None    # already broken — the whole-file rewrite IS the repair path
+        try:
+            ast.parse(content)
+            return None
+        except SyntaxError as e:
+            lines = content.splitlines()
+            frag = lines[e.lineno - 1].strip() if e.lineno and e.lineno <= len(lines) else ""
+            fate = "was not created" if before is None else "was left unchanged"
+            return (f"[write rejected: the content you sent does not parse — {e.msg} at "
+                    f"line {e.lineno}: {frag!r}. The file {fate}. The error is inside "
+                    f"YOUR content: fix it and re-send the complete file. {bash_hint}]")
+    if before is None:
+        return None            # new tree-sitter file: warn-only (grammar-quirk risk)
+    before_errs = _ts_errors(lang, before)
+    if before_errs is None or before_errs[0] > 0:
+        return None
+    after_errs = _ts_errors(lang, content)
+    if after_errs is None or after_errs[0] == 0:
+        return None
+    return (f"[write rejected: the new content no longer parses — syntax error near "
+            f"{_ts_error_loc(content, after_errs[1] or 1)}. The file was left "
+            f"unchanged. Fix the syntax and re-send the complete file. {bash_hint}]")
 
 
 def indent_reject(path: str, before: str, after: str) -> str | None:

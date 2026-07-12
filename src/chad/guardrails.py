@@ -401,7 +401,7 @@ def edit_failed_to_land(result: str) -> bool:
     for its remaining steps and never called done)."""
     return result.startswith((
         "[no-op edit", "[old string not found", "[old string appears",
-        "[old string matches", "[no such file", "[edit rejected"))
+        "[old string matches", "[no such file", "[edit rejected", "[write rejected"))
 
 
 def edit_fail_kind(result: str) -> str | None:
@@ -414,6 +414,11 @@ def edit_fail_kind(result: str) -> str | None:
     while being told to re-read and paste verbatim."""
     if result.startswith("[no-op edit"):
         return "noop"
+    if result.startswith("[write rejected"):
+        # The write gate refused the content itself (plan 079): the syntax error is in
+        # what the model SENT, so neither re-reading the file nor switching edit tools
+        # helps — it must fix its own content.
+        return "badsyntax"
     if result.startswith("[edit rejected"):
         # Three reverted-edit shapes, each with its own remedy (plan 073): a structural
         # parse break (stop patching fragments → whole statement / replace_symbol), a
@@ -457,6 +462,12 @@ _STRUCTURE_BREAK = (
     "complete new function, or a single `replace_lines` covering the ENTIRE statement "
     "(the reject message printed its exact line span — use those numbers). Never edit "
     "part of a multi-line statement.]")
+_BADSYNTAX_BREAK = (
+    "[STOP re-sending broken content: your last writes were REJECTED because the content "
+    "you sent does not parse — the error is inside YOUR content, not the file on disk. "
+    "Re-reading the file or switching tools will not help. Look at the exact line the "
+    "reject message quoted, fix that syntax error in your draft, and re-send the "
+    "COMPLETE corrected file in one write.]")
 
 
 def edit_loop_break(noop_edit_streak, break_nudges, kind=None):
@@ -481,6 +492,8 @@ def edit_loop_break(noop_edit_streak, break_nudges, kind=None):
         return _INDENT_BREAK
     if kind == "structure":
         return _STRUCTURE_BREAK
+    if kind == "badsyntax":
+        return _BADSYNTAX_BREAK
     return _NOMATCH_BREAK
 
 
