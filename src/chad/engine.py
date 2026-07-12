@@ -202,10 +202,37 @@ def enforce_cache_budget(cache_dir: str, max_bytes: int, protect: set) -> int:
     return freed
 
 
+class _KeyedSampler:
+    """Categorical sampler on an explicit PRNG key chain.
+
+    MLX's implicit-key RNG never advances on non-main threads: every
+    mx.random.categorical() there reuses the same frozen noise, so temp>0
+    "sampling" replays one draw per position — byte-identical responses across
+    identical requests AND loop-prone quasi-greedy decoding (`chad --serve`
+    generates on a worker thread; the night-7 replay class). Per-request
+    mx.random.seed() cannot fix it because the seeded state is never consumed
+    off the main thread. Splitting an explicit key per draw sidesteps global
+    RNG state entirely and behaves identically on every thread. Measured on
+    mlx 0.32.0: worker-thread draws [7,7,7,...] implicit vs varied explicit.
+    """
+
+    def __init__(self, temp: float, seed: Optional[int] = None):
+        self._inv_t = 1.0 / temp
+        self._key = mx.random.key(
+            int.from_bytes(os.urandom(4), "little") if seed is None else seed)
+
+    def __call__(self, logprobs):
+        self._key, sub = mx.random.split(self._key)
+        return mx.random.categorical(logprobs * self._inv_t, key=sub)
+
+
 @dataclass
 class Engine:
     model_id: str = "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"
-    draft_id: Optional[str] = "mlx-community/Qwen2.5-Coder-0.5B-Instruct-4bit"
+    # No draft model on the shipped path (cli.py passes None explicitly; the old
+    # 0.5B default predates the single-model design and was a footgun waiting for
+    # a caller that forgot to override it).
+    draft_id: Optional[str] = None
     num_draft_tokens: int = 3
     temp: float = 0.0
     kv_bits: Optional[int] = None   # set to 8 to quantize the KV cache (saves RAM)
@@ -235,10 +262,25 @@ class Engine:
     _pld_hybrid: bool = field(init=False, default=False)
     _warm_prefix_ids: Any = field(init=False, default=None)
     kv_bytes_per_token: float = field(init=False, default=0.0)  # measured at load (036)
+    # Model-shape facts read from config at load, for the adaptive prefill chunk
+    # (plan 075 WS1.3): MoE prefill amortizes routing with bigger chunks (+14%
+    # measured 512→2048 on the 35B) while the dense 9B is compute-flat, and the
+    # unfused head_dim-256 attention's transient scales with heads*chunk*kv_len.
+    _is_moe: bool = field(init=False, default=False)
+    _n_attn_heads: int = field(init=False, default=16)
     # One-deep cache quarantine stack (plan 041): push_cache stashes the live
     # (cache, cached_ids, flags) here so a subagent can run in a fresh isolated cache;
     # pop_cache restores it bit-identically. Depth 1 only — subagents never nest.
     _cache_stack: list = field(init=False, default_factory=list)
+    # Bounded rewind for the non-trimmable hybrid (plan 075): ONE recurrent-state
+    # snapshot per turn, taken at prefill-end (reference copy — the DeltaNet layers
+    # reassign their state arrays each step, so old arrays stay immutably valid).
+    # {"pos": resident tokens at snapshot, "recurrent": _snap_recurrent()}. Lets
+    # _sync_to recover a divergence INSIDE the last turn (truncated generation,
+    # a dropped stream, an identical-prompt retry) by restoring the recurrent state,
+    # native-trimming the attention KV, and re-feeding the few agreed-on tokens —
+    # instead of the full-transcript re-prefill divergence used to cost.
+    _rewind_snap: Optional[dict] = field(init=False, default=None)
 
     def _read_config(self, repo):
         import json
@@ -304,9 +346,45 @@ class Engine:
             d_override, _ = self._ctx_override(dpath)
             self.draft, _ = load(dpath, model_config=d_override) if d_override \
                 else load(dpath)
+        self._read_model_shape(path)
+        self._install_memory_clamp()
         self._reset_cache()
         self.kv_bytes_per_token = self._measure_kv_bytes_per_token()
         return time.time() - t0
+
+    def _read_model_shape(self, path: str) -> None:
+        """Capture the config facts the adaptive prefill chunk needs (plan 075):
+        attention head count (sizes the unfused-SDPA transient) and whether the
+        model is a MoE (bigger chunks amortize expert routing). Best-effort —
+        the defaults are the shipped 9B/35B shapes."""
+        try:
+            cfg = self._read_config(path)
+            tc = cfg.get("text_config", cfg)
+            self._n_attn_heads = int(tc.get("num_attention_heads") or 16)
+            self._is_moe = (tc.get("num_experts") is not None
+                            or "moe" in str(cfg.get("model_type", "")).lower()
+                            or "moe" in str(tc.get("model_type", "")).lower())
+        except Exception:  # noqa: BLE001 — shape probing must never break load
+            pass
+
+    def _install_memory_clamp(self) -> None:
+        """Plan 075 WS1.1: give the Metal allocator explicit limits instead of the
+        purely predictive ctx-limit formula. `set_wired_limit` keeps the resident
+        working set wired up to Apple's recommendation (the mlx-lm `wired_limit()`
+        pattern chad never adopted); `set_memory_limit` slightly below it makes the
+        allocator back-pressure (block/relieve) on a transient spike instead of
+        letting it ride into a jetsam SIGKILL — the documented 35B-on-24GB failure
+        mode. Opt out with CHAD_NO_MEMORY_CLAMP."""
+        if config.flag("CHAD_NO_MEMORY_CLAMP"):
+            return
+        try:
+            budget = int(mx.device_info()["max_recommended_working_set_size"])
+            mx.set_wired_limit(budget)
+            mx.set_memory_limit(int(budget * 0.92))
+            log.info("MEMORY clamp: wired=%.2f GB, limit=%.2f GB",
+                     budget / 1e9, budget * 0.92 / 1e9)
+        except Exception as e:  # noqa: BLE001 — clamping is defense-in-depth only
+            log.warning("memory clamp unavailable: %s", e)
 
     def _measure_kv_bytes_per_token(self, probe: int = 8) -> float:
         """One-time: per-token bytes the growing attention KV cache costs, so the
@@ -339,6 +417,13 @@ class Engine:
 
     # -- cache management -------------------------------------------------
 
+    @property
+    def resident_tokens(self) -> int:
+        """Tokens currently resident in the live KV cache. Lets the governor's live
+        ctx-limit recheck (cli._compute_ctx_limit) separate the model's fixed floor
+        from the grown cache when reading mx.get_active_memory()."""
+        return len(self._cached_ids)
+
     def reset(self):
         """Public alias for `_reset_cache` (plan 046 BaseEngine seam). Consumers (TUI /
         REPL / cli governor) call this; the private name stays the engine's own internal
@@ -359,6 +444,10 @@ class Engine:
         """Classify the live cache: trimmable (attention-only) vs a qwen3_5-style
         hybrid we can still roll back specially. Called whenever self._cache is
         replaced (reset, warm-start load, compaction reload)."""
+        # A replaced cache invalidates the turn-boundary rewind snapshot — its
+        # position is meaningless against new contents. (pop_cache restores the
+        # pushed snapshot explicitly, after its direct flag assignments.)
+        self._rewind_snap = None
         self._trimmable = cache_utils.can_trim_prompt_cache(self._cache)
         # ...BUT a qwen3_5-style hybrid is recoverable a different way: its
         # Gated-DeltaNet layers (ArraysCache) reassign their state arrays each step
@@ -466,6 +555,50 @@ class Engine:
         kv = [c for c in self._cache if isinstance(c, cache_utils.KVCache)]
         cache_utils.trim_prompt_cache(kv, n)
 
+    def _take_rewind_snapshot(self, pos: int) -> None:
+        """Capture the turn-boundary rewind point: the recurrent state as of `pos`
+        resident tokens. Called at prefill-end, before decode, on the non-trimmable
+        hybrid only (a trimmable cache rewinds natively). `pos` is passed explicitly
+        because `_cached_ids` is only reconciled AFTER decode — at prefill-end it
+        still holds the pre-turn prefix. The copy is by reference — DeltaNet layers
+        REASSIGN their state arrays each step, so the snapshot pins one generation
+        of state arrays (~tens of MB) and stays exact."""
+        # Gate on the same cache composition the PLD-hybrid rollback validated
+        # (_pld_hybrid: non-trimmable, draft-less, plain KVCache + ArraysCache
+        # layers only): _rewind_to trims via _trim_kv, which only sees plain
+        # KVCache — a quantized or exotic cache layer would silently NOT be
+        # trimmed and corrupt the rewind. kv_bits also converts layers mid-decode,
+        # so it is excluded outright.
+        if not self._pld_hybrid or self.kv_bits or pos <= 0:
+            return
+        self._rewind_snap = {"pos": pos, "recurrent": self._snap_recurrent()}
+
+    def _rewind_to(self, target_ids: list, upto: int) -> Optional[int]:
+        """Bounded rewind on the non-trimmable hybrid: land the cache at exactly
+        `target_ids[:upto]` using the turn-boundary snapshot, when the snapshot
+        position is at or before `upto` (both sequences agree through `upto` by the
+        caller's contract). Restore the recurrent state to the snapshot point,
+        native-trim the attention KV back to it, then re-feed the agreed-on tokens
+        so both stacks advance together — the same restore/trim/re-feed primitive
+        the PLD-hybrid path proved bit-exact (test_pld_hybrid_equals_greedy), over
+        a longer range. Returns `upto` on success, None when no usable snapshot
+        (caller falls back to the full rebuild)."""
+        snap = self._rewind_snap
+        if not snap or snap["pos"] > upto or snap["pos"] > len(self._cached_ids):
+            return None
+        peel = len(self._cached_ids) - snap["pos"]
+        self._restore_recurrent(snap["recurrent"])
+        if peel:
+            self._trim_kv(peel)
+        self._cached_ids = self._cached_ids[: snap["pos"]]
+        refeed = list(target_ids[snap["pos"] : upto])
+        if refeed:
+            self._prefill(refeed)
+            self._cached_ids = list(target_ids[:upto])
+        log.info("REWIND to %d resident tokens (snapshot@%d, re-fed %d) — "
+                 "skipped a full re-prefill", upto, snap["pos"], len(refeed))
+        return upto
+
     def _sync_to(self, target_ids: list) -> int:
         """Trim the cache down to the longest common prefix with target_ids.
 
@@ -486,6 +619,12 @@ class Engine:
                 if draft_cache:
                     cache_utils.trim_prompt_cache(draft_cache, extra)
                 self._cached_ids = self._cached_ids[:common]
+            elif self._rewind_to(target_ids, common) is not None:
+                # Bounded rewind (plan 075): the divergence sits inside the last
+                # turn (truncated generation re-rendered, a dropped serve stream,
+                # a retried prompt) — recovered above at the cost of re-feeding at
+                # most one turn's tokens instead of the whole transcript.
+                pass
             else:
                 # Not trimmable (hybrid) -> can't partially rewind in RAM, so rebuild.
                 # But the dominant divergence in agentic loops is *compaction*, which
@@ -564,6 +703,11 @@ class Engine:
             "warm_prefix_ids": self._warm_prefix_ids,
             "cache": self._cache,
             "spill_path": None,
+            # The rewind snapshot is reference-copied recurrent state belonging to
+            # THIS cache; it survives the push in RAM either way (tiny next to the
+            # cache itself) and is restored on pop so the parent's rewind window
+            # isn't lost to a subagent round-trip.
+            "rewind_snap": self._rewind_snap,
         }
         if self._should_spill(self._cached_ids):
             path = self._ckpt_path(self._cached_ids, tag=_CKPT_PUSH)
@@ -616,6 +760,7 @@ class Engine:
         self._trimmable = frame["trimmable"]
         self._pld_hybrid = frame["pld_hybrid"]
         self._warm_prefix_ids = frame["warm_prefix_ids"]
+        self._rewind_snap = frame["rewind_snap"]
         mx.clear_cache()
 
     def _enforce_kv_budget(self, just_written: str) -> None:
@@ -631,12 +776,66 @@ class Engine:
 
     # -- generation -------------------------------------------------------
 
+    def _adaptive_chunk(self, kv_len: int) -> int:
+        """Prefill chunk size for the next chunk, given `kv_len` tokens already
+        resident (plan 075 WS1.3). Two measured facts drive this:
+
+        - The 35B MoE gains +14% prefill throughput from 512→2048 chunks (routing
+          amortization); the dense 9B is compute-bound flat across chunk sizes, so
+          bigger chunks buy it nothing and only add transient memory.
+        - Both models run head_dim-256 attention, which falls off MLX's fused-SDPA
+          path: each chunk materializes an fp32 (heads, chunk, kv_len) score tensor
+          per attention layer, so the transient grows with chunk*kv_len — big chunks
+          at long context are the prefill-OOM signature.
+
+        So: start from a model-shaped base (MoE 2048, dense 512) and cap the chunk
+        so the score-tensor transient stays inside half the free band under the
+        Metal budget, floored at 256 so progress never stalls."""
+        base = 2048 if getattr(self, "_is_moe", False) else 512
+        try:
+            budget = int(mx.device_info()["max_recommended_working_set_size"])
+            free = budget * 0.90 - mx.get_active_memory()
+            allow = max(free * 0.5, 256e6)
+            per_tok = 4.0 * getattr(self, "_n_attn_heads", 16) * max(kv_len, 1)
+            return max(256, min(base, int(allow / per_tok)))
+        except Exception:  # noqa: BLE001 — memory probe unavailable -> static base
+            return base
+
+    def _snapshot_cache_refs(self):
+        """Reference snapshot of every cache layer's attributes, taken before a
+        prefill chunk so a caught Metal OOM (catchable on mlx>=0.32) can roll the
+        cache back exactly. MLX arrays are immutable graph nodes — a failed step
+        leaves the *python attributes* pointing at poisoned lazy arrays, but the
+        pre-step arrays we hold references to are untouched, so restore is exact and
+        free. Snapshot the raw `__dict__` (lists copied one level, since ArraysCache
+        mutates its list elements in place) rather than the `.state` property — the
+        KVCache getter RAISES on an empty cache (keys is None before token one),
+        and a snapshot helper must work at every point in the cache lifecycle."""
+        snap = []
+        for c in self._cache:
+            d = {k: (list(v) if isinstance(v, list) else v)
+                 for k, v in c.__dict__.items()}
+            snap.append((c, d))
+        return snap
+
+    def _restore_cache_refs(self, snap) -> None:
+        for c, d in snap:
+            for k, v in d.items():
+                setattr(c, k, list(v) if isinstance(v, list) else v)
+
     def _prefill(self, ids: list, should_stop=None, chunk: Optional[int] = None,
                  on_progress=None) -> int:
         """Feed token ids through the model into the live cache in chunks, checking
         should_stop between chunks. Returns the count actually fed (< len(ids) when
         interrupted). This is what makes a large re-prefill abortable: MLX runs one
         chunk at a time and we get a chance to bail between them.
+
+        Chunk sizing: an explicit `chunk` argument or CHAD_PREFILL_CHUNK wins;
+        otherwise each chunk is sized adaptively from the model shape and the live
+        free band (see `_adaptive_chunk`). A Metal OOM inside a chunk (catchable on
+        mlx>=0.32) rolls the cache back to the pre-chunk snapshot, drops the scratch
+        pool, and retries at half the size — turning the old process-killing spike
+        into a slower-but-alive step.
 
         on_progress(done, total), if given, fires once per chunk with the tokens fed
         so far (monotonic, ending at `total` on a clean pass) so a caller can show a
@@ -645,14 +844,31 @@ class Engine:
         non-trimmable cache."""
         mc = self._cache
         n = len(ids)
-        chunk = chunk if chunk is not None else config.env_int("CHAD_PREFILL_CHUNK", 512)
+        if chunk is None:
+            chunk = config.env_int("CHAD_PREFILL_CHUNK", 0) or None
+        kv_base = len(getattr(self, "_cached_ids", None) or [])
+        oom_cap: Optional[int] = None  # halved on each caught Metal OOM
         i = 0
         while i < n:
             if should_stop and should_stop():
                 break
-            step = min(chunk, n - i)
-            self.model(mx.array(ids[i : i + step], dtype=mx.uint32)[None], cache=mc)
-            mx.eval([c.state for c in mc])
+            step = chunk if chunk else self._adaptive_chunk(kv_base + i)
+            if oom_cap:
+                step = min(step, oom_cap)
+            step = min(step, n - i)
+            snap = self._snapshot_cache_refs()
+            try:
+                self.model(mx.array(ids[i : i + step], dtype=mx.uint32)[None], cache=mc)
+                mx.eval([c.state for c in mc])
+            except RuntimeError as e:
+                if "memory" not in str(e).lower() or step <= 64:
+                    raise
+                self._restore_cache_refs(snap)
+                mx.clear_cache()
+                oom_cap = max(64, step // 2)
+                log.warning("PREFILL Metal OOM at %d/%d (kv=%d): retrying with "
+                            "chunk=%d", i, n, kv_base + i, oom_cap)
+                continue
             i += step
             if on_progress:
                 on_progress(i, n)
@@ -728,6 +944,15 @@ class Engine:
                 self._cached_ids = self._cached_ids[:-1]
                 stats.prompt_tokens = 1
                 stats.cached_tokens = common - 1
+            elif self._rewind_to(prompt_ids, len(prompt_ids) - 1) is not None:
+                # Non-trimmable hybrid with a turn-boundary snapshot (plan 075):
+                # land the cache at exactly prompt_ids[:-1] via the bounded rewind,
+                # then re-feed the last token as the conditioning input — same shape
+                # as the trimmable branch above, no full rebuild.
+                common = len(prompt_ids) - 1
+                suffix = prompt_ids[-1:]
+                stats.prompt_tokens = 1
+                stats.cached_tokens = common
             else:
                 # Non-trimmable hybrid (e.g. Ornith): we cannot pop a single token off
                 # the recurrent state, so trimming is invalid and re-feeding would
@@ -745,7 +970,8 @@ class Engine:
 
         kwargs = dict(
             max_tokens=max_tokens,
-            sampler=make_sampler(temp=self.temp),
+            sampler=(_KeyedSampler(self.temp) if self.temp > 0
+                     else make_sampler(temp=self.temp)),
             prompt_cache=self._cache,
         )
         if self.kv_bits:
@@ -759,6 +985,7 @@ class Engine:
         # but the last token ourselves so should_stop is honored between chunks.
         # stream_generate then only has to prefill the final token before decoding.
         gen_prompt = suffix
+        resident = common
         if self.draft is None and not self.kv_bits and len(suffix) > 1:
             fed = self._prefill(suffix[:-1], should_stop, on_progress=on_prefill_progress)
             if fed < len(suffix) - 1:  # interrupted mid-prefill
@@ -766,28 +993,51 @@ class Engine:
                 stats.prefill_s = time.time() - t0
                 return "", stats
             gen_prompt = suffix[-1:]
+            resident = common + fed
+        # Turn-boundary rewind point (plan 075): everything resident right now is the
+        # agreed-on prompt; whatever this turn appends past here is what a divergence
+        # inside it will need to rewind. No-op on trimmable caches.
+        self._take_rewind_snapshot(resident)
 
         text = ""
         gen_ids = []
         first_token_at = None
-        for resp in stream_generate(self.model, self.tok, mx.array(gen_prompt), **kwargs):
-            if first_token_at is None:
-                first_token_at = time.time()
-                stats.prefill_s = first_token_at - t0
-            text += resp.text
-            gen_ids.append(resp.token)
-            if on_token:
-                on_token(resp.text)
-            if stop_texts and any(s in text for s in stop_texts):
-                break
-            if should_stop and should_stop():
-                break
-            if stop_condition is not None and stop_condition(text, len(gen_ids)):
-                stats.stop_condition_fired = True
-                break
+        oom_degraded = False
+        try:
+            for resp in stream_generate(self.model, self.tok, mx.array(gen_prompt),
+                                        **kwargs):
+                if first_token_at is None:
+                    first_token_at = time.time()
+                    stats.prefill_s = first_token_at - t0
+                text += resp.text
+                gen_ids.append(resp.token)
+                if on_token:
+                    on_token(resp.text)
+                if stop_texts and any(s in text for s in stop_texts):
+                    break
+                if should_stop and should_stop():
+                    break
+                if stop_condition is not None and stop_condition(text, len(gen_ids)):
+                    stats.stop_condition_fired = True
+                    break
+        except RuntimeError as e:
+            # Metal OOM mid-decode (catchable on mlx>=0.32). stream_generate manages
+            # the cache internally, so its state after a mid-forward failure is
+            # unknowable — the only safe recovery is a clean rebuild. Keep the text
+            # decoded so far (a partial turn beats a dead process); the next turn
+            # warm-starts the system prefix from disk and re-prefills the body.
+            if "memory" not in str(e).lower():
+                raise
+            log.warning("DECODE Metal OOM after %d tokens: dropping cache, keeping "
+                        "partial text", len(gen_ids))
+            oom_degraded = True
         stats.gen_s = time.time() - (first_token_at or t0)
         stats.generated_tokens = len(gen_ids)
 
+        if oom_degraded:
+            self._reset_cache()
+            mx.clear_cache()
+            return text, stats
         # The cache now holds prefix + the tokens we generated.
         self._cached_ids = prompt_ids + gen_ids
         # Return MLX's freed-buffer pool to the OS. The live KV cache is held in
@@ -823,7 +1073,7 @@ class Engine:
 
         mc = self._cache  # model-only cache (no draft model on this path)
         eos = self._eos_ids()
-        prefill_step = 512
+        prefill_step = None  # None -> env override or adaptive sizing (see _prefill)
         # On a hybrid cache we roll drafts back by snapshot/restore instead of trim.
         hybrid = self._pld_hybrid and not self._trimmable
 
@@ -841,6 +1091,10 @@ class Engine:
                 self._cached_ids = list(prompt_ids[: common + fed])
                 stats.prefill_s = time.time() - t0
                 return False
+            # Turn-boundary rewind point (plan 075) — see generate(). `common` and
+            # `suffix` are rebound by the degenerate branch before its call, so this
+            # is correct from both call sites.
+            self._take_rewind_snapshot(common + fed)
             return True
 
         # Prefill everything but the last token (we need a token to condition on).

@@ -33,7 +33,11 @@ dependencies = [
     # Apple-only: no CPU/CUDA build exists. Platform-gated so `pip install chad-code`
     # succeeds on Linux (e.g. a benchmark container) for the remote `--backend llama/openai`
     # path, which loads no MLX. On macOS the default in-process engine installs it as before.
-    "mlx>=0.31.2,<0.32; sys_platform == 'darwin'",
+    # mlx 0.32.0: Metal command-buffer failures (incl. OOM) become catchable Python
+    # exceptions instead of a SIGABRT (ml-explore/mlx#3523) — engine._prefill/generate
+    # lean on that for the 35B-on-24GB recovery path (plan 075 WS1.2). Perf re-gated
+    # on the bump: prefill/decode within noise of 0.31.2 on both shipped models.
+    "mlx>=0.32.0,<0.33; sys_platform == 'darwin'",
     "mlx-lm>=0.31.3,<0.32; sys_platform == 'darwin'",
     # mlx-lm requires transformers>=5.0, but 5.13.0 regressed AutoTokenizer.register:
     # it now does `key.__module__.startswith("transformers.")` with no hasattr guard, and

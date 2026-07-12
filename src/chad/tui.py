@@ -255,9 +255,10 @@ def _make_history():
 class TUI:
     def __init__(self, engine: BaseEngine, ctx_limit: int, mode: str = "normal",
                  thinking: bool = True, max_chars: int = 400_000, resume: list = None,
-                 ctx_window: int = None, finalize=None):
+                 ctx_window: int = None, finalize=None, ctx_limit_fn=None):
         self.engine = engine
         self.ctx_limit = ctx_limit
+        self._ctx_limit_fn = ctx_limit_fn  # live per-turn recheck (plan 075 WS1.4)
         self.ctx_window = ctx_window or ctx_limit  # window shown in the banner
         self.thinking = thinking
         self._resume = resume
@@ -300,7 +301,7 @@ class TUI:
         self.agent = Agent(
             engine, ctx_limit=ctx_limit, mode=mode, thinking=thinking,
             emit=self._emit, confirm=self._confirm, should_stop=self._interrupt.is_set,
-            resume=resume, persist=True,
+            resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn,
         )
 
         # Plan-mode handoff state. After a plan-mode turn writes a plan file,
@@ -613,7 +614,7 @@ class TUI:
         self.agent = Agent(
             self.engine, ctx_limit=self.ctx_limit, mode=mode,
             thinking=self.thinking, emit=self._emit, confirm=self._confirm,
-            should_stop=self._interrupt.is_set,
+            should_stop=self._interrupt.is_set, ctx_limit_fn=self._ctx_limit_fn,
         )
         self._pending_plan = None
         self._pending_budget_note = None
@@ -916,6 +917,6 @@ class TUI:
 
 
 def run_tui(engine: BaseEngine, ctx_limit: int, mode: str = "normal", thinking: bool = True,
-            resume: list = None, ctx_window: int = None, finalize=None):
+            resume: list = None, ctx_window: int = None, finalize=None, ctx_limit_fn=None):
     asyncio.run(TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume,
-                    ctx_window=ctx_window, finalize=finalize).run())
+                    ctx_window=ctx_window, finalize=finalize, ctx_limit_fn=ctx_limit_fn).run())

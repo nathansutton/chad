@@ -156,14 +156,22 @@ def test_pick_model_prefers_local_dir(monkeypatch):
 
 def test_ram_aware_ctx_limit():
     GB = 1e9
-    # Measured 24 GB M4 Pro numbers (scripts/kv_ram_probe.py): 19.07 GB working set,
-    # 12.06 GB resident after load, 20,578 B/token, 262 k window. Expect a trigger well
-    # above the old 120 k cap but below the window.
+    # Measured 24 GB M4 Pro numbers: 19.07 GB working set, 12.06 GB resident after
+    # load, 20,578 B/token KV, 262 k window. The divisor is kv × slope_factor (1.75,
+    # the 2026-07-12 ram_safety_check all-in fit: peak grows 35.7 KB/token, not the
+    # KV-only 20.5) — the raw-KV pick of ~175k extrapolated to 102.9% of budget.
     n = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
                                 reserve_gb=1.5, safety=0.90)
-    check("24GB box: above old 120k cap", n > 120_000, n)
     check("24GB box: below the window", n < 262144 - 2048, n)
-    check("24GB box: in the measured ~175k range", 150_000 < n < 200_000, n)
+    check("24GB box: in the safe ~100k range", 90_000 < n < 110_000, n)
+    # The measured worst case (peak ≈ active + 1.0 GB + 35.7 KB/tok × (ctx + 8k gen))
+    # must stay under the working-set budget at the picked trigger.
+    worst = 12.06 * GB + 1.0 * GB + 35_700 * (n + 8192)
+    check("24GB box: worst-case peak under budget", worst < 19.07 * GB, worst / GB)
+    # slope_factor=1.0 recovers the old raw-KV behavior (env override escape hatch).
+    raw = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
+                                  slope_factor=1.0)
+    check("slope_factor=1.0 recovers raw-KV pick", 150_000 < raw < 200_000, raw)
 
     # Tight box (less working set) compacts sooner — strictly smaller window.
     tight = cli.ram_aware_ctx_limit(262144, 10.0 * GB, 8.0 * GB, 20578)
@@ -185,6 +193,30 @@ def test_ram_aware_ctx_limit():
     # Over-subscribed (model already past the safe budget) -> floor, never negative.
     floored = cli.ram_aware_ctx_limit(262144, 14 * GB, 18 * GB, 20578)
     check("over-subscribed -> floor", floored == 8192, floored)
+
+    # Host physical pressure (plan 075 WS1.4): when the host's reclaimable band is
+    # tighter than the Metal band, IT binds — Docker/harbor pressure the Metal
+    # budget cannot see must shrink the window.
+    baseline = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578)
+    pressured = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
+                                        host_avail_bytes=3.0 * GB)
+    check("tight host band binds below the Metal band", pressured < baseline,
+          (pressured, baseline))
+    check("tight host band still floored, never negative",
+          cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
+                                  host_avail_bytes=0.5 * GB) == 8192)
+    # A roomy host band changes nothing — the Metal band stays the binding one.
+    roomy = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
+                                    host_avail_bytes=200 * GB)
+    check("roomy host band leaves the Metal result", roomy == baseline,
+          (roomy, baseline))
+
+
+def test_host_avail_bytes():
+    # Live probe on macOS: returns a plausible positive number (or None on a
+    # platform without vm_stat — not this CI). Bounds, not exact values.
+    got = cli._host_avail_bytes()
+    check("host avail probe returns bytes", got is None or got > 100e6, got)
 
 
 def test_env_float(monkeypatch):

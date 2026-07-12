@@ -54,6 +54,18 @@ def test_build_chat_body_ships_decoded_prompt_as_single_user_message():
     assert body["temperature"] == 0.0
     assert body["stream"] is True
     assert body["stream_options"] == {"include_usage": True}
+    assert "stop" not in body  # no local stop markers -> field omitted
+
+
+def test_build_chat_body_forwards_stop_markers_capped_at_four():
+    # Stop markers must reach the SERVER: a client that stops reading locally and
+    # drops the connection desyncs a warm-prefix server's cache tail from the
+    # transcript it keeps (plan 075 canary finding). OpenAI-compatible servers cap
+    # `stop` at 4 entries.
+    body = build_chat_body("m", "p", max_tokens=8, temp=0.0,
+                           stop=["</tool_call>", "a", "b", "c", "d"])
+    assert body["stop"] == ["</tool_call>", "a", "b", "c"]
+    assert build_chat_body("m", "p", 8, 0.0, stop=[]).get("stop") is None
 
 
 def test_parse_sse_chunk():
@@ -121,6 +133,21 @@ def test_generate_streams_tokens_and_marks_stats_approximate():
     # server usage is preferred when present
     assert stats.generated_tokens == 2
     assert stats.prompt_tokens == 42
+
+
+def test_generate_adopts_server_cached_tokens():
+    """chad --serve reports prefix-cache reuse in prompt_tokens_details; the client
+    must adopt it (TB2 trajectories logged cached_tokens=0 against a warm server)."""
+    lines = list(_sse(
+        {"choices": [{"delta": {"content": "hi"}}]},
+        {"choices": [], "usage": {"prompt_tokens": 42, "completion_tokens": 1,
+                                  "prompt_tokens_details": {"cached_tokens": 40}}},
+        "[DONE]",
+    ))
+    ad = _adapter_with_stream(lines)
+    _, stats = ad.generate([1, 2, 3], max_tokens=8)
+    assert stats.prompt_tokens == 42
+    assert stats.cached_tokens == 40
 
 
 def test_generate_falls_back_to_chunk_count_without_usage():

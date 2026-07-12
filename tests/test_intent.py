@@ -52,6 +52,18 @@ CASES = [
     # overrides so the nudge is suppressed anyway.
     ("walk me through auth.py, but do not edit anything", True, True),
     ("just explain how the retry loop works", False, True),
+    # File-demand override (TB2 count-dataset-tokens): an explanatory opener that
+    # ALSO demands the answer be written to a file is an action task, not read-only —
+    # read_only=True here disarmed every no-progress gate and let a garbled final
+    # step end the task with an empty diff.
+    ('tell me how many tokens are in the dataset. write the integer number of tokens '
+     'without spaces or commas (e.g. "1000000") to the file /app/answer.txt.',
+     True, False),
+    ("tell me the answer and save it to results.txt", True, False),
+    # …but a plain explanatory ask (no file demand) stays read-only.
+    ("tell me how the compaction trigger works", False, True),
+    # …and an explicit negation still wins over the file words.
+    ("how does save_session write to the file? don't change anything", True, True),
 ]
 
 

@@ -55,13 +55,20 @@ from .base_engine import GenStats
 
 
 def build_chat_body(model_id: str, prompt_text: str, max_tokens: int, temp: float,
-                    stream: bool = True) -> dict:
+                    stream: bool = True, stop: Optional[list] = None) -> dict:
     """Build the `/v1/chat/completions` request body (pure — no network, unit-tested).
 
     The decoded chad prompt goes in as a SINGLE user message (see the module docstring's
     DETOKENIZE note). `stream_options.include_usage` asks the server to append a final
-    usage chunk so we can report real token counts when it obliges."""
-    return {
+    usage chunk so we can report real token counts when it obliges.
+
+    `stop` forwards chad's local stop markers (tool-call close) to the SERVER. Without
+    it the client stops reading at the marker and drops the connection while the server
+    generates on — wasted decode, and against a warm-prefix server (chad --serve) the
+    server's cache tail then diverges from the transcript the client kept, turning
+    every subsequent step into a full re-prefill (observed in the first TB2 canary:
+    request 2 was 97% cached, requests 3+ were 0%)."""
+    body = {
         "model": model_id,
         "messages": [{"role": "user", "content": prompt_text}],
         "max_tokens": max_tokens,
@@ -69,6 +76,9 @@ def build_chat_body(model_id: str, prompt_text: str, max_tokens: int, temp: floa
         "stream": stream,
         "stream_options": {"include_usage": True},
     }
+    if stop:
+        body["stop"] = list(stop)[:4]  # OpenAI-compatible servers cap stop at 4
+    return body
 
 
 def parse_sse_chunk(line: str) -> Optional[dict]:
@@ -200,7 +210,8 @@ class OpenAIEngine:
         if on_prefill:
             on_prefill(stats.prompt_tokens, 0)
 
-        body = build_chat_body(self.model_id, prompt_text, max_tokens, self.temp)
+        body = build_chat_body(self.model_id, prompt_text, max_tokens, self.temp,
+                               stop=stop_texts)
         text = ""
         n_out = 0
         t0 = time.time()
@@ -247,6 +258,12 @@ class OpenAIEngine:
         if usage:
             stats.generated_tokens = int(usage.get("completion_tokens", n_out))
             stats.prompt_tokens = int(usage.get("prompt_tokens", stats.prompt_tokens))
+            # chad --serve (and OpenAI proper) report prefix-cache reuse here; without
+            # this the TB2 trajectories logged cached_tokens=0 against a server that
+            # was in fact warm, hiding the serving win from run forensics.
+            details = usage.get("prompt_tokens_details") or {}
+            if "cached_tokens" in details:
+                stats.cached_tokens = int(details["cached_tokens"])
         else:
             stats.generated_tokens = n_out
         return text, stats

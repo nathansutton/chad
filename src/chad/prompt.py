@@ -90,7 +90,7 @@ _ACTION_WORDS = (
     "modify", "change", "fix", "add", "implement", "make ", "refactor", "rename",
     "update", "edit", "create", "remove", "delete", "replace", "robust", "support",
     "handle", "patch", "correct", "write", "test", "build", "wire", "convert",
-    "generate", "rewrite", "extend", "append", "document",
+    "generate", "rewrite", "extend", "append", "document", "save",
 )
 # Explanatory openers: an ask that legitimately ends in prose. Deliberately NARROW —
 # a bare trailing "?" doesn't count (too ambiguous), and "can/could/should you…" are
@@ -106,6 +106,17 @@ _READ_ONLY_PHRASES = (
     "do not modify", "without changing", "without editing", "just explain",
     "only explain", "don't write", "do not write", "read-only", "read only",
 )
+# A demand to deliver the answer INTO a file ("write the number … to /app/answer.txt",
+# "save the results to a file") — overrides an explanatory opener. TB2
+# count-dataset-tokens (2026-07-12): "Tell me how many … write the integer to the file
+# /app/answer.txt" classified read_only, which disarmed every no-progress gate and let
+# a garbled final step end the task with an empty diff. Explicit negations
+# (_READ_ONLY_PHRASES) still win: they are OR'd in separately below.
+# Periods are allowed in the gap (abbreviations like `e.g.` and quoted examples sit
+# mid-sentence in real task text); newlines and ?/! still bound the match.
+_FILE_DEMAND_RE = re.compile(
+    r"\b(?:write|save|store|append|output|put)\b[^\n?!]{0,120}?"
+    r"\b(?:to|into|in)\s+(?:the\s+|a\s+)?(?:file\b|/\S+|\S+\.\w{1,8}\b)")
 
 
 def classify_intent(user_text: str) -> dict:
@@ -120,7 +131,9 @@ def classify_intent(user_text: str) -> dict:
     ut = user_text.lower()
     s = ut.strip()
     explanatory = s.startswith(_EXPLAIN_OPENERS)
-    read_only = explanatory or any(p in ut for p in _READ_ONLY_PHRASES)
+    file_demand = bool(_FILE_DEMAND_RE.search(ut))
+    read_only = ((explanatory and not file_demand)
+                 or any(p in ut for p in _READ_ONLY_PHRASES))
     action = any(w in ut for w in _ACTION_WORDS)
     return {"action": action, "read_only": read_only}
 

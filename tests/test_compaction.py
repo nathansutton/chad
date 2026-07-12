@@ -279,8 +279,68 @@ def test_subagent_compaction():
           _COLLAPSED in big_read["content"] and big_read["content"].startswith("0: line"))
 
 
+def test_overlimit_latch():
+    """Plan 075 WS1.5: when compaction CANNOT reclaim below ctx_limit (the protected
+    floor — system + skills + recent window + active query — exceeds the window),
+    re-running it every step destroys the warm prefix cache for nothing: each attempt
+    mutates the transcript, which diverges the prefix and forces a full re-prefill on
+    the non-trimmable cache (measured 26-28s/step, traces/session2.jsonl). With a
+    caller-owned `state` dict, the over-limit result latches a floor; subsequent calls
+    return the prompt untouched until the transcript grows _OVERLIMIT_REARM tokens
+    past it, and the latch disarms the moment the prompt is back under the limit."""
+    from chad.compaction import _OVERLIMIT_REARM
+
+    # A transcript whose PROTECTED span alone exceeds ctx_limit: a big system prompt,
+    # an active user query, and recent messages inside the KEEP_RECENT window. Every
+    # message is protected, so the passes can reclaim nothing meaningful.
+    def floor_bound_msgs():
+        return ([{"role": "system", "content": "S" * 4000}]
+                + [{"role": "user", "content": "the active query"}]
+                + [{"role": "tool", "name": "read", "content": f"recent {i} " + "r" * 100}
+                   for i in range(4)])
+
+    msgs = floor_bound_msgs()
+    render = make_render(msgs)
+    ctx = 2000  # far below the ~4500-char protected floor
+    state = {}
+
+    out1 = compact_if_needed(msgs, render, noop_emit, ctx, render(), state=state)
+    check("floor-bound compaction returns over-limit", len(out1) > ctx, len(out1))
+    check("over-limit latches a floor in state", state.get("overlimit_floor"), state)
+
+    # Second call, transcript unchanged: the latch must skip all work — messages
+    # untouched (same object contents) and the prompt returned as-is.
+    snapshot = [dict(m) for m in msgs]
+    out2 = compact_if_needed(msgs, render, noop_emit, ctx, render(), state=state)
+    check("latched: prompt returned unchanged", out2 == render(), len(out2))
+    check("latched: transcript not mutated",
+          [dict(m) for m in msgs] == snapshot)
+
+    # Growth past the rearm margin re-attempts compaction (which mutates again).
+    msgs.append({"role": "tool", "name": "read",
+                 "content": "g" * (_OVERLIMIT_REARM + 200)})
+    before = [dict(m) for m in msgs]
+    compact_if_needed(msgs, render, noop_emit, ctx, render(), state=state)
+    check("rearm: growth past the margin re-compacts",
+          [dict(m) for m in msgs] != before)
+
+    # Back under the limit: the latch disarms.
+    small = [{"role": "system", "content": "s"}, {"role": "user", "content": "q"}]
+    r2 = make_render(small)
+    compact_if_needed(small, r2, noop_emit, ctx, r2(), state=state)
+    check("under-limit call disarms the latch", "overlimit_floor" not in state, state)
+
+    # And with NO state (legacy callers, sub-agents): behavior is unchanged — every
+    # over-limit call recompacts. Just prove it doesn't crash and stays over-limit.
+    msgs3 = floor_bound_msgs()
+    r3 = make_render(msgs3)
+    out = compact_if_needed(msgs3, r3, noop_emit, ctx, r3())
+    check("stateless call still works (legacy path)", len(out) > ctx, len(out))
+
+
 if __name__ == "__main__":
     test_compaction()
     test_subagent_compaction()
+    test_overlimit_latch()
     print(f"\n{passed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)

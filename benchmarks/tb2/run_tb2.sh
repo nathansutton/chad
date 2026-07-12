@@ -8,12 +8,17 @@
 #
 # Required env:
 #   CHAD_BASE_URL   model server origin AS SEEN FROM INSIDE THE TASK CONTAINERS,
-#                   e.g. http://host.docker.internal:8080/v1 (mlx_lm.server on this Mac)
+#                   e.g. http://host.docker.internal:8080/v1 (chad --serve on this Mac)
 #                   or   http://100.x.y.z:8081               (llama.cpp on a GPU box)
 # Optional env:
-#   CHAD_BACKEND      openai (default — mlx_lm.server on the Mac running the benchmark)
+#   CHAD_BACKEND      openai (default — a chat-completions server on the Mac running
+#                     the benchmark; `chad --serve --host 0.0.0.0 --port 8080` is the
+#                     recommended one: unlike mlx_lm.server it keeps the prefix KV
+#                     cache warm across an agent's steps, so a warm step prefills
+#                     ~tens of tokens instead of the whole transcript)
 #                     or llama (llama.cpp raw /completion on a GPU box — the
-#                     substitution our reference runs use, dev Mac RAM being the limit)
+#                     substitution our earlier reference runs used when 24 GB
+#                     couldn't hold the 35B; plan 075 made the Mac arm primary)
 #   CHAD_TOKENIZER    HF repo whose tokenizer matches the served model's vocab
 #                     (default: nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX — the served
 #                     MLX repo itself; Ornith's vocab is quant-invariant, so the same

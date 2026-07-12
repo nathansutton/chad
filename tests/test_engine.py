@@ -480,6 +480,78 @@ def test_pld_hybrid_equals_greedy():
           f"corruption guard above is vacuous")
 
 
+def test_hybrid_rewind_matches_fresh():
+    """Tier 2 (hybrid weights): the bounded rewind (plan 075) must be INVISIBLE in
+    output. Drive the exact production shape: turn 1 generates (leaving cache =
+    prompt + generated ids and a turn-boundary snapshot), then the next prompt
+    DIVERGES inside that generation (a truncated turn re-rendered — Site A on a
+    hybrid). `_sync_to` must take the rewind path (cached_tokens > 0 through the
+    divergence point, no full rebuild), and the resulting generation must equal the
+    same prompt from a fresh engine. Runs strict bit-equality on bf16 weights; on
+    quantized weights argmax exact-ties make bit-equality undefined (see
+    _is_quantized), so it degrades to structural checks + a warm/fresh prefix
+    sanity comparison."""
+    if os.environ.get("CHAD_FAST_TESTS"):
+        return skip("hybrid_rewind", "CHAD_FAST_TESTS set (fast gate)")
+    model_id = os.environ.get("CHAD_TEST_HYBRID_MODEL")
+    if not model_id:
+        return skip("hybrid_rewind", "CHAD_TEST_HYBRID_MODEL unset")
+    eng = _build_engine(model_id=model_id)
+    if eng is None:
+        return skip("hybrid_rewind", f"could not load {model_id}")
+    if eng._trimmable or not eng._pld_hybrid:
+        return skip("hybrid_rewind", "not a hybrid cache; rewind path won't engage")
+    eng.prompt_lookup = False   # plain decode path; rewind is what's under test
+
+    messages = [
+        {"role": "system", "content": "You are a terse assistant."},
+        {"role": "user", "content": "Print hello world in Python."},
+    ]
+    prompt_ids = list(eng.tok.apply_chat_template(messages, add_generation_prompt=True))
+
+    # Turn 1: real generation — cache ends at prompt + gen ids, snapshot at prompt end.
+    eng._reset_cache()
+    _t1, _s1 = eng.generate(list(prompt_ids), max_tokens=24)
+    check("turn 1 left a rewind snapshot", eng._rewind_snap is not None)
+    snap_pos = eng._rewind_snap["pos"]
+    gen_ids = eng._cached_ids[len(prompt_ids):]
+    check("turn 1 cache holds prompt+generation",
+          len(gen_ids) > 4, f"gen_ids={len(gen_ids)}")
+
+    # Turn 2 prompt: keep a PREFIX of the generation, then diverge (the truncated-turn
+    # re-render shape: same start, different tail).
+    keep = len(gen_ids) // 2
+    tail = list(eng.tok.encode("\nNow say done.", add_special_tokens=False))
+    recover = list(prompt_ids) + list(gen_ids[:keep]) + tail
+
+    rewinds = []
+    orig_rewind = eng._rewind_to
+    eng._rewind_to = lambda t, u: (rewinds.append(u), orig_rewind(t, u))[1]
+    warm_text, warm_stats = eng.generate(list(recover), max_tokens=24)
+    check("rewind path actually ran", rewinds == [len(prompt_ids) + keep], rewinds)
+    check("warm run reused the shared prefix through the divergence",
+          warm_stats.cached_tokens == len(prompt_ids) + keep,
+          f"cached={warm_stats.cached_tokens} want={len(prompt_ids) + keep} "
+          f"(snap@{snap_pos})")
+
+    # Baseline: same prompt, fresh engine state.
+    eng._rewind_to = orig_rewind
+    eng._reset_cache()
+    fresh_text, _ = eng.generate(list(recover), max_tokens=24)
+    if _is_quantized(model_id):
+        # quantized: argmax exact-ties → outputs may differ legally; both must decode.
+        check("quantized: warm rewind generation non-empty", len(warm_text) > 0)
+        check("quantized: fresh generation non-empty", len(fresh_text) > 0)
+        print(f"  (quantized weights: strict equality skipped; warm={warm_text[:40]!r} "
+              f"fresh={fresh_text[:40]!r})")
+    else:
+        # CORRUPTION GUARD: rewound-cache generation == fresh generation, byte-exact.
+        # If this fails the rewind corrupted the cache — do NOT loosen; STOP and report.
+        check("hybrid rewind: warm generation == fresh generation",
+              warm_text == fresh_text,
+              f"\n--- WARM (rewound) ---\n{warm_text!r}\n--- FRESH ---\n{fresh_text!r}")
+
+
 # === Tier 2b: cache-reuse correctness on the truncation/degenerate paths (plan 010) ==
 # These force the two rare cache-fast-path branches that plan 010 fixed and assert
 # byte/text identity to the no-splice / fresh-cache baseline. The optimization must
@@ -717,6 +789,267 @@ def test_ckpt_path_filenames_are_kind_tagged():
         check("kinds hash differently", warm.split("-", 1)[1] != push.split("-", 1)[1])
 
 
+def test_adaptive_chunk_bounds():
+    """Tier 1 (no weights): the adaptive prefill chunk (plan 075 WS1.3) obeys its
+    contract at the boundaries that don't depend on live memory numbers:
+
+      - dense model, short context -> the 512 base (the measured-flat 9B keeps its
+        old default; also what the interrupted-prefill test's chunk math assumes);
+      - MoE model, short context -> the 2048 base (+14% measured prefill);
+      - ANY model at huge resident context -> the 256 floor (the unfused
+        head_dim-256 score tensor makes big chunks the long-context OOM vector; the
+        cap math cannot exceed the floor at kv=3M on any real Mac's free band).
+    """
+    from chad.engine import Engine
+
+    eng = object.__new__(Engine)  # bypass __init__ (no weights)
+    # No _is_moe/_n_attn_heads set: getattr defaults (dense, 16 heads) apply — the
+    # same shape a fake-engine test double presents.
+    # kv=50M: the score-tensor cap math would need a >1.6 TB free band to beat the
+    # floor, so this asserts the floor on any real machine, laptop or Studio.
+    check("dense short-ctx chunk is the 512 base", eng._adaptive_chunk(0) == 512,
+          eng._adaptive_chunk(0))
+    check("huge-ctx chunk hits the 256 floor", eng._adaptive_chunk(50_000_000) == 256,
+          eng._adaptive_chunk(50_000_000))
+    eng._is_moe = True
+    eng._n_attn_heads = 16
+    got = eng._adaptive_chunk(0)
+    check("MoE short-ctx chunk is the 2048 base", got == 2048, got)
+    check("MoE huge-ctx chunk hits the 256 floor too",
+          eng._adaptive_chunk(50_000_000) == 256)
+
+
+def test_prefill_oom_retry_rolls_back():
+    """Tier 1 (no weights): a Metal OOM inside a prefill chunk (catchable on
+    mlx>=0.32) must (a) restore every cache layer's state to the pre-chunk
+    snapshot, (b) retry at half the width, and (c) still feed every token exactly
+    once. A non-memory RuntimeError must propagate unchanged."""
+    import mlx.core as mx
+
+    from chad.engine import Engine
+
+    class _FakeCacheItem:
+        def __init__(self):
+            self.state = mx.array([0.0])
+
+    forwards = []          # width of every attempted forward
+    restored = []          # state objects assigned back by _restore_cache_refs
+
+    class _TrackedItem(_FakeCacheItem):
+        def __setattr__(self, name, value):
+            if name == "state" and "state" in self.__dict__:
+                restored.append(value)
+            super().__setattr__(name, value)
+
+    def _model(arr, cache=None):
+        w = int(arr.shape[1])
+        forwards.append(w)
+        if w > 64:
+            raise RuntimeError("[METAL] Command buffer execution failed: "
+                               "Insufficient Memory")
+
+    eng = object.__new__(Engine)
+    eng._cache = [_TrackedItem(), _TrackedItem()]
+    eng.model = _model
+    eng._cached_ids = []
+
+    fed = eng._prefill(list(range(200)))  # chunk=None -> adaptive base 512
+    ok_widths = [w for w in forwards if w <= 64]
+    check("OOM retry fed the full range", fed == 200, fed)
+    check("first attempt was the adaptive base (dense=512 -> capped to 200)",
+          forwards[0] == 200, forwards)
+    check("failures halved the width down to <=64",
+          all(w <= 64 for w in forwards[2:]), forwards)
+    check("every token fed exactly once by the successful widths",
+          sum(ok_widths) == 200, forwards)
+    check("cache state was rolled back once per failed chunk",
+          len(restored) == 2 * 2, f"{len(restored)} restores (2 layers x 2 fails)")
+
+    # Non-memory errors propagate: the retry logic must not swallow real bugs.
+    def _boom(arr, cache=None):
+        raise RuntimeError("boom")
+    eng2 = object.__new__(Engine)
+    eng2._cache = [_FakeCacheItem()]
+    eng2.model = _boom
+    eng2._cached_ids = []
+    try:
+        eng2._prefill([1, 2, 3])
+        check("non-memory RuntimeError propagates", False, "no exception raised")
+    except RuntimeError as e:
+        check("non-memory RuntimeError propagates", "boom" in str(e), str(e))
+
+
+def test_bounded_rewind_orchestration():
+    """Tier 1 (no weights): `_sync_to`'s bounded-rewind branch (plan 075) — the
+    orchestration math, with the tier-2-proven primitives (restore recurrent /
+    trim KV / re-feed) stubbed out and recorded.
+
+      cache: [P0..P9, G0..G4]  (prompt + last turn's generation), snapshot@10
+      target: [P0..P9, G0, G1, X, Y]  (divergence INSIDE the last turn, common=12)
+
+    Expected: restore recurrent once, trim the attention KV back to the snapshot
+    (peel = 15-10 = 5), re-feed exactly the agreed-on tokens target[10:12], and
+    report common=12 — never a cache reset. Then: a divergence BEFORE the snapshot
+    must fall back to the full rebuild (reset + warm-prefix reload), and a missing
+    snapshot must too."""
+    from chad.engine import Engine
+
+    class _NoTrim:
+        def is_trimmable(self):
+            return False
+
+    def make(snap_pos):
+        eng = object.__new__(Engine)
+        eng._pld_hybrid = True
+        eng._trimmable = False
+        eng.kv_bits = None
+        eng.draft = None
+        eng._cache = [_NoTrim()]
+        eng.model = type("M", (), {"layers": [0]})()  # _sub_caches slices by layer count
+        eng._cached_ids = list(range(100, 110)) + list(range(200, 205))  # P0..P9+G0..G4
+        eng._rewind_snap = ({"pos": snap_pos, "recurrent": "SNAP"}
+                            if snap_pos is not None else None)
+        eng.calls = []
+        eng._restore_recurrent = lambda s: eng.calls.append(("restore", s))
+        eng._trim_kv = lambda n: eng.calls.append(("trim", n))
+        eng._prefill = lambda ids, *a, **k: (eng.calls.append(("feed", list(ids))),
+                                             len(ids))[1]
+        eng._reset_cache = lambda: eng.calls.append(("reset",))
+        eng._reload_warm_prefix = lambda t: (eng.calls.append(("warm",)), 0)[1]
+        return eng
+
+    # Divergence inside the last turn: rewind path, no reset.
+    eng = make(snap_pos=10)
+    target = list(range(100, 110)) + [200, 201, 999, 998]   # common with cache = 12
+    common = eng._sync_to(target)
+    check("rewind: common is the shared prefix", common == 12, common)
+    check("rewind: restore+trim+feed, in order, no reset",
+          eng.calls == [("restore", "SNAP"), ("trim", 5), ("feed", [200, 201])],
+          eng.calls)
+    check("rewind: cached_ids land at target[:common]",
+          eng._cached_ids == target[:12], eng._cached_ids)
+    check("rewind: snapshot survives for reuse", eng._rewind_snap is not None)
+
+    # Divergence BEFORE the snapshot (e.g. compaction): full rebuild fallback.
+    eng = make(snap_pos=10)
+    early = [100, 101, 777]                                  # common = 2 < snap pos
+    common = eng._sync_to(early)
+    check("pre-snapshot divergence falls back to rebuild",
+          ("reset",) in eng.calls and ("warm",) in eng.calls, eng.calls)
+    check("pre-snapshot divergence: no rewind primitives ran",
+          not any(c[0] in ("restore", "trim") for c in eng.calls), eng.calls)
+
+    # No snapshot at all: rebuild, exactly as before plan 075.
+    eng = make(snap_pos=None)
+    eng._sync_to(target)
+    check("no snapshot -> rebuild", ("reset",) in eng.calls, eng.calls)
+
+    # Snapshot exactly at the divergence point: trim only, nothing re-fed.
+    eng = make(snap_pos=12)
+    common = eng._sync_to(target)
+    check("snapshot at divergence: trim only, no feed",
+          eng.calls == [("restore", "SNAP"), ("trim", 3)], eng.calls)
+    check("snapshot at divergence: common intact", common == 12, common)
+
+
+def test_take_rewind_snapshot_gating():
+    """Tier 1: the snapshot is only taken on the validated cache composition —
+    hybrid (_pld_hybrid), no kv quantization, tokens resident. Anything else is a
+    silent no-op (a snapshot on the wrong cache kind would CORRUPT a later rewind:
+    _trim_kv only trims plain KVCache layers)."""
+    from chad.engine import Engine
+
+    def make(pld_hybrid=True, kv_bits=None):
+        eng = object.__new__(Engine)
+        eng._pld_hybrid = pld_hybrid
+        eng.kv_bits = kv_bits
+        eng._rewind_snap = None
+        eng._snap_recurrent = lambda: "REC"
+        return eng
+
+    eng = make()
+    eng._take_rewind_snapshot(42)
+    check("hybrid snapshot taken with explicit pos",
+          eng._rewind_snap == {"pos": 42, "recurrent": "REC"}, eng._rewind_snap)
+    eng = make(pld_hybrid=False)
+    eng._take_rewind_snapshot(42)
+    check("non-hybrid: no snapshot", eng._rewind_snap is None)
+    eng = make(kv_bits=8)
+    eng._take_rewind_snapshot(42)
+    check("kv_bits: no snapshot", eng._rewind_snap is None)
+    eng = make()
+    eng._take_rewind_snapshot(0)
+    check("zero resident tokens: no snapshot", eng._rewind_snap is None)
+
+
+def test_snapshot_survives_empty_kvcache():
+    """Regression (caught on real weights, missed by simple fakes): mlx-lm's
+    KVCache.state property RAISES on an EMPTY cache (`keys` is None before the
+    first token), so the pre-chunk snapshot must read raw attributes, never the
+    property. A snapshot/restore round-trip on an empty-KVCache-like item must not
+    raise, must restore attribute values exactly, and must deep-copy list attrs one
+    level (ArraysCache mutates its list elements in place)."""
+    from chad.engine import Engine
+
+    class _EmptyKVLike:
+        def __init__(self):
+            self.keys = None
+            self.values = None
+            self.offset = 0
+
+        @property
+        def state(self):  # what mlx-lm's KVCache does when empty
+            return self.keys.shape  # AttributeError on None
+
+    class _ArraysLike:
+        def __init__(self):
+            self.cache = ["a", "b"]
+
+    eng = object.__new__(Engine)
+    kv, arr = _EmptyKVLike(), _ArraysLike()
+    eng._cache = [kv, arr]
+    snap = eng._snapshot_cache_refs()          # must not touch .state
+    kv.keys, kv.offset = "poisoned", 99        # simulate a failed chunk's leftovers
+    arr.cache[0] = "poisoned"                  # in-place list element mutation
+    eng._restore_cache_refs(snap)
+    check("empty-KVCache attrs restored", kv.keys is None and kv.offset == 0,
+          (kv.keys, kv.offset))
+    check("list attr restored one level deep", arr.cache == ["a", "b"], arr.cache)
+
+
+def test_keyed_sampler_worker_thread_entropy():
+    """Regression (plan 075 canary): MLX's implicit-key RNG never advances on
+    non-main threads, so make_sampler(temp>0) run from `chad --serve`'s engine
+    worker thread replays ONE frozen noise vector — byte-identical responses for
+    identical prompts and loop-prone quasi-greedy decoding. _KeyedSampler must
+    (a) vary across draws on a worker thread, (b) replay exactly for a fixed
+    seed, (c) diverge across seeds."""
+    import threading
+
+    try:
+        import mlx.core as mx
+    except ImportError:
+        skip("keyed sampler", "mlx not installed")
+        return
+    from chad.engine import _KeyedSampler
+
+    logits = mx.array([[1.0, 1.1, 0.9, 1.05, 0.95, 1.2, 0.8, 1.15]])
+    out = {}
+
+    def draws(name, seed):
+        s = _KeyedSampler(1.0, seed=seed)
+        out[name] = [int(s(logits).item()) for _ in range(12)]
+
+    for name, seed in (("a", 1), ("b", 2), ("a2", 1)):
+        t = threading.Thread(target=draws, args=(name, seed))
+        t.start()
+        t.join()
+    check("worker-thread draws vary (frozen-noise regression)",
+          len(set(out["a"])) > 1, out["a"])
+    check("fixed seed replays exactly", out["a"] == out["a2"], (out["a"], out["a2"]))
+    check("seeds diverge", out["a"] != out["b"], (out["a"], out["b"]))
+
+
 if __name__ == "__main__":
     tier1 = (test_longest_match_wins, test_recency_tie_break, test_no_match,
              test_guards, test_draft_length, test_prefill_progress_callback,
@@ -726,9 +1059,16 @@ if __name__ == "__main__":
              test_enforce_cache_budget_evicts_lru_first,
              test_enforce_cache_budget_protects_paths,
              test_enforce_cache_budget_disabled_when_zero,
-             test_ckpt_path_filenames_are_kind_tagged)
+             test_ckpt_path_filenames_are_kind_tagged,
+             test_adaptive_chunk_bounds,
+             test_prefill_oom_retry_rolls_back,
+             test_snapshot_survives_empty_kvcache,
+             test_bounded_rewind_orchestration,
+             test_take_rewind_snapshot_gating,
+             test_keyed_sampler_worker_thread_entropy)
     tier2 = (test_pld_equals_greedy,
              test_pld_hybrid_equals_greedy,
+             test_hybrid_rewind_matches_fresh,
              test_degenerate_reprefill_matches_fresh,
              test_truncation_recovery_matches_fresh,
              test_push_pop_bit_exact)

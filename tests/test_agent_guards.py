@@ -228,6 +228,19 @@ def test_nudge_for_no_calls():
     kind6, nudge6 = nudge_for_no_calls("here is the explanation", hit_cap=False, **base)
     check("genuine final answer -> no nudge", kind6 is None and nudge6 is None)
 
+    # A CLOSED but unparseable tool-call block (garbled_call) -> malformed nudge,
+    # never a final answer (TB2 count-dataset-tokens prose-quit class, 2026-07-12).
+    kind6g, nudge6g = nudge_for_no_calls(
+        '<tool_call>{"name": "bash", …</parameter></function></tool_call>',
+        hit_cap=False, garbled_call=True, **base)
+    check("garbled closed block -> truncated kind", kind6g == "truncated")
+    check("garbled nudge text", "did not contain one valid JSON" in nudge6g)
+    # …and it is bounded by the same truncation counter as the open-call variant.
+    b6h = dict(base); b6h["truncation_nudges"] = 2
+    kind6h, _ = nudge_for_no_calls("<tool_call>garbage</tool_call>", hit_cap=False,
+                                   garbled_call=True, **b6h)
+    check("garbled nudge capped", kind6h != "truncated")
+
     # Counter caps: truncation already nudged twice -> falls through to next branch.
     b7 = dict(base); b7["truncation_nudges"] = 2; b7["action_task"] = True
     kind7, _ = nudge_for_no_calls("```code```", hit_cap=True, **b7)

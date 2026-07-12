@@ -283,7 +283,8 @@ class Agent:
                  max_gen_tokens: int = 8192, resume: list = None, persist: bool = False,
                  think_budget: int = None, turn_budget_tokens: int = None,
                  turn_budget_s: float = None, subagent: bool = False,
-                 subagent_tools: str = "read-only", session_id: str = None):
+                 subagent_tools: str = "read-only", session_id: str = None,
+                 ctx_limit_fn=None):
         self.engine = engine
         # A spawned sub-agent (plan 041) SHARES the parent's session — the same engine,
         # the same live skills/MCP connections — so it must NOT tear those down. Only a
@@ -333,6 +334,14 @@ class Agent:
         # unlike the think-budget there is no capability trade. A/B off via env.
         self._no_repeat_guard = config.flag("CHAD_NO_REPEAT_GUARD")
         self.ctx_limit = ctx_limit  # prompt-token budget before compaction kicks in
+        # Cross-call compaction state (plan 075 WS1.5): holds the over-limit latch so
+        # a transcript whose protected floor exceeds ctx_limit isn't re-compacted —
+        # and its warm prefix cache destroyed — on every single step.
+        self._compact_state: dict = {}
+        # Live ctx-limit recheck (plan 075 WS1.4): the startup limit was computed on
+        # an idle box; Docker/harbor spinning up mid-session changes what's safe.
+        # Called at the top of each turn; only a >10% move is applied (hysteresis).
+        self._ctx_limit_fn = ctx_limit_fn
         # Runaway-turn governor (plan 040): a per-turn budget on cumulative prefill tokens
         # (and optional wall-clock) that ends a turn which has burned through a checkpoint
         # WITHOUT landing+verifying a change — banking a deterministic progress note so the
@@ -426,7 +435,8 @@ class Agent:
 
     def _compact_if_needed(self, prompt_ids):
         return compaction.compact_if_needed(
-            self.messages, self._render, self._emit, self.ctx_limit, prompt_ids)
+            self.messages, self._render, self._emit, self.ctx_limit, prompt_ids,
+            state=self._compact_state)
 
     def save(self):
         """Persist the conversation for the current dir (no-op unless `persist`)."""
@@ -671,6 +681,18 @@ class Agent:
     def _run_turn(self, user_text: str, stream=True):
         self.interrupted = False
         self._backend_retries = 0   # per-turn allowance; see _MAX_BACKEND_RETRIES
+        # Live ctx-limit recheck (plan 075 WS1.4): re-derive the compaction trigger
+        # from current memory conditions. Hysteresis: apply only a >10% move, so the
+        # limit doesn't jitter with ordinary turn-to-turn allocator noise.
+        if self._ctx_limit_fn is not None:
+            try:
+                fresh = self._ctx_limit_fn()
+                if fresh and abs(fresh - self.ctx_limit) > 0.10 * self.ctx_limit:
+                    log.info("GOVERNOR ctx_limit %d -> %d (live memory recheck)",
+                             self.ctx_limit, fresh)
+                    self.ctx_limit = fresh
+            except Exception:  # noqa: BLE001 — a pressure probe must never kill a turn
+                pass
         # ds4-style warm start: on a cold cache, load the system+tools KV from disk
         # (or prefill+persist it once) so the first turn doesn't re-prefill the
         # ~3.2k-token stable prefix every session. Cheap no-op on a warm cache.
@@ -1090,10 +1112,18 @@ class Agent:
                 # edited but never ran the check. Each nudge is bounded so real answers and
                 # genuinely-stuck cases still escape.
                 has_code = "```" in text
+                # A CLOSED tool-call block that still parsed to nothing is a garbled
+                # call, not an answer (parse salvage handles most; this is the
+                # backstop for what it can't reconstruct). Markers checked on the
+                # think-stripped text so a call drafted inside <think> doesn't count.
+                _stripped_for_markers = strip_think(text)
+                garbled = ("<tool_call>" in _stripped_for_markers
+                           or "</function>" in _stripped_for_markers
+                           or "<function=" in _stripped_for_markers)
                 kind, nudge = guardrails.nudge_for_no_calls(
                     text, hit_cap, made_edit, unverified_edit, read_only_intent,
                     action_task, truncation_nudges, answer_nudges, verify_nudges,
-                    _has_open_tool_call(text))
+                    _has_open_tool_call(text), garbled_call=garbled)
                 if kind == "truncated":
                     truncation_nudges += 1
                 elif kind == "no-edit":
@@ -1498,9 +1528,9 @@ class Agent:
 
 
 def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = None,
-         thinking: bool = True):
+         thinking: bool = True, ctx_limit_fn=None):
     agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking,
-                  resume=resume, persist=True)
+                  resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn)
     label = engine.model_id.split("/")[-1] + (" + draft" if getattr(engine, "draft", None) else "")
     print(banner(label, ctx_limit, mode=agent.mode))
     print(f"{C_DIM}type a task, or /reset, /exit.{C_RST}")
@@ -1515,7 +1545,7 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             break
         if line in ("/reset", "/clear"):
             agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking,
-                          persist=True)
+                          persist=True, ctx_limit_fn=ctx_limit_fn)
             engine.reset()
             print(f"{C_DIM}session reset.{C_RST}")
             continue

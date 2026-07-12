@@ -192,9 +192,39 @@ def test_hybrid_name_parameter_dialect():
     eq("h6 salvaged name", parse_tool_calls(h6), [("grep", {"pattern": "foo"})])
 
 
+def test_salvage_closed_block_unclosed_json():
+    """TB2 count-dataset-tokens (2026-07-12 canary): the model re-emitted a complete
+    bash call whose JSON args never closed, finished with XML-dialect closers, and
+    properly closed the <tool_call> tag. _TAG_RE requires a trailing `}` so the block
+    never reached repair_json; the call was dropped and the garble was accepted as a
+    final answer with budget left. The salvage path strips the XML cruft and repairs."""
+    # 1. The observed shape: unclosed JSON string + </parameter></function> tail.
+    g1 = ('<tool_call>{"name": "bash", "arguments": {"command": "python3 -c \\"\\n'
+          'print(1)\\n\\"\\n</parameter>\n</function>\n</tool_call>')
+    res1 = parse_tool_calls(g1)
+    check("g1 salvaged one call", len(res1) == 1 and res1[0][0] == "bash")
+    check("g1 command survived", "print(1)" in res1[0][1].get("command", ""))
+
+    # 2. Unclosed JSON but clean tag close, no XML cruft — still salvaged.
+    g2 = '<tool_call>{"name": "read", "arguments": {"path": "a.py"</tool_call>'
+    eq("g2 unclosed args salvaged", parse_tool_calls(g2),
+       [("read", {"path": "a.py"})])
+
+    # 3. An UNCLOSED <tool_call> must NOT be salvaged (mid-content truncation —
+    #    running half a call is worse than the malformed-call nudge).
+    g3 = '<tool_call>{"name": "write", "arguments": {"content": "def f(): ...'
+    eq("g3 unclosed tag not salvaged", parse_tool_calls(g3), [])
+
+    # 4. Well-formed calls are untouched by the salvage path (strict path wins).
+    g4 = '<tool_call>{"name": "glob", "arguments": {"pattern": "*.py"}}</tool_call>'
+    eq("g4 strict path unchanged", parse_tool_calls(g4),
+       [("glob", {"pattern": "*.py"})])
+
+
 if __name__ == "__main__":
     test_parse()
     test_salvage_garbled_tool_name()
     test_hybrid_name_parameter_dialect()
+    test_salvage_closed_block_unclosed_json()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

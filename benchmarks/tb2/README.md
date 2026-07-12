@@ -26,15 +26,16 @@ score.** Sonnet on your laptop. 🗿
 ## Architecture of a run
 
 The benchmark runs from a Mac, whole: Harbor and the task containers on the machine,
-and the model served beside them by `mlx_lm.server` — the same MLX stack chad ships.
+and the model served beside them by `chad --serve` — the same in-process MLX engine
+chad ships, warm prefix cache included.
 
 ```
 your Mac
 ┌──────────────────────────────────┐      ┌──────────────────────────────┐
-│ harbor ──▶ task container        │      │ mlx_lm.server  :8080         │
+│ harbor ──▶ task container        │      │ chad --serve   :8080         │
 │            ┌───────────────────┐ │ /v1  │ Ornith-1.0-35B UD-Q2_K_XL    │
-│            │ chad (installed   │ │◀────▶│ (MLX — the exact quant chad  │
-│            │ by setup(), runs  │ │      │  ships; ~12 GB resident)     │
+│            │ chad (installed   │ │◀────▶│ (in-process MLX engine, warm │
+│            │ by setup(), runs  │ │      │  prefix KV; ~12 GB resident) │
 │            │ the real shell)   │ │      └──────────────────────────────┘
 │            └───────────────────┘ │        reached from containers as
 └──────────────────────────────────┘        http://host.docker.internal:8080/v1
@@ -46,17 +47,20 @@ runs chad with a remote backend pointed at the server. No weights load in the
 container; on Linux chad's install is torch-free and MLX-free (both are Darwin-gated),
 so the venv fits TB2's small task images.
 
-> **Why our own reference run substitutes a GPU box.** The maintainer's dev Mac has
-> 24 GB — not enough to hold the 35B *and* run the benchmark — so our in-flight
-> reference sweep serves Ornith from a GPU server that happened to be on the shelf,
-> via llama.cpp (`chad_backend=llama`, [below](#alternative-arm-llamacpp-on-a-gpu-box)).
-> That's a memory limit, not a design choice: on a ≥32 GB Mac the whole thing runs on
-> the laptop, and that Mac-native arm is the configuration the branding claims.
+> **The 24 GB Mac arm.** Earlier reference sweeps served Ornith from a GPU box via
+> llama.cpp (`chad_backend=llama`, [below](#alternative-arm-llamacpp-on-a-gpu-box))
+> because a 24 GB Mac couldn't reliably hold the 35B *and* run the benchmark. The
+> plan-075 work (Metal memory clamps, catchable-OOM prefill retry, adaptive chunking,
+> pressure-aware context governor, and `chad --serve`'s warm-cache serving) exists to
+> retire that substitution: the target configuration is the whole benchmark on one
+> 24 GB Mac. Until a full 24 GB reference pass is published, treat 24 GB as
+> supported-but-being-validated and ≥ 32 GB as the comfortable path.
 
 ## Requirements
 
-- An **Apple Silicon Mac with ≥ 32 GB** (the 35B tier — same floor as chad itself),
-  **Docker** (Docker Desktop), and **[uv](https://docs.astral.sh/uv/)**.
+- An **Apple Silicon Mac** — **≥ 32 GB is comfortable**; **24 GB is the target
+  configuration** for the Mac-native arm (see the note above), **Docker** (Docker
+  Desktop, VM capped at ~4 GB on a 24 GB box), and **[uv](https://docs.astral.sh/uv/)**.
 - **[Harbor](https://harborframework.com)** — Terminal-Bench 2's harness:
   `uv tool install harbor` (the reference runs used **harbor 0.16.1**).
 - Disk: ~12 GB of model weights, ~1 GB of dataset export, plus tens of GB of Docker
@@ -65,13 +69,23 @@ so the venv fits TB2's small task images.
 
 ## Step 1 — serve Ornith on the Mac
 
-Serve the exact quant chad ships (`UD-Q2_K_XL`, ~12 GB resident) with `mlx_lm.server`:
+Serve the exact quant chad ships (`UD-Q2_K_XL`, ~12 GB resident) with **chad's own
+server** — the same in-process engine the TUI runs, behind an OpenAI-compatible
+endpoint:
 
 ```bash
-uvx --from mlx-lm mlx_lm.server \
-  --model nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX \
-  --host 0.0.0.0 --port 8080
+CHAD_MODEL=nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX \
+  chad --serve --host 0.0.0.0 --port 8080
 ```
+
+Why chad's server and not `mlx_lm.server`: Ornith's hybrid SSM/attention cache is
+non-trimmable, and `mlx_lm.server` cannot reuse its prompt cache across requests — so
+every agent step re-prefills the whole growing transcript (tens of seconds per step at
+TB2 context sizes; the failure mode that originally pushed our reference runs off the
+Mac). `chad --serve` keeps the engine's persistent prefix KV cache warm across an
+agent's steps: a warm step prefills only the newly appended tokens (measured: 1.1 s vs
+11.7 s on a 7.7k-token transcript, 35B on a 24 GB M4 Pro). `mlx_lm.server` remains a
+valid *cold-cache* arm — score it, label it.
 
 Fidelity notes, each load-bearing:
 
@@ -124,6 +138,48 @@ harbor's own schema:
 
 Exit 0 means the bundle is submittable; it fails loudly if any passing trial lacks a
 valid trajectory.
+
+## Alternative arm: Q6 on a rented 48 GB Mac (EC2 `mac-m4pro.metal`)
+
+The cheapest way to run a **higher-bit all-Apple arm** — the same MLX serving stack,
+6-bit weights instead of 2-bit. A 48 GB M4 Pro's ~36 GB Metal working set holds the
+~28.5 GB Q6 comfortably alongside a 120k-token window. On AWS that's an EC2
+`mac-m4pro.metal` dedicated host; **note the 24-hour minimum allocation** — plan the
+day: an n=3 sweep of a task subset fits easily, a full 89-task pass is
+overnight-scale per pass.
+
+Setup on the fresh host — the prebuilt quant lives at
+[`nathansutton/Ornith-1.0-35B-Q6-MLX`](https://huggingface.co/nathansutton/Ornith-1.0-35B-Q6-MLX)
+(~28.5 GB), so there is nothing to build:
+
+```bash
+# 0. one-time host deps (EC2 Macs are bare metal — Docker Desktop works; start it
+#    and verify `docker info` EARLY, it gates everything else)
+brew install uv git && brew install --cask docker
+uv tool install harbor
+
+# 1. clone + install
+git clone https://github.com/nathansutton/mlxcc && cd mlxcc && uv sync
+
+# 2. serve (downloads the quant on first run; foreground — use tmux/screen so the
+#    host survives your ssh dropping)
+benchmarks/tb2/serve_q6.sh
+
+# 3. run — smoke one task, then n=3 passes (separate shell)
+cd benchmarks/tb2
+CHAD_BASE_URL=http://host.docker.internal:8080/v1 ./run_tb2.sh 0 1 fix-git
+CHAD_BASE_URL=http://host.docker.internal:8080/v1 ./run_repeated.sh 3
+```
+
+To rebuild the quant from the bf16 source instead (verifiable supply chain, ~65 GB
+download): `uv run python benchmarks/tb2/quantize_q6.py`, then
+`benchmarks/tb2/serve_q6.sh <built-dir>`.
+
+Disk: ~29 GB quant + Docker image cache (+~65 GB bf16 only if rebuilding) — size
+the root volume ≥ 200 GB. Per the fidelity notes: this is a **different arm** from
+the shipped 2-bit laptop configuration (same class as the llama.cpp Q6_K arm below,
+but MLX group-64 affine on Apple silicon, warm-cache serving included) — score it,
+label it `q6-mlx-48gb`, don't blend it into laptop numbers.
 
 ## Alternative arm: llama.cpp on a GPU box
 

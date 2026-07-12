@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 
@@ -83,8 +84,31 @@ def _version_string():
     return f"chad {__version__}{detail}"
 
 
+def _host_avail_bytes():
+    """Host-wide reclaimable memory (free + inactive pages) via vm_stat, or None.
+    The Metal `max_recommended_working_set_size` is a static per-GPU number that
+    cannot see what Docker/harbor/browsers are holding; on a 24 GB box running the
+    benchmark stack beside the model, PHYSICAL pressure is what jetsam kills on, so
+    the context budget must respect it too (plan 075 WS1.4)."""
+    try:
+        out = subprocess.check_output(["vm_stat"], text=True)
+        page = 16384
+        m = re.search(r"page size of (\d+)", out)
+        if m:
+            page = int(m.group(1))
+        pages = 0
+        for key in ("Pages free", "Pages inactive", "Pages speculative"):
+            m = re.search(rf"{key}:\s+(\d+)", out)
+            if m:
+                pages += int(m.group(1))
+        return pages * page if pages else None
+    except Exception:  # noqa: BLE001 — a pressure probe must never be the crash
+        return None
+
+
 def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
-                        reserve_gb=1.5, safety=0.90, gen_margin=2048, floor=8192):
+                        reserve_gb=1.5, safety=0.90, gen_margin=2048, floor=8192,
+                        host_avail_bytes=None, slope_factor=1.75):
     """Plan 036: largest prompt-token budget (= the compaction trigger) that keeps the
     growing KV cache inside a safe slice of the Metal *recommended working set*, given the
     model's already-resident footprint and the *measured* per-token KV cost. Pure +
@@ -102,9 +126,22 @@ def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
     if not (budget_bytes and kv_bytes_per_token and active_bytes):
         return None
     usable = budget_bytes * safety - active_bytes - reserve_gb * 1e9
+    # The Metal budget is blind to other processes' physical pressure (Docker VM,
+    # harbor, browsers). When the host's reclaimable band is tighter than the Metal
+    # band, IT is the binding constraint — the KV cache grows into physical pages
+    # 1:1, and jetsam kills on physical pressure, not on Metal accounting.
+    if host_avail_bytes:
+        usable = min(usable, host_avail_bytes * 0.85 - reserve_gb * 1e9)
     if usable <= 0:
         return floor
-    ram_ctx = int(usable / kv_bytes_per_token)
+    # Peak memory grows FASTER than the KV cache alone: prefill/decode scratch also
+    # scales with resident context (2026-07-12 ram_safety_check fit on the 35B, fused
+    # wheel: 35.7 KB/token all-in vs 20.5 KB/token KV — the raw KV divisor picked a
+    # 175k trigger that extrapolated to 102.9% of budget, the WS1.6 FAIL). The fixed
+    # `reserve_gb` cannot cover a term that grows per-token, so fold it into the
+    # divisor. 1.75 is the 35B measurement; unmeasured on the 9B, where it errs safe
+    # (over-compaction costs a re-prefill, undershoot costs a jetsam kill).
+    ram_ctx = int(usable / (kv_bytes_per_token * slope_factor))
     return max(floor, min(eff_ctx - gen_margin, ram_ctx))
 
 
@@ -121,11 +158,18 @@ def _compute_ctx_limit(eng):
     if not ctx_limit:
         try:
             import mlx.core as mx
+            # Subtract the resident KV from active so a LIVE recheck (mid-session,
+            # cache already grown) measures the same model floor the startup call
+            # does — otherwise the limit would shrink as the cache approaches it.
+            active_floor = (mx.get_active_memory()
+                            - eng.kv_bytes_per_token * getattr(eng, "resident_tokens", 0))
             ctx_limit = ram_aware_ctx_limit(
                 eng.effective_ctx,
                 mx.device_info()["max_recommended_working_set_size"],
-                mx.get_active_memory(), eng.kv_bytes_per_token,
-                reserve_gb=_env_float("CHAD_CTX_RESERVE_GB") or 1.5)
+                active_floor, eng.kv_bytes_per_token,
+                reserve_gb=_env_float("CHAD_CTX_RESERVE_GB") or 1.5,
+                host_avail_bytes=_host_avail_bytes(),
+                slope_factor=_env_float("CHAD_CTX_SLOPE_FACTOR") or 1.75)
         except Exception:  # noqa: BLE001 — never let memory probing break startup
             ctx_limit = None
     if not ctx_limit:
@@ -359,6 +403,17 @@ def main():
                          "'openai' (spike: OpenAI-compatible /v1/chat/completions), or "
                          "'llama' (spike: llama.cpp raw /completion, token-id prompts). "
                          "The remote backends require --base-url.")
+    ap.add_argument("--serve", action="store_true",
+                    help="serve the in-process engine as an OpenAI-compatible endpoint "
+                         "(/v1/chat/completions) instead of running the agent. This is "
+                         "the TB2 Mac arm's server: unlike mlx_lm.server it keeps the "
+                         "prefix KV cache warm across requests (plan 075 WS3). One "
+                         "request at a time; pair with --n-concurrent-agents 1.")
+    ap.add_argument("--host", dest="serve_host", default="127.0.0.1",
+                    help="--serve bind address (default 127.0.0.1; use 0.0.0.0 to let "
+                         "Docker containers reach it via host.docker.internal)")
+    ap.add_argument("--port", dest="serve_port", type=int, default=8090,
+                    help="--serve port (default 8090)")
     ap.add_argument("--base-url", dest="base_url", default=None,
                     help="remote-backend base URL: for --backend openai an OpenAI-compatible "
                          "base (e.g. http://localhost:8080/v1, also CHAD_OPENAI_BASE_URL); "
@@ -488,6 +543,23 @@ def main():
         except ValueError:
             sys.stderr.write(f"[ignoring CHAD_TEMP={_temp!r}: not a number]\n")
 
+    # --serve: OpenAI-compatible endpoint on the in-process engine (plan 075 WS3).
+    # Loads synchronously (nothing to interact with until it's up), then serves until
+    # interrupted. MLX backend only — serving a remote backend would just proxy.
+    if args.serve:
+        if args.backend != "mlx":
+            sys.stderr.write("chad --serve requires the in-process MLX backend\n")
+            sys.exit(1)
+        from .serve import serve
+        sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} [{why}] ...\n")
+        try:
+            load_s = eng.load()
+        except Exception as e:  # noqa: BLE001 — convert any load failure into guidance
+            _fail_model_load(model_id, e)
+        sys.stderr.write(f"ready in {load_s:.1f}s | context {eng.effective_ctx} tokens\n")
+        serve(eng, host=args.serve_host, port=args.serve_port)
+        return
+
     # The full-screen TUI loads the 11 GB of weights on a BACKGROUND thread so the banner
     # + input come up in ~0.6 s and you can read/queue while it loads (the load itself is
     # disk-bound and can't be made faster). Headless one-shot and the plain --repl still
@@ -510,6 +582,13 @@ def main():
 
     start_mode = "plan" if args.plan else ("auto" if args.yolo else "normal")
     thinking = not args.no_think
+
+    # Live per-turn ctx-limit recheck (plan 075 WS1.4): the startup number was
+    # computed on whatever the box looked like at load; Docker/harbor/browsers
+    # changing the physical free band mid-session changes what is safe. MLX
+    # backend only — the remote backends hold no local KV.
+    ctx_limit_fn = (lambda: _compute_ctx_limit(eng)) if args.backend == "mlx" \
+        and not _env_int("CHAD_CTX_LIMIT") else None
 
     # Resume seeds a FRESH Agent's messages; that Agent mints a new session_id, so the
     # picked/newest session is copied, never overwritten (implicit fork — plan 043).
@@ -553,7 +632,7 @@ def main():
                       mode=run_mode, thinking=thinking, resume=resume, persist=True,
                       think_budget=args.think_budget,
                       turn_budget_tokens=args.turn_budget_tokens,
-                      turn_budget_s=args.turn_budget_s)
+                      turn_budget_s=args.turn_budget_s, ctx_limit_fn=ctx_limit_fn)
         agent.run_turn(task)
         # Plan 040: if the turn hard-stopped on a budget (governor token/wall budget, the
         # step cap's final window landing nothing, or the iter-2 no-empty-diff gate),
@@ -579,11 +658,12 @@ def main():
                           mode=run_mode, thinking=thinking, persist=True,
                           think_budget=args.think_budget,
                           turn_budget_tokens=args.turn_budget_tokens,
-                          turn_budget_s=args.turn_budget_s)
+                          turn_budget_s=args.turn_budget_s, ctx_limit_fn=ctx_limit_fn)
             agent.run_turn(f"{task}\n\n[{note}]")
         agent.save()  # persist so a follow-up `chad -c "..."` picks up the thread
     elif args.repl:
-        repl(eng, yolo=args.yolo, ctx_limit=ctx_limit, resume=resume, thinking=thinking)
+        repl(eng, yolo=args.yolo, ctx_limit=ctx_limit, resume=resume, thinking=thinking,
+             ctx_limit_fn=ctx_limit_fn)
     else:
         from .engine import peek_context_window
         from .tui import run_tui
@@ -600,7 +680,7 @@ def main():
             return load_s, _compute_ctx_limit(eng)
 
         run_tui(eng, provisional, mode=start_mode, thinking=thinking, resume=resume,
-                ctx_window=window, finalize=finalize)
+                ctx_window=window, finalize=finalize, ctx_limit_fn=ctx_limit_fn)
 
 
 if __name__ == "__main__":

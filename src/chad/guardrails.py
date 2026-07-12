@@ -267,7 +267,7 @@ def recheck_spiral(post_recheck_edits):
 
 def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_intent,
                        action_task, truncation_nudges, answer_nudges, verify_nudges,
-                       open_tool_call):
+                       open_tool_call, garbled_call=False):
     """Pick the nudge for a step that produced NO tool call, in the original priority
     order: (1) TRUNCATED — hit the token cap mid-thought, so it isn't an answer;
     (2) ANSWERED ON PAPER — produced/described code but never applied it; (3) UNVERIFIED
@@ -283,18 +283,29 @@ def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_inte
     # TB2 vulnerable-secret died at 45s of 900 on a 28-token `{"name":"bash>` garble that
     # the old code accepted as the final answer). Bounded by truncation_nudges. This fires
     # before the bare-stall branch so a garbled call isn't misread as an empty stall.
-    if open_tool_call and truncation_nudges < 2:
-        if hit_cap:
+    if (open_tool_call or garbled_call) and truncation_nudges < 2:
+        if open_tool_call and hit_cap:
             nudge = ("[your tool call was cut off at the length limit — the "
                      "content was too long to emit in one call. Do NOT retry it "
                      "whole. Create the file with `write` using only the FIRST "
                      "portion of the content, then append the rest with one or "
                      "more `edit` calls. Emit one complete tool call at a time.]")
-        else:
+        elif open_tool_call:
             nudge = ("[your last tool call was malformed and did not run — it opened a "
                      "<tool_call> (or <function=…>) that was never properly closed, so no "
                      "tool executed and nothing happened. Re-emit it now as ONE complete, "
                      "well-formed <tool_call> block with valid JSON arguments.]")
+        else:
+            # garbled_call: the block WAS closed but nothing inside parsed — mixed
+            # JSON/XML dialects, invalid JSON the repair pass couldn't reconstruct,
+            # etc. Without this branch the garble is accepted as a final answer
+            # (TB2 count-dataset-tokens, 2026-07-12: `{"name": "bash", …
+            # </parameter></function></tool_call>` ended the task with budget left).
+            nudge = ("[your last tool call was malformed and did not run — the "
+                     "<tool_call> block did not contain one valid JSON object, so no "
+                     "tool executed and nothing happened. Re-emit it now as ONE "
+                     "complete <tool_call> block: a single JSON object with \"name\" "
+                     "and \"arguments\", no XML tags inside.]")
         return "truncated", nudge
     if hit_cap and truncation_nudges < 2:
         # Cap hit but the call (if any) was balanced — a plain mid-thought truncation.

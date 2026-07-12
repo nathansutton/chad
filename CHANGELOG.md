@@ -4,6 +4,47 @@ Notable, user-visible changes. Started 2026-07; earlier history is summarized co
 
 ## [Unreleased]
 
+- **`chad --serve` — an OpenAI-compatible endpoint on the in-process engine**
+  (`/v1/chat/completions`, streaming + non-streaming, `/v1/models`, `/health`).
+  Unlike `mlx_lm.server`, it keeps chad's persistent prefix KV cache warm across
+  an agent's requests: an append-only follow-up step prefills only the newly
+  added tokens (measured on the 35B at a 7.7k-token transcript: 1.1 s warm vs
+  11.7 s cold). One request at a time by design; this is the Terminal-Bench 2.0
+  Mac arm's server (`benchmarks/tb2/README.md`).
+- **35B-on-24GB stability pack (plan 075)**: the engine now installs Metal
+  allocator clamps at load (`set_wired_limit`/`set_memory_limit`; opt out with
+  `CHAD_NO_MEMORY_CLAMP=1`); a Metal OOM inside a prefill chunk (catchable on
+  mlx ≥ 0.32, now required) rolls the cache back exactly, halves the chunk and
+  retries instead of killing the process; a mid-decode OOM keeps the partial
+  turn and rebuilds cleanly. The prefill chunk size is now adaptive per chunk
+  (MoE 2048 / dense 512 base — worth ~+14% prefill on the 35B — decaying toward
+  256 as resident context and memory pressure grow; explicit
+  `CHAD_PREFILL_CHUNK` still wins). The RAM-aware compaction trigger now also
+  respects host-physical free memory (Docker/harbor pressure Metal can't see)
+  and re-checks per turn (>10% hysteresis). Compaction that CANNOT get under
+  `ctx_limit` (protected floor bigger than the window) now latches instead of
+  destroying the warm cache every step — the old behavior cost a measured
+  26–28 s full re-prefill per step. Known trade: mlx 0.32.0 itself decodes
+  ~2.5% slower than 0.31.2 on the shipped models; taken for the catchable-OOM
+  recovery, and more than paid back by the chunk-size default on the 35B.
+- **Fixed: temp>0 sampling was frozen on `chad --serve`'s worker thread.** MLX's
+  implicit-key RNG never advances on non-main threads (present in stock mlx
+  0.32.0), so the server's single engine worker "sampled" with one frozen noise
+  vector: identical prompts produced byte-identical responses, and decoding was
+  quasi-greedy and markedly loop-prone (per-thread `mx.random.seed()` cannot fix
+  it — the seeded state is never consumed there). The engine now samples through
+  an explicit split-per-draw key chain (`_KeyedSampler`, fresh entropy per
+  generation) whenever temperature > 0, on every thread. Greedy (temp 0) decoding
+  is unchanged.
+- **Bounded rewind for the hybrid cache (plan 075)**: the engine now snapshots the
+  recurrent (DeltaNet) state once per turn at prefill-end — a free reference copy —
+  and can rewind to it: restore the recurrent state, native-trim the attention KV,
+  re-feed the few agreed-on tokens. A prompt that diverges *inside the last turn*
+  (a truncated generation re-rendered, a dropped `--serve` stream, an identical
+  prompt retried) now costs at most one turn's re-feed instead of a full-transcript
+  re-prefill (tens of seconds at TB2 context sizes). Divergences before the last
+  turn (compaction) fall back to the warm-prefix rebuild exactly as before.
+  Bit-exactness pinned by `test_hybrid_rewind_matches_fresh` on bf16 hybrid weights.
 - **`chad prove` — a two-minute offline smoke test**: four tiny fix-it tasks from
   chad's own dev suite (disclosed as such — it's a proof of life, not a
   benchmark), run through the real agent loop on the validated 9B, mechanically

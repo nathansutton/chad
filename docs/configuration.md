@@ -197,22 +197,43 @@ CHAD_MAX_CONTEXT=131072 uv run chad      # YaRN-extend to the model's full 128k 
 CHAD_KV_BITS=8          uv run chad      # quantize the KV cache (~half the RAM, ~20-30% slower)
 CHAD_CTX_LIMIT=28000    uv run chad      # force the compaction threshold (overrides the RAM-aware default)
 CHAD_CTX_RESERVE_GB=2.5 uv run chad      # scratch RAM held back when auto-sizing that threshold
+CHAD_CTX_SLOPE_FACTOR=1.0 uv run chad    # per-token cost multiplier for that auto-sizing (default
+                                         # 1.75: measured peak grows ~1.75x the raw KV bytes/token)
 CHAD_MODEL=/path/to/mlx-model uv run chad  # power-user escape hatch: run a different MLX model
+CHAD_PREFILL_CHUNK=1024 uv run chad      # force a fixed prefill chunk (default: adaptive — MoE 2048
+                                         # / dense 512, decaying to 256 as context+pressure grow)
+CHAD_NO_MEMORY_CLAMP=1  uv run chad      # A/B knob: skip the Metal allocator clamps installed at load
 ```
 
 By default the auto-compaction threshold (when chad reclaims old context — a full
 re-prefill on this non-trimmable cache, so we do it as rarely as RAM allows) is **sized
-automatically** from the live Metal memory budget and the model's measured per-token KV
-cost, then capped at the model's window. On a 24 GB Mac running the 35B that lands around
-~175k tokens (vs a fixed 120k before) — long sessions stay warm and TTFT flat. It
-self-calibrates per machine: less RAM compacts sooner, more RAM runs nearer the full
-window. `CHAD_CTX_LIMIT` forces an exact threshold (used by evals/tests);
-`CHAD_CTX_RESERVE_GB` (default 1.5) tunes how much headroom is held back for
-prefill/decode scratch — raise it if you run other memory-hungry apps alongside chad.
+automatically** from the live Metal memory budget and the model's measured per-token
+cost, then capped at the model's window. The per-token cost is the KV bytes/token times
+a slope factor (default 1.75) because measured peak memory grows faster than the KV
+cache alone — prefill/decode scratch scales with resident context too. On a 24 GB Mac
+running the 35B that lands around ~100k tokens. It self-calibrates per machine: less
+RAM compacts sooner, more RAM runs nearer the full window. `CHAD_CTX_LIMIT` forces an
+exact threshold (used by evals/tests); `CHAD_CTX_RESERVE_GB` (default 1.5) tunes how
+much headroom is held back for prefill/decode scratch — raise it if you run other
+memory-hungry apps alongside chad; `CHAD_CTX_SLOPE_FACTOR` tunes the per-token
+multiplier (1.0 recovers the old raw-KV sizing).
 
 `CHAD_MODEL` points chad at any local MLX model directory instead of Ornith. The harness
 is tuned for Ornith, so this is unsupported and mostly there for research — the happy
 path is the single bundled model, no flag.
+
+**Memory safety (plan 075).** At load the engine wires the Metal working set and caps
+the allocator slightly below it (`mx.set_wired_limit`/`set_memory_limit`), so a
+transient spike back-pressures instead of escalating to a jetsam SIGKILL; a Metal OOM
+caught inside a prefill chunk rolls the cache back exactly, halves the chunk, and
+retries. `CHAD_NO_MEMORY_CLAMP=1` disables the clamps (A/B). The compaction threshold
+additionally respects host-physical free memory (pressure from Docker or other apps
+that the Metal budget can't see) and is re-checked between turns.
+
+**`chad --serve`** exposes the in-process engine as an OpenAI-compatible endpoint
+(`/v1/chat/completions`), keeping the prefix KV cache warm across requests — see
+`benchmarks/tb2/README.md` for its role in the Terminal-Bench Mac arm. One request at
+a time; `--host 0.0.0.0` to accept connections from Docker containers.
 
 **Forcing the small model.** `CHAD_MODEL` also names another Ornith on Hugging Face, so
 it doubles as the "use the 9B" recipe. chad's default keys on *physical* RAM, so a 24 GB

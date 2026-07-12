@@ -19,3 +19,5 @@ traces/
 benchmarks/tb2/dataset/
 benchmarks/tb2/jobs/
 benchmarks/tb2/*.tsv
+# Local model builds (quantize_q6.py default --out)
+benchmarks/tb2/models/

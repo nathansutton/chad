@@ -239,6 +239,12 @@ class ChadAgent(BaseAgent):
             "CHAD_PREFILL_TRACE": trace,
             "CHAD_TRAJECTORY_JSON": traj_c,   # ATIF-v1.7; required for passing trials
             "CHAD_TEMP": self._temp,        # TB2 reference sampling temperature
+            # Ornith's real window. The openai-backend default is a conservative 32k,
+            # which makes the in-container chad compact at ~30k — and every client-side
+            # compaction rewrites the transcript, which costs a FULL re-prefill on the
+            # warm-prefix server. The server's own memory clamps bound the KV growth;
+            # the client should use the window (its ctx-limit fallback caps at 120k).
+            "CHAD_MAX_CONTEXT": "262144",
             "PYTHONUNBUFFERED": "1",
             "HOME": "/root" if str(run_user) in ("root", "0") else os.environ.get("HOME", "/root"),
         }

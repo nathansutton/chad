@@ -37,6 +37,17 @@ _INT_PARAMS = {"offset", "limit", "timeout"}
 # being dropped silently, wasting the step and a re-prefill. The opener tolerates a missing
 # closing brace and single or double quotes.
 _HYBRID_NAME_RE = re.compile(r"""\{\s*["']name["']\s*:\s*["']([^"']+)["']""")
+# Lenient variant of _TAG_RE for salvage: a CLOSED <tool_call> block whose interior
+# starts as JSON but doesn't end with `}` — the observed TB2 garble is JSON args that
+# never close, followed by XML-dialect closers (`…\n</parameter>\n</function>\n
+# </tool_call>`). _TAG_RE requires a trailing `}` so these never even reach
+# repair_json; count-dataset-tokens (2026-07-12 canary) died exactly here: a complete,
+# runnable bash command dropped, then the turn accepted as a final answer. Closed
+# blocks only — an UNCLOSED block usually means generation truncated mid-content, and
+# running a half-emitted call is worse than the existing malformed-call nudge.
+_TAG_SALVAGE_RE = re.compile(r"<tool_call>\s*(\{.*?)\s*</tool_call>", re.DOTALL)
+# Trailing XML-ish cruft to strip from a salvaged interior before JSON repair.
+_XML_CRUFT_RE = re.compile(r"(?:\s*</?(?:parameter|function|tool_call)[^>]*>)+\s*$")
 
 
 def strip_think(text: str) -> str:
@@ -152,6 +163,12 @@ def parse_tool_calls(text: str):
     seen = set()
     candidates = [m.group(1) for m in _TAG_RE.finditer(text)]
     candidates += [m.group(1) for m in _FENCE_RE.finditer(text)]
+    if not candidates:
+        # Salvage: closed <tool_call> blocks whose JSON never closed (garbled tail,
+        # e.g. `…\n</parameter>\n</function>\n</tool_call>`). Strip the XML cruft and
+        # let repair_json below reconstruct the call.
+        candidates = [_XML_CRUFT_RE.sub("", m.group(1))
+                      for m in _TAG_SALVAGE_RE.finditer(text)]
     if not candidates:  # last resort: any bare top-level JSON object
         candidates = list(_iter_json_objects(text))
     for raw in candidates:

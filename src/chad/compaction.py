@@ -99,7 +99,17 @@ def _headtail(text: str, head: int = 12, tail: int = 8, max_chars: int = 8000) -
     return text
 
 
-def compact_if_needed(messages, render, emit, ctx_limit, prompt_ids):
+# When compaction cannot get under ctx_limit (the protected floor — system prompt +
+# skills + recent window + active query — exceeds the limit), re-running it every step
+# is pure loss: each attempt mutates the transcript, which diverges the prefix and
+# forces a FULL re-prefill on the non-trimmable cache (measured: 26-28s per step, 7
+# steps consecutive, traces/session2.jsonl). The latch skips re-compaction until the
+# transcript has actually grown this many tokens past the recorded floor; the engine's
+# memory clamps (plan 075 WS1.1) make the small over-limit excursion safe.
+_OVERLIMIT_REARM = 2048
+
+
+def compact_if_needed(messages, render, emit, ctx_limit, prompt_ids, state=None):
     """Context compaction for long agentic sessions. On a non-trimmable cache
     (Ornith) any prefix change forces a full re-prefill, so compaction is
     expensive — we must reclaim enough in ONE pass that it won't re-trigger next
@@ -108,9 +118,22 @@ def compact_if_needed(messages, render, emit, ctx_limit, prompt_ids):
       1. strip stale <think> reasoning from older assistant turns;
       2. head/tail-truncate the oldest large tool outputs;
       3. as a last resort, drop the oldest messages entirely.
-    Recent context (last few tool results / assistant turns) is kept verbatim."""
+    Recent context (last few tool results / assistant turns) is kept verbatim.
+
+    `state`, if given, is a caller-owned dict that persists across calls; it holds
+    the over-limit latch (see _OVERLIMIT_REARM) so a floor-bound transcript is not
+    re-compacted — and its warm cache not destroyed — every single step."""
     if len(prompt_ids) <= ctx_limit:
+        if state is not None:
+            state.pop("overlimit_floor", None)  # back under: disarm the latch
         return prompt_ids
+    if state is not None:
+        floor = state.get("overlimit_floor")
+        if floor and len(prompt_ids) <= floor + _OVERLIMIT_REARM:
+            # Floor-bound: last compaction couldn't reclaim below ctx_limit and the
+            # transcript hasn't grown enough for a retry to fare any better. Leave
+            # it untouched so the prefix cache stays warm.
+            return prompt_ids
     target = int(ctx_limit * 0.7)  # reclaim to here so we don't recompact soon
     emit("status", "Compacting context")
     before = len(prompt_ids)
@@ -252,5 +275,15 @@ def compact_if_needed(messages, render, emit, ctx_limit, prompt_ids):
     log.info("COMPACT %d→%d tokens | limit=%d target=%d msgs=%d dropped=%d notice=%s%s",
              before, len(new_ids), ctx_limit, target, len(messages), len(dropped), noticed,
              " OVER-LIMIT" if len(new_ids) > ctx_limit else "")
+    if state is not None:
+        if len(new_ids) > ctx_limit:
+            # Couldn't get under the limit: the protected floor is bigger than the
+            # window. Latch, so the next steps don't thrash the warm cache retrying.
+            if not state.get("overlimit_floor"):
+                log.warning("COMPACT floor-bound: latching until context grows past "
+                            "%d (+%d)", len(new_ids), _OVERLIMIT_REARM)
+            state["overlimit_floor"] = len(new_ids)
+        else:
+            state.pop("overlimit_floor", None)
     emit("info", f"  [compacted context: {before}→{len(new_ids)} tokens]")
     return new_ids
