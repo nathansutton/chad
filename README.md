@@ -191,7 +191,7 @@ Face cache (`~/.cache/huggingface`, reused across every project):
 
 | Your Mac | Model | Footprint |
 |---|---|---|
-| **≥ 32 GB** | [Ornith-1.0-35B `UD-Q2_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX) — 35B MoE, 2-bit experts | ~12 GB resident (~14 GB with KV + runtime) |
+| **≥ 32 GB** | [Ornith-1.0-35B `UD-Q2_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX) — 35B MoE, 2-bit experts (3-bit down-projections) | ~13.4 GB resident (~16 GB with KV + runtime) |
 | **16 / 18 / 24 GB** (default) | [Ornith-1.0-9B `UD-Q4_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX) — 4-bit AWQ | ~5 GB |
 
 The 35B's ~14 GB working set needs headroom the 24 GB machine doesn't have — dogfooding

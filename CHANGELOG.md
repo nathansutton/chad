@@ -4,6 +4,21 @@ Notable, user-visible changes. Started 2026-07; earlier history is summarized co
 
 ## [Unreleased]
 
+- **The shipped 35B quant is better at the same speed** (plan 075 quant sweep).
+  `UD-Q2_K_XL` on Hugging Face now carries 3-bit expert down-projections
+  (2-bit gate/up, 6-bit backbone, 8-bit routers; 3.09 bits/weight, ~13.4 GB
+  resident, was ~12 GB). Held-out code perplexity drops 7.25 → 6.86 and prefill/
+  decode are unchanged (~728 tok/s / ~67 tok/s @8k on a 24 GB M4 Pro) — decode
+  reads only the 8 active experts, so the extra bits are effectively free. On the
+  TB2 canary set the old build went 2/6, the new one 15/17 model-attributable
+  over n=3. The AWQ calibration pass was dropped: measured as neutral-to-negative
+  on held-out code (RTN 7.19 vs AWQ 7.25). Existing installs pick the new build
+  up on their next model download; local caches keep working.
+- **New: a 6-bit build for big-memory Macs** —
+  [`Ornith-1.0-35B-Q6-MLX`](https://huggingface.co/nathansutton/Ornith-1.0-35B-Q6-MLX)
+  (~28.5 GB; needs ≥48 GB). Built by `benchmarks/tb2/quantize_q6.py`; the TB2
+  kit gained a rental-host arm (`serve_q6.sh`, `run_repeated.sh`, README
+  section) that serves it on e.g. an EC2 `mac-m4pro.metal`.
 - **`chad --serve` — an OpenAI-compatible endpoint on the in-process engine**
   (`/v1/chat/completions`, streaming + non-streaming, `/v1/models`, `/health`).
   Unlike `mlx_lm.server`, it keeps chad's persistent prefix KV cache warm across

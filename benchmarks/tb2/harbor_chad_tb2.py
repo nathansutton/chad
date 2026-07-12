@@ -140,11 +140,16 @@ class ChadAgent(BaseAgent):
         self.logger.info(f"[chad-tb2] installing chad into container at {_CHAD_SRC}")
         clean = Path(tempfile.mkdtemp(prefix="chad_src_"))
         try:
+            # jobs/dataset/models/*.tsv are run artifacts that live INSIDE the
+            # project tree: gigabytes the container doesn't need, and jobs/ MUTATES
+            # while a sweep is running — copying it here raced a concurrent cleanup
+            # and failed a trial at setup (log-summary-date-ranges, 2026-07-12).
             shutil.copytree(
                 self._project, clean / "src",
                 ignore=shutil.ignore_patterns(
                     ".venv", "__pycache__", "*.pyc", ".git", ".mypy_cache",
-                    ".pytest_cache", ".ruff_cache", "dist", "traces", ".gstack"))
+                    ".pytest_cache", ".ruff_cache", "dist", "traces", ".gstack",
+                    "jobs", "dataset", "models", "*.tsv"))
             await environment.upload_dir(clean / "src", _CHAD_SRC)
         finally:
             shutil.rmtree(clean, ignore_errors=True)

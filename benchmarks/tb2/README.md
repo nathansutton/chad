@@ -35,7 +35,7 @@ your Mac
 │ harbor ──▶ task container        │      │ chad --serve   :8080         │
 │            ┌───────────────────┐ │ /v1  │ Ornith-1.0-35B UD-Q2_K_XL    │
 │            │ chad (installed   │ │◀────▶│ (in-process MLX engine, warm │
-│            │ by setup(), runs  │ │      │  prefix KV; ~12 GB resident) │
+│            │ by setup(), runs  │ │      │  prefix KV; ~13 GB resident) │
 │            │ the real shell)   │ │      └──────────────────────────────┘
 │            └───────────────────┘ │        reached from containers as
 └──────────────────────────────────┘        http://host.docker.internal:8080/v1
@@ -69,7 +69,7 @@ so the venv fits TB2's small task images.
 
 ## Step 1 — serve Ornith on the Mac
 
-Serve the exact quant chad ships (`UD-Q2_K_XL`, ~12 GB resident) with **chad's own
+Serve the exact quant chad ships (`UD-Q2_K_XL`, ~13.4 GB resident) with **chad's own
 server** — the same in-process engine the TUI runs, behind an OpenAI-compatible
 endpoint:
 

@@ -34,17 +34,18 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
 # discoverability. The quant itself is MLX group-64 affine, not llama.cpp Q2_K
 # k-quants — the model card says so; the tag is for recognition, not bit-for-bit
 # equivalence.
-_HF_35B = "nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX"   # default: 35B MoE, ~12 GB resident
+_HF_35B = "nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX"   # default: 35B MoE, ~13.4 GB resident
 _HF_9B = "nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX"     # low-RAM fallback, ~5 GB resident
 # A dev clone that already built the weights locally should use them rather than
 # re-download — prefer these dirs when present.
-_LOCAL_35B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-35B-dyn2-q2-awq")
+_LOCAL_35B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-35B-dyn2-q2_down3")
 _LOCAL_9B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-9B-4bit-awq")
-# The 35B (2-bit experts / 6-bit backbone) is ~12 GB resident + KV + runtime ≈ 14 GB
-# peak, and the KV grows across a long agentic turn. On a 24 GB Mac the Metal wired
-# limit (~2/3 RAM ≈ 16 GB) minus the OS and whatever else is open leaves too little
-# headroom — dogfooding SIGKILLed the 35B mid-turn there. So the floor for the 35B is
-# 32 GB; 24 GB (and the 16/18 GB MacBook Pros) fall back to the 9B, which fits easily.
+# The 35B (2-bit experts, 3-bit expert down-projections, 6-bit backbone) is ~13.4 GB
+# resident + KV + runtime, and the KV grows across a long agentic turn. On a 24 GB Mac
+# the Metal wired limit (~2/3 RAM ≈ 16 GB) minus the OS and whatever else is open
+# leaves too little headroom — dogfooding SIGKILLed the 35B mid-turn there before the
+# plan-075 clamps/governor landed. The floor stays 32 GB until the 24 GB profile is
+# proven end-to-end (plan 075 WS1.6); 24 GB and below fall back to the 9B.
 _BIG_RAM_GB = 31.5
 
 
