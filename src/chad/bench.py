@@ -18,6 +18,7 @@ eval suite.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 # Reuse the exact model selection chad itself uses (RAM-aware default, local-dir-preferred,
@@ -178,13 +179,19 @@ def main(argv=None) -> int:
                     help="size of the cold prompt to prefill (default: 5000)")
     ap.add_argument("--gen-tokens", type=int, default=128,
                     help="tokens to decode for the decode measurement (default: 128)")
+    ap.add_argument("--chunk", type=int, default=None,
+                    help="prefill chunk size to feed the engine (overrides the "
+                         "CHAD_PREFILL_CHUNK env var and the built-in default).")
     ap.add_argument("--agentic", action="store_true",
                     help="run the agentic-session prefill benchmark: reproduce the "
                          "truncated-turn cache miss and the fix, measuring the re-prefill "
-                         "the next step pays (with/without the think-close fix)")
+                         "the next step pays (with/without the think-close fix).")
     ap.add_argument("--context-tokens", type=int, default=24000,
                     help="seeded context size for --agentic (default: 24000)")
     args = ap.parse_args(argv)
+
+    if args.chunk is not None:
+        os.environ["CHAD_PREFILL_CHUNK"] = str(args.chunk)
 
     if args.agentic:
         model_id, why = _pick_model()
@@ -204,7 +211,9 @@ def main(argv=None) -> int:
 
     # 1 + 2: cold prefill, then decode. One generate() call does both; GenStats splits the
     # time into prefill_s (reading the prompt) and gen_s (writing new tokens).
-    _, stats = eng.generate(prompt_ids, max_tokens=args.gen_tokens)
+    _, stats = eng.generate(prompt_ids, max_tokens=args.gen_tokens,
+                            on_prefill_progress=None)
+
     prefill_tps = stats.prompt_tokens / stats.prefill_s if stats.prefill_s else 0.0
     decode_tps = stats.tok_per_s
 

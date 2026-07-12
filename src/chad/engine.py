@@ -631,7 +631,7 @@ class Engine:
 
     # -- generation -------------------------------------------------------
 
-    def _prefill(self, ids: list, should_stop=None, chunk: int = 256,
+    def _prefill(self, ids: list, should_stop=None, chunk: Optional[int] = None,
                  on_progress=None) -> int:
         """Feed token ids through the model into the live cache in chunks, checking
         should_stop between chunks. Returns the count actually fed (< len(ids) when
@@ -645,6 +645,7 @@ class Engine:
         non-trimmable cache."""
         mc = self._cache
         n = len(ids)
+        chunk = chunk if chunk is not None else config.env_int("CHAD_PREFILL_CHUNK", 512)
         i = 0
         while i < n:
             if should_stop and should_stop():

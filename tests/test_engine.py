@@ -182,11 +182,11 @@ def test_interrupted_prefill_records_only_fed_tokens():
     eng._reset_cache = lambda: None                 # keep our fake _cache in place
     eng._ckpt_path = lambda ids, tag=None: "/tmp/chad-test-nonexistent/no.ckpt"  # -> miss
 
-    prefix = list(range(600))              # > 2 chunks at the 256-token default
+    prefix = list(range(600))              # > 1 chunk at the 512-token default
     checks = {"n": 0}
 
     def should_stop():
-        # False on the first check (feed chunk 0..256), True after (break before chunk 2).
+        # False on the first check (feed chunk 0..512), True after (break before chunk 1).
         checks["n"] += 1
         return checks["n"] > 1
 
@@ -194,7 +194,7 @@ def test_interrupted_prefill_records_only_fed_tokens():
 
     check("cold-miss path taken", status == "miss", status)
     check("prefill was interrupted (fed < full prefix)", fed < len(prefix), fed)
-    check("interrupt fed exactly one 256-chunk", fed == 256, fed)
+    check("interrupt fed exactly one 512-chunk", fed == 512, fed)
     # THE invariant: _cached_ids length == tokens actually pushed == sum of forward widths.
     check("_cached_ids records only the fed tokens (NOT the full prefix)",
           len(eng._cached_ids) == fed, f"len={len(eng._cached_ids)} vs fed={fed}")
