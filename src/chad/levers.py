@@ -164,6 +164,19 @@ LEVERS: dict[str, Lever] = {
         "content are blind. The reject refreshes the anchor, so it never locks out.",
         "iter6"),
 
+    # --- iter-7 (plan 074): parse-clean semantic drift in whole-unit rewrites,
+    #     derived from the first successful post-073 dogfood (replace_symbol dropped
+    #     an argparse line whose Namespace attr was still read → --agentic crashed,
+    #     with no signal at edit time). ----------------------------------------------
+    "edit_drift_warn": Lever(
+        "After a Python edit lands, warn in the same result when it DROPPED a binding "
+        "(def/class/param/assignment/self-attr) or a CLI-flag string that the rest of "
+        "the file still uses — the parse-clean drift class the syntax gates can't see. "
+        "Warn not reject: a reject would make legitimate remove-a-feature edits "
+        "order-dependent. OFF restores silent drift (the measured --context-tokens "
+        "AttributeError shipped without a word).",
+        "iter7"),
+
     # --- from the LangChain harness-tuning playbook. -------------------------------
     "compact_notice": Lever(
         "After compaction, inject an in-band message telling the model its context was "

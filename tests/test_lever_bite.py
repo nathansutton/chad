@@ -226,6 +226,21 @@ def test_stale_file_guard(monkeypatch, tmp_path):
         "ablated: the stale edit goes straight through"
 
 
+# === iter-7 (plan 074) =====================================================
+
+def test_edit_drift_warn(monkeypatch):
+    """The measured drift: a rewrite drops a def still called elsewhere. ON: the
+    result warns with the dangling reference. OFF: silent (the --context-tokens
+    AttributeError class ships without a word)."""
+    n = bite("edit_drift_warn")
+    before = "def helper():\n    return 1\n\ndef main():\n    return helper()\n"
+    after = "def main():\n    return helper()\n"
+    on(monkeypatch)
+    assert syntaxgate.drift_warn("m.py", before, after)
+    off(monkeypatch, n)
+    assert syntaxgate.drift_warn("m.py", before, after) is None
+
+
 # === iter-3 ================================================================
 
 def test_progress_note_rich(monkeypatch):

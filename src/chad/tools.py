@@ -205,7 +205,10 @@ def tool_write(path: str, content: str) -> str:
     _mark_seen(path, content)
     result = f"[wrote {len(content)} bytes to {_rel(path)}]"
     warn = syntaxgate.check_syntax(path, before)
-    return result + warn if warn else result
+    if warn:
+        result += warn
+    drift = syntaxgate.drift_warn(path, before, content)
+    return result + drift if drift else result
 
 
 # Edit robustness. Dogfooding logs showed ~1 in 6 `edit` calls failed to apply —
@@ -389,7 +392,10 @@ def _apply_edit(path: str, before: str, after: str, note: str,
     _mark_seen(path, after)
     result = f"[edited {_rel(path)}{note}]"
     warn = syntaxgate.check_syntax(path, before)
-    return result + warn if warn else result
+    if warn:
+        result += warn
+    drift = syntaxgate.drift_warn(path, before, after)
+    return result + drift if drift else result
 
 
 def tool_edit(path: str, old: str, new: str) -> str:

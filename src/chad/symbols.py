@@ -248,7 +248,10 @@ class SymbolService:
         dels = sum(d.startswith("-") for d in diff)
         result = f"[{label} in {self._rel(fp)}: +{adds} -{dels}]\n" + "\n".join(diff)
         warn = syntaxgate.check_syntax(fp, code)  # `code` is the pre-edit content
-        return result + warn if warn else result
+        if warn:
+            result += warn
+        drift = syntaxgate.drift_warn(fp, code, text)
+        return result + drift if drift else result
 
     # -- locate: jedi for .py, tree-sitter tags for everything else --------
 
