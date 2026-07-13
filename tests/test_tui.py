@@ -326,6 +326,43 @@ def test_interrupt_stops_turn():
     _stop_worker(tui, th)
 
 
+# -- Step 3b: escape hard-interrupts a running turn (parity with ctrl-c) ------
+
+def _escape_binding_matching(tui):
+    """Return the single-Escape key binding whose filter is active under the current
+    TUI state (there are several `("escape",)` bindings — deny-confirm, newline combo
+    head, and the interrupt — distinguished only by filter)."""
+    from prompt_toolkit.keys import Keys
+
+    kb = tui._bindings()
+    for b in kb.bindings:
+        if tuple(b.keys) == (Keys.Escape,) and b.filter():
+            return b
+    return None
+
+
+def test_escape_interrupts_when_busy():
+    tui, _ = _worker_tui()
+    tui._busy = True
+    tui._confirm_req = None
+    binding = _escape_binding_matching(tui)
+    assert binding is not None, "no escape binding active while busy"
+    assert not tui._interrupt.is_set()
+    binding.handler(None)  # handler ignores the event; None stands in
+    assert tui._interrupt.is_set(), "escape did not set the interrupt while busy"
+
+
+def test_escape_does_not_interrupt_when_idle():
+    tui, _ = _worker_tui()
+    tui._busy = False
+    tui._confirm_req = None
+    # No escape binding should interrupt when idle — idle escape stays free for the
+    # newline combo / meta prefix, and must never fire a spurious interrupt.
+    binding = _escape_binding_matching(tui)
+    assert binding is None, "an escape binding was active while idle"
+    assert not tui._interrupt.is_set()
+
+
 # -- Step 4: confirm handshake rendezvous ------------------------------------
 
 def test_confirm_blocks_until_answered():

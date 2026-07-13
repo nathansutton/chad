@@ -164,13 +164,15 @@ By default the harness uses the model's **full native window** instead of an arb
 cap. `CHAD_MAX_CONTEXT` requests more and **YaRN-extends** a model past native when its
 config supports it, capped at the model's documented max — so `CHAD_MAX_CONTEXT=262144`
 resolves to "256k, or the model's max". KV cache grows lazily, so a large window costs
-nothing until tokens fill it, and `CHAD_KV_BITS=8` halves its footprint.
+nothing until tokens fill it — and on the shipped Ornith models the KV cache is
+**quantized to 8-bit by default** (half the fp16 footprint; `CHAD_KV_BITS=0`
+restores fp16).
 
 How much it costs depends on the model's attention design. The table below is
 illustrative for a **pure-attention** transformer (e.g. the Qwen2.5-Coder models the
 eval bench keeps for research), where the KV cache grows linearly with context:
 
-| Context | KV cache (fp16) | KV cache (`CHAD_KV_BITS=8`) |
+| Context | KV cache (`CHAD_KV_BITS=0`, fp16) | KV cache (8-bit, default) |
 |---|---|---|
 | 32k | 1.2 GB | 0.6 GB |
 | 128k (YaRN) | 4.8 GB | 2.4 GB |
@@ -180,11 +182,19 @@ Ornith — the model chad ships — is a **hybrid SSM/attention** model: its rec
 layers carry a *fixed-size* state no matter how long the context gets, so only its
 attention layers grow. Its real footprint is flatter than the table above and sits well
 inside 24 GB alongside the ~5 GB of weights. When the prompt nears the window, old
-verbose tool outputs are compacted. Note `CHAD_KV_BITS=8` costs ~20–30%
-throughput (dequant overhead), so leave it off unless you actually need the memory.
+verbose tool outputs are compacted.
+
+8-bit KV used to cost ~20-30% throughput (mlx_lm's quantized attention is
+unfused), which is why it was opt-in. chad now ships a fused quantized-KV
+decode kernel (installed automatically when the model's attention shape is
+covered — both shipped Ornith models are), making the quantized cache *faster*
+than fp16 at long context (35B @32k: 60.2 vs 55.8 tok/s) on top of the RAM
+halving, so it is the default. `CHAD_KV_BITS=0` restores the fp16 cache;
+`CHAD_NO_QSDPA=1` keeps the quantized cache but disables the fused kernel
+(debug only — that combination is the old slow path).
 
 ```bash
-CHAD_MAX_CONTEXT=131072 CHAD_KV_BITS=8 uv run chad   # full 128k agentic context
+CHAD_MAX_CONTEXT=131072 uv run chad   # full 128k agentic context
 ```
 
 ## Advanced (env vars)
@@ -194,7 +204,7 @@ The rarely-touched tuning knobs live in environment variables so they stay off t
 
 ```bash
 CHAD_MAX_CONTEXT=131072 uv run chad      # YaRN-extend to the model's full 128k window
-CHAD_KV_BITS=8          uv run chad      # quantize the KV cache (~half the RAM, ~20-30% slower)
+CHAD_KV_BITS=0          uv run chad      # fp16 KV cache (8-bit fused is the default where covered)
 CHAD_CTX_LIMIT=28000    uv run chad      # force the compaction threshold (overrides the RAM-aware default)
 CHAD_CTX_RESERVE_GB=2.5 uv run chad      # scratch RAM held back when auto-sizing that threshold
 CHAD_CTX_SLOPE_FACTOR=1.0 uv run chad    # per-token cost multiplier for that auto-sizing (default

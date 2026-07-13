@@ -185,6 +185,53 @@ def test_failed_edit_shows_visible_whitespace():
     check("not-found shows visible ws", "·" in res, res)
 
 
+TAB_OBJ = (
+    "export const keys = {\n"
+    "\tjson: true,\n"
+    "\ttimeout: true,\n"
+    "};\n"
+)
+
+
+def test_ws_recovery_inserted_line_takes_neighbor_indent():
+    # ky-timeoutMessage (session dbf9dee0/20260713): model's old/new carry wrong
+    # absolute AND relative tabs; the inserted line must inherit its resolved
+    # neighbor's file indent, not first-line math.
+    old = "\texport const keys = {\n\t\tjson: true,\n\t\ttimeout: true,\n\t};"
+    new = ("\texport const keys = {\n\t\tjson: true,\n\t\ttimeout: true,\n"
+           "\t\t\ttimeoutMessage: true,\n\t};")
+    res, after = run(TAB_OBJ, old, new)
+    check("insert: recovered", "recovered" in res, res)
+    check("insert: neighbor tab depth",
+          "\n\ttimeoutMessage: true,\n" in after, repr(after))
+
+
+def test_ws_recovery_insert_after_opener_indents_one_unit():
+    old = "\texport const keys = {\n\t\tjson: true,"
+    new = "\texport const keys = {\n\t\t\tfirst: true,\n\t\tjson: true,"
+    res, after = run(TAB_OBJ, old, new)
+    check("opener: one unit deeper", "\n\tfirst: true,\n\tjson: true,\n" in after,
+          repr(after))
+
+
+def test_recovery_result_echoes_landed_indentation():
+    old = "\texport const keys = {\n\t\tjson: true,\n\t\ttimeout: true,\n\t};"
+    new = ("\texport const keys = {\n\t\tjson: true,\n\t\ttimeout: true,\n"
+           "\t\t\ttimeoutMessage: true,\n\t};")
+    res, _ = run(TAB_OBJ, old, new)
+    check("echo: legend present", "→ = one tab" in res, res)
+    check("echo: shows landed tabs", "→timeoutMessage: true," in res, res)
+
+
+def test_ws_only_edit_result_echoes_landed_indentation():
+    # `old` strips to the file lines but is NOT an exact substring (no leading tab), so
+    # this exercises the ws-flexible verbatim path — not the exact-match fast path, which
+    # the plan keeps echo-free. (Plan 082's literal `old` accidentally exact-matched.)
+    res, _ = run(TAB_OBJ, "json: true,\ntimeout: true,",
+                 "\t\tjson: true,\n\t\ttimeout: true,")
+    check("ws-only echo", "→→json: true," in res, res)
+
+
 if __name__ == "__main__":
     test_edit()
     test_ws_recovery_prefers_file_indentation()
@@ -192,5 +239,9 @@ if __name__ == "__main__":
     test_indent_break_is_rejected_and_reverted()
     test_already_broken_file_stays_editable()
     test_failed_edit_shows_visible_whitespace()
+    test_ws_recovery_inserted_line_takes_neighbor_indent()
+    test_ws_recovery_insert_after_opener_indents_one_unit()
+    test_recovery_result_echoes_landed_indentation()
+    test_ws_only_edit_result_echoes_landed_indentation()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

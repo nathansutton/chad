@@ -819,6 +819,36 @@ def test_adaptive_chunk_bounds():
           eng._adaptive_chunk(50_000_000) == 256)
 
 
+def test_load_fails_fast_without_mlx():
+    """Tier 1 (no weights): when the mlx imports failed (broken/half-installed
+    mlx-metal, or a non-Apple host that somehow built an Engine), load() must raise
+    a RuntimeError naming the original import cause — NOT fall through to `load(path)`
+    and die with a bare `TypeError: 'NoneType' object is not callable` 300 lines from
+    the real problem. Regression for the missing-libmlx.dylib dogfood incident."""
+    from chad import engine as engmod
+    from chad.engine import Engine
+
+    eng = object.__new__(Engine)  # bypass __init__ (no weights)
+    orig_has, orig_err = engmod._HAS_MLX, engmod._MLX_IMPORT_ERROR
+    cause = ImportError("dlopen: libmlx.dylib not loaded")
+    try:
+        engmod._HAS_MLX = False
+        engmod._MLX_IMPORT_ERROR = cause
+        try:
+            eng.load()
+            check("load() without mlx raises", False, "no exception raised")
+        except RuntimeError as e:
+            check("load() without mlx raises RuntimeError, not NoneType TypeError",
+                  "libmlx.dylib" in str(e) and "mlx-metal" in str(e), str(e))
+            check("original import error is chained as __cause__",
+                  e.__cause__ is cause, repr(e.__cause__))
+        except TypeError as e:
+            check("load() without mlx must NOT raise the opaque NoneType TypeError",
+                  False, str(e))
+    finally:
+        engmod._HAS_MLX, engmod._MLX_IMPORT_ERROR = orig_has, orig_err
+
+
 def test_prefill_oom_retry_rolls_back():
     """Tier 1 (no weights): a Metal OOM inside a prefill chunk (catchable on
     mlx>=0.32) must (a) restore every cache layer's state to the pre-chunk
@@ -954,9 +984,12 @@ def test_bounded_rewind_orchestration():
 
 def test_take_rewind_snapshot_gating():
     """Tier 1: the snapshot is only taken on the validated cache composition —
-    hybrid (_pld_hybrid), no kv quantization, tokens resident. Anything else is a
-    silent no-op (a snapshot on the wrong cache kind would CORRUPT a later rewind:
-    _trim_kv only trims plain KVCache layers)."""
+    hybrid (_pld_hybrid) with tokens resident. Anything else is a silent no-op
+    (a snapshot on the wrong cache kind would CORRUPT a later rewind: _trim_kv
+    only trims KVCache/QuantizedKVCache layers). Since plan 081 the quantized
+    cache is built quantized-from-start (no mid-decode type conversion), so
+    kv_bits no longer disables the snapshot — the quantized path is covered by
+    test_engine_kvquant.py's end-to-end rewind."""
     from chad.engine import Engine
 
     def make(pld_hybrid=True, kv_bits=None):
@@ -976,7 +1009,8 @@ def test_take_rewind_snapshot_gating():
     check("non-hybrid: no snapshot", eng._rewind_snap is None)
     eng = make(kv_bits=8)
     eng._take_rewind_snapshot(42)
-    check("kv_bits: no snapshot", eng._rewind_snap is None)
+    check("kv_bits (quantized-native): snapshot taken",
+          eng._rewind_snap == {"pos": 42, "recurrent": "REC"}, eng._rewind_snap)
     eng = make()
     eng._take_rewind_snapshot(0)
     check("zero resident tokens: no snapshot", eng._rewind_snap is None)
@@ -1061,6 +1095,7 @@ if __name__ == "__main__":
              test_enforce_cache_budget_disabled_when_zero,
              test_ckpt_path_filenames_are_kind_tagged,
              test_adaptive_chunk_bounds,
+             test_load_fails_fast_without_mlx,
              test_prefill_oom_retry_rolls_back,
              test_snapshot_survives_empty_kvcache,
              test_bounded_rewind_orchestration,

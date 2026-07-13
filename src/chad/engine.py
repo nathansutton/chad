@@ -42,13 +42,20 @@ try:
     from mlx_lm.models import cache as cache_utils
     from mlx_lm.sample_utils import make_sampler
     _HAS_MLX = True
-except ImportError:  # non-Apple host: remote backend only
+    _MLX_IMPORT_ERROR: Optional[BaseException] = None
+except ImportError as _e:  # non-Apple host: remote backend only
     # `unused-ignore` because the `assignment` ignore is only *needed* where mlx is
     # installed (mac). On the Linux lint runner mlx is absent, `ignore_missing_imports`
     # types these as Any, and the bare ignore would trip `warn_unused_ignores`.
     mx = None  # type: ignore[assignment, unused-ignore]
     load = stream_generate = cache_utils = make_sampler = None  # type: ignore[assignment, unused-ignore]
     _HAS_MLX = False
+    # Stash the real cause. A *missing* mlx is the benign Linux case; a mlx that
+    # is present but fails to import (e.g. a half-installed mlx-metal wheel whose
+    # libmlx.dylib got dropped by a partial `uv sync`) is a broken Apple env, and
+    # load() below raises this instead of nulling `load` and dying 300 lines later
+    # with a bare `TypeError: 'NoneType' object is not callable`.
+    _MLX_IMPORT_ERROR = _e
 
 # GenStats moved to base_engine.py (plan 046) so a non-MLX backend can build one without
 # importing mlx.core. Re-exported here so existing `from .engine import GenStats` keeps
@@ -235,7 +242,15 @@ class Engine:
     draft_id: Optional[str] = None
     num_draft_tokens: int = 3
     temp: float = 0.0
-    kv_bits: Optional[int] = None   # set to 8 to quantize the KV cache (saves RAM)
+    # KV cache quantization. None = AUTO: 8-bit when the fused decode kernel
+    # (mlx_qsdpa) covers the model's attention shape — both shipped Ornith
+    # models qualify — else off. 0 forces off; an explicit bit width forces on
+    # (an uncovered shape then decodes via mlx_lm's slow unfused path). The
+    # cache is quantized FROM THE START (plan 081 follow-on): prefill runs
+    # dequant + fused fp16 attention, decode runs the fused quantized kernel,
+    # and the cache's layer types never change mid-session — which is what
+    # lets the rewind machinery below stay enabled.
+    kv_bits: Optional[int] = None
     max_context: Optional[int] = None  # request a context window; YaRN-extends if > native
     prompt_lookup: bool = True      # n-gram prompt-lookup speculative decoding (no draft model)
     pld_num_draft: int = 10         # tokens to draft per forward via n-gram lookup
@@ -268,6 +283,8 @@ class Engine:
     # unfused head_dim-256 attention's transient scales with heads*chunk*kv_len.
     _is_moe: bool = field(init=False, default=False)
     _n_attn_heads: int = field(init=False, default=16)
+    _n_kv_heads: int = field(init=False, default=0)
+    _head_dim: int = field(init=False, default=0)
     # One-deep cache quarantine stack (plan 041): push_cache stashes the live
     # (cache, cached_ids, flags) here so a subagent can run in a fresh isolated cache;
     # pop_cache restores it bit-identically. Depth 1 only — subagents never nest.
@@ -330,6 +347,17 @@ class Engine:
         return None, want
 
     def load(self):
+        if not _HAS_MLX:
+            # We're on the in-process MLX path (Engine was constructed), but the mlx
+            # imports failed. Surface the ORIGINAL dlopen/import error — otherwise
+            # `load` is None and the next line dies with an opaque NoneType TypeError.
+            raise RuntimeError(
+                "MLX is unavailable, so the in-process engine cannot load a model. "
+                "On Apple Silicon this usually means a broken mlx/mlx-metal install "
+                "(e.g. a missing libmlx.dylib after a partial `uv sync`) — try "
+                "`uv sync --reinstall-package mlx-metal`. Original import error: "
+                f"{_MLX_IMPORT_ERROR!r}"
+            ) from _MLX_IMPORT_ERROR
         t0 = time.time()
         # Resolve a cached repo id to its local snapshot dir once, then load from disk —
         # skips the per-launch hub revision check on both the weights and _read_config.
@@ -347,6 +375,16 @@ class Engine:
             self.draft, _ = load(dpath, model_config=d_override) if d_override \
                 else load(dpath)
         self._read_model_shape(path)
+        # Decode fast-path (fused projections + compiled S=1 layer step) for the
+        # hybrid MoE checkpoint; silent no-op on any other model or on failure.
+        from . import mlx_fastpath
+        mlx_fastpath.install(self.model)
+        # Fused quantized-KV decode attention: makes kv_bits=8 a speed win
+        # instead of a loss (plan 081). Patches mlx_lm's quantized SDPA branch
+        # only; inert unless a QuantizedKVCache is actually in play.
+        from . import mlx_qsdpa
+        qsdpa_ok = mlx_qsdpa.install()
+        self._resolve_kv_bits(qsdpa_ok)
         self._install_memory_clamp()
         self._reset_cache()
         self.kv_bytes_per_token = self._measure_kv_bytes_per_token()
@@ -355,17 +393,48 @@ class Engine:
     def _read_model_shape(self, path: str) -> None:
         """Capture the config facts the adaptive prefill chunk needs (plan 075):
         attention head count (sizes the unfused-SDPA transient) and whether the
-        model is a MoE (bigger chunks amortize expert routing). Best-effort —
+        model is a MoE (bigger chunks amortize expert routing) — plus the kv-head
+        count and head_dim the kv-quantization auto-gate needs. Best-effort —
         the defaults are the shipped 9B/35B shapes."""
         try:
             cfg = self._read_config(path)
             tc = cfg.get("text_config", cfg)
             self._n_attn_heads = int(tc.get("num_attention_heads") or 16)
+            self._n_kv_heads = int(tc.get("num_key_value_heads") or 0)
+            self._head_dim = int(tc.get("head_dim") or 0)
             self._is_moe = (tc.get("num_experts") is not None
                             or "moe" in str(cfg.get("model_type", "")).lower()
                             or "moe" in str(tc.get("model_type", "")).lower())
         except Exception:  # noqa: BLE001 — shape probing must never break load
             pass
+
+    def _resolve_kv_bits(self, qsdpa_ok: bool) -> None:
+        """Turn the kv_bits request into a concrete mode before the first cache
+        is built. None = auto: default ON (8-bit) exactly when the fused decode
+        kernel covers this model's attention shape AND installed — measured a
+        WIN over the fp16 cache on both time (60.2 vs 55.8 tok/s @32k on the
+        35B) and RAM (kv bytes/token halved -> ~2x the governor's ctx_limit ->
+        fewer ~100 s compaction re-prefills). 0/falsy forces off; an explicit
+        width is honored as-is (uncovered shapes then decode on mlx_lm's slow
+        unfused path — the user asked, warn but obey). Draft-model (speculative)
+        setups stay fp16: that path was never validated against a quantized
+        cache."""
+        from . import mlx_qsdpa
+        gqa = self._n_attn_heads // self._n_kv_heads if self._n_kv_heads else 0
+        covered = qsdpa_ok and mlx_qsdpa.covers(self._head_dim, gqa)
+        if self.kv_bits is None:
+            self.kv_bits = 8 if (covered and self.draft is None) else None
+            if self.kv_bits:
+                log.info("KV cache: quantized 8-bit group-64 by default (fused "
+                         "decode kernel covers head_dim=%d gqa=%d); "
+                         "CHAD_KV_BITS=0 restores fp16", self._head_dim, gqa)
+        elif not self.kv_bits:
+            self.kv_bits = None            # explicit 0 -> fp16 cache
+        elif not covered:
+            log.warning("KV cache: kv_bits=%s forced on a shape the fused "
+                        "kernel does not cover (head_dim=%s gqa=%s) — decode "
+                        "will use the slow unfused path", self.kv_bits,
+                        getattr(self, "_head_dim", "?"), gqa or "?")
 
     def _install_memory_clamp(self) -> None:
         """Plan 075 WS1.1: give the Metal allocator explicit limits instead of the
@@ -404,10 +473,12 @@ class Engine:
             mx.eval([c.state for c in self._cache])
             bpt = 0.0
             for c in self._cache:
-                if isinstance(c, cache_utils.KVCache):
-                    for arr in (getattr(c, "keys", None), getattr(c, "values", None)):
-                        if arr is not None and len(arr.shape) >= 3 and arr.shape[2]:
-                            bpt += arr.nbytes / arr.shape[2]
+                if isinstance(c, (cache_utils.KVCache, cache_utils.QuantizedKVCache)):
+                    for entry in (getattr(c, "keys", None), getattr(c, "values", None)):
+                        arrs = entry if isinstance(entry, (tuple, list)) else (entry,)
+                        for arr in arrs:
+                            if arr is not None and len(arr.shape) >= 3 and arr.shape[2]:
+                                bpt += arr.nbytes / arr.shape[2]
             return bpt
         except Exception:  # noqa: BLE001 — instrumentation must never break load
             return 0.0
@@ -432,6 +503,18 @@ class Engine:
 
     def _reset_cache(self):
         self._cache = cache_utils.make_prompt_cache(self.model)
+        if self.kv_bits and self.draft is None:
+            # Quantized-from-start attention cache (plan 081 follow-on): the
+            # layer types never change mid-session, so trim/rewind stay valid
+            # (QuantizedKVCache trims by offset; realloc rebinds but never
+            # mutates rows below the write point). Prefill over it runs
+            # dequant + fused fp16 sdpa, decode the fused quantized kernel —
+            # both installed by mlx_qsdpa at load().
+            self._cache = [
+                cache_utils.QuantizedKVCache(group_size=64, bits=self.kv_bits)
+                if type(c) is cache_utils.KVCache else c
+                for c in self._cache
+            ]
         if self.draft is not None:
             self._cache += cache_utils.make_prompt_cache(self.draft)
         self._cached_ids = []
@@ -462,9 +545,11 @@ class Engine:
             not self._trimmable
             and self.draft is None
             and bool(self._cache)
-            and all(isinstance(c, (cache_utils.KVCache, cache_utils.ArraysCache))
+            and all(isinstance(c, (cache_utils.KVCache, cache_utils.ArraysCache,
+                                   cache_utils.QuantizedKVCache))
                     for c in self._cache)
-            and any(isinstance(c, cache_utils.KVCache) for c in self._cache)
+            and any(isinstance(c, (cache_utils.KVCache, cache_utils.QuantizedKVCache))
+                    for c in self._cache)
         )
 
     # -- ds4-style on-disk KV checkpoints ---------------------------------
@@ -480,6 +565,11 @@ class Engine:
     def _ckpt_path(self, ids: list, tag: str = "") -> str:
         h = hashlib.sha1()
         h.update(self.model_id.encode("utf-8", "ignore"))
+        h.update(b"\x00")
+        # the cache MODE is part of the identity: an fp16 checkpoint loaded into
+        # a quantized session (or vice versa) would silently flip the attention
+        # path for the whole session
+        h.update(f"kv{self.kv_bits or 0}".encode())
         h.update(b"\x00")
         if tag:  # namespace distinct checkpoint kinds (warm-prefix vs push-spill)
             h.update(tag.encode("utf-8", "ignore"))
@@ -552,7 +642,8 @@ class Engine:
             c.cache = list(arrs)
 
     def _trim_kv(self, n):
-        kv = [c for c in self._cache if isinstance(c, cache_utils.KVCache)]
+        kv = [c for c in self._cache
+              if isinstance(c, (cache_utils.KVCache, cache_utils.QuantizedKVCache))]
         cache_utils.trim_prompt_cache(kv, n)
 
     def _take_rewind_snapshot(self, pos: int) -> None:
@@ -564,12 +655,13 @@ class Engine:
         REASSIGN their state arrays each step, so the snapshot pins one generation
         of state arrays (~tens of MB) and stays exact."""
         # Gate on the same cache composition the PLD-hybrid rollback validated
-        # (_pld_hybrid: non-trimmable, draft-less, plain KVCache + ArraysCache
-        # layers only): _rewind_to trims via _trim_kv, which only sees plain
-        # KVCache — a quantized or exotic cache layer would silently NOT be
-        # trimmed and corrupt the rewind. kv_bits also converts layers mid-decode,
-        # so it is excluded outright.
-        if not self._pld_hybrid or self.kv_bits or pos <= 0:
+        # (_pld_hybrid: non-trimmable, draft-less, KVCache/QuantizedKVCache +
+        # ArraysCache layers only): _rewind_to trims via _trim_kv — an exotic
+        # cache layer would silently NOT be trimmed and corrupt the rewind.
+        # Quantized layers are safe here since plan 081: the cache is quantized
+        # from the start (no mid-decode type conversion) and trims by offset
+        # (rows below the trim point are never mutated in place).
+        if not self._pld_hybrid or pos <= 0:
             return
         self._rewind_snap = {"pos": pos, "recurrent": self._snap_recurrent()}
 
@@ -974,19 +1066,17 @@ class Engine:
                      else make_sampler(temp=self.temp)),
             prompt_cache=self._cache,
         )
-        if self.kv_bits:
-            kwargs["kv_bits"] = self.kv_bits
         if self.draft is not None:
             kwargs["draft_model"] = self.draft
             kwargs["num_draft_tokens"] = self.num_draft_tokens
 
         t0 = time.time()
-        # Interruptible prefill (single-model, unquantized cache): feed everything
+        # Interruptible prefill (single-model): feed everything
         # but the last token ourselves so should_stop is honored between chunks.
         # stream_generate then only has to prefill the final token before decoding.
         gen_prompt = suffix
         resident = common
-        if self.draft is None and not self.kv_bits and len(suffix) > 1:
+        if self.draft is None and len(suffix) > 1:
             fed = self._prefill(suffix[:-1], should_stop, on_progress=on_prefill_progress)
             if fed < len(suffix) - 1:  # interrupted mid-prefill
                 self._cached_ids = prompt_ids[: common + fed]

@@ -474,7 +474,9 @@ def main():
     # Advanced, rarely-touched knobs live in env vars to keep the CLI sane:
     #   CHAD_MAX_CONTEXT       YaRN-extend the window (e.g. 131072 for 128k)
     #   CHAD_CTX_LIMIT         prompt-token budget before old tool outputs compact
-    #   CHAD_KV_BITS           quantize the KV cache (e.g. 8) to save RAM on long runs
+    #   CHAD_KV_BITS           KV cache quantization; default AUTO (8-bit where the
+    #                          fused kernel covers the model — both shipped Ornith
+    #                          models). 0 forces the fp16 cache.
     #   CHAD_KV_CACHE_MAX_GB   cap the on-disk KV cache (LRU-evict above it); 0 = unlimited
     max_context = _env_int("CHAD_MAX_CONTEXT")
     kv_bits = _env_int("CHAD_KV_BITS")

@@ -531,6 +531,7 @@ class TUI:
     def _bindings(self):
         kb = KeyBindings()
         confirming = Condition(lambda: self._confirm_req is not None)
+        busy = Condition(lambda: self._busy)
         in_input = has_focus(self.input)
 
         # Enter submits (eager, so it beats the multiline buffer's newline insert);
@@ -581,6 +582,16 @@ class TUI:
                 self.input.buffer.reset()
             else:
                 self._shutdown_app(event)
+
+        # Escape hard-interrupts a running turn (parity with ctrl-c and Claude Code)
+        # so you can stop a trace and steer immediately instead of queueing behind it.
+        # Not eager: prompt_toolkit still disambiguates the escape,enter newline combo
+        # and meta/alt sequences by the flush timeout. A pending confirm is handled by
+        # the eager escape=deny binding above, so this only fires mid-turn.
+        @kb.add("escape", filter=busy & ~confirming)
+        def _(event):
+            self._interrupt.set()
+            self._emit("info", "  [interrupting…]")
 
         @kb.add("c-d")
         def _(event):
@@ -756,7 +767,7 @@ class TUI:
                 self._emit("info", "  " + ln)
             return False
         if text == "/help":
-            self._emit("info", "shift-tab: cycle mode (normal/auto/plan) · ctrl-c: "
+            self._emit("info", "shift-tab: cycle mode (normal/auto/plan) · esc/ctrl-c: "
                                "interrupt · /init /skills /mcp /mcp trust /mcp login <server> "
                                "/resume /reset /clear /compact /model /mode /accept /exit · !cmd shell · @path "
                                "attach · type while busy to queue · plan ready: type to "

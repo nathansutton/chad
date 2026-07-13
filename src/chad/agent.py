@@ -1420,6 +1420,10 @@ class Agent:
                                         if guardrails.edit_failed_to_land(result) else 0)
                     last_edit_fail_kind = guardrails.edit_fail_kind(result)
                     if not guardrails.edit_failed_to_land(result):
+                        recent_sigs.clear()  # a landed change resets the identical-call
+                                             # loop guard: re-running the same verify
+                                             # command after an edit is progress, not a
+                                             # loop (false-fired 2x in dbf9dee0/20260713)
                         _wp = str(args.get("path", "") or "")
                         if _wp and os.path.exists(_wp):
                             try:

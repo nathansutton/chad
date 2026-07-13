@@ -302,7 +302,8 @@ def _ws_flexible_spans(data: str, old: str):
     return spans
 
 
-def _reindent(new: str, target_indent: str, span_text: str | None = None) -> str:
+def _reindent(new: str, target_indent: str, span_text: str | None = None,
+              indent_unit: str | None = None) -> str:
     """Shift `new` so its first non-blank line carries target_indent, preserving the
     relative indentation of the rest (so a recovered block lands at the file's indent).
 
@@ -313,7 +314,20 @@ def _reindent(new: str, target_indent: str, span_text: str | None = None) -> str
     model's relative indents are the least trustworthy part of the edit — the
     demonstrated failure (sphinx-7440): a semantically correct one-line fix landed
     with the model's broken 10-space indent, shipped an IndentationError, and the
-    resulting file was unrepairable through this same path."""
+    resulting file was unrepairable through this same path.
+
+    Inserted lines — lines in `new` with no counterpart in the span — used to take the
+    FIRST span line's indent (`target_indent`) via first-line math, which is irrelevant
+    to a line inserted deep inside the block (ky-timeoutMessage, session
+    dbf9dee0/20260713: `timeoutMessage: true,` inserted between two `\\t`-indented
+    siblings landed at the wrong tab depth, then cost ~35 tool calls of tab surgery).
+    Now each run of unresolved lines is NEIGHBOR-ANCHORED: it takes the file indent of
+    the nearest resolved line before it (else after it), one `indent_unit` deeper when
+    that neighbor opens a block (`{ ( [` or a trailing `:`). The model's relative depth
+    between unresolved lines is deliberately ignored — in that session the model believed
+    a sibling belonged one level deeper, so honoring relative depth reproduces the bug;
+    a multi-line nested insert may therefore land under-indented, but the recovery-path
+    echo makes that visible and a whitespace-only follow-up applies verbatim."""
     def _ind(s: str) -> str:
         return s[: len(s) - len(s.lstrip())]
     lines = new.split("\n")
@@ -323,21 +337,61 @@ def _reindent(new: str, target_indent: str, span_text: str | None = None) -> str
     for sl in span_lines:
         if sl.strip():
             strip_map.setdefault(sl.strip(), _ind(sl))
+
+    # Pass 1: resolve each non-blank line's indent from the FILE where a counterpart
+    # exists (positional map, else stripped-content map). `resolved[i]` is None for a
+    # blank line or an inserted line with no file counterpart.
+    resolved: list[str | None] = []
+    for i, ln in enumerate(lines):
+        if not ln.strip():
+            resolved.append(None)
+        elif positional and span_lines[i].strip():
+            resolved.append(_ind(span_lines[i]))
+        elif ln.strip() in strip_map:
+            resolved.append(strip_map[ln.strip()])
+        else:
+            resolved.append(None)
+
+    # Pass 2: emit. Resolved lines take their file indent; unresolved lines are
+    # neighbor-anchored (above). When nothing at all resolved (no span / nothing
+    # matched) fall back to the legacy first-line math, byte-for-byte unchanged.
+    any_resolved = any(r is not None for r in resolved)
     first = next((l for l in lines if l.strip()), "")
     src = _ind(first)
     out = []
     for i, ln in enumerate(lines):
+        r = resolved[i]
         if not ln.strip():
             out.append("")
-        elif positional and span_lines[i].strip():
-            out.append(_ind(span_lines[i]) + ln.strip())
-        elif ln.strip() in strip_map:
-            out.append(strip_map[ln.strip()] + ln.strip())
-        elif ln.startswith(src):
-            out.append(target_indent + ln[len(src):])
+        elif r is not None:
+            out.append(r + ln.strip())
+        elif not any_resolved:
+            if ln.startswith(src):
+                out.append(target_indent + ln[len(src):])
+            else:
+                out.append(target_indent + ln.lstrip())
         else:
-            out.append(target_indent + ln.lstrip())
+            anchor = _nearest_resolved(lines, resolved, i)
+            base = anchor[0]
+            if anchor[1] and indent_unit and anchor[2].rstrip().endswith(("{", "(", "[", ":")):
+                base = base + indent_unit
+            out.append(base + ln.strip())
     return "\n".join(out)
+
+
+def _nearest_resolved(lines: list[str], resolved: list[str | None],
+                      i: int) -> tuple[str, bool, str]:
+    """Indent of the nearest resolved non-blank line to `i`, preferring the one BEFORE
+    it (so an insert sits with the sibling it follows). Returns (indent, is_before,
+    anchor_stripped); the opener bump only applies to a before-anchor. Never called
+    unless some line resolved, so the final `("", ...)` is unreachable in practice."""
+    for j in range(i - 1, -1, -1):
+        if resolved[j] is not None:
+            return resolved[j], True, lines[j].strip()  # type: ignore[return-value]
+    for j in range(i + 1, len(lines)):
+        if resolved[j] is not None:
+            return resolved[j], False, lines[j].strip()  # type: ignore[return-value]
+    return "", False, ""
 
 
 def _closest_hint(data: str, old: str) -> str:
@@ -387,6 +441,18 @@ def _indent_hint(data: str, old: str) -> str:
         shown = shown[:800] + "…"
     return ("\n[current lines in the file (· = one space, → = one tab) — copy this "
             f"indentation exactly:\n{shown}\n]")
+
+
+def _landed_hint(block: str) -> str:
+    """Echo the replacement block that just landed with leading whitespace made visible
+    (· = space, → = tab), so a recovery-path edit SHOWS the model the depth it chose
+    instead of it verifying via extra read/sed/od round-trips (ky-timeoutMessage, session
+    dbf9dee0/20260713: ~10 blind whitespace-check rounds after a recovered insert). Same
+    legend wording as `_indent_hint`, capped at 800 chars, so the model sees one format."""
+    shown = "\n".join(_show_ws(l) for l in block.split("\n"))
+    if len(shown) > 800:
+        shown = shown[:800] + "…"
+    return f"\n[landed lines (· = one space, → = one tab):\n{shown}\n]"
 
 
 # Per-session freshness bookkeeping (plan 073): the content hash of each file when the
@@ -493,7 +559,7 @@ def tool_edit(path: str, old: str, new: str) -> str:
         indent = head[: len(head) - len(head.lstrip())]
         used_unew = uold != old  # this path only unescapes `new` when `old` was unescaped
         raw = (unew if used_unew else new).strip("\n")
-        repl = _reindent(raw, indent, data[s:e])
+        repl = _reindent(raw, indent, data[s:e], indent_unit=_indent_unit(data))
         if data[:s] + repl + data[e:] == data and raw != data[s:e]:
             # Reindenting reproduced the file byte-for-byte, yet the model's `new`
             # differs from the span — the edit IS a whitespace change (an
@@ -501,12 +567,20 @@ def tool_edit(path: str, old: str, new: str) -> str:
             # unrepairable through this tool (sphinx-7440: every fix attempt
             # returned "[no-op edit]" and the model fell back to blind sed). Trust
             # the model's whitespace verbatim.
-            return _apply_edit(path, data, data[:s] + raw + data[e:],
-                               " (applied verbatim: whitespace-only change)"
-                               + (note_new if used_unew else ""))
-        return _apply_edit(path, data, data[:s] + repl + data[e:],
-                           " (recovered: matched ignoring indentation/whitespace)"
-                           + (note_new if used_unew else ""))
+            res = _apply_edit(path, data, data[:s] + raw + data[e:],
+                              " (applied verbatim: whitespace-only change)"
+                              + (note_new if used_unew else ""))
+            landed = raw
+        else:
+            res = _apply_edit(path, data, data[:s] + repl + data[e:],
+                              " (recovered: matched ignoring indentation/whitespace)"
+                              + (note_new if used_unew else ""))
+            landed = repl
+        # Echo the landed region with visible whitespace (ky-timeoutMessage, session
+        # dbf9dee0/20260713): recovery reindents, so the model must SEE the depth that
+        # landed rather than re-derive it via read/sed/od. Only on a result that landed —
+        # `_apply_edit` can return a syntaxgate rejection or drift warning instead.
+        return res + _landed_hint(landed) if res.startswith("[edited") else res
     if len(spans) > 1:
         return (f"[old string matches {len(spans)} places ignoring whitespace; include "
                 f"more surrounding lines to make it unique]")

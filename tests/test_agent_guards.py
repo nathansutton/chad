@@ -193,6 +193,33 @@ def test_loop_guard():
           loop_signature([("read", {"path": "a"})]) != loop_signature([("read", {"path": "b"})]))
 
 
+def test_loop_guard_resets_on_landed_edit():
+    # dbf9dee0/20260713 (ky-timeoutMessage): edit -> npm test -> edit -> npm test
+    # -> edit -> npm test tripped "loop detected" on the 3rd identical test run
+    # even though every rerun followed a LANDED edit. A landed change must clear
+    # the identical-call history; only edit-free repetition is a loop.
+    test_call = [("bash", {"command": "npm test"})]
+    sig = loop_signature(test_call)
+    recent = []
+    outcomes = []
+    for _ in range(3):                     # edit lands, then the same test rerun
+        recent.clear()                     # <- the landed-edit reset under test
+        seen_before = recent.count(sig)
+        recent.append(sig)
+        outcomes.append("nudge" if is_repeat_loop(seen_before) else "ok")
+    check("verify-after-edit never nudges", outcomes == ["ok", "ok", "ok"],
+          f"outcomes={outcomes}")
+    # and with NO edits in between the guard still fires on the 3rd occurrence
+    recent = []
+    fired = []
+    for _ in range(3):
+        seen_before = recent.count(sig)
+        recent.append(sig)
+        fired.append(is_repeat_loop(seen_before))
+    check("edit-free repetition still loops", fired == [False, False, True],
+          f"fired={fired}")
+
+
 def test_nudge_for_no_calls():
     base = dict(made_edit=False, unverified_edit=False, read_only_intent=False,
                 action_task=False, truncation_nudges=0, answer_nudges=0,
@@ -759,6 +786,7 @@ if __name__ == "__main__":
     test_done_rejection()
     test_update_work_flags()
     test_loop_guard()
+    test_loop_guard_resets_on_landed_edit()
     test_nudge_for_no_calls()
     test_landing_nudge()
     test_extend_step_cap()
