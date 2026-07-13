@@ -410,3 +410,73 @@ def test_confirm_returns_false_on_shutdown_midwait():
     assert not th.is_alive(), "confirm did not unblock on shutdown"
     assert out["v"] is False
     assert tui._confirm_req is None
+
+
+# ---------------------------------------------------------------------------
+# Mid-run steering (improve 01): input typed while a turn runs redirects THAT
+# turn — routed to `_steer_queue` and drained by the agent between steps —
+# instead of parking as a type-ahead that lands too late. `!cmd` keeps the old
+# type-ahead (a shell side-channel), and a steer that misses the turn's final
+# drain falls back to the type-ahead queue so it is never dropped.
+# ---------------------------------------------------------------------------
+
+class _Buff:
+    """`_on_accept` reads only `.text` from the prompt_toolkit buffer."""
+
+    def __init__(self, text):
+        self.text = text
+
+
+def test_midturn_input_routes_to_steer_queue_not_typeahead():
+    tui, _ = _worker_tui()
+    tui._busy = True
+    tui._on_accept(_Buff("actually target the other file"))
+    assert list(tui._steer_queue) == ["actually target the other file"]
+    assert list(tui._queue) == []
+
+
+def test_idle_input_still_starts_a_turn():
+    tui, _ = _worker_tui()
+    tui._busy = False
+    tui._on_accept(_Buff("do a task"))
+    assert list(tui._queue) == ["do a task"]
+    assert list(tui._steer_queue) == []
+
+
+def test_midturn_shell_passthrough_keeps_typeahead():
+    # `!cmd` is a shell side-channel, not a message to the model — steering it into
+    # the transcript would hand the model a literal "!ls" as an instruction.
+    tui, _ = _worker_tui()
+    tui._busy = True
+    tui._on_accept(_Buff("!ls"))
+    assert list(tui._queue) == ["!ls"]
+    assert list(tui._steer_queue) == []
+
+
+def test_drain_steering_hands_over_fifo_and_empties():
+    tui, _ = _worker_tui()
+    tui._steer_queue.extend(["first", "second"])
+    assert tui._drain_steering() == ["first", "second"]
+    assert tui._drain_steering() == []
+
+
+def test_agent_is_wired_to_the_tui_drain():
+    # The real Agent must be constructed with the TUI's drain hook (both at startup
+    # and connected to the same queue `_on_accept` fills) — this pins the wiring.
+    tui = TUI(_fake_engine(), ctx_limit=24000)
+    assert tui.agent._drain_steering == tui._drain_steering
+
+
+def test_leftover_steer_falls_back_to_typeahead():
+    # A steer enqueued after the turn's final drain (here: the fake agent never
+    # drains at all) must run as the NEXT turn, not vanish.
+    tui, fake = _worker_tui()
+    done = threading.Event()
+    fake.on_call = (lambda m: (tui._steer_queue.append("too late to steer"), None)
+                    if m == "task" else done.set())
+    th = _start_worker(tui)
+    tui._queue.append("task")
+    tui._wake.set()
+    assert done.wait(_JOIN), "the leftover steer never ran as a follow-up turn"
+    assert fake.calls == ["task", "too late to steer"]
+    _stop_worker(tui, th)

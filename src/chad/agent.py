@@ -279,7 +279,8 @@ INIT_PROMPT = (
 class Agent:
     def __init__(self, engine: BaseEngine, yolo: bool = False, max_steps: int = 40,
                  ctx_limit: int = 24000, mode: str = None, emit=None,
-                 confirm=None, should_stop=None, thinking: bool = True,
+                 confirm=None, should_stop=None, drain_steering=None,
+                 thinking: bool = True,
                  max_gen_tokens: int = 8192, resume: list = None, persist: bool = False,
                  think_budget: int = None, turn_budget_tokens: int = None,
                  turn_budget_s: float = None, subagent: bool = False,
@@ -374,6 +375,11 @@ class Agent:
         self._emit = emit or _default_emit
         self._confirm_cb = confirm  # callable(name, args)->bool; None => input() prompt
         self._should_stop = should_stop or (lambda: False)
+        # Mid-run steering (improve 01): callable() -> list[str] of user redirections
+        # typed while the turn runs, drained between steps and injected into the live
+        # transcript (a pure append — the warm KV prefix stays valid) instead of
+        # forcing interrupt + re-prefill. None (headless/bench/sub-agent) = off.
+        self._drain_steering = drain_steering
         self._backend_retries = 0   # reset per turn; see _MAX_BACKEND_RETRIES
         # ATIF trajectory capture (plan 068), off unless CHAD_TRAJECTORY_JSON is set. A
         # sub-agent runs on the parent's engine inside one of the parent's steps; recording
@@ -833,6 +839,22 @@ class Agent:
                          "unverified_edit=%s)", step, step_cap - step,
                          made_edit, unverified_edit)
                 self.messages.append({"role": "tool", "name": "edit", "content": land})
+            # Mid-run steering (improve 01): user text typed while the turn ran is
+            # injected HERE, between steps — after the previous step's tool results,
+            # before the next generation (this point sits at the top of the iteration
+            # so the retry/nudge `continue` paths above also pass through it). It rides
+            # the same synthetic tool-role path as the guardrail nudges, a template
+            # shape proven not to confuse Ornith; and it is a pure append, so the warm
+            # KV prefix stays valid and the steer prefills only itself — vs an
+            # interrupt's lost work + big re-prefill on the non-trimmable cache.
+            if self._drain_steering is not None:
+                for steer in self._drain_steering():
+                    log.info("STEER injected at step %d: %r", step, redact(steer[:200]))
+                    self.messages.append({
+                        "role": "tool", "name": "steer",
+                        "content": "[user steering — this overrides prior instructions "
+                                   "for the rest of the turn]\n" + steer})
+                    self._emit("info", "  [steering injected]")
             # The engine diffs this full render against its live KV cache and prefills
             # only the appended tokens, so a plain re-render IS the cache-extension path
             # (truncated-turn divergence is handled inside engine._sync_to, not here).

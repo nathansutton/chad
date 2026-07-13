@@ -278,6 +278,7 @@ class TUI:
         self._todos = []                   # live write_todos list for the pinned panel
         self._lock = threading.Lock()
         self._queue = deque()              # user messages awaiting the worker
+        self._steer_queue = deque()        # mid-run steering awaiting the agent's drain
         self._wake = threading.Event()     # signal the worker that work/queue changed
         self._shutdown = False
         self._busy = False
@@ -301,6 +302,7 @@ class TUI:
         self.agent = Agent(
             engine, ctx_limit=ctx_limit, mode=mode, thinking=thinking,
             emit=self._emit, confirm=self._confirm, should_stop=self._interrupt.is_set,
+            drain_steering=self._drain_steering,
             resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn,
         )
 
@@ -421,6 +423,29 @@ class TUI:
         out += "".join(f"{C_YEL}  {ln}{C_RST}\n" for ln in lines[1:])
         return out
 
+    def _drain_steering(self):
+        """Hand queued mid-run steering to the agent (called from the worker thread
+        between steps — see agent.py's drain point). deque.popleft is atomic, so the
+        UI thread can keep appending while this drains; FIFO order is preserved."""
+        out = []
+        while self._steer_queue:
+            try:
+                out.append(self._steer_queue.popleft())
+            except IndexError:  # lost a race with another drain — queue is empty
+                break
+        return out
+
+    def _requeue_leftover_steers(self):
+        """A steer with no running turn left to redirect (typed in the turn's last
+        moments, during a `!cmd` passthrough, or in the instant between the final
+        drain and `_busy` flipping false) must not vanish silently: fall back to
+        type-ahead — it runs as the next turn, like before this feature."""
+        while self._steer_queue:
+            try:
+                self._queue.append(self._steer_queue.popleft())
+            except IndexError:
+                break
+
     def _confirm(self, name, args) -> bool:
         # Block the worker until the user answers y/n in the UI.
         if self._interrupt.is_set():
@@ -488,6 +513,9 @@ class TUI:
         ]
         if qn:
             bits.append(f" queued:{qn} ")
+        sn = len(self._steer_queue)
+        if sn:
+            bits.append(f" steer:{sn} ")
         return left + [("class:" + MODE_STYLE[mode], "".join(bits))]
 
     def _todo_fragments(self):
@@ -611,6 +639,7 @@ class TUI:
         """Clear the conversation + KV cache and start a new Agent in `mode`.
         Returns False (without resetting) if a turn won't yield in time."""
         self._queue.clear()
+        self._steer_queue.clear()
         if self._busy:
             # A turn is on the worker thread mutating engine._cache / _cached_ids.
             # Signal it to stop and wait for it to unwind before we reset the cache,
@@ -625,7 +654,8 @@ class TUI:
         self.agent = Agent(
             self.engine, ctx_limit=self.ctx_limit, mode=mode,
             thinking=self.thinking, emit=self._emit, confirm=self._confirm,
-            should_stop=self._interrupt.is_set, ctx_limit_fn=self._ctx_limit_fn,
+            should_stop=self._interrupt.is_set, drain_steering=self._drain_steering,
+            ctx_limit_fn=self._ctx_limit_fn,
         )
         self._pending_plan = None
         self._pending_budget_note = None
@@ -770,7 +800,8 @@ class TUI:
             self._emit("info", "shift-tab: cycle mode (normal/auto/plan) · esc/ctrl-c: "
                                "interrupt · /init /skills /mcp /mcp trust /mcp login <server> "
                                "/resume /reset /clear /compact /model /mode /accept /exit · !cmd shell · @path "
-                               "attach · type while busy to queue · plan ready: type to "
+                               "attach · type while busy to steer the running turn "
+                               "(applies after the current step) · plan ready: type to "
                                "steer, ctrl-g to accept")
             return False
         # A typed message while a governor budget note is pending = continue fresh:
@@ -789,6 +820,15 @@ class TUI:
         # A typed message while a plan is pending = steer: continue the plan-mode
         # session so the model revises the plan file. Drop the pending banner state.
         self._pending_plan = None
+        # Mid-run steering (improve 01): input typed while a turn RUNS redirects that
+        # turn — the agent injects it after the current step (a pure append, so the
+        # warm KV prefix survives) instead of parking it as a new turn that lands too
+        # late. `!cmd` keeps the old type-ahead (a shell side-channel, not a message
+        # to the model); esc/ctrl-c remain the hard stop.
+        if self._busy and not text.startswith("!"):
+            self._steer_queue.append(text)
+            self._emit("user", text + "   (steering — applies after current step)")
+            return False
         # enqueue the message; echo it (note when it's queued behind running work)
         self._queue.append(text)
         self._emit("user", text + ("   (queued)" if self._busy else ""))
@@ -800,9 +840,15 @@ class TUI:
     def _worker(self):
         while not self._shutdown:
             if not self._queue:
-                self._wake.wait(timeout=0.2)
-                self._wake.clear()
-                continue
+                # Idle sweep: a steer can slip in between the finished turn's final
+                # drain and `_busy` flipping false — with no turn left to redirect it
+                # would sit in `_steer_queue` forever. Only runs between turns, so it
+                # can never steal a steer from a live one.
+                self._requeue_leftover_steers()
+                if not self._queue:
+                    self._wake.wait(timeout=0.2)
+                    self._wake.clear()
+                    continue
             # Hold queued messages until the background weight load finishes (the input
             # accepts and queues them meanwhile, so typing ahead feels instant).
             if not self._model_ready.is_set():
@@ -857,6 +903,7 @@ class TUI:
             except Exception as e:  # noqa: BLE001 — surface, keep the session alive
                 self._emit("error", f"[turn error: {type(e).__name__}: {e}]")
             finally:
+                self._requeue_leftover_steers()
                 # Commit the turn's trailing (newline-less) line to scrollback and
                 # leave a blank line between turns. Without this, the final prose
                 # line stays buffered in StdoutProxy until the next newline.

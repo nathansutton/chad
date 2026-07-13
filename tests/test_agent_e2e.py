@@ -494,3 +494,135 @@ def test_backend_retry_budget_resets_per_turn(monkeypatch):
     eng._i = 1                        # replay from "second"
     agent.run_turn("two")
     assert eng.calls == 4             # 3 failures re-rolled, 4th succeeds
+
+
+# --- Mid-run steering (improve 01) -------------------------------------------
+# User text typed while a turn runs is drained between steps and injected as a
+# synthetic `role:"tool", name:"steer"` message — a pure append, so the warm KV
+# prefix stays valid (the whole point vs interrupt + re-prefill). These drive the
+# REAL run_turn drain point with a scripted engine that "types" a steer after the
+# first assistant turn streams, exactly like the TUI's worker-thread wiring.
+
+class _SteerAfterFirstTurn(ScriptedEngine):
+    """Enqueues `steer_text` into `steer_queue` right after the FIRST scripted turn
+    returns — emulating a user typing while step 0's tool batch executes."""
+
+    def __init__(self, script, steer_queue, steer_text, **kw):
+        super().__init__(script, **kw)
+        self._steer_queue = steer_queue
+        self._steer_text = steer_text
+
+    def generate(self, *a, **kw):
+        out = super().generate(*a, **kw)
+        if self._i == 1:
+            self._steer_queue.append(self._steer_text)
+        return out
+
+
+def test_steering_injects_between_steps_and_run_continues(tmp_path, monkeypatch):
+    """The steer lands in `messages` after step 0's tool result and before step 1's
+    assistant turn, framed as an overriding tool-role message; the run continues to
+    `done` (interrupted stays False)."""
+    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck")
+    target = tmp_path / "note.txt"
+    steer_text = "actually, stop — the OTHER file is the target"
+    script = [
+        _tool_call("write", path=str(target), content="v1\n"),
+        _tool_call("read", path=str(target)),
+        _tool_call("done", summary="finished"),
+    ]
+    steers = []
+    eng = _SteerAfterFirstTurn(script, steers, steer_text)
+
+    def drain():
+        out, steers[:] = list(steers), []
+        return out
+
+    agent = Agent(eng, mode="auto", thinking=False, drain_steering=drain, max_steps=10)
+    result = agent.run_turn("create note.txt")
+
+    assert result == "finished"
+    assert agent.interrupted is False
+    idx = [i for i, m in enumerate(agent.messages)
+           if m.get("role") == "tool" and m.get("name") == "steer"]
+    assert len(idx) == 1, "the steer must be injected exactly once"
+    i = idx[0]
+    # after step 0's tool result...
+    prev = agent.messages[i - 1]
+    assert (prev.get("role"), prev.get("name")) == ("tool", "write")
+    # ...and before step 1's assistant turn (between steps, never inside a tool batch)
+    assert agent.messages[i + 1].get("role") == "assistant"
+    # framed as user steering that overrides the original ask, with the text verbatim
+    assert agent.messages[i]["content"].startswith("[user steering — ")
+    assert agent.messages[i]["content"].endswith(steer_text)
+
+
+def test_no_drain_hook_means_no_injection(tmp_path, monkeypatch):
+    """drain_steering=None (headless / bench / sub-agent) keeps today's transcript
+    byte-identical — no steer messages, no behavior change (zero TB2 risk)."""
+    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck")
+    target = tmp_path / "note.txt"
+    script = [
+        _tool_call("write", path=str(target), content="v1\n"),
+        _tool_call("done", summary="finished"),
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("create note.txt")
+    assert not any(m.get("name") == "steer" for m in agent.messages)
+
+
+class _SeqTok(_FakeTok):
+    """Content-faithful fake tokenizer: the render is a per-message concatenation of
+    the role+content bytes, so appending a message EXTENDS the render while mutating
+    or reordering an earlier one changes its tokens. This is exactly the property
+    engine.py's prefix diff relies on to prefill only the appended tail."""
+
+    def apply_chat_template(self, messages, tools=None, add_generation_prompt=False,
+                            enable_thinking=False):
+        ids = []
+        for m in messages:
+            ids.extend(ord(c) for c in m.get("role", "") + ":" + str(m.get("content", "")))
+            ids.append(0)  # message separator
+        return ids
+
+
+def test_steering_keeps_the_render_prefix_stable(tmp_path, monkeypatch):
+    """The cache-safety claim itself: every render the engine sees — including the one
+    right after the injection — is a pure EXTENSION of the previous render (common
+    prefix == the whole previous prompt). A steer that rewrote or reordered history
+    would break this and force a full re-prefill on Ornith's non-trimmable cache."""
+    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck")
+    target = tmp_path / "note.txt"
+    script = [
+        _tool_call("write", path=str(target), content="v1\n"),
+        _tool_call("read", path=str(target)),
+        _tool_call("done", summary="finished"),
+    ]
+    steers = []
+    eng = _SteerAfterFirstTurn(script, steers, "use two-space indent everywhere")
+    eng.tok = _SeqTok()
+    renders = []
+    real_generate = eng.generate
+
+    def generate(prompt_ids, **kw):
+        renders.append(list(prompt_ids))
+        return real_generate(prompt_ids, **kw)
+
+    eng.generate = generate
+
+    def drain():
+        out, steers[:] = list(steers), []
+        return out
+
+    # _SeqTok yields one id per CHARACTER, so the ~44k-char system prompt alone would
+    # cross the default 24k compaction threshold; raise it — this test is about the
+    # injection's prefix purity, not compaction (test_compaction.py owns that).
+    agent = Agent(eng, mode="auto", thinking=False, drain_steering=drain,
+                  max_steps=10, ctx_limit=200_000)
+    agent.run_turn("create note.txt")
+
+    assert len(renders) == 3          # one per scripted turn; steer forced no re-roll
+    for prev, cur in zip(renders, renders[1:]):
+        assert cur[: len(prev)] == prev, (
+            "a render stopped being a pure extension of its predecessor — the steer "
+            "injection invalidated the warm KV prefix")
