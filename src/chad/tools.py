@@ -10,8 +10,10 @@ import fnmatch
 import glob as _glob
 import hashlib
 import io
+import itertools
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -118,15 +120,102 @@ BASH_MAX_CHARS = 20000
 BASH_HEAD_CHARS = 8000
 BASH_TAIL_CHARS = 12000
 
+# When output overflows the head/tail budget, the omitted middle used to be simply
+# gone — the model's only way back to it (the first error of a cascade, one failing
+# test among hundreds) was to re-run the command with a filter, paying the whole
+# wall-clock again. So spill the FULL output to a session-scoped file and put the
+# path in the truncation notice: a follow-up `grep marker <path>` costs seconds.
+# Same philosophy as compaction._spill (dropped content goes to disk, not /dev/null).
+# The dir is bounded two ways — chad has already had one unbounded-cache disk
+# incident: each session keeps only its newest BASH_SPILL_KEEP files, and stale
+# session dirs (orphaned by dead processes) are swept on the first spill.
+BASH_SPILL_KEEP = 20
+_SPILL_MAX_AGE_S = 7 * 24 * 3600
+_SPILL_IDS = itertools.count(1)
+_SPILL_SWEPT = False
 
-def _bash_headtail(s: str) -> str:
+
+def _spill_dir() -> str:
+    """Per-process spill dir, resolved fresh each call (the eval harness repoints
+    HOME per task). Never under cwd: a stray file would pollute the project's git
+    status and fail the plan-mode untouched-tree check."""
+    base = os.environ.get("CHAD_SPILL_DIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "chad", "spill")
+    return os.path.join(base, str(os.getpid()))
+
+
+def _sweep_stale_spills(base: str) -> None:
+    """Delete sibling session dirs untouched for _SPILL_MAX_AGE_S. A spill is only
+    useful to the session that wrote it; an old dir was orphaned by a dead process.
+    Best-effort, runs once per process (on the first spill). Never raises."""
+    try:
+        deadline = time.time() - _SPILL_MAX_AGE_S
+        me = str(os.getpid())
+        for name in os.listdir(base):
+            path = os.path.join(base, name)
+            try:
+                if name != me and os.path.isdir(path) and os.path.getmtime(path) < deadline:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _prune_spills(d: str) -> None:
+    """Keep only the newest BASH_SPILL_KEEP spill files in `d` (by sequence number,
+    which is monotonic within a process). Never raises."""
+    def seq(name: str) -> int:
+        try:
+            return int(name[len("bash-"):-len(".log")])
+        except ValueError:
+            return -1
+    try:
+        names = sorted((n for n in os.listdir(d)
+                        if n.startswith("bash-") and n.endswith(".log")), key=seq)
+        for name in names[:-BASH_SPILL_KEEP]:
+            try:
+                os.remove(os.path.join(d, name))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _spill_bash(s: str) -> str | None:
+    """Write the full untruncated output to a fresh 0600 spill file and return its
+    absolute path, or None if the write failed — spilling is best-effort, and a
+    disk error must not turn a successful command into a broken tool result."""
+    global _SPILL_SWEPT
+    d = _spill_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+        if not _SPILL_SWEPT:
+            _SPILL_SWEPT = True
+            _sweep_stale_spills(os.path.dirname(d))
+        path = os.path.join(d, f"bash-{next(_SPILL_IDS)}.log")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", errors="replace") as f:
+            f.write(s)
+        _prune_spills(d)
+        return os.path.abspath(path)
+    except OSError:
+        return None
+
+
+def _bash_headtail(s: str, spill: bool = True) -> str:
     if len(s) <= BASH_MAX_CHARS:
         return s
     omitted = len(s) - BASH_HEAD_CHARS - BASH_TAIL_CHARS
-    return (s[:BASH_HEAD_CHARS]
-            + f"\n[… {omitted} chars omitted — output truncated; the TAIL below is "
-              f"usually the failure summary …]\n"
-            + s[-BASH_TAIL_CHARS:])
+    path = _spill_bash(s) if spill else None
+    if path:
+        notice = (f"\n[… {omitted} chars omitted — FULL output saved to {path}; "
+                  f"grep/sed that file instead of re-running the command. The TAIL "
+                  f"below is usually the failure summary …]\n")
+    else:
+        notice = (f"\n[… {omitted} chars omitted — output truncated; the TAIL below is "
+                  f"usually the failure summary …]\n")
+    return s[:BASH_HEAD_CHARS] + notice + s[-BASH_TAIL_CHARS:]
 
 
 # Local-model read budget. Every token a read returns must be PREFILLED into the

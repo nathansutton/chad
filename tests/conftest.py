@@ -15,6 +15,14 @@ if _SRC not in sys.path:
 
 
 @pytest.fixture(autouse=True)
+def _spill_tmpdir(tmp_path, monkeypatch):
+    """Point bash-output spills (tools._spill_bash, plan 02) at a per-test tmp dir —
+    any test that runs an oversized bash command would otherwise leave files in the
+    user's real ~/.cache/chad/spill."""
+    monkeypatch.setenv("CHAD_SPILL_DIR", str(tmp_path / "spill"))
+
+
+@pytest.fixture(autouse=True)
 def _fresh_file_seen():
     """Isolate the per-session freshness bookkeeping (tools._FILE_SEEN, plan 073)
     between tests — a leftover seen-hash from one test must not make another test's

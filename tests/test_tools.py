@@ -143,6 +143,82 @@ def test_bash():
     check("bash: exit prefix survives truncation", fail.startswith("[exit 1]\n"), fail[:40])
 
 
+def _spill_path_from(result):
+    """Extract the spill path the truncation notice points at."""
+    return result.split("FULL output saved to ", 1)[1].split(";", 1)[0]
+
+
+def test_bash_spill():
+    """Truncation spills the FULL output to a session-scoped file (plan 02): the
+    omitted middle is a `grep <path>` away instead of a full re-run away."""
+    old = os.environ.get("CHAD_SPILL_DIR")
+    d = tempfile.mkdtemp(prefix="spill_")
+    os.environ["CHAD_SPILL_DIR"] = d
+    session_dir = os.path.join(d, str(os.getpid()))
+    try:
+        # oversized output -> notice names an absolute, existing path whose file holds
+        # the COMPLETE original output. The marker sits at ~char 20k — inside the
+        # omitted middle (head keeps 8k, tail keeps the last 12k of ~40k) — so it is
+        # recoverable ONLY through the spill file.
+        big = tools.tool_bash(
+            "head -c 20000 /dev/zero | tr '\\0' 'x'; printf 'MIDDLE_MARKER'; "
+            "head -c 20000 /dev/zero | tr '\\0' 'y'")
+        check("spill: notice present", "FULL output saved to " in big, big)
+        path = _spill_path_from(big)
+        check("spill: path absolute", os.path.isabs(path), path)
+        check("spill: file exists", os.path.exists(path), path)
+        check("spill: file is 0600", os.stat(path).st_mode & 0o777 == 0o600,
+              oct(os.stat(path).st_mode))
+        with open(path) as f:
+            full = f.read()
+        check("spill: marker omitted from transcript", "MIDDLE_MARKER" not in big)
+        check("spill: middle recoverable from file", "MIDDLE_MARKER" in full)
+        check("spill: file holds the complete output", len(full) == 40013, len(full))
+
+        # output under the cap -> no new spill file
+        before = len(os.listdir(session_dir))
+        check("spill: small output untouched", tools.tool_bash("printf hi") == "hi")
+        check("spill: small output makes no file",
+              len(os.listdir(session_dir)) == before, os.listdir(session_dir))
+
+        # killed command with a large partial -> same spill, and the [timed out
+        # prefix guardrails.py keys on stays FIRST (the notice lives mid-string)
+        killed = tools.tool_bash(
+            "head -c 15000 /dev/zero | tr '\\0' 'x'; printf 'KILLED_MID'; "
+            "head -c 15000 /dev/zero | tr '\\0' 'y'; sleep 5", timeout=1)
+        check("spill: killed keeps prefix", killed.startswith("[timed out after 1s;"),
+              killed[:60])
+        check("spill: killed gets a path", "FULL output saved to " in killed, killed[:400])
+        with open(_spill_path_from(killed)) as f:
+            check("spill: killed middle recoverable", "KILLED_MID" in f.read())
+
+        # cap: 25 more oversized results -> only the newest BASH_SPILL_KEEP files remain
+        for i in range(25):
+            tools._bash_headtail(f"run{i}-" + "z" * tools.BASH_MAX_CHARS)
+        names = [n for n in os.listdir(session_dir)
+                 if n.startswith("bash-") and n.endswith(".log")]
+        check("spill: capped per session", len(names) == tools.BASH_SPILL_KEEP, len(names))
+
+        # stale sibling session dirs get swept on the first spill of a process
+        stale = os.path.join(d, "99999999")
+        os.makedirs(stale)
+        os.utime(stale, (0, 0))
+        tools._SPILL_SWEPT = False
+        tools._bash_headtail("s" * (tools.BASH_MAX_CHARS + 1))
+        check("spill: stale session swept", not os.path.exists(stale))
+
+        # a failed spill degrades to the old notice, never breaks the result
+        os.environ["CHAD_SPILL_DIR"] = "/dev/null/nope"
+        deg = tools._bash_headtail("q" * (tools.BASH_MAX_CHARS + 1))
+        check("spill: failure falls back", "output truncated" in deg
+              and "saved to" not in deg, deg[7990:8100])
+    finally:
+        if old is None:
+            os.environ.pop("CHAD_SPILL_DIR", None)
+        else:
+            os.environ["CHAD_SPILL_DIR"] = old
+
+
 # --- tool_grep ----------------------------------------------------------------
 
 def test_grep():
