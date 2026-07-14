@@ -834,6 +834,16 @@ def _reindent_python(new: str, base_indent: str, unit: str) -> str:
     return "\n".join(out)
 
 
+def _shape_nl(t: str, ended_nl: bool) -> str:
+    """Match `t`'s trailing newline to the boundary it replaces: terminate a mid-file block
+    so the following line stays put; leave it unterminated only at a no-newline EOF."""
+    if ended_nl and not t.endswith("\n"):
+        return t + "\n"
+    if not ended_nl and t.endswith("\n"):
+        return t.rstrip("\n")
+    return t
+
+
 def _splice(path: str, data: str, prefix: str, suffix: str, new: str,
             target_indent: str, ended_nl: bool, label: str,
             edit_range: tuple[int, int] | None = None) -> str:
@@ -847,13 +857,7 @@ def _splice(path: str, data: str, prefix: str, suffix: str, new: str,
     end] being replaced (start = end+1 for an insertion boundary), carried into the
     reject message so it can name the severed statement and echo current numbers."""
     def shape(t: str) -> str:
-        # Match the boundary's trailing-newline shape: terminate the block mid-file so the
-        # following line stays put; leave it unterminated only at a no-newline EOF.
-        if ended_nl and not t.endswith("\n"):
-            return t + "\n"
-        if not ended_nl and t.endswith("\n"):
-            return t.rstrip("\n")
-        return t
+        return _shape_nl(t, ended_nl)
     fitted, shifted = _fit_indent(new, target_indent)
     after = prefix + shape(fitted) + suffix
     note = f" ({label}{'; fit indentation' if shifted else ''})"
@@ -898,17 +902,29 @@ def _region_echo(path: str, first: int, last: int, delta: int) -> str:
             f"{syntaxgate._numbered(data, a, b)}\n]")
 
 
-def tool_replace_lines(path: str, start: int, end: int, new: str) -> str:
+def tool_replace_lines(path: str, start: int | None = None, end: int | None = None,
+                       new: str | None = None, edits: Any = None) -> str:
     """Replace file lines [start, end] (1-based, inclusive — the numbers `read` prints)
     with `new`, fitting the new block's indentation to the region it lands in. This is
     the line-addressed alternative to `edit`: the model that already knows the line
     numbers doesn't re-quote an exact `old` string and doesn't re-transcribe leading
     whitespace (the two things that drive the string-edit death loop). Empty `new` deletes
-    the range. Goes through _apply_edit, so the same indent-reject + syntax gate apply."""
+    the range. Goes through _apply_edit, so the same indent-reject + syntax gate apply.
+
+    Pass `edits=[{start, end, new}, …]` instead to change several disjoint ranges in ONE
+    call — validated all-or-nothing against the ORIGINAL file and gated once (see
+    `_replace_lines_batch`). The flat single-edit form keeps working unchanged."""
     if not os.path.exists(path) and path.startswith("/") and os.path.exists(path.lstrip("/")):
         path = path.lstrip("/")
     if not os.path.exists(path):
         return f"[no such file: {path}]"
+    if edits is not None:
+        return _replace_lines_batch(path, edits)
+    if start is None or end is None or new is None:
+        missing = [k for k, v in (("start", start), ("end", end), ("new", new)) if v is None]
+        return (f"[replace_lines: missing {', '.join(missing)}. Pass start, end, new for a "
+                f"single edit, or edits=[{{start, end, new}}, …] to change several disjoint "
+                f"ranges at once.]")
     if isinstance(start, bool) or isinstance(end, bool) \
             or not isinstance(start, int) or not isinstance(end, int):
         return "[replace_lines: start and end must be integer line numbers (1-based)]"
@@ -949,6 +965,128 @@ def tool_replace_lines(path: str, start: int, end: int, new: str) -> str:
             delta = 0
         result += _region_echo(path, start - 1, end + delta + 1, delta)
     return result
+
+
+def _parse_batch_edits(edits: Any):
+    """Validate the `edits` array shape for a batched replace_lines. Returns (items, None)
+    with items a list of (start, end, new) tuples, or (None, error) when the array is
+    garbled — a half-parsed batch must fail LOUDLY (so the model re-sends the whole call)
+    rather than silently apply the items that happened to parse ([[chad-canary-harness-fixes]]
+    — the garbled-tool-call death spiral is a measured loss class)."""
+    if not isinstance(edits, list) or not edits:
+        return None, ("[replace_lines: `edits` must be a non-empty array of "
+                      "{start, end, new} objects. No change made.]")
+    items = []
+    for i, e in enumerate(edits):
+        if not isinstance(e, dict):
+            return None, f"[replace_lines: edits[{i}] must be an object with start, end, new. No change made.]"
+        s, en, nw = e.get("start"), e.get("end"), e.get("new")
+        if isinstance(s, bool) or isinstance(en, bool) \
+                or not isinstance(s, int) or not isinstance(en, int):
+            return None, (f"[replace_lines: edits[{i}] needs integer start and end line "
+                          f"numbers (1-based). No change made.]")
+        if not isinstance(nw, str):
+            return None, (f"[replace_lines: edits[{i}] needs a string `new` (empty string "
+                          f"deletes the range). No change made.]")
+        items.append((s, en, nw))
+    return items, None
+
+
+def _build_batch(lines: list[str], ordered: list[tuple[int, int, str]]):
+    """Splice every (start, end, new) in `ordered` (ascending by start, already checked
+    disjoint) into `lines`, fitting each replacement's indentation to its target region.
+    Applies the highest line numbers FIRST so an earlier edit never shifts the indices a
+    later one still refers to. Returns (after_text, landed) where landed lists
+    (orig_start, orig_end, new_start, new_end, deleted, preview) against the RESULTING file."""
+    prepared = []   # (start, end, repl_lines), one per edit, ascending by start
+    for (start, end, new) in ordered:
+        replaced = "".join(lines[start - 1:end])
+        if new == "":
+            repl_lines: list[str] = []
+        else:
+            anchor = next((ln for ln in replaced.split("\n") if ln.strip()), "")
+            target_indent = anchor[: len(anchor) - len(anchor.lstrip())]
+            fitted, _ = _fit_indent(new, target_indent)
+            fitted = _shape_nl(fitted, replaced.endswith("\n"))
+            repl_lines = fitted.splitlines(keepends=True)
+        prepared.append((start, end, repl_lines))
+    work = list(lines)
+    for start, end, repl_lines in sorted(prepared, key=lambda p: p[0], reverse=True):
+        work[start - 1:end] = repl_lines
+    after = "".join(work)
+    landed = []
+    offset = 0   # net line delta from all edits BEFORE this one (ascending order)
+    for start, end, repl_lines in prepared:
+        span = len(repl_lines)
+        ls = start + offset
+        if span == 0:
+            landed.append((start, end, ls, ls - 1, True, ""))
+        else:
+            landed.append((start, end, ls, ls + span - 1, False, repl_lines[0].strip()))
+        offset += span - (end - start + 1)
+    return after, landed
+
+
+def _replace_lines_batch(path: str, edits: Any) -> str:
+    """Apply several {start, end, new} line replacements to `path` in ONE call, all-or-
+    nothing. Every range is validated against the ORIGINAL file (the line numbers `read`
+    printed) BEFORE anything is written, ranges must be disjoint, and the combined result
+    passes through a SINGLE syntax gate — if the whole batch wouldn't parse, nothing is
+    written (same revert semantics as a single edit, [[chad-indent-edit-loop-fix]]). This
+    saves the per-site render→prefill→decode round trips a rename or signature change would
+    otherwise cost one range at a time ([[mlxcc-localization-lever-measured]])."""
+    items, err = _parse_batch_edits(edits)
+    if err:
+        return err
+    with open(path, errors="replace") as f:
+        lines = f.readlines()
+    data = "".join(lines)
+    n = len(lines)
+    # Per-item range validation — reject the WHOLE batch on the first bad range, so a
+    # partial application can never happen.
+    checked = []
+    for (start, end, new) in items:
+        if start < 1 or end < start:
+            return (f"[replace_lines: invalid range start={start} end={end} in the batch; "
+                    f"need 1 <= start <= end (1-based, inclusive). No change made.]")
+        if start > n:
+            return (f"[replace_lines: start={start} is past the last line ({n}) in the "
+                    f"batch; pick a start within the file. No change made.]")
+        checked.append((start, min(end, n), new))
+    # Disjoint check: sort by start, reject any overlap (offsets would collide and the
+    # all-or-nothing contract would be ambiguous).
+    ordered = sorted(checked, key=lambda it: it[0])
+    for a, b in zip(ordered, ordered[1:]):
+        if b[0] <= a[1]:
+            return (f"[replace_lines: batched ranges overlap ({a[0]}-{a[1]} and "
+                    f"{b[0]}-{b[1]}); make them disjoint. No change made.]")
+    stale = _stale_check(path, data, (ordered[0][0], ordered[-1][1]))
+    if stale:
+        return stale
+    after, landed = _build_batch(lines, ordered)
+    if after == data:
+        return "[no-op edit: the batched edits leave the file unchanged]"
+    edit_range = (ordered[0][0], ordered[-1][1])
+    result = _apply_edit(path, data, after, f" (batched: {len(ordered)} edits)", edit_range)
+    if not result.startswith("[edited"):
+        return result   # syntax reject / no-op — atomic, the file is left untouched
+    # Success: report each landed range (numbers reflect the NEW file), then one bounded
+    # re-anchoring echo of the changed span (same edit-result echo the single form gives).
+    try:
+        with open(path, errors="replace") as f:
+            delta = len(f.readlines()) - n
+    except OSError:
+        delta = 0
+    summary = [f"{len(ordered)} edits applied; line numbers below reflect the new file."]
+    for (o_start, o_end, l_start, l_end, deleted, preview) in landed:
+        if deleted:
+            summary.append(f"  lines {o_start}-{o_end} deleted")
+        else:
+            summary.append(f"  lines {l_start}-{l_end}: {preview[:60]}")
+    first = min(l_start for _, _, l_start, _, _, _ in landed)
+    last = max(l_end for _, _, _, l_end, _, _ in landed)
+    echo = _region_echo(path, first - 1, last + 1, delta)
+    return result + "\n" + "\n".join(summary) + echo
 
 
 def tool_insert_lines(path: str, after_line: int, code: str) -> str:
@@ -1242,7 +1380,7 @@ DISPATCH = {
     "write": lambda a, ss=None: tool_write(a["path"], a["content"]),
     "edit": lambda a, ss=None: tool_edit(a["path"], a["old"], a["new"]),
     "replace_lines": lambda a, ss=None: tool_replace_lines(
-        a["path"], a["start"], a["end"], a["new"]),
+        a["path"], a.get("start"), a.get("end"), a.get("new"), a.get("edits")),
     "insert_lines": lambda a, ss=None: tool_insert_lines(
         a["path"], a["after_line"], a["code"]),
     "glob": lambda a, ss=None: tool_glob(a["pattern"], should_stop=ss),
@@ -1448,7 +1586,11 @@ SCHEMAS: list[dict[str, Any]] = [
                            "send the complete statement, or use replace_symbol for a whole "
                            "function. Prefer this over `edit` whenever you know the line "
                            "numbers, and over rewriting a whole function when only a few "
-                           "lines change.",
+                           "lines change. To change several DISJOINT ranges at once (a "
+                           "rename, a signature change touching many sites), pass "
+                           "edits=[{start, end, new}, …] instead of start/end/new — all "
+                           "ranges are checked against the CURRENT line numbers and applied "
+                           "together, or the whole batch is rejected and nothing changes.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1459,8 +1601,22 @@ SCHEMAS: list[dict[str, Any]] = [
                             "description": "Last line to replace (1-based, inclusive)."},
                     "new": {"type": "string",
                             "description": "Replacement text (empty string deletes the range)."},
+                    "edits": {
+                        "type": "array",
+                        "description": "Batch form: several disjoint replacements applied "
+                                       "all-or-nothing. Use INSTEAD of start/end/new.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "start": {"type": "integer"},
+                                "end": {"type": "integer"},
+                                "new": {"type": "string"},
+                            },
+                            "required": ["start", "end", "new"],
+                        },
+                    },
                 },
-                "required": ["path", "start", "end", "new"],
+                "required": ["path"],
             },
         },
     },

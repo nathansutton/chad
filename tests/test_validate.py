@@ -177,6 +177,46 @@ def test_dynamic_tool_validates(tmp_path, monkeypatch):
         skills.reset_session()
 
 
+# --- Batched replace_lines schema (improve 04) -------------------------------
+# The batch form takes edits=[{start, end, new}, …]. The schema must (a) accept a
+# well-formed batch and coerce loose item types, and (b) fail LOUDLY on a half-parsed
+# array — the whole point is that a garbled batch feeds the self-repair path rather than
+# silently applying the items that happened to parse.
+def test_replace_lines_batch_schema():
+    # top-level `start/end/new` are optional now (only `path` required) so the single
+    # form still validates and the batch form isn't forced to send them.
+    sch = _param_schema("replace_lines")
+    check("replace_lines requires only path", sch.get("required") == ["path"], sch)
+    check("replace_lines exposes edits array",
+          sch["properties"]["edits"]["type"] == "array", sch)
+
+    # a well-formed batch validates clean, coercing "2"->2 in an item
+    a, e = coerce_and_validate("replace_lines", {
+        "path": "a.py",
+        "edits": [{"start": 1, "end": "2", "new": "x"}]})
+    check("batch: valid batch accepted", e == [], [str(x) for x in e])
+    check("batch: item int coerced", a["edits"][0]["end"] == 2, a)
+
+    # the single form still validates against the same schema
+    _, e = coerce_and_validate("replace_lines",
+                               {"path": "a.py", "start": 1, "end": 1, "new": "x"})
+    check("batch: single form still valid", e == [], [str(x) for x in e])
+
+    # a garbled item (missing `new`) is flagged on that item's field, not silently kept
+    _, e = coerce_and_validate("replace_lines", {
+        "path": "a.py",
+        "edits": [{"start": 1, "end": 1, "new": "x"}, {"start": 2, "end": 2}]})
+    check("batch: missing item field reported",
+          any("new" in x.path and x.got == "missing" for x in e),
+          [str(x) for x in e])
+
+    # a JSON-encoded edits string (the nested-container failure mode) un-stringifies
+    a, e = coerce_and_validate("replace_lines", {
+        "path": "a.py", "edits": '[{"start": 1, "end": 1, "new": "x"}]'})
+    check("batch: edits JSON-string un-stringified", e == [] and isinstance(a["edits"], list),
+          (a, [str(x) for x in e]))
+
+
 def test_dynamic_tool_absent_without_skills(tmp_path, monkeypatch):
     # With no skills installed, activate_skill is NOT exposed to the model, so the
     # validator must treat it as unknown (symmetry: the hint won't list it either).
@@ -201,5 +241,6 @@ if __name__ == "__main__":
     test_validation()
     test_render()
     test_legacy_validate()
+    test_replace_lines_batch_schema()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

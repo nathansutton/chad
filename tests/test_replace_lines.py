@@ -237,6 +237,160 @@ def test_insert_guards():
     check("insert out of range", res.startswith("[insert_lines: after_line=9 out of range"), res)
 
 
+# --- batched replace_lines (improve 04) --------------------------------------------
+
+def run_batch(before, edits, name="f.py"):
+    """Apply a batched tool_replace_lines to a temp file; return (result, contents_after)."""
+    d = tempfile.mkdtemp(prefix="rlbatch_")
+    p = os.path.join(d, name)
+    with open(p, "w") as f:
+        f.write(before)
+    res = tool_replace_lines(p, edits=edits)
+    with open(p) as f:
+        after = f.read()
+    return res, after
+
+
+def test_batch_three_disjoint_edits():
+    """3 disjoint batched edits all land, content is exact, and the echo lists every
+    landed range."""
+    before = "a = 1\nb = 2\nc = 3\nd = 4\ne = 5\n"
+    res, after = run_batch(before, [
+        {"start": 1, "end": 1, "new": "a = 10"},
+        {"start": 3, "end": 3, "new": "c = 30"},
+        {"start": 5, "end": 5, "new": "e = 50"},
+    ])
+    check("batch: edited", res.startswith("[edited"), res)
+    check("batch: all three applied",
+          after == "a = 10\nb = 2\nc = 30\nd = 4\ne = 50\n", repr(after))
+    check("batch: count reported", "3 edits applied" in res, res)
+    for rng in ("lines 1-1", "lines 3-3", "lines 5-5"):
+        check(f"batch: echo lists {rng}", rng in res, res)
+
+
+def test_batch_growing_and_shrinking_edits_track_line_shift():
+    """Edits that change line COUNT: the landed ranges reflect the shifted new-file numbers,
+    not the original ones."""
+    before = "a = 1\nb = 2\nc = 3\n"
+    # edit 1 grows line 1 into two lines; edit 2 replaces line 3 — its landed number shifts.
+    res, after = run_batch(before, [
+        {"start": 1, "end": 1, "new": "a = 1\naa = 11"},
+        {"start": 3, "end": 3, "new": "c = 30"},
+    ])
+    check("batch-shift: applied",
+          after == "a = 1\naa = 11\nb = 2\nc = 30\n", repr(after))
+    # line 3 became line 4 after the growth above it
+    check("batch-shift: landed range shifted", "lines 4-4: c = 30" in res, res)
+
+
+def test_batch_overlapping_rejected_atomic():
+    """Overlapping items → rejected, file byte-identical (all-or-nothing)."""
+    before = "a = 1\nb = 2\nc = 3\n"
+    res, after = run_batch(before, [
+        {"start": 1, "end": 2, "new": "x = 0"},
+        {"start": 2, "end": 3, "new": "y = 0"},
+    ])
+    check("batch-overlap: rejected", "overlap" in res, res)
+    check("batch-overlap: file untouched", after == before, repr(after))
+
+
+def test_batch_out_of_range_rejected_atomic():
+    """An out-of-range item among valid ones → the WHOLE batch is rejected atomically."""
+    before = "a = 1\nb = 2\n"
+    res, after = run_batch(before, [
+        {"start": 1, "end": 1, "new": "a = 10"},
+        {"start": 9, "end": 9, "new": "z = 0"},   # past EOF
+    ])
+    check("batch-oor: rejected", "past the last line" in res, res)
+    check("batch-oor: file untouched", after == before, repr(after))
+    # invalid range (end < start) also rejects atomically
+    res, after = run_batch(before, [
+        {"start": 2, "end": 1, "new": "x"},
+        {"start": 1, "end": 1, "new": "a = 10"},
+    ])
+    check("batch-badrange: rejected", "invalid range" in res, res)
+    check("batch-badrange: file untouched", after == before, repr(after))
+
+
+def test_batch_syntax_error_full_revert():
+    """A batch that would introduce a SyntaxError reverts atomically (syntaxgate parity):
+    even the well-formed items in the same batch do NOT land."""
+    before = "def f():\n    return 1\n\n\ndef g():\n    return 2\n"
+    res, after = run_batch(before, [
+        {"start": 2, "end": 2, "new": "    return 1  # ok"},
+        {"start": 6, "end": 6, "new": "    return (2"},   # unbalanced paren -> break
+    ])
+    check("batch-syntax: rejected", res.startswith("[edit rejected"), res)
+    check("batch-syntax: file untouched (both reverted)", after == before, repr(after))
+
+
+def test_batch_descending_application_preserves_offsets():
+    """Two edits where NAIVE ascending application (edit 1 first) would corrupt edit 2's
+    line numbers. Applying high line numbers first keeps every original number valid."""
+    before = "l1\nl2\nl3\nl4\nl5\n"
+    # edit 1 deletes 3 lines (1-3), edit 2 replaces line 5 — if edit 1 applied first,
+    # line 5 would no longer be line 5. Descending application gets both right.
+    res, after = run_batch(before, [
+        {"start": 1, "end": 3, "new": "X"},
+        {"start": 5, "end": 5, "new": "Y"},
+    ])
+    check("batch-order: applied correctly", after == "X\nl4\nY\n", repr(after))
+
+
+def test_batch_indentation_fitted_per_item():
+    """Each batched item's replacement is fitted to its OWN target indentation, sent
+    flush-left, the same way the single form fits."""
+    before = "class C:\n    def a(self):\n        return 1\n    def b(self):\n        return 2\n"
+    res, after = run_batch(before, [
+        {"start": 3, "end": 3, "new": "return 11"},
+        {"start": 5, "end": 5, "new": "return 22"},
+    ])
+    want = "class C:\n    def a(self):\n        return 11\n    def b(self):\n        return 22\n"
+    check("batch-indent: fitted both", after == want, repr(after))
+
+
+def test_batch_deletion_item():
+    """An empty `new` inside a batch deletes that range; the summary names it."""
+    before = "a = 1\nb = 2\nc = 3\n"
+    res, after = run_batch(before, [
+        {"start": 2, "end": 2, "new": ""},
+        {"start": 3, "end": 3, "new": "c = 30"},
+    ])
+    check("batch-del: applied", after == "a = 1\nc = 30\n", repr(after))
+    check("batch-del: reported", "lines 2-2 deleted" in res, res)
+
+
+def test_batch_garbled_edits_rejected():
+    """A garbled/half-parsed edits array fails loudly and changes nothing — never applies
+    the subset that happened to parse."""
+    before = "a = 1\nb = 2\n"
+    # missing `new` on the second item
+    res, after = run_batch(before, [
+        {"start": 1, "end": 1, "new": "a = 10"},
+        {"start": 2, "end": 2},
+    ])
+    check("batch-garble: rejected", res.startswith("[replace_lines:") and "new" in res, res)
+    check("batch-garble: file untouched", after == before, repr(after))
+    # non-list edits
+    res, after = run_batch(before, "not a list")
+    check("batch-garble: non-list rejected", res.startswith("[replace_lines:"), res)
+    check("batch-garble: non-list untouched", after == before, repr(after))
+
+
+def test_single_form_unchanged():
+    """Legacy single-edit call shape → unchanged behavior (no `edits`)."""
+    res, after = run(GEO, 2, 2, "    return w * h * 2")
+    check("single: still works", res.startswith("[edited"), res)
+    check("single: applied", after == "def area(w, h):\n    return w * h * 2\n", repr(after))
+    # missing a required field on the single form is reported clearly (no KeyError)
+    d = tempfile.mkdtemp(prefix="rlmiss_")
+    p = os.path.join(d, "f.py")
+    with open(p, "w") as f:
+        f.write(GEO)
+    res = tool_replace_lines(p, 2, 2)   # no `new`
+    check("single: missing new reported", "missing new" in res, res)
+
+
 if __name__ == "__main__":
     test_fit_indent_unit()
     test_basic_replace()
@@ -256,5 +410,15 @@ if __name__ == "__main__":
     test_insert_at_top_and_eof()
     test_insert_multiline_nested()
     test_insert_guards()
+    test_batch_three_disjoint_edits()
+    test_batch_growing_and_shrinking_edits_track_line_shift()
+    test_batch_overlapping_rejected_atomic()
+    test_batch_out_of_range_rejected_atomic()
+    test_batch_syntax_error_full_revert()
+    test_batch_descending_application_preserves_offsets()
+    test_batch_indentation_fitted_per_item()
+    test_batch_deletion_item()
+    test_batch_garbled_edits_rejected()
+    test_single_form_unchanged()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
