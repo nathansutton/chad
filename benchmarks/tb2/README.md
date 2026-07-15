@@ -63,6 +63,13 @@ so the venv fits TB2's small task images.
   Desktop, VM capped at ~4 GB on a 24 GB box), and **[uv](https://docs.astral.sh/uv/)**.
 - **[Harbor](https://harborframework.com)** — Terminal-Bench 2's harness:
   `uv tool install harbor` (the reference runs used **harbor 0.16.1**).
+- **`HF_TOKEN` (recommended)** — export a [Hugging Face access
+  token](https://huggingface.co/settings/tokens) in the shell that runs `run_tb2.sh`.
+  `setup()` pre-fetches the tokenizer into each container's HF cache before chad ever
+  runs (so a later load is offline and can't race the Hub); an unauthenticated prefetch
+  is more likely to get rate-limited, and a prefetch that fails after 5 retries now
+  fails the trial's *setup* (harbor records an env failure and the task can be
+  re-run) rather than silently degrading to an online load at chad startup.
 - Disk: ~12 GB of model weights, ~1 GB of dataset export, plus tens of GB of Docker
   image cache over a full run. Time: many tasks carry 20–60 minute budgets — a full
   89-task pass is an overnight-to-a-day affair, dominated by serving throughput.

@@ -106,6 +106,7 @@ class ChadAgent(BaseAgent):
         self._project = chad_project or _REPO_ROOT
         self._workdir = chad_workdir
         self._installed = False
+        self._tok_cached = False   # set once the tokenizer is confirmed in the HF cache
 
     @staticmethod
     def name() -> str:
@@ -200,7 +201,71 @@ class ChadAgent(BaseAgent):
             self.logger.warning("[chad-tb2] install OK in DEGRADED mode (no tree-sitter)")
         else:
             self.logger.info("[chad-tb2] install OK")
+        await self._prefetch_tokenizer(environment)
         self._installed = True
+
+    async def _prefetch_tokenizer(self, environment: BaseEnvironment) -> None:
+        """Warm the tokenizer into the container's HF cache during setup (the separate
+        setup budget) and REQUIRE it to succeed.
+
+        Both remote backends (openai, llama) load only a tokenizer client-side
+        (`openai_engine.py` / `completion_engine.py`, `AutoTokenizer.from_pretrained`,
+        unguarded) — generation is proxied over HTTP, but that one call still hits the
+        Hub at chad startup. An unauthenticated pull there can be rate-limited, which
+        crashed a whole trial before chad ran a single step (financial-document-
+        processor: "Can't load tokenizer ... unauthenticated requests"). Retrying with
+        backoff here and RAISING on failure — instead of the old silent degrade to an
+        online load racing the rate limiter — turns that into a harbor-recorded setup/
+        env failure (task re-runnable) rather than a guaranteed forfeit.
+        """
+        tok_id = self._tokenizer or self._chad_model()
+        if not tok_id:
+            self.logger.warning("[chad-tb2] no tokenizer id resolvable (no chad_tokenizer "
+                                "and no model name); skipping prefetch")
+            return
+        served = self._chad_model()
+        if self._tokenizer and served and self._tokenizer != served:
+            # Vocab is quant-invariant across Ornith MLX/GGUF repos, so a differing repo
+            # still *works* — but it doubles the Hub pulls and confuses triage.
+            self.logger.warning(
+                "[chad-tb2] served model (%s) and chad_tokenizer (%s) are different HF "
+                "repos — confirm they share the same vocab family before trusting this run",
+                served, tok_id)
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+        if not hf_token:
+            self.logger.warning(
+                "[chad-tb2] no HF_TOKEN/HUGGING_FACE_HUB_TOKEN in the operator env — "
+                "prefetch will hit the Hub unauthenticated and may be rate-limited; "
+                "export one (see benchmarks/tb2/README.md)")
+        tok = shlex.quote(tok_id)
+        token_export = (f"export HF_TOKEN={shlex.quote(hf_token)} "
+                        f"HUGGING_FACE_HUB_TOKEN={shlex.quote(hf_token)}; " if hf_token else "")
+        fetch = (
+            # hf-xet (the Rust CAS/fast-transfer client, pulled in by transformers'
+            # huggingface_hub dep) throws opaque "Reqwest error: builder error" in
+            # constrained container networks — a widely reported class of failure
+            # (huggingface_hub#3266, xet-core#850/#581). Force the plain-HTTP downloader;
+            # a single small tokenizer repo has nothing to gain from chunked CAS transfer.
+            "export HOME=/root PATH=/root/.local/bin:/usr/local/bin:$PATH HF_HUB_DISABLE_XET=1; "
+            + token_export +
+            f"cd {_CHAD_SRC}; ok=0; "
+            "for i in 1 2 3 4 5; do "
+            f"  .venv/bin/python -c \"from transformers import AutoTokenizer; "
+            f"AutoTokenizer.from_pretrained({tok!r})\" && {{ ok=1; break; }}; "
+            "  echo \"[chad-tb2] tokenizer prefetch attempt $i failed; retrying\"; "
+            "  sleep $((i * 5)); "
+            "done; "
+            "[ $ok = 1 ] && echo '[chad-tb2] tokenizer cached' || echo '[chad-tb2] tokenizer prefetch FAILED'"
+        )
+        res = await environment.exec(fetch, timeout_sec=600, user="root")
+        if "tokenizer cached" not in (res.stdout or ""):
+            tail = (res.stdout or res.stderr or "")[-1200:]
+            raise RuntimeError(
+                f"[chad-tb2] tokenizer prefetch failed after 5 attempts for {tok_id!r} — "
+                f"failing setup() instead of risking a silent online-load forfeit at chad "
+                f"startup. tail: {tail}")
+        self._tok_cached = True
+        self.logger.info("[chad-tb2] tokenizer pre-fetched into HF cache")
 
     async def _detect_workdir(self, environment: BaseEnvironment) -> str:
         if self._workdir:
@@ -253,6 +318,19 @@ class ChadAgent(BaseAgent):
             "PYTHONUNBUFFERED": "1",
             "HOME": "/root" if str(run_user) in ("root", "0") else os.environ.get("HOME", "/root"),
         }
+        # Only force OFFLINE tokenizer load when setup() confirmed the cache is warm —
+        # otherwise a cold cache + offline would guarantee the very startup crash
+        # _prefetch_tokenizer exists to avoid. setup() now raises on a failed prefetch,
+        # so this is always true by the time run() gets here; the guard stays for the
+        # defensive setup() call above (a fresh run() without a prior setup()).
+        if self._tok_cached:
+            env["HF_HUB_OFFLINE"] = "1"
+            env["TRANSFORMERS_OFFLINE"] = "1"
+        env["HF_HUB_DISABLE_XET"] = "1"  # see _prefetch_tokenizer; applies to any fallback pull too
+        _hf = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        if _hf:
+            env["HF_TOKEN"] = _hf
+            env["HUGGING_FACE_HUB_TOKEN"] = _hf
 
         parts = [f"{_CHAD_SRC}/.venv/bin/chad", shlex.quote(str(instruction)), "--yolo",
                  "--backend", self._backend, "--base-url", shlex.quote(self._base_url or "")]
