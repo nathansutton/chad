@@ -51,11 +51,12 @@ import time
 import urllib.request
 from typing import Any, Callable, Iterator, Optional
 
-from .base_engine import GenStats
+from .base_engine import THINK_CLOSE, GenStats, think_ceiling_hit
 
 
 def build_chat_body(model_id: str, prompt_text: str, max_tokens: int, temp: float,
-                    stream: bool = True, stop: Optional[list] = None) -> dict:
+                    stream: bool = True, stop: Optional[list] = None,
+                    assistant_prefix: Optional[str] = None) -> dict:
     """Build the `/v1/chat/completions` request body (pure — no network, unit-tested).
 
     The decoded chad prompt goes in as a SINGLE user message (see the module docstring's
@@ -67,10 +68,19 @@ def build_chat_body(model_id: str, prompt_text: str, max_tokens: int, temp: floa
     generates on — wasted decode, and against a warm-prefix server (chad --serve) the
     server's cache tail then diverges from the transcript the client kept, turning
     every subsequent step into a full re-prefill (observed in the first TB2 canary:
-    request 2 was 97% cached, requests 3+ were 0%)."""
+    request 2 was 97% cached, requests 3+ were 0%).
+
+    `assistant_prefix` (plan 086 close-and-continue): a trailing assistant message the
+    server should CONTINUE rather than answer — llama.cpp (and OpenAI-compatible servers
+    with assistant-prefill) resume decoding from this partial content instead of emitting
+    a fresh assistant turn. Used to hand back the force-closed <think> so the model decodes
+    its action in the same step; the server's prefix cache keeps the re-request cheap."""
+    messages = [{"role": "user", "content": prompt_text}]
+    if assistant_prefix is not None:
+        messages.append({"role": "assistant", "content": assistant_prefix})
     body = {
         "model": model_id,
-        "messages": [{"role": "user", "content": prompt_text}],
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temp,
         "stream": stream,
@@ -197,10 +207,17 @@ class OpenAIEngine:
         on_prefill: Optional[Callable[[int, int], None]] = None,
         on_prefill_progress: Optional[Callable[[int, int], None]] = None,
         stop_condition: Optional[Callable[[str, int], bool]] = None,
+        think_ceiling: Optional[int] = None,
     ) -> tuple[str, GenStats]:
         """Stream a completion from the endpoint. See the module docstring for the honest
         degradations baked into this path (detokenize, cached_tokens=0/approximate, no
-        prefill progress, interrupt = drop the stream)."""
+        prefill progress, interrupt = drop the stream).
+
+        `think_ceiling` (plan 086 close-and-continue): when a <think> run crosses the
+        ceiling, stop the first request, inject THINK_CLOSE, and immediately re-request
+        with the force-closed text as an ASSISTANT-PREFIX so the server continues decoding
+        the action in the same step (one extra request, prefix-cached). A server can't
+        inject mid-stream, so this stop-then-continue IS the salvage on this backend."""
         # DETOKENIZE (degradation #1): decode chad's rendered ids back to text, keeping the
         # special role/think markers so the server receives chad's exact prompt verbatim.
         prompt_text = self.tok.decode(prompt_ids, skip_special_tokens=False)
@@ -210,60 +227,96 @@ class OpenAIEngine:
         if on_prefill:
             on_prefill(stats.prompt_tokens, 0)
 
-        body = build_chat_body(self.model_id, prompt_text, max_tokens, self.temp,
-                               stop=stop_texts)
         text = ""
-        n_out = 0
+        n_out = 0                 # running total across the WHOLE step (drives `remaining`)
+        step_tokens = 0           # honest per-request-summed total: usage.completion_tokens
+                                  # where the server reported it, else that request's own
+                                  # streamed-chunk count — NOT a global "any usage seen" flag.
+                                  # A salvaged request's stream is closed before it can ever
+                                  # send usage, so a global flag would silently drop its whole
+                                  # token count; summing per-request keeps it honest.
         t0 = time.time()
         first_at: Optional[float] = None
-        usage: Optional[dict] = None
-        stream = self._stream_completion(body)
-        try:
-            for raw in stream:
-                # INTERRUPT (degradation #4): no server-side cancel — stop reading and let
-                # the `finally` close the response, discarding whatever it kept generating.
-                if should_stop and should_stop():
-                    break
-                for sub in raw.splitlines():   # a read may carry >1 SSE line
-                    chunk = parse_sse_chunk(sub)
-                    if chunk is None:
-                        continue
-                    if chunk.get("usage"):     # final include_usage chunk
-                        usage = chunk["usage"]
-                    seg = delta_text(chunk)
-                    if not seg:
-                        continue
-                    if first_at is None:
-                        first_at = time.time()
-                        stats.prefill_s = first_at - t0
-                    text += seg
-                    n_out += 1
-                    if on_token:
-                        on_token(seg)
-                    if stop_texts and any(s in text for s in stop_texts):
-                        should_stop = lambda: True  # noqa: E731 — bail on next outer read
+        # assistant_prefix stays None for the first request; a salvage sets it to the
+        # force-closed text so the continuation request resumes that assistant turn.
+        assistant_prefix: Optional[str] = None
+        while True:
+            remaining = max_tokens - n_out
+            if remaining <= 0:
+                break
+            body = build_chat_body(self.model_id, prompt_text, remaining, self.temp,
+                                   stop=stop_texts, assistant_prefix=assistant_prefix)
+            salvage_here = False
+            usage: Optional[dict] = None
+            n_out_this_request = 0
+            stream = self._stream_completion(body)
+            try:
+                for raw in stream:
+                    # INTERRUPT (degradation #4): no server-side cancel — stop reading and
+                    # let `finally` close the response, discarding the rest server-side.
+                    if should_stop and should_stop():
                         break
-                    if stop_condition is not None and stop_condition(text, n_out):
-                        stats.stop_condition_fired = True
-                        should_stop = lambda: True  # noqa: E731
+                    for sub in raw.splitlines():   # a read may carry >1 SSE line
+                        chunk = parse_sse_chunk(sub)
+                        if chunk is None:
+                            continue
+                        if chunk.get("usage"):     # final include_usage chunk
+                            usage = chunk["usage"]
+                        seg = delta_text(chunk)
+                        if not seg:
+                            continue
+                        if first_at is None:
+                            first_at = time.time()
+                            stats.prefill_s = first_at - t0
+                        text += seg
+                        n_out += 1
+                        n_out_this_request += 1
+                        if on_token:
+                            on_token(seg)
+                        if stop_texts and any(s in text for s in stop_texts):
+                            should_stop = lambda: True  # noqa: E731 — bail on next outer read
+                            break
+                        # Close-and-continue: still inside <think> past the ceiling. Stop
+                        # this request, inject THINK_CLOSE, and re-request continuing the
+                        # assistant turn (below). Checked before stop_condition so the high
+                        # pathological ceiling salvages rather than ending the step.
+                        if think_ceiling_hit(text, n_out, think_ceiling):
+                            salvage_here = True
+                            break
+                        if stop_condition is not None and stop_condition(text, n_out):
+                            stats.stop_condition_fired = True
+                            should_stop = lambda: True  # noqa: E731
+                            break
+                    if salvage_here or (should_stop and should_stop()):
                         break
-        finally:
-            close = getattr(stream, "close", None)
-            if close:
-                close()
+            finally:
+                close = getattr(stream, "close", None)
+                if close:
+                    close()
+            if usage:
+                step_tokens += int(usage.get("completion_tokens", 0)) or n_out_this_request
+                # First request's prompt_tokens is the honest prefill size; a salvage's
+                # continuation re-prefills prompt+prefix (server prefix-cache keeps it
+                # cheap — plan 086 STOP condition watches for a double-prefill here).
+                if assistant_prefix is None:
+                    stats.prompt_tokens = int(usage.get("prompt_tokens", stats.prompt_tokens))
+                    details = usage.get("prompt_tokens_details") or {}
+                    if "cached_tokens" in details:
+                        stats.cached_tokens = int(details["cached_tokens"])
+            else:
+                # No usage chunk for THIS request — almost always the salvaged (interrupted)
+                # request, whose stream we closed before the server could send one. Fall
+                # back to what we actually counted, so its tokens aren't silently dropped.
+                step_tokens += n_out_this_request
+            if not salvage_here:
+                break
+            # Force-close the runaway <think> and loop once more; THINK_CLOSE now sits in
+            # `text`, so the ceiling check can't fire again (</think> is present).
+            text += THINK_CLOSE
+            n_out += 4  # ~tokens for the injected marker, keeping the budget honest
+            stats.salvaged = True
+            assistant_prefix = text
 
         stats.gen_s = time.time() - (first_at or t0)
-        # Prefer the server's real token counts when it sent a usage chunk; otherwise the
-        # streamed-chunk count is our (approximate) generated-token estimate.
-        if usage:
-            stats.generated_tokens = int(usage.get("completion_tokens", n_out))
-            stats.prompt_tokens = int(usage.get("prompt_tokens", stats.prompt_tokens))
-            # chad --serve (and OpenAI proper) report prefix-cache reuse here; without
-            # this the TB2 trajectories logged cached_tokens=0 against a server that
-            # was in fact warm, hiding the serving win from run forensics.
-            details = usage.get("prompt_tokens_details") or {}
-            if "cached_tokens" in details:
-                stats.cached_tokens = int(details["cached_tokens"])
-        else:
-            stats.generated_tokens = n_out
+        stats.generated_tokens = step_tokens
         return text, stats

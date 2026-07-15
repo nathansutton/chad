@@ -210,6 +210,30 @@ LEVERS: dict[str, Lever] = {
         "idea; targets the lost-track-of-file-state no-op/loop episodes.",
         "iter8"),
 
+    # --- plan 085 (TB2 deadline awareness): the adapter now passes the wall budget
+    #     down (--turn-budget-s = cap-60), so the governor arms on every TB2 run. This
+    #     lever is the wrap-up NUDGE that rides on top of it. -------------------------
+    "wrapup_window": Lever(
+        "One-shot wall-clock steering note in the turn's final stretch (remaining <= "
+        "max(120s, 15% of the wall budget)): stop exploring and land your best answer "
+        "before the force-stop. Distinct from the governor's no-progress hard-stop — this "
+        "fires even on a productive turn so it commits a scored partial instead of being "
+        "SIGKILLed mid-edit. Only active when a wall budget is configured; off with the "
+        "governor (CHAD_NO_GOVERNOR).",
+        "iter9"),
+
+    # --- plan 086 (TB2 think-spiral salvage): close-and-continue force-closes a runaway
+    #     <think> at CHAD_THINK_CEILING and keeps decoding the action in-step (the engine
+    #     mechanism, env-gated, has no lever — off by default like CHAD_THINK_BUDGET). This
+    #     lever is the ESCALATION on top of it. --------------------------------------
+    "no_think_escalation": Lever(
+        "After 2 consecutive steps that hit the gen cap (or were salvaged) yet produced no "
+        "tool call — the think-spiral signature — run the next step with <think> disabled "
+        "to force an action, then restore. Mechanical 'act now', replacing a third prose "
+        "nudge that demonstrably does not land. Only active when the close-and-continue "
+        "ceiling is armed (CHAD_THINK_CEILING), so default chad is unaffected.",
+        "iter9"),
+
     # --- from the LangChain harness-tuning playbook. -------------------------------
     "compact_notice": Lever(
         "After compaction, inject an in-band message telling the model its context was "

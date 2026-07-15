@@ -439,6 +439,7 @@ def _sub_agent_ending(monkeypatch, ending):
     parent.mode = "auto"
     parent.ctx_limit, parent.thinking, parent.max_gen_tokens = 24000, False, 512
     parent.think_budget, parent._subagent = None, False
+    parent.think_ceiling = None
     parent.gen_tokens = parent.gen_time = parent.prefill_tokens = 0
     parent.think_tokens = parent.forwards = 0
     parent._emit = lambda kind, text: None
@@ -471,6 +472,7 @@ def test_subagent_failsafe_restores_cache_on_crash(monkeypatch):
     parent.mode = "auto"
     parent.ctx_limit, parent.thinking, parent.max_gen_tokens = 24000, False, 512
     parent.think_budget, parent._subagent = None, False
+    parent.think_ceiling = None
     parent.gen_tokens = parent.gen_time = parent.prefill_tokens = 0
     parent.think_tokens = parent.forwards = 0
     parent._emit = lambda kind, text: None

@@ -534,6 +534,31 @@ def test_write_diff_note(monkeypatch, tmp_path):
     assert res.startswith("[wrote") and "lines vs previous" not in res
 
 
+# === plan 085 (TB2 deadline awareness) =====================================
+
+def test_wrapup_window(monkeypatch):
+    """Inside the final wall-clock stretch, the wrap-up nudge fires — unless ablated.
+    900s budget, 800s elapsed => 100s left, inside the max(120, 135)=135s window."""
+    n = bite("wrapup_window")
+    on(monkeypatch)
+    assert guardrails.wrapup_window_nudge(800, 900, wrapup_fired=False), \
+        "inside the wrap-up window the nudge must fire"
+    off(monkeypatch, n)
+    assert guardrails.wrapup_window_nudge(800, 900, wrapup_fired=False) is None, \
+        "ablated: no wrap-up nudge, a slow turn rides to the SIGKILL"
+
+
+def test_no_think_escalation(monkeypatch):
+    """The escalation's behavioral bite (two capped stalls -> a no-think render, gone when
+    ablated) lives in test_agent_e2e.py::test_no_think_escalation_*. Here assert the gate
+    itself flips, so the coverage contract stays honest."""
+    n = bite("no_think_escalation")
+    on(monkeypatch)
+    assert levers.enabled(n)
+    off(monkeypatch, n)
+    assert not levers.enabled(n)
+
+
 # === playbook levers (behavior asserted in their own suites) ===============
 
 def test_playbook_levers_have_dedicated_suites(monkeypatch):

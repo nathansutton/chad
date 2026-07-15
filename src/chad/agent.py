@@ -282,7 +282,8 @@ class Agent:
                  confirm=None, should_stop=None, drain_steering=None,
                  thinking: bool = True,
                  max_gen_tokens: int = 8192, resume: list = None, persist: bool = False,
-                 think_budget: int = None, turn_budget_tokens: int = None,
+                 think_budget: int = None, think_ceiling: int = None,
+                 turn_budget_tokens: int = None,
                  turn_budget_s: float = None, subagent: bool = False,
                  subagent_tools: str = "read-only", session_id: str = None,
                  ctx_limit_fn=None):
@@ -330,6 +331,15 @@ class Agent:
         if think_budget is None:
             think_budget = config.env_int("CHAD_THINK_BUDGET")
         self.think_budget = think_budget
+        # Close-and-continue think ceiling (plan 086). None => OFF (byte-identical to
+        # before), like think_budget. Distinct from it: think_budget is a low soft-cap that
+        # ENDS the step (the model re-derives next step — 084 confirmed that inflates total
+        # think 3.8x); this is a HIGH pathological cap (~6000) that force-closes the runaway
+        # <think> and CONTINUES decoding the action in the same step, so the reasoning so
+        # far stays in context and nothing is re-derived. Env-armed for the eval harness.
+        if think_ceiling is None:
+            think_ceiling = config.env_int("CHAD_THINK_CEILING")
+        self.think_ceiling = think_ceiling
         # Degenerate-repetition stop (see guardrails.degenerate_tail): default ON —
         # it only fires on output that is already garbage (a literal decode loop), so
         # unlike the think-budget there is no capability trade. A/B off via env.
@@ -502,10 +512,14 @@ class Agent:
         MLX path returns a plain list already — untouched by this guard."""
         return rendered["input_ids"] if hasattr(rendered, "input_ids") else rendered
 
-    def _render(self):
+    def _render(self, thinking: bool = None):
+        # `thinking` overrides self.thinking for THIS render only (plan 086 no-think
+        # escalation renders one step with <think> off, then restores). None => self.thinking.
+        if thinking is None:
+            thinking = self.thinking
         ids = self._template_ids(self.engine.tok.apply_chat_template(
             self.messages, tools=self._active_schemas(), add_generation_prompt=True,
-            enable_thinking=self.thinking,
+            enable_thinking=thinking,
         ))
         # Debug hook (env-gated, off by default): dump the first decoded render so a
         # rendered-prompt difference across environments can be diffed. Best-effort.
@@ -609,6 +623,7 @@ class Agent:
                 emit=self._sub_emit,
                 should_stop=self._should_stop,
                 think_budget=self.think_budget,
+                think_ceiling=self.think_ceiling,
                 turn_budget_tokens=0,              # the sub-agent's own max_steps bounds it
                 turn_budget_s=0.0,
                 subagent=True,
@@ -757,6 +772,13 @@ class Agent:
         edited_syntax_watch: dict = {}
         think_cap_hits = 0  # soft think-cap firings this turn (plan 039; drives escalation)
         repeat_stops = 0  # degenerate-repetition cut-offs this turn (3rd aborts the turn)
+        salvaged_steps = 0  # close-and-continue firings this turn (plan 086; telemetry)
+        # No-think escalation (plan 086 scope 2): after 2 consecutive steps that hit the gen
+        # cap (or salvaged) yet produced NO tool call — the think-spiral signature — run the
+        # NEXT step with <think> disabled for one step to force an action, then restore.
+        # capped_stall_streak counts the consecutive stalls; no_think_next is the one-shot.
+        capped_stall_streak = 0
+        no_think_next = False
         # Runaway-turn governor state (plan 040). turn_start drives the optional wall
         # budget; gov_band is the highest budget checkpoint already evaluated; gov_progress
         # tracks whether a change landed+verified within the CURRENT band (resets each time
@@ -767,6 +789,9 @@ class Agent:
         gov_band = 0
         gov_progress = False
         gov_soft_fired = False
+        # Deadline wrap-up window (plan 085): one-shot latch for the final-stretch nudge,
+        # independent of the governor's progress logic (it fires even on a working turn).
+        gov_wrapup_fired = False
         # Action vs Q&A intent (see classify_intent): a task that asks to change code
         # should END in an applied edit, not a prose explanation. Telemetry caught the
         # model navigating to the right function then "answering on paper" without
@@ -828,6 +853,22 @@ class Agent:
                              self.prefill_tokens, self._turn_budget_tokens)
                     self.messages.append({"role": "tool", "name": "edit",
                                           "content": guardrails.GOVERNOR_SOFT_NUDGE})
+                # Deadline wrap-up window (plan 085): a WALL-CLOCK nudge fired once, near
+                # the end, regardless of progress — the governor above only interrupts a
+                # NO-progress turn, but a slow-but-working turn also needs to stop and land
+                # a scored partial before the wall SIGKILLs it mid-edit. Reuses the steer
+                # tool-role note pattern; bounded to one per turn by gov_wrapup_fired. The
+                # wrapup_window lever gate lives inside the helper.
+                wrap = guardrails.wrapup_window_nudge(
+                    time.monotonic() - turn_start, self._turn_budget_s, gov_wrapup_fired)
+                if wrap:
+                    gov_wrapup_fired = True
+                    log.info("WRAPUP nudge at step %d: %.0fs of %ss wall budget", step,
+                             time.monotonic() - turn_start, self._turn_budget_s)
+                    self._emit("info", "  [final wrap-up window — asking the model to "
+                                       "land its best answer now]")
+                    self.messages.append({"role": "tool", "name": "steer",
+                                          "content": wrap})
             # Forced landing (A): inside the last few steps with nothing cleanly applied,
             # tell the model to stop exploring and commit its edit before the hard cap —
             # otherwise the loop just dies at max_steps with the task untouched.
@@ -855,11 +896,24 @@ class Agent:
                         "content": "[user steering — this overrides prior instructions "
                                    "for the rest of the turn]\n" + steer})
                     self._emit("info", "  [steering injected]")
+            # No-think escalation (plan 086 scope 2): a one-shot armed by the no-tool-call
+            # branch after 2 consecutive capped/salvaged stalls. Render THIS step with
+            # <think> off so the model must act, then the flag clears and thinking restores.
+            # Consumes the one-shot here; the render/decode/accounting below all key off
+            # `step_thinking` rather than self.thinking for exactly this step.
+            step_thinking = self.thinking
+            if no_think_next:
+                no_think_next = False
+                capped_stall_streak = 0
+                step_thinking = False
+                log.info("NO-THINK ESCALATION at step %d: rendering with <think> disabled "
+                         "for one step to break a capped no-tool-call stall", step)
+                self._emit("info", "  [no-think escalation: acting without <think> this step]")
             # The engine diffs this full render against its live KV cache and prefills
             # only the appended tokens, so a plain re-render IS the cache-extension path
             # (truncated-turn divergence is handled inside engine._sync_to, not here).
             _t0 = time.perf_counter()
-            prompt_ids = self._render()
+            prompt_ids = self._render(thinking=step_thinking)
             _render_s = time.perf_counter() - _t0
             _pre_compact_len = len(prompt_ids)
             _t0 = time.perf_counter()
@@ -882,7 +936,7 @@ class Agent:
             # byte-identical to before (the mechanism is off by default).
             think_stop = None
             think_cap = None
-            if self.think_budget and self.thinking:
+            if self.think_budget and step_thinking:
                 stuck = (think_cap_hits + self._loop_nudges + thrash_nudges
                          + verify_nudges)
                 think_cap = guardrails.think_budget(stuck, base=self.think_budget)
@@ -910,7 +964,7 @@ class Agent:
                         return True
                     return False
 
-            view = _StreamView(self._emit, started_in_think=self.thinking) if stream else None
+            view = _StreamView(self._emit, started_in_think=step_thinking) if stream else None
             gen_count = [0]  # decoded chunks this step (~tokens); fed to the live ↓ counter
 
             def on_token(t):
@@ -944,11 +998,16 @@ class Agent:
                     last_pct[0] = pct
                     self._emit("prefill", f"{done}/{total}")
 
+            # Close-and-continue ceiling (plan 086): armed only when CHAD_THINK_CEILING is
+            # set AND this step is actually thinking (a no-think escalation step has no
+            # <think> to salvage). None => the engine path is byte-identical to before.
+            step_ceiling = self.think_ceiling if (self.think_ceiling and step_thinking) else None
             try:
                 text, stats = self.engine.generate(
                     prompt_ids, max_tokens=self.max_gen_tokens, on_token=on_token,
                     should_stop=self._should_stop, on_prefill=on_prefill,
-                    on_prefill_progress=on_prefill_progress, stop_condition=stop_condition)
+                    on_prefill_progress=on_prefill_progress, stop_condition=stop_condition,
+                    think_ceiling=step_ceiling)
             except BackendError as e:
                 # A transient backend fault (5xx / mid-stream error chunk) used to escape
                 # run_turn and kill the process from cli.main — forfeiting the rest of an
@@ -983,6 +1042,14 @@ class Agent:
                      "cached_tokens": stats.cached_tokens,
                      "generated_tokens": stats.generated_tokens})
             hit_cap = stats.generated_tokens >= self.max_gen_tokens
+            # Close-and-continue fired (plan 086): the engine force-closed a runaway <think>
+            # and decoded the action in the same step. Counted for autopsy (a salvaged step
+            # is one the spiral would otherwise have wasted) and surfaced to the status line.
+            if stats.salvaged:
+                salvaged_steps += 1
+                self._emit("salvaged", str(salvaged_steps))
+                log.info("SALVAGE at step %d: <think> force-closed past the ceiling, "
+                         "continued in-step (salvaged=%d this turn)", step, salvaged_steps)
             self.gen_tokens += stats.generated_tokens
             self.gen_time += stats.gen_s
             self.prefill_tokens += stats.prompt_tokens
@@ -1009,7 +1076,7 @@ class Agent:
                 self.interrupted = True
                 if text:
                     self.messages.append({"role": "assistant",
-                                          "content": close_unclosed_think(text, self.thinking)})
+                                          "content": close_unclosed_think(text, step_thinking)})
                 self._emit("info", "  [interrupted]")
                 return "[interrupted]"
 
@@ -1017,7 +1084,7 @@ class Agent:
             # stored turn stays a prefix of the live KV cache (else: full re-prefill next
             # step on the non-trimmable cache). See close_unclosed_think.
             self.messages.append({"role": "assistant",
-                                  "content": close_unclosed_think(text, self.thinking)})
+                                  "content": close_unclosed_think(text, step_thinking)})
 
             # Estimate reasoning overhead: the generation opens inside <think> (the
             # template emits the opening tag), so everything up to </think> is thinking.
@@ -1060,6 +1127,7 @@ class Agent:
                     "gen_tokens": stats.generated_tokens,
                     "gen_s": round(stats.gen_s, 4),
                     "compacted": compacted, "sync_kind": sync_kind,
+                    "salvaged": stats.salvaged,   # plan 086 close-and-continue (autopsy count)
                     "peak_ctx": len(prompt_ids),
                     # Loop overhead outside the engine: chat-template re-tokenization
                     # and compaction wall time this step, plus the tools the *previous*
@@ -1125,6 +1193,20 @@ class Agent:
 
             calls = parse_tool_calls(text)
             if not calls:
+                # No-think escalation bookkeeping (plan 086 scope 2): a step that hit the gen
+                # cap or was salvaged yet emitted NO tool call is the think-spiral signature.
+                # Count consecutive such stalls; after 2, arm a one-shot no-think render for
+                # the NEXT step to force an action. Gated by the lever AND the ceiling being
+                # armed, so default chad (no CHAD_THINK_CEILING) is byte-identical. A stall
+                # that is neither capped nor salvaged is a different pathology (the nudges
+                # below own it) and resets the streak.
+                if hit_cap or stats.salvaged:
+                    capped_stall_streak += 1
+                    if (self.think_ceiling and self.thinking and capped_stall_streak >= 2
+                            and levers.enabled("no_think_escalation")):
+                        no_think_next = True
+                else:
+                    capped_stall_streak = 0
                 # No tool call this step. Decide whether this is a genuine final answer
                 # or a stall to push past. Three stalls telemetry caught, in priority
                 # order: (1) TRUNCATED — generation hit the token cap mid-thought, so it
@@ -1189,6 +1271,9 @@ class Agent:
                 return strip_think(text).strip()
             log.info("step %d: model emitted %d tool call(s): %s",
                      step, len(calls), ", ".join(n for n, _ in calls))
+            # The step acted — the spiral broke on its own, so clear the no-think escalation
+            # streak (plan 086): escalation is only for consecutive capped/salvaged stalls.
+            capped_stall_streak = 0
 
             # Terminal tool -> end the turn cleanly, but enforce verify-before-done
             # (forge's prerequisite idea): if files were changed and nothing has been

@@ -16,8 +16,9 @@ import platform
 import re
 import subprocess
 import sys
+import time
 
-from . import config, levers
+from . import config, guardrails, levers
 from .agent import Agent, repl
 from .engine import Engine
 
@@ -380,6 +381,11 @@ def main():
                     help="soft-cap each step's <think> run at N tokens, then force-close "
                          "it and continue (escalates when stuck); off by default. Also "
                          "settable via CHAD_THINK_BUDGET.")
+    ap.add_argument("--think-ceiling", type=int, default=None, dest="think_ceiling",
+                    help="close-and-continue (plan 086): force-close a runaway <think> past "
+                         "N tokens and keep decoding the action IN THE SAME STEP (vs "
+                         "--think-budget, which ends the step). A high pathological cap "
+                         "(~6000); off by default. Also settable via CHAD_THINK_CEILING.")
     ap.add_argument("--turn-budget-tokens", type=int, default=None, dest="turn_budget_tokens",
                     help="runaway-turn governor: end a turn once it has burned N cumulative "
                          "prefill tokens WITHOUT landing+verifying a change (nudges at ~50%%, "
@@ -394,6 +400,12 @@ def main():
                          "turn, relaunch a FRESH turn (cleared context) seeded with the "
                          "progress note, up to N times. Default: 2 on an unattended "
                          "(auto-approve) run, 0 otherwise; pass 0 to disable.")
+    ap.add_argument("--review-pass", action="store_true", dest="review_pass",
+                    help="early-finish self-review (plan 085): on a one-shot run that ends "
+                         "CLEANLY with >30%% of --turn-budget-s still unspent, relaunch ONE "
+                         "fresh-context turn to independently verify the deliverables and fix "
+                         "any mismatch. Off by default (needs --turn-budget-s to arm); also "
+                         "CHAD_REVIEW_PASS=1.")
     # Backend selection (plan 046/047 spikes). Default 'mlx' is the in-process engine and
     # the whole point of chad; 'openai' drives the SAME harness against an OpenAI-compatible
     # endpoint (honest degradations apply — see openai_engine.py); 'llama' drives a
@@ -455,6 +467,8 @@ def main():
     # their __init__ reads, so the flag works on every entrypoint, not just headless.
     if args.think_budget is not None:
         os.environ["CHAD_THINK_BUDGET"] = str(args.think_budget)
+    if args.think_ceiling is not None:
+        os.environ["CHAD_THINK_CEILING"] = str(args.think_ceiling)
     # --turn-budget-* (plan 040) reach the TUI/REPL Agents through the same env knobs
     # their __init__ reads, so the governor is configurable on every entrypoint.
     if args.turn_budget_tokens is not None:
@@ -633,9 +647,12 @@ def main():
             sys.stderr.write("[headless: auto-approving tools (use --plan for read-only)]\n")
         agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
                       mode=run_mode, thinking=thinking, resume=resume, persist=True,
-                      think_budget=args.think_budget,
+                      think_budget=args.think_budget, think_ceiling=args.think_ceiling,
                       turn_budget_tokens=args.turn_budget_tokens,
                       turn_budget_s=args.turn_budget_s, ctx_limit_fn=ctx_limit_fn)
+        # Plan 085: wall time across ALL of this task's turns (initial + any auto-continue
+        # relaunches), measured against the wall budget to decide the early-finish review.
+        task_start = time.monotonic()
         agent.run_turn(task)
         # Plan 040: if the turn hard-stopped on a budget (governor token/wall budget, the
         # step cap's final window landing nothing, or the iter-2 no-empty-diff gate),
@@ -663,6 +680,29 @@ def main():
                           turn_budget_tokens=args.turn_budget_tokens,
                           turn_budget_s=args.turn_budget_s, ctx_limit_fn=ctx_limit_fn)
             agent.run_turn(f"{task}\n\n[{note}]")
+        # Early-finish self-review (plan 085 scope 3): if the task settled CLEANLY (no
+        # banked budget note) with more than 30% of the wall budget still unspent, relaunch
+        # ONE fresh-context turn to independently verify the deliverables — the fresh KV
+        # cache sheds the poisoned context that convinced the first attempt it was done,
+        # catching the confident-wrong `done`. Off unless armed (--review-pass /
+        # CHAD_REVIEW_PASS) and a wall budget is set, so interactive/unmetered runs and
+        # clean A/B baselines never trigger it.
+        review_armed = args.review_pass or config.flag("CHAD_REVIEW_PASS")
+        elapsed = time.monotonic() - task_start
+        if review_armed and guardrails.review_pass_should_fire(
+                not agent.budget_note, args.turn_budget_s, elapsed):
+            # The review turn respects the SAME task deadline: give it only the wall time
+            # that remains, floored, so its own governor/wrap-up can't blow past the cap.
+            review_budget = max(30.0, args.turn_budget_s - elapsed)
+            sys.stderr.write(f"[review] task finished with {args.turn_budget_s - elapsed:.0f}s "
+                             "of budget left; running one fresh-context verification pass\n")
+            eng.reset()
+            agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
+                          mode=run_mode, thinking=thinking, persist=True,
+                          think_budget=args.think_budget,
+                          turn_budget_tokens=args.turn_budget_tokens,
+                          turn_budget_s=review_budget, ctx_limit_fn=ctx_limit_fn)
+            agent.run_turn(task + guardrails.REVIEW_PASS_PROMPT)
         agent.save()  # persist so a follow-up `chad -c "..."` picks up the thread
     elif args.repl:
         repl(eng, yolo=args.yolo, ctx_limit=ctx_limit, resume=resume, thinking=thinking,
