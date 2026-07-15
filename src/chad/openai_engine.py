@@ -295,14 +295,22 @@ class OpenAIEngine:
                     close()
             if usage:
                 step_tokens += int(usage.get("completion_tokens", 0)) or n_out_this_request
-                # First request's prompt_tokens is the honest prefill size; a salvage's
+                # First request's usage is the honest prefill accounting; a salvage's
                 # continuation re-prefills prompt+prefix (server prefix-cache keeps it
                 # cheap — plan 086 STOP condition watches for a double-prefill here).
+                # usage.prompt_tokens is the FULL prompt (OpenAI semantics: cached +
+                # prefilled) — NOT the GenStats contract, which is new-tokens-only on
+                # every backend. Normalizing HERE (plan 090) instead of leaking server
+                # semantics upstream: before this, agent.py's sync_kind attribution
+                # double-counted the cached prefix and tagged nearly every TB2 step
+                # "warm-reload" on a server that was in fact appending perfectly.
                 if assistant_prefix is None:
-                    stats.prompt_tokens = int(usage.get("prompt_tokens", stats.prompt_tokens))
+                    full = int(usage.get("prompt_tokens", stats.prompt_tokens))
+                    stats.prompt_total_tokens = full
                     details = usage.get("prompt_tokens_details") or {}
                     if "cached_tokens" in details:
                         stats.cached_tokens = int(details["cached_tokens"])
+                    stats.prompt_tokens = max(0, full - stats.cached_tokens)
             else:
                 # No usage chunk for THIS request — almost always the salvaged (interrupted)
                 # request, whose stream we closed before the server could send one. Fall

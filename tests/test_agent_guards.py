@@ -819,6 +819,53 @@ def test_review_pass_should_fire():
           review_pass_should_fire(True, 900, 630) is False)
 
 
+def test_classify_sync_kind():
+    from chad.agent import classify_sync_kind
+
+    # Plan 090: the openai backend used to report usage.prompt_tokens (the FULL prompt)
+    # where the contract says NEW-tokens-only, inflating prev_total and mis-tagging a
+    # perfectly-appending server session as 'warm-reload' on nearly every TB2 step.
+    # These sequences simulate the agent's accumulation (prev_total = cached + new + gen)
+    # under BOTH semantics to pin the fixed behavior.
+
+    # A pure-append session under the (correct) new-tokens semantics: every step's cache
+    # hit equals the prior step's total -> 'append' on every step after the first.
+    prev = 0
+    steps = [  # (cached, new_prefilled, generated) — e.g. a warm chad --serve session
+        (0, 5000, 800), (5800, 120, 600), (6520, 90, 700), (7310, 200, 400)]
+    kinds = []
+    for cached, new, gen in steps:
+        kinds.append(classify_sync_kind(cached, prev, False))
+        prev = cached + new + gen
+    check("pure-append session -> append every step", kinds == ["append"] * 4, kinds)
+
+    # The SAME server behavior recorded under the buggy full-prompt semantics (new :=
+    # cached + new): prev_total inflates and every later step mis-tags 'warm-reload'.
+    # This is the aws-q6 signature the replay gate quantifies — kept as a characterization
+    # that the classifier itself is sound and the bug was in the inputs.
+    prev = 0
+    kinds = []
+    for cached, new, gen in steps:
+        kinds.append(classify_sync_kind(cached, prev, False))
+        prev = cached + (cached + new) + gen   # prompt_tokens double-counts the prefix
+    # Step 1 has no cached prefix to double-count and step 2's inflation only lands in
+    # prev AFTER it classifies, so the mis-tag starts at step 3 and never recovers.
+    check("full-prompt (buggy) inputs mis-tag appends as warm-reload",
+          kinds == ["append", "append", "warm-reload", "warm-reload"], kinds)
+
+    # Genuine divergence (cached < prior total but > 0) must still tag warm-reload.
+    check("genuine divergence -> warm-reload",
+          classify_sync_kind(3000, 6400, False) == "warm-reload")
+    # A compaction step (head rewrite shrank the render) keeps its own tag.
+    check("compaction -> reprefill-compaction",
+          classify_sync_kind(3000, 6400, True) == "reprefill-compaction")
+    # Cold reset mid-session (cached == 0) is reprefill-other.
+    check("cold reset -> reprefill-other",
+          classify_sync_kind(0, 6400, False) == "reprefill-other")
+    # First traced step (prev_total == 0) is an append by definition.
+    check("first step -> append", classify_sync_kind(0, 0, False) == "append")
+
+
 if __name__ == "__main__":
     test_reject_escalation()
     test_reject_loop_signature_resets_on_change()
@@ -846,5 +893,6 @@ if __name__ == "__main__":
     test_progress_note()
     test_wrapup_window_nudge()
     test_review_pass_should_fire()
+    test_classify_sync_kind()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

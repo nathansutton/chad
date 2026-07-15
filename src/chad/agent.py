@@ -76,7 +76,31 @@ from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_rep
 # zero string/dict/IO work, per plan 020's "instrumentation must not tax the product"
 # rule. Set CHAD_PREFILL_TRACE=path/to/trace.jsonl to capture one JSON row per engine
 # generate() call (== one prefill event) for scripts/prefill_tax.py to analyze offline.
+#
+# HISTORICAL-TRACE WARNING (plan 090): openai-backend traces recorded BEFORE the
+# prompt_tokens normalization (2026-07) carry bogus `sync_kind` — the backend reported the
+# FULL prompt where the contract says new-tokens-only, so prev_total double-counted the
+# cached prefix and nearly every perfect append was mis-tagged 'warm-reload' (aws-q6 run:
+# 3,890 of 4,383 steps). Their raw prompt_tokens/cached_tokens/gen_tokens fields are fine;
+# re-derive tags with evals/_tb2_autopsy_20260714/replay_synckind.py. Annotate, don't
+# rewrite. MLX-backend traces were always correct.
 _PREFILL_TRACE = config.env_str("CHAD_PREFILL_TRACE")
+
+
+def classify_sync_kind(cached: int, prev_total: int, compacted: bool) -> str:
+    """Name WHY a step prefilled what it did, from cache telemetry alone (plan 035; pure
+    so plan 090's offline replay gate and the unit tests share the run_turn definition).
+    `cached` is this step's prefix-cache hit; `prev_total` is the prior step's total cache
+    length (cached + NEW prefilled + generated — GenStats new-tokens semantics, which every
+    backend now honors, plan 090: the openai path used to report the FULL prompt here,
+    inflating prev_total and mis-tagging perfect appends as 'warm-reload')."""
+    if cached >= prev_total:
+        return "append"               # prefix fully retained; only new tail prefilled
+    if compacted:
+        return "reprefill-compaction"  # head rewrite shrank the render
+    if cached > 0:
+        return "warm-reload"          # diverged but salvaged a prefix (cheap)
+    return "reprefill-other"          # cold reset (think-mismatch / mid-edit)
 
 
 def _trace_prefill(row: dict) -> None:
@@ -1110,14 +1134,7 @@ class Agent:
             # content; tagging that by cause is what feeds the A/B/C attribution.
             if _PREFILL_TRACE:
                 common = stats.cached_tokens
-                if common >= self._prefill_trace_prev:
-                    sync_kind = "append"          # prefix fully retained; only new tail
-                elif compacted:
-                    sync_kind = "reprefill-compaction"  # head rewrite shrank the render
-                elif common > 0:
-                    sync_kind = "warm-reload"     # diverged but salvaged a prefix (cheap)
-                else:
-                    sync_kind = "reprefill-other" # cold reset (think-mismatch / mid-edit)
+                sync_kind = classify_sync_kind(common, self._prefill_trace_prev, compacted)
                 self._prefill_trace_seq += 1
                 _trace_prefill({
                     "seq": self._prefill_trace_seq, "step": step,

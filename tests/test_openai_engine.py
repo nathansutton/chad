@@ -132,12 +132,20 @@ def test_generate_streams_tokens_and_marks_stats_approximate():
     assert stats.cached_tokens == 0
     # server usage is preferred when present
     assert stats.generated_tokens == 2
+    # plan 090: usage.prompt_tokens is the FULL prompt; with no cached_tokens detail
+    # the whole thing counts as prefilled, and the raw figure is kept separately
     assert stats.prompt_tokens == 42
+    assert stats.prompt_total_tokens == 42
 
 
 def test_generate_adopts_server_cached_tokens():
     """chad --serve reports prefix-cache reuse in prompt_tokens_details; the client
-    must adopt it (TB2 trajectories logged cached_tokens=0 against a warm server)."""
+    must adopt it (TB2 trajectories logged cached_tokens=0 against a warm server).
+    Plan 090: usage.prompt_tokens (the FULL prompt, OpenAI semantics) is normalized
+    to the GenStats contract — NEW tokens only — by subtracting the cached prefix;
+    the raw full-prompt figure survives in prompt_total_tokens. Before this, the
+    sync_kind attribution double-counted the cached prefix and tagged nearly every
+    TB2 step 'warm-reload' against a server that was appending perfectly."""
     lines = list(_sse(
         {"choices": [{"delta": {"content": "hi"}}]},
         {"choices": [], "usage": {"prompt_tokens": 42, "completion_tokens": 1,
@@ -146,7 +154,8 @@ def test_generate_adopts_server_cached_tokens():
     ))
     ad = _adapter_with_stream(lines)
     _, stats = ad.generate([1, 2, 3], max_tokens=8)
-    assert stats.prompt_tokens == 42
+    assert stats.prompt_tokens == 2          # 42 full - 40 cached: actually prefilled
+    assert stats.prompt_total_tokens == 42   # raw server figure, kept for forensics
     assert stats.cached_tokens == 40
 
 

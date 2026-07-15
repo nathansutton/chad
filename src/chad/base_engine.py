@@ -53,8 +53,20 @@ class BackendError(RuntimeError):
 
 @dataclass
 class GenStats:
-    prompt_tokens: int = 0          # tokens actually prefilled this turn
+    prompt_tokens: int = 0          # tokens actually PREFILLED this turn — NEW tokens only,
+                                    # never including the cached prefix. This is the contract
+                                    # on EVERY backend (plan 090): the MLX engine counts the
+                                    # suffix it forwards, completion_engine adopts the
+                                    # server's prompt_n (same meaning), and openai_engine
+                                    # normalizes usage.prompt_tokens (which is the FULL
+                                    # prompt, OpenAI semantics) by subtracting cached_tokens.
+                                    # The raw full-prompt figure, when a server reported one,
+                                    # lands in prompt_total_tokens.
     cached_tokens: int = 0          # tokens served from the prefix cache
+    prompt_total_tokens: int = 0    # FULL prompt size as reported by an OpenAI-style server
+                                    # (usage.prompt_tokens = cached + prefilled), kept raw for
+                                    # forensics. 0 = server didn't report one (MLX/llama paths
+                                    # derive totals from prompt_tokens + cached_tokens).
     generated_tokens: int = 0
     prefill_s: float = 0.0
     gen_s: float = 0.0
