@@ -61,7 +61,7 @@ except ImportError as _e:  # non-Apple host: remote backend only
 # importing mlx.core. Re-exported here so existing `from .engine import GenStats` keeps
 # working (bench.py, tests) — the class is unchanged.
 from . import config
-from .base_engine import GenStats
+from .base_engine import THINK_CLOSE, GenStats, think_ceiling_hit
 from .diag import log
 
 # checkpoint filename kinds (prefix on the basename) — lets cleanup target the
@@ -976,6 +976,7 @@ class Engine:
         on_prefill: Optional[Callable[[int, int], None]] = None,
         on_prefill_progress: Optional[Callable[[int, int], None]] = None,
         stop_condition: Optional[Callable[[str, int], bool]] = None,
+        think_ceiling: Optional[int] = None,
     ):
         """Generate a completion for the already-templated prompt_ids.
 
@@ -992,6 +993,12 @@ class Engine:
         distinguish a deliberate early stop from an EOS/max_tokens finish. This is the
         soft think-cap hook (plan 039): run_turn uses it to stop a ballooning <think>
         run and force-close the block. None => byte-identical to a plain generate call.
+
+        think_ceiling (plan 086 close-and-continue): a runaway <think> past this many
+        tokens is force-closed by injecting THINK_CLOSE ids through the append-only cache,
+        and decoding CONTINUES into the action in the SAME step (GenStats.salvaged set) —
+        no new step, no re-derivation. None => off. This touches no cache trim/diff logic
+        (the high-risk-zone invariant): the injection is a plain prefix-extension.
         """
         # Fairness / measurement knob (CHAD_NO_PREFIX_CACHE): drop the persistent prefix
         # cache before every turn so each step full-prefills from scratch. This forfeits
@@ -1012,7 +1019,8 @@ class Engine:
                 and (self._trimmable or (self._pld_hybrid and self.enable_pld_hybrid))):
             return self._generate_prompt_lookup(prompt_ids, max_tokens, on_token,
                                                 stop_texts, should_stop, on_prefill,
-                                                on_prefill_progress, stop_condition)
+                                                on_prefill_progress, stop_condition,
+                                                think_ceiling)
 
         common = self._sync_to(prompt_ids)
         suffix = prompt_ids[common:]
@@ -1093,9 +1101,17 @@ class Engine:
         gen_ids = []
         first_token_at = None
         oom_degraded = False
-        try:
-            for resp in stream_generate(self.model, self.tok, mx.array(gen_prompt),
-                                        **kwargs):
+
+        # Decode loop, factored so close-and-continue (plan 086) can RE-ENTER it: after a
+        # ceiling force-close, the same persistent cache is fed the </think> ids and
+        # decoding resumes into the action. Re-entry is a plain append (stream_generate
+        # prefills `seed_ids` onto self._cache, then decodes) — it touches no trim/diff/
+        # snapshot logic, so the non-trimmable-cache invariant holds. Returns why it
+        # stopped: 'ceiling' | 'stop' | 'condition' | 'eos'.
+        def _decode(seed_ids, budget):
+            nonlocal first_token_at, text
+            kw = dict(kwargs, max_tokens=max(1, budget))
+            for resp in stream_generate(self.model, self.tok, mx.array(seed_ids), **kw):
                 if first_token_at is None:
                     first_token_at = time.time()
                     stats.prefill_s = first_token_at - t0
@@ -1104,12 +1120,26 @@ class Engine:
                 if on_token:
                     on_token(resp.text)
                 if stop_texts and any(s in text for s in stop_texts):
-                    break
+                    return "stop"
                 if should_stop and should_stop():
-                    break
+                    return "stop"
+                if think_ceiling_hit(text, len(gen_ids), think_ceiling):
+                    return "ceiling"
                 if stop_condition is not None and stop_condition(text, len(gen_ids)):
                     stats.stop_condition_fired = True
-                    break
+                    return "condition"
+            return "eos"
+
+        try:
+            if _decode(gen_prompt, max_tokens) == "ceiling":
+                # Inject </think> and keep decoding the action IN THE SAME STEP. One salvage
+                # per step: THINK_CLOSE is now in `text`, so think_ceiling_hit can't refire.
+                close_ids = list(self.tok.encode(THINK_CLOSE, add_special_tokens=False))
+                text += THINK_CLOSE
+                gen_ids.extend(close_ids)
+                stats.salvaged = True
+                if len(gen_ids) < max_tokens and not (should_stop and should_stop()):
+                    _decode(close_ids, max_tokens - len(gen_ids))
         except RuntimeError as e:
             # Metal OOM mid-decode (catchable on mlx>=0.32). stream_generate manages
             # the cache internally, so its state after a mid-forward failure is
@@ -1150,11 +1180,17 @@ class Engine:
 
     def _generate_prompt_lookup(self, prompt_ids, max_tokens, on_token, stop_texts,
                                 should_stop=None, on_prefill=None,
-                                on_prefill_progress=None, stop_condition=None):
+                                on_prefill_progress=None, stop_condition=None,
+                                think_ceiling=None):
         """Single-model speculative decoding using n-gram prompt lookup as the
         drafter. Mirrors the prefix-cache contract of `generate`: only the new
         suffix is prefilled, drafts are verified in one batched forward, accepted
-        runs are committed, and the cache is trimmed back on rejection."""
+        runs are committed, and the cache is trimmed back on rejection.
+
+        `think_ceiling` is accepted for signature parity but NOT wired here: this path
+        is greedy (temp==0) only, whereas the think-spiral close-and-continue targets a
+        temp>0 sampling pathology (plan 086) — the TB2 arm runs the openai backend, and
+        the interactive MLX default falls to the main `generate` decode loop above."""
         common = self._sync_to(prompt_ids)
         suffix = prompt_ids[common:]
         stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)

@@ -16,6 +16,24 @@ the OpenAI adapter can build one without dragging in `mlx.core`.
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
+# Close-and-continue salvage (plan 086): the marker injected to force-close a <think> run
+# that has blown past the ceiling, so decoding continues into the ACTION *in the same step*
+# — vs plan 039's think-cap, which ends the step and lets the next one re-derive the whole
+# reasoning (the 084 anti-fix: force-close-then-new-step measured 3.8x total think). Both
+# engines inject this same string: the MLX path tokenizes it and feeds the ids through the
+# append-only cache; the openai path hands it back as an assistant-prefix continuation.
+THINK_CLOSE = "\n</think>\n\n"
+
+
+def think_ceiling_hit(text: str, n_tokens: int, ceiling: Optional[int]) -> bool:
+    """True when generation is still inside the auto-opened <think> block (no </think>
+    emitted yet) and has run past `ceiling` tokens — the close-and-continue trigger
+    (plan 086). `ceiling` None/0 disables it (byte-identical to no ceiling). Pure so both
+    engines share one definition and it is unit-testable without a model."""
+    if not ceiling:
+        return False
+    return n_tokens >= ceiling and "</think>" not in text
+
 
 class BackendError(RuntimeError):
     """A generation backend refused or failed a request.
@@ -45,6 +63,11 @@ class GenStats:
     draft_accepted: int = 0         # PLD: n-gram tokens accepted
     stop_condition_fired: bool = False  # generation halted by the caller's stop_condition
                                     # (plan 039 soft think-cap), not by EOS / max_tokens
+    salvaged: bool = False          # close-and-continue fired (plan 086): a runaway <think>
+                                    # was force-closed mid-step and decoding CONTINUED into
+                                    # the action in the same step. Distinct from
+                                    # stop_condition_fired (which ENDS the step) — a salvaged
+                                    # step returns a complete turn the caller parses normally.
     approximate: bool = False       # stats are best-effort, not exact (plan 046): an
                                     # OpenAI-style backend can't report cached_tokens /
                                     # per-forward accounting, so it sets this and callers
@@ -97,10 +120,15 @@ class BaseEngine(Protocol):
         on_prefill: Optional[Callable[[int, int], None]] = None,
         on_prefill_progress: Optional[Callable[[int, int], None]] = None,
         stop_condition: Optional[Callable[[str, int], bool]] = None,
+        think_ceiling: Optional[int] = None,
     ) -> tuple[str, GenStats]:
         """Generate a completion for the already-templated `prompt_ids`, streaming decoded
         text to `on_token`. Returns `(text, GenStats)`. Signature mirrors `Engine.generate`
-        exactly so `Engine` satisfies this protocol unchanged."""
+        exactly so `Engine` satisfies this protocol unchanged.
+
+        `think_ceiling` (plan 086): when set, a <think> run that exceeds this many tokens is
+        force-closed (THINK_CLOSE injected) and decoding CONTINUES into the action in the
+        same step, setting `GenStats.salvaged`. None => off (byte-identical to before)."""
         ...
 
     # --- cache lifecycle -------------------------------------------------

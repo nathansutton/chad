@@ -57,8 +57,20 @@ Agent kwargs (--ak key=value):
                              defaults to the model id for openai (the MLX repo ships it)
     chad_temp=1.0            sampling temperature (default 1.0 — TB2 reference)
     chad_think=true|false    reasoning channel (default true)
+    chad_think_ceiling=6000  close-and-continue think ceiling (plan 086); unset (default) =
+                             feature OFF, byte-identical to pre-086 chad. Passed through as
+                             --think-ceiling.
     chad_timeout_sec=1500    host-side wall on the chad process (default 1500; keep < the
                              task's [agent] timeout so chad is killed cleanly, not by harbor)
+    chad_deadline_margin_s=60  seconds of headroom between chad's own wall budget
+                             (--turn-budget-s = timeout - margin) and the exec SIGKILL, so
+                             the governor/wrap-up window can land a partial before the kill
+                             (plan 085). 0 disables the deadline plumbing.
+    chad_review_pass=false   arm the early-finish self-review (plan 085 scope 3): a clean
+                             finish with >30%% of the wall budget left triggers one fresh-
+                             context verification pass. DEFAULT OFF — the 085 gate showed it
+                             fires mostly on already-correct tasks (+140-584s wall, 0 flips
+                             on the fast arm); arm explicitly for A/Bs only.
     chad_project=<path>      chad checkout to upload (default: the repo this file lives in)
     chad_workdir=<dir>       container dir to run chad in (default: auto via `pwd`, else /app)
 """
@@ -89,7 +101,10 @@ class ChadAgent(BaseAgent):
         chad_tokenizer: str | None = None,
         chad_temp: str | float = 1.0,
         chad_think: str | bool = True,
+        chad_think_ceiling: str | int | None = None,
         chad_timeout_sec: str | int = 1500,
+        chad_deadline_margin_s: str | int = 60,
+        chad_review_pass: str | bool = False,
         chad_project: str | None = None,
         chad_workdir: str | None = None,
         **kwargs,
@@ -102,7 +117,13 @@ class ChadAgent(BaseAgent):
         self._tokenizer = chad_tokenizer
         self._temp = str(chad_temp)
         self._think = str(chad_think).lower() not in ("false", "0", "no", "off")
+        self._think_ceiling = int(chad_think_ceiling) if chad_think_ceiling not in (None, "") else None
         self._timeout = int(chad_timeout_sec)
+        # Plan 085 deadline plumbing: tell chad its own wall budget so the governor arms on
+        # every run and the wrap-up window fires before the exec SIGKILL. Margin is the
+        # headroom left for chad to wrap up; 0 disables the whole deadline path.
+        self._deadline_margin_s = int(chad_deadline_margin_s)
+        self._review_pass = str(chad_review_pass).lower() not in ("false", "0", "no", "off")
         self._project = chad_project or _REPO_ROOT
         self._workdir = chad_workdir
         self._installed = False
@@ -294,8 +315,16 @@ class ChadAgent(BaseAgent):
         logdir.mkdir(parents=True, exist_ok=True)
 
         model = self._chad_model()
+        home = "/root" if str(run_user) in ("root", "0") else os.environ.get("HOME", "/root")
         trace = "/tmp/chad.prefill.jsonl"
         stdout_c = "/tmp/chad.stdout.log"   # chad writes here IN the container
+        # chad's diagnostic session log (diag.py -> $HOME/.chad/session.log): the ONLY place
+        # the governor / wrap-up-window / step-cap decisions surface (they're log.info, not
+        # stdout). We KEEP it on for evals — the container is throwaway and the log is
+        # secret-redacted — and download it so a gate can confirm those levers fired (plan
+        # 085 mechanism metrics). PYTHONUNBUFFERED + RotatingFileHandler keep it current, so
+        # it survives the timeout SIGKILL like the stdout/trajectory files.
+        session_c = f"{home}/.chad/session.log"
         # The leaderboard requires an ATIF trajectory for every PASSING trial. chad rewrites
         # this file after every step (src/chad/atif.py), so it survives the timeout SIGKILL
         # exactly like the stdout log. Verify a job with `validate_atif.py <jobdir>`.
@@ -304,7 +333,6 @@ class ChadAgent(BaseAgent):
         # the TASK's toolchain/python, not chad's venv.
         env = {
             "CHAD_MODEL": model or "",
-            "CHAD_NO_SESSION_LOG": "1",
             "CHAD_NO_SKILLS": "1",          # no personal-skill leakage into benchmark prompts
             "CHAD_PREFILL_TRACE": trace,
             "CHAD_TRAJECTORY_JSON": traj_c,   # ATIF-v1.7; required for passing trials
@@ -316,7 +344,7 @@ class ChadAgent(BaseAgent):
             # the client should use the window (its ctx-limit fallback caps at 120k).
             "CHAD_MAX_CONTEXT": "262144",
             "PYTHONUNBUFFERED": "1",
-            "HOME": "/root" if str(run_user) in ("root", "0") else os.environ.get("HOME", "/root"),
+            "HOME": home,
         }
         # Only force OFFLINE tokenizer load when setup() confirmed the cache is warm —
         # otherwise a cold cache + offline would guarantee the very startup crash
@@ -338,6 +366,17 @@ class ChadAgent(BaseAgent):
             parts += ["--tokenizer", shlex.quote(self._tokenizer)]
         if not self._think:
             parts.append("--no-think")
+        if self._think_ceiling is not None:
+            parts += ["--think-ceiling", str(self._think_ceiling)]
+        # Plan 085: hand chad a wall budget under the exec timeout so its governor + wrap-up
+        # window arm (and, when armed, its early-finish review pass has a budget to measure
+        # against). Leave `_deadline_margin_s` of headroom for chad to land a partial before
+        # `environment.exec` SIGKILLs it at `self._timeout`.
+        turn_budget_s = self._timeout - self._deadline_margin_s
+        if turn_budget_s > 0:
+            parts += ["--turn-budget-s", str(turn_budget_s)]
+            if self._review_pass:
+                parts.append("--review-pass")
         # Redirect chad's stdout to a FILE INSIDE THE CONTAINER (not exec's return value):
         # on the timeout path `environment.exec` raises before returning, so a return-value
         # capture loses the whole trajectory on exactly the trials we most need to see (the
@@ -359,7 +398,7 @@ class ChadAgent(BaseAgent):
         # trajectory.json lands at the SAME path harbor's own agents use, so the
         # submission bundle and `validate_atif.py` find it without special-casing chad.
         for src, dst in ((stdout_c, "chad.stdout.log"), (trace, "chad.prefill.jsonl"),
-                         (traj_c, "trajectory.json")):
+                         (traj_c, "trajectory.json"), (session_c, "chad.session.log")):
             try:
                 await environment.download_file(src, logdir / dst)
             except Exception as e:  # noqa: BLE001 — telemetry is best-effort

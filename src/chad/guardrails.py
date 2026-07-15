@@ -817,6 +817,72 @@ def progress_note(messages, max_lines: int = 24) -> str:
     return "\n".join(lines[:max_lines])
 
 
+# --- deadline wrap-up window + early-finish review (plan 085) -----------------------
+# The governor's HARD stop (above) only fires on a NO-PROGRESS band — a turn that keeps
+# landing+verifying is never interrupted. But TB2 scores container end-state, and a
+# still-working turn that gets SIGKILLed at the wall ships whatever half-applied mess it
+# was mid-edit on. The wrap-up window is the complementary lever: a one-shot WALL-CLOCK
+# nudge, fired regardless of progress, once the turn is inside its final stretch — "land
+# your best answer NOW, then call done" — so a productive-but-slow turn commits a scored
+# partial instead of being cut off mid-think. It sits beside the governor check and is
+# only meaningful when a wall budget (turn_budget_s) is configured (evals / one-shot).
+WRAPUP_MIN_S = 120.0     # never start the wrap-up window with less than this much runway
+WRAPUP_FRAC = 0.15       # or the last 15% of the wall budget, whichever is larger
+
+
+def wrapup_window_nudge(wall_s, wall_budget_s, wrapup_fired) -> str | None:
+    """One-shot steering note when the turn's wall clock has entered its final wrap-up
+    window: remaining time <= max(WRAPUP_MIN_S, WRAPUP_FRAC * budget). Returns the nudge
+    text (with the approximate seconds left) or None (lever off, no wall budget, already
+    fired, or not yet inside the window). Pure/testable; the caller owns `wrapup_fired`."""
+    if not levers.enabled("wrapup_window"):
+        return None
+    if wrapup_fired or not wall_budget_s:
+        return None
+    remaining = wall_budget_s - wall_s
+    threshold = max(WRAPUP_MIN_S, WRAPUP_FRAC * wall_budget_s)
+    if remaining > threshold:
+        return None
+    secs = max(0, int(remaining))
+    return (f"[about {secs}s left before this turn is force-stopped. STOP exploring and "
+            "STOP reading now — you are out of time to investigate further. Save your "
+            "best available answer immediately: write each deliverable to the EXACT path "
+            "the task named, even if it is imperfect, then run one quick check and call "
+            "done. A landed partial answer can score; being SIGKILLed mid-edit scores "
+            "nothing.]")
+
+
+# Injected as the review turn's task preamble (plan 085 scope 3). A fresh Agent on a
+# reset KV cache re-derives the deliverables from a clean context — the poisoned context
+# that convinced the first attempt it was done is gone — so it can catch the confident-
+# wrong `done` (fix-code-vulnerability claimed its OWN tests passed; adaptive-rejection-
+# sampler called done on a hallucinated file). It must NOT rewrite already-correct work
+# (the "second attempt wrecks correct state" risk); verify first, fix only real failures.
+REVIEW_PASS_PROMPT = (
+    "\n\n[A previous attempt believes it already finished this task. Do NOT trust that — "
+    "independently verify the deliverables against the instruction above from scratch. "
+    "Re-read the task and list every concrete deliverable it names (each output file, its "
+    "exact path, and the exact format/content it must contain). For EACH one, inspect what "
+    "is actually on disk NOW — `ls` the path, `cat`/`head` the contents — and run whatever "
+    "check the task implies (the real tests, not a syntax probe). If a deliverable already "
+    "checks out, do NOT rewrite it: correct output left alone stays correct, and re-editing "
+    "working files only risks breaking them. ONLY fix what actually fails verification — "
+    "something missing, at the wrong path, or in the wrong format — with the single "
+    "targeted change it needs. Call done once every deliverable verifies.]"
+)
+
+
+def review_pass_should_fire(clean_end, turn_budget_s, elapsed_s, spare_frac=0.30) -> bool:
+    """Whether to launch a fresh-context review turn after a task's turns settle: the task
+    ended CLEANLY (no budget/step hard-stop banked a note) AND more than `spare_frac` of
+    the wall budget is still unspent. Off when no wall budget is configured (interactive /
+    unmetered runs never trigger it). Pure/testable; the caller owns the lever/flag gate
+    and the actual relaunch."""
+    if not clean_end or not turn_budget_s:
+        return False
+    return elapsed_s < (1.0 - spare_frac) * turn_budget_s
+
+
 def loop_signature(calls) -> str:
     """Canonical signature of a tool-call set, for the repeated-call loop guard."""
     return json.dumps(calls, sort_keys=True)

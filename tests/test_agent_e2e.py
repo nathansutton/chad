@@ -60,7 +60,7 @@ class ScriptedEngine:
 
     def generate(self, prompt_ids, max_tokens=2048, on_token=None, stop_texts=None,
                  should_stop=None, on_prefill=None, on_prefill_progress=None,
-                 stop_condition=None):
+                 stop_condition=None, think_ceiling=None):
         if on_prefill:                 # fire once with no cached prefix, like OpenAIEngine
             on_prefill(len(prompt_ids), 0)
         if self._i >= len(self.script):
@@ -185,6 +185,47 @@ def test_done_spec_recheck_defers_first_done_then_accepts(tmp_path):
     assert len(recheck_turns) == 1
 
 
+def test_wrapup_window_injects_one_steer_in_final_stretch(tmp_path, monkeypatch):
+    """Plan 085: with a wall budget set, a productive-but-slow turn (a change lands +
+    verifies in each budget band, so the governor never hard-stops) gets exactly ONE
+    wrap-up steer injected once its wall clock enters the final stretch. Fake clock
+    (advanced per generate) drives the timing; assert the steer lands in the transcript
+    exactly once. The recheck lever is disabled so the single `done` terminates cleanly."""
+    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck")
+    m = tmp_path / "m.py"
+    # turn_budget_s=1000 -> wrap-up threshold = max(120, 0.15*1000) = 150s remaining.
+    # Clock read at each step's governor check (BEFORE that step's generate):
+    #   step0: 0    (band 0, no governor, no wrap)
+    #   step1: 600  (crossing into band 1 — suppressed by step0's landed edit)
+    #   step2: 870  (crossing into band 2 — suppressed by step1's verify — AND inside the
+    #                wrap-up window: remaining 130 <= 150, so the steer fires here)
+    schedule = [600.0, 870.0, 870.0]   # clock value set AFTER generate #1, #2, #3
+    clock = {"now": 0.0}
+    monkeypatch.setattr("chad.agent.time.monotonic", lambda: clock["now"])
+
+    class ClockEngine(ScriptedEngine):
+        def generate(self, *a, **kw):
+            out = super().generate(*a, **kw)
+            i = self._i - 1
+            if i < len(schedule):
+                clock["now"] = schedule[i]
+            return out
+
+    script = [
+        _tool_call("write", path=str(m), content="x = 1\n"),   # step0: land an edit
+        _tool_call("bash", command=f"python3 {m}"),            # step1: verify -> progress
+        _tool_call("done", summary="done"),                    # step2: after the wrap-up fires
+    ]
+    agent = Agent(ClockEngine(script), mode="auto", thinking=False, turn_budget_s=1000.0)
+    agent.run_turn("do the thing")
+
+    steers = [msg for msg in agent.messages
+              if msg.get("name") == "steer" and "force-stopped" in msg.get("content", "")]
+    assert len(steers) == 1, f"expected exactly one wrap-up steer, got {len(steers)}"
+    assert "STOP exploring" in steers[0]["content"]
+    assert agent.engine._i == len(script)   # the turn terminated on `done`, no spin
+
+
 def test_done_spec_recheck_spiral_is_capped(tmp_path):
     """Plan 070: if the deliverable recheck drives repeated post-recheck edits (the
     model re-'fixing' already-correct output into a thrash), the turn stops and keeps
@@ -260,7 +301,7 @@ class _TokenizingEngine(ScriptedEngine):
 
     def generate(self, prompt_ids, max_tokens=2048, on_token=None, stop_texts=None,
                  should_stop=None, on_prefill=None, on_prefill_progress=None,
-                 stop_condition=None):
+                 stop_condition=None, think_ceiling=None):
         if self._i >= len(self.script):
             raise AssertionError("scripted engine ran dry — the agent loop did not "
                                  "terminate within the provided turns")
@@ -626,3 +667,69 @@ def test_steering_keeps_the_render_prefix_stable(tmp_path, monkeypatch):
         assert cur[: len(prev)] == prev, (
             "a render stopped being a pure extension of its predecessor — the steer "
             "injection invalidated the warm KV prefix")
+
+
+# --- plan 086: no-think escalation ------------------------------------------
+
+class _ThinkFlagTok(_FakeTok):
+    """Records the `enable_thinking` passed to each render, so a test can see WHICH steps
+    the loop chose to render with <think> disabled (the no-think escalation, plan 086).
+    `warm_prefix` is gated behind cache_dir (None here), so every recorded flag is a step
+    render — nothing else calls apply_chat_template on the scripted path."""
+
+    def __init__(self):
+        self.flags = []
+
+    def apply_chat_template(self, messages, tools=None, add_generation_prompt=False,
+                            enable_thinking=False):
+        self.flags.append(enable_thinking)
+        return super().apply_chat_template(messages, tools, add_generation_prompt,
+                                           enable_thinking)
+
+
+class _CappedEngine(ScriptedEngine):
+    """Every scripted turn reports hit_cap (generated_tokens == max_tokens), so a no-tool
+    turn reads as a token-cap truncation — the think-spiral stall that arms no-think
+    escalation after two in a row (plan 086 scope 2)."""
+
+    def generate(self, prompt_ids, max_tokens=2048, on_token=None, **kw):
+        text, stats = super().generate(prompt_ids, max_tokens, on_token, **kw)
+        stats.generated_tokens = max_tokens
+        return text, stats
+
+
+def _run_escalation(monkeypatch, *, ablated: bool):
+    # Arm the close-and-continue ceiling so escalation is active at all (it is gated on the
+    # ceiling being set, so default chad is unaffected — plan 086).
+    monkeypatch.setenv("CHAD_THINK_CEILING", "3000")
+    if ablated:
+        monkeypatch.setenv("CHAD_DISABLE", "no_think_escalation")
+    else:
+        monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    # Capped no-tool-call stalls: the model just "thinks" and never acts (the spiral).
+    eng = _CappedEngine(["<think>stalling</think>"] * 8)
+    tok = _ThinkFlagTok()
+    eng.tok = tok
+    # thinking=True so there IS a <think> to disable; max_gen_tokens tiny so the forced
+    # generated_tokens == max_tokens trips hit_cap.
+    agent = Agent(eng, mode="auto", thinking=True, max_gen_tokens=64)
+    agent.run_turn("change the config value")   # an action task, not read-only
+    return tok.flags
+
+
+def test_no_think_escalation_disables_think_after_two_capped_stalls(monkeypatch):
+    flags = _run_escalation(monkeypatch, ablated=False)
+    # The first two stalls still render WITH <think> (no premature escalation) ...
+    assert flags[:2] == [True, True], flags
+    # ... then a step renders with <think> OFF (the mechanical "act now").
+    assert False in flags, flags
+    # One-shot, not a latch: thinking is still used on other steps (it restores after each
+    # escalation step), so the run is a MIX of thinking and no-think renders.
+    assert True in flags and False in flags, flags
+
+
+def test_no_think_escalation_is_gone_when_ablated(monkeypatch):
+    flags = _run_escalation(monkeypatch, ablated=True)
+    # With the lever off, the spiral is never broken by a no-think render.
+    assert flags, "the turn should have taken at least one step"
+    assert False not in flags, flags

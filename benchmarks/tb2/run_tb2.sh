@@ -26,6 +26,10 @@
 #   CHAD_MODEL_LABEL  harbor -m run label (cosmetic — no weights load from it)
 #   CHAD_TB2_TEMP     sampling temperature chad sends per-request (default 1.0, the
 #                     TB2 reference recipe; top-p/k/min-p stay SERVER-side)
+#   CHAD_TB2_THINK_CEILING  close-and-continue think ceiling (plan 086), e.g. 6000.
+#                     Unset (default) = feature OFF, byte-identical to pre-086 chad.
+#   TB2_DATASET       harbor registry dataset id (default terminal-bench/terminal-bench-2;
+#                     set terminal-bench/terminal-bench-2-1 for the TB 2.1 task set)
 #   TB2_DATASET_DIR   existing dataset export; downloaded here on first run otherwise
 # Args: MAXCAP  (cap chad_timeout at this many sec, e.g. 1800 to bound wall-clock; 0 = uncapped)
 #       REPEATS (harbor -k; default 1)
@@ -39,14 +43,17 @@ BACKEND="${CHAD_BACKEND:-openai}"
 TOKENIZER="${CHAD_TOKENIZER:-nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX}"
 MODEL_LABEL="${CHAD_MODEL_LABEL:-mlx/nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX}"
 TEMP="${CHAD_TB2_TEMP:-1.0}"
+THINK_CEILING="${CHAD_TB2_THINK_CEILING:-}"
 MAXCAP="${1:-0}"; REPEATS="${2:-1}"; ONLY="${3:-}"
 
-# Dataset: harbor exports <dir>/terminal-bench-2/<task>/ — we need the task.toml files
+# Dataset: harbor exports <dir>/<dataset-name>/<task>/ — we need the task.toml files
 # locally to read per-task [agent] budgets. ~1 GB on first download.
-TB2="${TB2_DATASET_DIR:-$PWD/dataset/terminal-bench-2}"
+DATASET="${TB2_DATASET:-terminal-bench/terminal-bench-2}"
+DATASET_NAME="${DATASET#*/}"
+TB2="${TB2_DATASET_DIR:-$PWD/dataset/$DATASET_NAME}"
 if [ ! -d "$TB2" ]; then
-  echo "=== downloading terminal-bench-2 dataset -> $PWD/dataset ==="
-  harbor download terminal-bench/terminal-bench-2 -o "$PWD/dataset" || exit 1
+  echo "=== downloading $DATASET dataset -> $PWD/dataset ==="
+  harbor download "$DATASET" -o "$PWD/dataset" || exit 1
 fi
 
 # Best-effort health probe: the container-visible URL may not resolve on the host
@@ -71,14 +78,16 @@ for d in "$TB2"/*/; do
   cap=$((budget - 30))
   [ "$MAXCAP" -gt 0 ] && [ "$cap" -gt "$MAXCAP" ] && cap="$MAXCAP"
   t0=$(date +%s)
-  reward=$(harbor run -d terminal-bench/terminal-bench-2 --agent-import-path harbor_chad_tb2:ChadAgent \
+  extra_ak=()
+  [ -n "$THINK_CEILING" ] && extra_ak+=(--ak "chad_think_ceiling=$THINK_CEILING")
+  reward=$(harbor run -d "$DATASET" --agent-import-path harbor_chad_tb2:ChadAgent \
     -m "$MODEL_LABEL" --n-concurrent-agents 1 \
     --agent-setup-timeout-multiplier 12 --environment-build-timeout-multiplier 3 \
-    --include-task-name "terminal-bench/$t" \
+    --include-task-name "${DATASET%%/*}/$t" \
     --ak chad_base_url="$BASE_URL" \
     --ak chad_backend="$BACKEND" \
     --ak chad_tokenizer="$TOKENIZER" \
-    --ak chad_temp="$TEMP" --ak chad_timeout_sec=$cap -k "$REPEATS" 2>&1 \
+    --ak chad_temp="$TEMP" --ak chad_timeout_sec=$cap "${extra_ak[@]}" -k "$REPEATS" 2>&1 \
     | grep -oiE "Mean: [01]\.[0-9]+" | tail -1 | grep -oE "[01]\.[0-9]+")
   wall=$(( $(date +%s) - t0 ))
   [ -z "$reward" ] && reward="ERR"

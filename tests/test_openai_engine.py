@@ -208,3 +208,118 @@ def test_generate_honors_stop_condition():
 def test_gen_stats_approximate_default_false():
     # the new field must default off so the MLX engine's stats are unaffected
     assert GenStats().approximate is False
+
+
+# --- plan 086: close-and-continue (think-spiral salvage) ------------------
+
+def test_think_ceiling_hit_only_inside_an_open_think_over_budget():
+    from chad.base_engine import think_ceiling_hit
+    # inside <think> (no close emitted) and over budget -> fire
+    assert think_ceiling_hit("still reasoning", 6000, 6000)
+    assert think_ceiling_hit("reasoning", 7000, 6000)
+    # under budget -> no
+    assert not think_ceiling_hit("reasoning", 5999, 6000)
+    # </think> already emitted (thinking done) -> no, whatever the count
+    assert not think_ceiling_hit("done</think>\nact", 9000, 6000)
+    # ceiling off (None / 0) -> never fires
+    assert not think_ceiling_hit("reasoning", 10**9, None)
+    assert not think_ceiling_hit("reasoning", 10**9, 0)
+
+
+def test_build_chat_body_appends_assistant_prefix_for_continuation():
+    # A continuation request (plan 086) carries the force-closed <think> as a trailing
+    # assistant message the server CONTINUES rather than answers.
+    body = build_chat_body("m", "PROMPT", max_tokens=64, temp=1.0,
+                           assistant_prefix="<think>reasoned\n</think>\n\n")
+    assert body["messages"] == [
+        {"role": "user", "content": "PROMPT"},
+        {"role": "assistant", "content": "<think>reasoned\n</think>\n\n"},
+    ]
+    # absent prefix -> the plain single-user-message shape is unchanged
+    assert build_chat_body("m", "P", 8, 1.0)["messages"] == [{"role": "user", "content": "P"}]
+
+
+def _salvage_adapter(first_lines, cont_lines):
+    """An OpenAIEngine whose stubbed stream returns `first_lines` for the initial request
+    and `cont_lines` for the continuation (identified by the assistant-prefix message).
+    Records every request body so the test can assert the continuation shape."""
+    ad = OpenAIEngine(model_id="ornith", base_url="http://x/v1")
+    ad.tok = _FakeTok()
+    bodies = []
+
+    def stream(body):
+        bodies.append(body)
+        is_continuation = any(m["role"] == "assistant" for m in body["messages"])
+        return iter(cont_lines if is_continuation else first_lines)
+
+    ad._stream_completion = stream
+    return ad, bodies
+
+
+def test_generate_close_and_continue_salvages_a_runaway_think():
+    # First request: 3 think chunks, no </think> -> crosses ceiling=3 and the salvage
+    # fires (the 4th chunk is never consumed). Continuation: the action, in ONE turn.
+    first = list(_sse(
+        {"choices": [{"delta": {"content": "reasoning "}}]},
+        {"choices": [{"delta": {"content": "and more "}}]},
+        {"choices": [{"delta": {"content": "and more "}}]},
+        {"choices": [{"delta": {"content": "NEVER-REACHED"}}]},
+        "[DONE]",
+    ))
+    cont = list(_sse(
+        {"choices": [{"delta": {"content": '<tool_call>{"name":"read"}</tool_call>'}}]},
+        {"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": 5}},
+        "[DONE]",
+    ))
+    ad, bodies = _salvage_adapter(first, cont)
+    text, stats = ad.generate([1, 2, 3], max_tokens=200, think_ceiling=3)
+
+    # One turn: the runaway think, a single injected close, then the action.
+    assert stats.salvaged is True
+    assert text.count("</think>") == 1
+    assert text == 'reasoning and more and more \n</think>\n\n<tool_call>{"name":"read"}</tool_call>'
+    assert "NEVER-REACHED" not in text          # the 4th think chunk was cut off
+    # Exactly two requests: the initial and one continuation.
+    assert len(bodies) == 2
+    # The continuation resumes the assistant turn from the force-closed text, and that
+    # text is a strict PREFIX of the final turn (the KV-prefix / prefix-cache invariant).
+    prefix = bodies[1]["messages"][-1]
+    assert prefix["role"] == "assistant"
+    assert prefix["content"] == "reasoning and more and more \n</think>\n\n"
+    assert text.startswith(prefix["content"])
+    # The runaway request's 3 tokens must NOT be dropped just because its stream was
+    # closed before the server could send usage for it: 3 (no-usage fallback, request 1)
+    # + 5 (usage.completion_tokens, the continuation) = 8. A prior bug silently discarded
+    # request 1's count whenever ANY request in the step reported usage.
+    assert stats.generated_tokens == 8
+
+
+def test_generate_no_salvage_when_think_closes_before_the_ceiling():
+    # The model closes </think> and acts on its own, under the ceiling -> no salvage,
+    # a single request, byte-identical to a plain generate.
+    lines = list(_sse(
+        {"choices": [{"delta": {"content": "brief think</think>\nact"}}]},
+        {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 3}},
+        "[DONE]",
+    ))
+    ad, bodies = _salvage_adapter(lines, lines)
+    text, stats = ad.generate([1], max_tokens=200, think_ceiling=6000)
+    assert stats.salvaged is False
+    assert len(bodies) == 1
+    assert text == "brief think</think>\nact"
+
+
+def test_generate_no_salvage_when_ceiling_unset():
+    # think_ceiling=None (the default): a long open think is NOT force-closed.
+    lines = list(_sse(
+        {"choices": [{"delta": {"content": "a "}}]},
+        {"choices": [{"delta": {"content": "b "}}]},
+        {"choices": [{"delta": {"content": "c "}}]},
+        {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 3}},
+        "[DONE]",
+    ))
+    ad, bodies = _salvage_adapter(lines, lines)
+    text, stats = ad.generate([1], max_tokens=200, think_ceiling=None)
+    assert stats.salvaged is False
+    assert len(bodies) == 1
+    assert text == "a b c "

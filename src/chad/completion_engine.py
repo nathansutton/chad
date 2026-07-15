@@ -44,7 +44,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Iterator, Optional
 
-from .base_engine import BackendError, GenStats
+from .base_engine import THINK_CLOSE, BackendError, GenStats, think_ceiling_hit
 from .openai_engine import parse_sse_chunk  # same SSE framing; reuse the parser
 
 
@@ -195,10 +195,18 @@ class CompletionEngine:
         on_prefill: Optional[Callable[[int, int], None]] = None,
         on_prefill_progress: Optional[Callable[[int, int], None]] = None,
         stop_condition: Optional[Callable[[str, int], bool]] = None,
+        think_ceiling: Optional[int] = None,
     ) -> tuple[str, GenStats]:
         """Stream a completion for the exact `prompt_ids` from the server. Stats come
         from the server's final-chunk `timings` when present (exact — `approximate`
-        stays False); otherwise from client-side estimates (`approximate=True`)."""
+        stays False); otherwise from client-side estimates (`approximate=True`).
+
+        `think_ceiling` (plan 086 close-and-continue): when a <think> run crosses the
+        ceiling, stop the request, tokenize THINK_CLOSE, and immediately re-request with
+        `prompt_ids` EXTENDED by the generation-so-far + close ids — no detokenize needed
+        (unlike the openai path), since this backend already speaks token ids. `cache_prompt`
+        reuses the common prefix, so the continuation is one cheap extra request, and
+        decoding continues into the action in the same step."""
         prompt_ids = list(prompt_ids)
         # Pre-generation estimate: `cache_prompt` reuses the longest common prefix of
         # the previous evaluation, which our `_cached_ids` mirrors — same numbers the
@@ -210,73 +218,133 @@ class CompletionEngine:
             on_prefill(stats.prompt_tokens, stats.cached_tokens)
         # No progress stream across the boundary: on_prefill_progress never fires.
 
-        body = build_completion_body(prompt_ids, max_tokens, self.temp)
         text = ""
-        gen_ids: list = []
-        n_chunks = 0
+        all_gen_ids: list = []          # generated ids across every request (cache mirror)
+        n_out = 0                       # tokens emitted across every request (ceiling counter)
+        step_tokens = 0                 # honest per-request-summed total: predicted_n where
+                                        # the server reported it, else that request's own
+                                        # streamed-chunk count — NOT a global "any timings
+                                        # seen" flag. A salvaged request's stream is closed
+                                        # before it can ever send its final timings chunk, so
+                                        # a global flag would silently drop its whole count.
+        gen_ms_from_timings = 0.0       # summed predicted_ms — only trusted if EVERY request
+                                        # in the step reported it (see all_requests_timed below)
+        all_requests_timed = True
         t0 = time.time()
         first_at: Optional[float] = None
-        timings: Optional[dict] = None
-        stream = self._stream_completion(body)
-        try:
-            for raw in stream:
-                # Dropping the stream closes the connection, which llama.cpp treats
-                # as a cancel — generation genuinely stops server-side.
-                if should_stop and should_stop():
-                    break
-                for sub in raw.splitlines():   # a read may carry >1 SSE line
-                    chunk = parse_sse_chunk(sub)
-                    if chunk is None:
-                        continue
-                    if chunk.get("error"):
-                        err = chunk["error"]
-                        code = err.get("code", 0) if isinstance(err, dict) else 0
-                        raise BackendError(f"llama-server error: {err}",
-                                           transient=code >= 500)
-                    if chunk.get("timings"):   # final stop-chunk carries real telemetry
-                        timings = chunk["timings"]
-                    gen_ids.extend(chunk.get("tokens") or [])
-                    seg = chunk_text(chunk)
-                    if not seg:
-                        continue
-                    if first_at is None:
-                        first_at = time.time()
-                        stats.prefill_s = first_at - t0
-                    text += seg
-                    n_chunks += 1
-                    if on_token:
-                        on_token(seg)
-                    if stop_texts and any(s in text for s in stop_texts):
-                        should_stop = lambda: True  # noqa: E731 — bail on next outer read
+        cur_prompt_ids = prompt_ids
+        is_first_request = True
+        while True:
+            remaining = max_tokens - n_out
+            if remaining <= 0:
+                break
+            body = build_completion_body(cur_prompt_ids, remaining, self.temp)
+            salvage_here = False
+            gen_ids: list = []
+            n_chunks = 0
+            timings: Optional[dict] = None
+            stream = self._stream_completion(body)
+            try:
+                for raw in stream:
+                    # Dropping the stream closes the connection, which llama.cpp treats
+                    # as a cancel — generation genuinely stops server-side.
+                    if should_stop and should_stop():
                         break
-                    if stop_condition is not None and stop_condition(text, n_chunks):
-                        stats.stop_condition_fired = True
-                        should_stop = lambda: True  # noqa: E731
+                    for sub in raw.splitlines():   # a read may carry >1 SSE line
+                        chunk = parse_sse_chunk(sub)
+                        if chunk is None:
+                            continue
+                        if chunk.get("error"):
+                            err = chunk["error"]
+                            code = err.get("code", 0) if isinstance(err, dict) else 0
+                            raise BackendError(f"llama-server error: {err}",
+                                               transient=code >= 500)
+                        if chunk.get("timings"):   # final stop-chunk carries real telemetry
+                            timings = chunk["timings"]
+                        gen_ids.extend(chunk.get("tokens") or [])
+                        seg = chunk_text(chunk)
+                        if not seg:
+                            continue
+                        if first_at is None:
+                            first_at = time.time()
+                            stats.prefill_s = first_at - t0
+                        text += seg
+                        n_chunks += 1
+                        n_out += 1
+                        if on_token:
+                            on_token(seg)
+                        if stop_texts and any(s in text for s in stop_texts):
+                            should_stop = lambda: True  # noqa: E731 — bail on next outer read
+                            break
+                        # Close-and-continue: still inside <think> past the ceiling. Stop
+                        # this request and re-request with the force-closed ids appended
+                        # (below). Checked before stop_condition so the high pathological
+                        # ceiling salvages rather than ending the step.
+                        if think_ceiling_hit(text, n_out, think_ceiling):
+                            salvage_here = True
+                            break
+                        if stop_condition is not None and stop_condition(text, n_out):
+                            stats.stop_condition_fired = True
+                            should_stop = lambda: True  # noqa: E731
+                            break
+                    if salvage_here or (should_stop and should_stop()):
                         break
-        finally:
-            close = getattr(stream, "close", None)
-            if close:
-                close()
+            finally:
+                close = getattr(stream, "close", None)
+                if close:
+                    close()
 
-        stats.gen_s = time.time() - (first_at or t0)
-        stats.generated_tokens = len(gen_ids) or n_chunks
-        if timings:
-            # Exact server-side accounting: prompt_n = tokens actually prefilled this
-            # call (the server subtracted its cache hit), so cached = the remainder.
-            n_eval = int(timings.get("prompt_n", stats.prompt_tokens))
-            stats.prompt_tokens = n_eval
-            stats.cached_tokens = max(0, len(prompt_ids) - n_eval)
-            if timings.get("prompt_ms") is not None:
-                stats.prefill_s = float(timings["prompt_ms"]) / 1000.0
-            if timings.get("predicted_n"):
-                stats.generated_tokens = int(timings["predicted_n"])
-            if timings.get("predicted_ms") is not None:
-                stats.gen_s = float(timings["predicted_ms"]) / 1000.0
+            all_gen_ids.extend(gen_ids)
+            if timings:
+                step_tokens += int(timings.get("predicted_n", 0)) or n_chunks
+                if timings.get("predicted_ms") is not None:
+                    gen_ms_from_timings += float(timings["predicted_ms"])
+                else:
+                    all_requests_timed = False
+                # First request's prompt_n/prompt_ms is the honest prefill size; a
+                # salvage's continuation re-prefills prompt+prefix (server prefix-cache
+                # keeps it cheap — plan 086 STOP condition watches for a double-prefill).
+                if is_first_request:
+                    n_eval = int(timings.get("prompt_n", stats.prompt_tokens))
+                    stats.prompt_tokens = n_eval
+                    stats.cached_tokens = max(0, len(prompt_ids) - n_eval)
+                    if timings.get("prompt_ms") is not None:
+                        stats.prefill_s = float(timings["prompt_ms"]) / 1000.0
+            else:
+                # No final timings chunk for THIS request — almost always the salvaged
+                # (interrupted) request, whose stream we closed before the server could
+                # send one. Fall back to what we actually counted, so its tokens aren't
+                # silently dropped from the step total.
+                step_tokens += len(gen_ids) or n_chunks
+                all_requests_timed = False
+            if not salvage_here:
+                break
+            # Force-close the runaway <think> and loop once more: tokenize THINK_CLOSE
+            # and extend the prompt for the continuation request so `cache_prompt`
+            # reuses the common prefix (no detokenize — this backend is token-native).
+            close_ids = list(self.tok.encode(THINK_CLOSE, add_special_tokens=False))
+            text += THINK_CLOSE
+            all_gen_ids.extend(close_ids)
+            n_out += len(close_ids)
+            stats.salvaged = True
+            cur_prompt_ids = prompt_ids + all_gen_ids
+            is_first_request = False
+
+        stats.generated_tokens = step_tokens
+        if all_requests_timed and step_tokens:
+            # Every request in the step (including a salvage continuation) reported exact
+            # server timings — trust the sum.
+            stats.gen_s = gen_ms_from_timings / 1000.0
         else:
-            # Older server / dropped stream: keep the client-side estimates and say so.
+            # Older server, dropped stream, or a salvaged request whose stream was closed
+            # before its final timings chunk arrived: keep the client-side wall-clock
+            # estimate and say so.
+            stats.gen_s = time.time() - (first_at or t0)
             stats.approximate = True
         # Mirror the server's slot cache (prompt + generation), exactly like the MLX
         # engine's `_cached_ids = prompt_ids + gen_ids` — this is what makes the next
-        # turn's pre-generation estimate accurate in append-only transcripts.
-        self._cached_ids = prompt_ids + gen_ids
+        # turn's pre-generation estimate accurate in append-only transcripts. Correct
+        # across a salvage too: `all_gen_ids` already carries gen1 + THINK_CLOSE + gen2,
+        # which is exactly what the server's own slot cache holds after the continuation.
+        self._cached_ids = prompt_ids + all_gen_ids
         return text, stats

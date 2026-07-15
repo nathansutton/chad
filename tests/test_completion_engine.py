@@ -255,6 +255,108 @@ def test_load_sizes_context_from_server_props(monkeypatch):
     assert ad.effective_ctx == 131072
 
 
+# --- plan 086: close-and-continue (think-spiral salvage) ------------------
+
+class _FakeTok:
+    """Minimal stand-in for the HF tokenizer: encode() only, since this backend never
+    decodes (token-id prompts go over the wire verbatim)."""
+
+    def encode(self, text, add_special_tokens=False):
+        # deterministic, distinguishable ids so the continuation prompt is inspectable
+        return [1000 + i for i in range(len(text))]
+
+
+def _salvage_adapter(first_lines, cont_lines):
+    """A CompletionEngine whose stubbed stream returns `first_lines` for the initial
+    request and `cont_lines` for any continuation (identified by a longer `prompt`
+    than the original). Records every request body so the test can assert the
+    continuation shape."""
+    ad = CompletionEngine(model_id="ornith", base_url="http://x:8081")
+    ad.tok = _FakeTok()
+    bodies = []
+
+    def stream(body):
+        bodies.append(body)
+        is_continuation = len(bodies) > 1
+        return iter(cont_lines if is_continuation else first_lines)
+
+    ad._stream_completion = stream
+    return ad, bodies
+
+
+def test_generate_close_and_continue_salvages_a_runaway_think():
+    # First request: 3 think chunks, no </think> -> crosses ceiling=3 and the salvage
+    # fires (the 4th chunk is never consumed). Continuation: the action, in ONE turn.
+    first = list(_sse(
+        {"content": "reasoning ", "tokens": [11], "stop": False},
+        {"content": "and more ", "tokens": [12], "stop": False},
+        {"content": "and more ", "tokens": [13], "stop": False},
+        {"content": "NEVER-REACHED", "tokens": [14], "stop": False},
+    ))
+    cont = list(_sse(
+        {"content": '<tool_call>{"name":"read"}</tool_call>', "tokens": [99], "stop": False},
+        {"content": "", "tokens": [], "stop": True,
+         "timings": {"prompt_n": 2, "prompt_ms": 5.0,
+                     "predicted_n": 1, "predicted_ms": 10.0}},
+    ))
+    ad, bodies = _salvage_adapter(first, cont)
+    text, stats = ad.generate([1, 2, 3], max_tokens=200, think_ceiling=3)
+
+    # One turn: the runaway think, a single injected close, then the action.
+    assert stats.salvaged is True
+    assert text.count("</think>") == 1
+    assert text == 'reasoning and more and more \n</think>\n\n<tool_call>{"name":"read"}</tool_call>'
+    assert "NEVER-REACHED" not in text          # the 4th think chunk was cut off
+    # Exactly two requests: the initial and one continuation.
+    assert len(bodies) == 2
+    # The continuation's prompt is the original ids + generation-so-far + the tokenized
+    # close marker — a strict PREFIX-extension (the KV/prefix-cache invariant): no
+    # detokenize round-trip on this backend, unlike the openai adapter.
+    cont_prompt = bodies[1]["prompt"]
+    assert cont_prompt[:3] == [1, 2, 3]
+    assert cont_prompt[3:6] == [11, 12, 13]     # the runaway think's own generated ids
+    # a strict prefix-extension of the first request's prompt (the KV-prefix invariant)
+    assert cont_prompt[:len(bodies[0]["prompt"])] == bodies[0]["prompt"]
+    # The runaway request's 3 tokens must NOT be dropped just because its stream was
+    # closed before the server could send a final timings chunk for it: 3 (no-timings
+    # fallback, request 1) + 1 (predicted_n, the continuation) = 4. A prior bug silently
+    # discarded request 1's count whenever ANY request in the step reported timings.
+    assert stats.generated_tokens == 4
+    # cache mirror ends up exactly what the server's slot cache now holds
+    assert ad._cached_ids[:6] == [1, 2, 3, 11, 12, 13]
+    assert ad._cached_ids[-1] == 99
+
+
+def test_generate_no_salvage_when_think_closes_before_the_ceiling():
+    # The model closes </think> and acts on its own, under the ceiling -> no salvage,
+    # a single request, byte-identical to a plain generate.
+    lines = list(_sse(
+        {"content": "brief think</think>\nact", "tokens": [5], "stop": False},
+        {"content": "", "tokens": [], "stop": True,
+         "timings": {"prompt_n": 1, "prompt_ms": 1.0, "predicted_n": 1, "predicted_ms": 1.0}},
+    ))
+    ad, bodies = _salvage_adapter(lines, lines)
+    text, stats = ad.generate([1], max_tokens=200, think_ceiling=6000)
+    assert stats.salvaged is False
+    assert len(bodies) == 1
+    assert text == "brief think</think>\nact"
+
+
+def test_generate_no_salvage_when_ceiling_unset():
+    # think_ceiling=None (the default): a long open think is NOT force-closed.
+    lines = list(_sse(
+        {"content": "a ", "tokens": [1], "stop": False},
+        {"content": "b ", "tokens": [2], "stop": False},
+        {"content": "c ", "tokens": [3], "stop": False},
+        {"content": "", "tokens": [], "stop": True,
+         "timings": {"prompt_n": 1, "prompt_ms": 1.0, "predicted_n": 3, "predicted_ms": 1.0}},
+    ))
+    ad, bodies = _salvage_adapter(lines, lines)
+    text, stats = ad.generate([1], max_tokens=200, think_ceiling=None)
+    assert stats.salvaged is False
+    assert len(bodies) == 1
+
+
 def test_load_keeps_explicit_ctx_and_survives_offline_props(monkeypatch):
     _stub_transformers(monkeypatch)
     ad = CompletionEngine(model_id="ornith", base_url="http://x:8081", effective_ctx=4096)

@@ -44,10 +44,12 @@ from chad.guardrails import (
     nudge_for_no_calls,
     progress_note,
     repeat_stop_abort,
+    review_pass_should_fire,
     think_budget,
     turn_governor,
     update_thrash,
     update_work_flags,
+    wrapup_window_nudge,
 )
 
 PASS = 0
@@ -774,6 +776,49 @@ def test_reject_loop_signature_resets_on_change():
     check("changed arg -> different sig (counter resets)", a != c, (a, c))
 
 
+def test_wrapup_window_nudge():
+    # No wall budget configured -> never fires (interactive / unmetered runs).
+    check("no wall budget -> None", wrapup_window_nudge(500, None, False) is None)
+    check("zero wall budget -> None", wrapup_window_nudge(500, 0, False) is None)
+    # A 900s budget: threshold = max(120, 0.15*900) = 135s of remaining time. Outside the
+    # window (plenty of runway) -> None; inside -> a nudge.
+    check("outside the window (600/900, 300s left) -> None",
+          wrapup_window_nudge(600, 900, False) is None)
+    nudge = wrapup_window_nudge(800, 900, False)  # 100s left, < 135 threshold
+    check("inside the window -> a nudge", isinstance(nudge, str) and "left" in nudge, nudge)
+    check("nudge reports the remaining seconds", "100s" in nudge, nudge)
+    # One-shot: once it has fired, it never fires again this turn.
+    check("already fired -> None", wrapup_window_nudge(850, 900, True) is None)
+    # The 120s floor dominates on a SMALL budget: for a 300s budget, 0.15*300 = 45 < 120,
+    # so the window opens at 120s remaining (not 45s).
+    check("floor dominates: 200/300 (100s left) is inside",
+          isinstance(wrapup_window_nudge(200, 300, False), str))
+    check("floor dominates: 170/300 (130s left) still inside (<=120? no, 130>120) -> None",
+          wrapup_window_nudge(170, 300, False) is None)
+    # Right at the exact boundary (remaining == threshold) fires (<=, not <).
+    check("boundary remaining == threshold fires",
+          isinstance(wrapup_window_nudge(900 - 135, 900, False), str))
+
+
+def test_review_pass_should_fire():
+    # Clean end + a wall budget + >30% unspent -> fire. 900s budget, 500s elapsed:
+    # 500 < 0.7*900 = 630 -> more than 30% left.
+    check("clean end, 500/900 spent -> fire",
+          review_pass_should_fire(True, 900, 500) is True)
+    # Same clock but the task did NOT end cleanly (a budget note was banked) -> never.
+    check("budget-stopped end -> no review",
+          review_pass_should_fire(False, 900, 500) is False)
+    # Less than 30% of the budget left -> not worth a review pass.
+    check("only ~20% left (720/900) -> no review",
+          review_pass_should_fire(True, 900, 720) is False)
+    # No wall budget configured (interactive / unmetered) -> never fires.
+    check("no wall budget -> no review", review_pass_should_fire(True, None, 10) is False)
+    check("zero wall budget -> no review", review_pass_should_fire(True, 0, 10) is False)
+    # Exact boundary: elapsed == 0.7*budget is NOT < -> no fire (need strictly more spare).
+    check("boundary elapsed == 70% -> no review",
+          review_pass_should_fire(True, 900, 630) is False)
+
+
 if __name__ == "__main__":
     test_reject_escalation()
     test_reject_loop_signature_resets_on_change()
@@ -799,5 +844,7 @@ if __name__ == "__main__":
     test_turn_governor()
     test_governor_two_band_jump_credits_progress()
     test_progress_note()
+    test_wrapup_window_nudge()
+    test_review_pass_should_fire()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
