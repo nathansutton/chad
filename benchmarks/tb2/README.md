@@ -117,10 +117,25 @@ CHAD_BASE_URL=http://host.docker.internal:8080/v1 ./run_tb2.sh 0 1 fix-git
 
 # The full 89-task pass:
 CHAD_BASE_URL=http://host.docker.internal:8080/v1 ./run_tb2.sh
+
+# Terminal-Bench 2.1 (same 89 tasks with upstream task fixes; the dataset Ornith's
+# reported recipe targets) — select the dataset with TB2_DATASET:
+TB2_DATASET=terminal-bench/terminal-bench-2-1 \
+  CHAD_BASE_URL=http://host.docker.internal:8080/v1 ./run_tb2.sh
 ```
 
 `CHAD_BASE_URL` must be reachable **from inside the task containers** —
 `host.docker.internal` when the server runs on the Mac itself.
+
+Deadline awareness (plan 085) is on by default: the adapter hands chad a wall budget
+(`chad_timeout_sec − chad_deadline_margin_s`, margin 60s) via `--turn-budget-s`, so the
+runaway-turn governor arms on every trial and a one-shot wrap-up nudge fires in the
+final stretch ("land your best answer now") instead of letting the SIGKILL eat
+half-applied work. `--ak chad_deadline_margin_s=0` disables the whole path for A/Bs.
+Two related knobs ship **off** and should stay off for benchmark runs:
+`chad_review_pass` (early-finish fresh-context re-verify — burned +140–584s per
+already-correct task for zero flips in its gate) and `chad_think_ceiling` (close-and-
+continue think salvage — FAILED its eval gate with 2.5× think inflation when armed).
 
 The script reads each task's `[agent] timeout_sec` and gives chad `budget − 30` seconds
 so chad's own catchable timeout fires just before harbor's hard SIGKILL — the run stays
