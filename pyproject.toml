@@ -141,3 +141,12 @@ implicit_optional = true        # `x: T = None` defaults are idiomatic throughou
 disable_error_code = ["var-annotated"]
 # Tighten (disallow_untyped_defs, re-enable var-annotated, add B/UP/SIM in ruff) in a
 # follow-up once this baseline holds.
+
+[[tool.mypy.overrides]]
+# mlx_fastpath patches mlx_lm classes that only exist on macOS: with mlx installed
+# (dev Macs, the macos CI jobs) its `type: ignore[method-assign]` comments are load-
+# bearing; on the Linux lint runner mlx_lm is absent, the patched classes type as Any,
+# and warn_unused_ignores flags those same comments — unfixable in the code for both
+# platforms at once, so the unused-ignore warning alone is relaxed for this module.
+module = "chad.mlx_fastpath"
+warn_unused_ignores = false
