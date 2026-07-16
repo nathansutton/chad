@@ -18,6 +18,16 @@ from mlx_lm.models.cache import KVCache, QuantizedKVCache  # noqa: E402
 
 from chad import mlx_qsdpa  # noqa: E402
 
+# Kernel-output tests only make sense where the kernel is numerically sound. On
+# M1-class GPUs (GitHub's macos-14 arm64 runners) the fused kernel silently returns
+# nan on small-n partial-chunk shapes — install() now refuses it there via the same
+# self-check, so decode falls back to stock and these tests skip rather than assert
+# against a kernel production chad would never use on that hardware.
+requires_healthy_kernel = pytest.mark.skipif(
+    not mlx_qsdpa.kernel_healthy(),
+    reason="qsdpa kernel fails its numeric self-check on this GPU/toolchain "
+           "(e.g. M1-class CI runners); install() refuses it here")
+
 B, HQ, D = 1, 16, 256
 HKV = 2          # 35B shape (gqa 8); the 9B is HKV=4 (gqa 4)
 SCALE = D ** -0.5
@@ -55,6 +65,7 @@ def _reference(q, cache, n, mask=None):
     return (p @ vf).reshape(B, HQ, s, D)
 
 
+@requires_healthy_kernel
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("hkv", [2, 4])
 @pytest.mark.parametrize("n", [3, 100, 1024, 5000])
@@ -68,6 +79,7 @@ def test_kernel_matches_dequant_reference(dtype, hkv, n):
     assert err < tol, f"n={n} hkv={hkv} err={err}"
 
 
+@requires_healthy_kernel
 def test_kernel_ignores_padded_tail():
     """Positions past `n` in the padded buffers must not affect the output."""
     n = 300  # step=256 pads to 512
@@ -102,6 +114,7 @@ def test_eligibility_gates():
     assert not mlx_qsdpa._eligible(q, empty, None)
 
 
+@requires_healthy_kernel
 def test_install_patches_seam_and_matches():
     from mlx_lm.models import base as lm_base
 
@@ -132,6 +145,7 @@ def test_covers():
     assert not mlx_qsdpa.covers(256, 2)
 
 
+@requires_healthy_kernel
 def test_prefill_dequant_path_matches():
     """S>1 over a quantized cache must route to dequant + fused sdpa and
     match the dequantized-fp32 causal reference."""
@@ -168,3 +182,36 @@ def test_install_leaves_fp16_path_stock():
 def test_no_qsdpa_flag_blocks_install(monkeypatch):
     monkeypatch.setenv("CHAD_NO_QSDPA", "1")
     assert mlx_qsdpa.install() is False
+
+
+def test_self_check_gate_catches_poisoned_kernel(monkeypatch):
+    """A kernel that silently returns nan (the M1-runner failure mode) must fail
+    kernel_healthy() and make install() refuse — the runtime try/except cannot see
+    it (nothing raises), so this gate is the only line of defense."""
+    def nan_kernel(q, keys, values, scale, n):
+        return mx.full(q.shape, float("nan"), dtype=q.dtype)
+
+    monkeypatch.setattr(mlx_qsdpa, "qsdpa", nan_kernel)
+    monkeypatch.setattr(mlx_qsdpa, "_KERNEL_HEALTHY", None)  # drop the cached verdict
+    assert mlx_qsdpa.kernel_healthy() is False
+    # a fresh (unpatched) seam + broken kernel -> install refuses
+    from mlx_lm.models import base as lm_base
+    if getattr(lm_base.scaled_dot_product_attention, "_chad_qsdpa", False):
+        pytest.skip("seam already patched by an earlier test in this process")
+    assert mlx_qsdpa.install() is False
+
+
+def test_self_check_result_is_cached(monkeypatch):
+    calls = []
+    real = mlx_qsdpa.qsdpa
+
+    def counting(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(mlx_qsdpa, "qsdpa", counting)
+    monkeypatch.setattr(mlx_qsdpa, "_KERNEL_HEALTHY", None)
+    first = mlx_qsdpa.kernel_healthy()
+    n_after_first = len(calls)
+    assert mlx_qsdpa.kernel_healthy() is first
+    assert len(calls) == n_after_first  # second call answered from the cache

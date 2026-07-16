@@ -364,9 +364,65 @@ def _eligible(q: Any, cache: Any, mask: Any) -> bool:
     return True
 
 
+_KERNEL_HEALTHY: bool | None = None   # one-time numeric self-check result (see below)
+
+
+def kernel_healthy() -> bool:
+    """One-time numeric self-check: run the fused kernel on the small synthetic shapes
+    that exposed SILENT nan output on M1-class GPUs (GitHub's macos-14 arm64 runners:
+    n=3 at gqa 8/4 and n=100 at gqa 8 returned nan while n>=300 was fine — a partial-
+    chunk edge this module's runtime try/except can NEVER catch, because the kernel
+    doesn't raise, it just poisons the logits) and compare against the dequantize->fp32
+    reference. install() refuses the kernel when this fails, so decode falls back to the
+    stock quantized path instead of silently generating garbage. Cached per process;
+    healthy hardware pays four tiny dispatches at first install(). The kernel itself is
+    untouched — plan 081's bit-determinism evidence still holds where this passes."""
+    global _KERNEL_HEALTHY
+    if _KERNEL_HEALTHY is not None:
+        return _KERNEL_HEALTHY
+    try:
+        import mlx.core as mx
+        from mlx_lm.models.cache import QuantizedKVCache
+    except ImportError:
+        _KERNEL_HEALTHY = False
+        return False
+    scale = _D ** -0.5
+    try:
+        for hkv, n, dtype, tol in ((2, 3, mx.float16, 4e-3), (2, 3, mx.bfloat16, 1.6e-2),
+                                   (4, 3, mx.float16, 4e-3), (2, 100, mx.float16, 4e-3)):
+            mx.random.seed(7)
+            q = mx.random.normal((1, 16, 1, _D)).astype(dtype)
+            k = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
+            v = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
+            c = QuantizedKVCache(group_size=64, bits=8)
+            c.update_and_fetch(k, v)
+            assert c.keys is not None and c.values is not None  # set by update_and_fetch
+            out = qsdpa(q, c.keys, c.values, scale, n)
+            kd = mx.dequantize(*c.keys, group_size=64, bits=8)[..., :n, :]
+            vd = mx.dequantize(*c.values, group_size=64, bits=8)[..., :n, :]
+            qf = (q.astype(mx.float32) * scale).reshape(1, hkv, 16 // hkv, 1, _D)
+            scores = qf @ mx.expand_dims(kd.astype(mx.float32), 2).swapaxes(-1, -2)
+            p = mx.softmax(scores, axis=-1, precise=True)
+            ref = (p @ mx.expand_dims(vd.astype(mx.float32), 2)).reshape(1, 16, 1, _D)
+            err = mx.abs(out.astype(mx.float32) - ref).max().item()
+            if not err < tol:   # NOT '>=': nan compares False both ways — this catches it
+                log.warning("QSDPA self-check FAILED (hkv=%d n=%d %s: err=%s, tol=%s) — "
+                            "fused quantized-KV kernel is numerically broken on this "
+                            "GPU/toolchain; refusing to install it", hkv, n, dtype, err, tol)
+                _KERNEL_HEALTHY = False
+                return False
+    except Exception as e:  # noqa: BLE001 — a broken probe means an unusable kernel
+        log.warning("QSDPA self-check errored (%s); refusing to install", e)
+        _KERNEL_HEALTHY = False
+        return False
+    _KERNEL_HEALTHY = True
+    return True
+
+
 def install() -> bool:
     """Patch the QuantizedKVCache branch of mlx_lm's attention helper to use
-    the fused kernels on eligible decode steps. Safe no-op on failure."""
+    the fused kernels on eligible decode steps. Safe no-op on failure (import
+    trouble, CHAD_NO_QSDPA, or a failed numeric self-check — see kernel_healthy)."""
     if config.flag("CHAD_NO_QSDPA"):
         return False
     try:
@@ -377,6 +433,10 @@ def install() -> bool:
         return False
     if getattr(lm_base.scaled_dot_product_attention, "_chad_qsdpa", False):
         return True  # already installed
+    if not kernel_healthy():
+        log.warning("QSDPA disabled: numeric self-check failed; stock quantized "
+                    "attention stays in place")
+        return False
 
     stock = lm_base.scaled_dot_product_attention
 
