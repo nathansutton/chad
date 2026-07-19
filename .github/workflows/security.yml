@@ -1,0 +1,83 @@
+name: security
+
+# Pre-public hygiene: known-vulnerability scan of the dependency tree, plus a
+# secret scan of the full git history before the repo goes public.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly re-scan so newly disclosed advisories surface even without a push.
+    - cron: "0 7 * * 1"
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    # pip-audit against the resolved environment. macos-14 because the deps include
+    # MLX (arm64); we audit the live synced env rather than re-resolving in a fresh
+    # venv, which is both faster and avoids ensurepip flakiness.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync
+      - name: pip-audit (known CVEs in dependencies)
+        # The ignored advisories all live in transitive deps (starlette, python-multipart,
+        # cryptography) pulled ONLY through `mcp` / the optional `serena-agent` (lsp extra).
+        # serena-agent 1.5.3 — the latest — hard-pins `mcp==1.27.0`, which in turn pins
+        # starlette==1.0.0 / python-multipart==0.0.27, so the whole subtree is frozen: no
+        # upstream upgrade exists to resolve to. Reachability review, per advisory:
+        #   • starlette (PYSEC-2026-{161,248,249}, CVE-2026-48817/48818) and
+        #     python-multipart (CVE-2026-53538/53539/53540) are ASGI SERVER request-handling
+        #     / multipart-parsing bugs. chad uses mcp as a CLIENT (ClientSession + stdio/http
+        #     client transports) — it never runs a Starlette server or parses uploads.
+        #   • cryptography GHSA-537c-gmf6-5ccf is an OpenSSL out-of-bounds-read DoS in the
+        #     bundled libssl; chad's only crypto use is JWT handling in the mcp OAuth path,
+        #     which doesn't drive the affected TLS/X.509 parsing.
+        #   • mcp CVE-2026-52869/52870/59950 are all mcp==1.27.0 SERVER-side bugs — cross-
+        #     session access in server.experimental task handlers, the SSE/streamable-HTTP
+        #     server transports (mcp.server.sse / streamable_http_manager), and the
+        #     websocket server transport. chad imports only mcp.client.* and mcp.shared.auth
+        #     (verified: no mcp.server.* anywhere in src/chad); it never runs an MCP server,
+        #     so none of these code paths are reachable. Fixed in mcp 1.27.2/1.28.1, but the
+        #     serena-agent pin freezes the tree at 1.27.0 — no resolvable upgrade yet.
+        # Each is pinned by ID (not whole-package) so a NEW advisory still fails the gate.
+        # Drop these when serena-agent unpins mcp and the tree can move to patched versions.
+        run: >-
+          uv run --with pip-audit python -m pip_audit
+          --ignore-vuln GHSA-537c-gmf6-5ccf
+          --ignore-vuln PYSEC-2026-161
+          --ignore-vuln PYSEC-2026-248
+          --ignore-vuln PYSEC-2026-249
+          --ignore-vuln CVE-2026-48817
+          --ignore-vuln CVE-2026-48818
+          --ignore-vuln CVE-2026-53538
+          --ignore-vuln CVE-2026-53539
+          --ignore-vuln CVE-2026-53540
+          --ignore-vuln CVE-2026-52869
+          --ignore-vuln CVE-2026-52870
+          --ignore-vuln CVE-2026-59950
+
+  secrets:
+    # Scans the entire history (fetch-depth: 0) for committed credentials. No license
+    # key needed for public repos.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          # Required for scanning pull_request events (incl. forks/Dependabot);
+          # push events scan the commit range and don't need it.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,152 @@
+[project]
+# Distribution name is `chad-code` (bare `chad` on PyPI is a squatted 2014 package).
+# The IMPORT package (src/chad/) and the `chad` command are unchanged — dist name,
+# import name, and command name are independent. `uvx chad-code` runs the alias
+# script added under [project.scripts].
+name = "chad-code"
+version = "1.0.0"
+description = "Local MLX-backed, Claude-Code-style coding agent (Apple Silicon, Ornith 35B/9B)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+keywords = ["mlx", "coding-agent", "apple-silicon", "local-llm", "tui"]
+# No License classifier: the SPDX `license` field above is authoritative (setuptools
+# rejects declaring both). Platforms are honest — the wheel is pure-python but the
+# mlx/mlx-lm dep tree resolves only on Apple Silicon macOS (cli._preflight hard-stops
+# elsewhere), so no cross-platform OS classifier is claimed.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+]
+dependencies = [
+    # Upper-bounded on purpose: chad's model loading rides on mlx-lm's qwen3_5/qwen3_5_moe
+    # loader (expert-weight stacking + vision-tower strip). A minor bump could refactor it
+    # and silently break the `uvx --from git+…` install path, which resolves fresh from
+    # PyPI and ignores uv.lock. Stay on the known-good 0.31 line; bump deliberately.
+    # Apple-only: no CPU/CUDA build exists. Platform-gated so `pip install chad-code`
+    # succeeds on Linux (e.g. a benchmark container) for the remote `--backend llama`
+    # path, which loads no MLX. On macOS the default in-process engine installs it as before.
+    # mlx 0.32.0: Metal command-buffer failures (incl. OOM) become catchable Python
+    # exceptions instead of a SIGABRT (ml-explore/mlx#3523) — engine._prefill/generate
+    # lean on that for the 35B-on-24GB recovery path. Perf re-gated
+    # on the bump: prefill/decode within noise of 0.31.2 on both shipped models.
+    "mlx>=0.32.0,<0.33; sys_platform == 'darwin'",
+    "mlx-lm>=0.31.3,<0.32; sys_platform == 'darwin'",
+    # mlx-lm requires transformers>=5.0, but 5.13.0 regressed AutoTokenizer.register:
+    # it now does `key.__module__.startswith("transformers.")` with no hasattr guard, and
+    # mlx-lm's tokenizer_utils passes the *string* "NewlineTokenizer" as config_class →
+    # AttributeError at import. Cap below 5.13 until mlx-lm or transformers fixes it.
+    "transformers>=5.0,<5.13",
+    # transformers needs jinja2 to render `apply_chat_template` (chad's `_render` on every
+    # backend). It's an OPTIONAL transformers dep — present transitively on a dev Mac but
+    # absent in a clean install (e.g. chad inside a Linux benchmark container), where its
+    # absence crashes the first turn. Declare it directly.
+    "jinja2>=3.1",
+    "numpy>=1.26,<2",
+    "huggingface-hub>=1.22.0", # first-run model download (cli.py/engine.py); imported directly, not just transitively
+    "jedi>=0.19.2", # in-process symbolic code intelligence (read/search/edit)
+    "prompt_toolkit>=3.0.43",
+    "tree-sitter>=0.26.0",
+    "tree-sitter-language-pack>=1.12.2",
+    # repomap's personalized PageRank. Native and battle-tested where the previous
+    # hand-rolled power iteration was ours to maintain; single self-contained Rust
+    # wheel, zero transitive deps. Benchmarked vs scipy/networkx/igraph on a real
+    # 421k-edge graph: identical top-50 ranking, 0.79s -> 0.04s.
+    "rustworkx>=0.15",
+    # Floor lowered from 1.28.1: serena-agent (the `lsp` extra) hard-pins mcp==1.27.0, and
+    # chad's mcp surface (ClientSession, stdio/streamable-http clients, OAuthClientProvider)
+    # is stable across 1.27+. The 1.27->1.28 delta is only deprecations chad doesn't touch.
+    "mcp>=1.27",
+]
+
+# Optional syntax highlighting in diffs / confirm previews. Pure-Python,
+# import-guarded in render.py: absent, output is byte-identical to the un-highlighted path.
+# Install with `uv sync --extra highlight`.
+# NOTE: no PyPI release exists; 'pip install chad' installs an unrelated squatted
+# package. Document uv/git installs only.
+[project.optional-dependencies]
+highlight = ["pygments>=2.17"]
+# Precision code intelligence (docs/design.md "Precision" phase): solidlsp ships inside
+# serena-agent and backs lsp.py's find-refs/rename via pyright. Optional on purpose —
+# heavyweight tree; absent, every caller falls back to the tree-sitter backend.
+# Install with `uv sync --extra lsp`.
+lsp = ["serena-agent>=1.5"]
+
+# The one entrypoint: `uv run chad`. (`chad-bench` reproduces docs/benchmarks.md.)
+# `chad-code` is an alias so `uvx chad-code` (which runs the console script matching
+# the DISTRIBUTION name) just works; the command you actually type stays `chad`.
+[project.scripts]
+chad = "chad.cli:main"
+chad-code = "chad.cli:main"
+chad-bench = "chad.bench:main"
+
+[project.urls]
+Repository = "https://github.com/nathansutton/chad"
+Issues = "https://github.com/nathansutton/chad/issues"
+
+[dependency-groups]
+# types-pyyaml: skills.py imports yaml directly; mypy 1.x refuses to honor
+# ignore_missing_imports for packages with known typeshed stubs, so the gate
+# needs the stubs installed to pass on a plain (no-extra) sync.
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "types-pyyaml>=6"]
+
+[build-system]
+requires = ["setuptools>=83.0.0"]
+build-backend = "setuptools.build_meta"
+
+# Standard src layout: the importable package lives at src/chad/. setuptools
+# auto-discovers it from the src dir below; the installed `chad` console script
+# then resolves `chad.cli:main` regardless of cwd.
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# No "-q" here: CI/docs/agents all invoke `pytest -q` explicitly, and stacking the two
+# (verbosity -2) suppresses the final "N passed" summary line entirely — an agent
+# running the gate then gets output with no verdict in it.
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Start tight-but-small and high-signal: pyflakes (F) catches real bugs
+# (unused/undefined names, bad imports); E9 (syntax errors); isort (I, auto-fixable).
+# The E4/E7 pycodestyle groups are intentionally NOT selected: this codebase
+# deliberately uses compound one-liners (`a; b`, `if x: return`) — 44 pre-existing
+# E701/E702/E731 hits — so enabling them would force churny, behavior-adjacent edits
+# far past this gate's mechanical-change limit. Expand (B, UP, SIM, E7) in a follow-up.
+select = ["F", "E9", "I"]
+ignore = ["E741"]  # ambiguous var names (l/I) appear in existing math code
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/chad"]
+ignore_missing_imports = true   # mlx/jedi/tree_sitter/mcp ship partial or no stubs
+warn_unused_ignores = true
+implicit_optional = true        # `x: T = None` defaults are idiomatic throughout; this
+                                # restores the pre-PEP-484 reading rather than rewriting
+                                # ~10 signatures to Optional[...] for a no-op annotation.
+# Lenient first pass: no --strict. `var-annotated` only flags empty-container vars whose
+# element type mypy can't infer (e.g. `box = {}`); it's low-signal and clearing it would
+# touch ~20 unrelated lines, so it's disabled now and re-enabled in the tightening pass.
+disable_error_code = ["var-annotated"]
+# Tighten (disallow_untyped_defs, re-enable var-annotated, add B/UP/SIM in ruff) in a
+# follow-up once this baseline holds.
+
+[[tool.mypy.overrides]]
+# mlx_fastpath patches mlx_lm classes that only exist on macOS: with mlx installed
+# (dev Macs, the macos CI jobs) its `type: ignore[method-assign]` comments are load-
+# bearing; on the Linux lint runner mlx_lm is absent, the patched classes type as Any,
+# and warn_unused_ignores flags those same comments — unfixable in the code for both
+# platforms at once, so the unused-ignore warning alone is relaxed for this module.
+module = "chad.mlx_fastpath"
+warn_unused_ignores = false

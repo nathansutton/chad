@@ -1,0 +1,39 @@
+version: 2
+updates:
+  # Keep the workflow action pins (checkout, setup-uv, codeql, gitleaks) current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+
+  # Python deps via uv (reads pyproject.toml + uv.lock). Grouped so a routine bump
+  # is one PR, not one-per-package. mlx/mlx-lm are intentionally upper-bounded in
+  # pyproject (the loader rides on a specific minor) — Dependabot will still open a
+  # PR when a new pin-compatible patch lands; review the loader before widening.
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      python-deps:
+        patterns: ["*"]
+    commit-message:
+      prefix: deps
+    # These carry deliberate upper bounds in pyproject.toml, so a bump across the cap
+    # can't resolve — Dependabot would otherwise reopen a red group PR every week.
+    # Patch bumps within the pinned line still flow; widen the cap by hand (after
+    # reviewing the loader / ABI) when you actually want the next minor.
+    ignore:
+      # mlx / mlx-lm: <0.32 — the model loader rides on the 0.31 minor line.
+      - dependency-name: "mlx"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "mlx-lm"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # transformers: <5.13 — 5.13 regressed AutoTokenizer.register (import crash).
+      - dependency-name: "transformers"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # numpy: <2 — the 2.0 ABI break isn't supported by the mlx dep tree yet.
+      - dependency-name: "numpy"
+        update-types: ["version-update:semver-major"]

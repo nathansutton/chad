@@ -1,0 +1,10 @@
+# Gitleaks config for the `security` workflow's secret scan.
+[extend]
+useDefault = true
+
+[allowlist]
+description = """test_log_redaction.py exists to PROVE chad's diagnostic-log redaction
+masks secrets, so it necessarily contains fake ones (an sk- shaped string, a ghp_
+token, AWS's own documented example key). They are fixtures, not credentials —
+allowlist the file, not the rules, so a real secret anywhere else still fails the scan."""
+paths = ['''tests/test_log_redaction\.py''']

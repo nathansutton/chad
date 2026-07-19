@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.venv/
+*.log
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.DS_Store
+
+# local agent guide — not published (kept locally, references the private workshop)
+/CLAUDE.md
+.gstack/
+
+# Prefill-tax capture (raw session traces, may contain previews)
+traces/
+
+# TB2 reproduction kit — run artifacts stay local (benchmarks/tb2/README.md)
+benchmarks/tb2/dataset/
+benchmarks/tb2/jobs/
+benchmarks/tb2/*.tsv
+# Local model builds (quantize_q6.py default --out)
+benchmarks/tb2/models/
+# Harbor per-run log dirs (job configs + trial logs) — run artifacts, never published
+benchmarks/tb2/harbor_logs_*/

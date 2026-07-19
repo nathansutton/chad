@@ -1,0 +1,37 @@
+name: codeql
+
+# Static analysis (security + quality) for Python. CodeQL extracts from source, so
+# it does NOT need MLX installed and runs on a cheap linux runner. Findings appear
+# under the repo's Security tab once the repo is public.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 1"
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    # Code scanning is free on public repos but unavailable on private ones (it needs
+    # GitHub Advanced Security), where analyze@v3 fails on result upload. Gate on
+    # visibility so this skips cleanly while private and goes live the moment the repo
+    # is made public — no further setup needed.
+    if: github.event.repository.visibility == 'public'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: python
+          # Pull the extra security queries on top of the default set.
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v4

@@ -1,0 +1,91 @@
+name: tests
+
+# Apple Silicon only: MLX builds/runs on arm64 macOS, so every job that imports
+# chad runs on macos-14 (GitHub's arm64 runner). The fast unit gate loads NO model
+# and finishes in seconds; the model-backed eval tiers (Ornith) self-skip without
+# weights and are not run here — run `uv run python run_tests.py --evals` locally
+# with the model on disk for those.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One run per ref; a new push cancels the in-flight run for that ref.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    # ruff + mypy need no Apple Silicon (mypy runs with ignore_missing_imports, so the
+    # mlx/jedi/tree_sitter stubs never matter for type-checking) — run on the cheap Linux
+    # runner like the `lock` job, not the ~10×-pricier macos-14.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync
+      - name: ruff (lint + import order)
+        run: uv run ruff check src tests
+      - name: mypy (src only; config pins python 3.11)
+        run: uv run mypy src/chad
+
+  test:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Sync dependencies (python ${{ matrix.python }})
+        run: uv sync --python ${{ matrix.python }}
+      - name: Fast test gate (no model)
+        # CHAD_FAST_TESTS=1 keeps this gate model-free (its documented contract): the
+        # tier-2 cache tests in test_engine.py self-skip instead of downloading a 4-bit
+        # proxy model. Those byte-exact warm-vs-fresh equality checks flip on quantized
+        # argmax near-ties across runner hardware (a numerical tie, not a cache bug — see
+        # the sibling quantization-tie skip), and are meant to run locally on real weights.
+        env:
+          CHAD_FAST_TESTS: "1"
+        run: uv run --python ${{ matrix.python }} pytest -q
+      - name: CLI smoke (entrypoint imports + parses, no model)
+        run: uv run --python ${{ matrix.python }} chad --help
+
+  build:
+    # Guards the public install path: `uvx --from git+https://… chad` resolves fresh
+    # from PyPI and IGNORES uv.lock. A dep bump that breaks a clean resolve would pass
+    # the locked test job but break every new user, so we build the dist and install
+    # it into a lock-free venv, then confirm the console script resolves.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Fresh resolve install (no uv.lock) + entrypoint check
+        run: |
+          uv venv --python 3.11 /tmp/fresh
+          VIRTUAL_ENV=/tmp/fresh uv pip install .
+          /tmp/fresh/bin/chad --help
+
+  lock:
+    # uv.lock must stay in sync with pyproject.toml. Pure metadata check — no MLX,
+    # so it runs on a cheap linux runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - name: Lockfile is up to date
+        run: uv lock --check
