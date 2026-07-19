@@ -2,7 +2,7 @@
 
 Notable, user-visible changes.
 
-## [1.0.0] — 2026-07-19
+## [1.0.1] — 2026-07-19
 
 First complete release: a single-user coding agent that runs **entirely locally on
 Apple Silicon** — Claude-Code-style tool use, plan mode, and a full-screen TUI, driven
