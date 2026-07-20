@@ -104,6 +104,27 @@ def _ts_error_loc(text: str, line: int) -> str:
 # error delta, not on every still-broken landing, so a streak there is unobservable.
 _BROKEN_STREAK: dict[str, int] = {}
 
+# Prose/data formats whose tree-sitter grammars exist but whose "syntax errors" are
+# noise for this gate: the language pack maps `.txt` to VIMDOC, so plain-text
+# deliverable writes (answer.txt, secret.txt, requirements.txt — the TB2.1 run1 README
+# finding, plan 107 follow-up) got grammar-checked and warned on exactly the
+# deliverable-landing write. A missing entry here costs a spurious warning, never a
+# missed real one — code languages are not listed.
+_NON_CODE_LANGS = frozenset({
+    "vimdoc", "markdown", "markdown_inline", "csv", "tsv", "psv", "text", "rst",
+    "org", "diff", "gitcommit", "git_rebase", "gitattributes", "gitignore",
+    "properties", "requirements",
+})
+
+
+def _code_lang(path: str) -> str | None:
+    """`lang_for`, filtered to languages this gate should police: None for both
+    unknown extensions and the prose/data formats above — every gate in this module
+    (warn, edit-revert, write-reject, severed-span) must skip those uniformly, or a
+    plain-text deliverable write gets warned on (or worse, REVERTED)."""
+    detected = repomap.service().lang_for(path)
+    return None if detected in _NON_CODE_LANGS else detected
+
 
 def check_syntax(path: str, before: str | None) -> str | None:
     """A warning string when the current on-disk content of `path` has a *newly
@@ -125,7 +146,7 @@ def check_syntax(path: str, before: str | None) -> str | None:
     if after == before:      # the tool didn't actually change the file — nothing to flag
         return None
 
-    lang = repomap.service().lang_for(path)
+    lang = _code_lang(path)
 
     if lang == "python":
         ap = os.path.abspath(path)
@@ -251,7 +272,7 @@ def edit_reject(path: str, before: str, after: str,
         return None
     if len(after) > _MAX_BYTES:
         return None
-    lang = repomap.service().lang_for(path)
+    lang = _code_lang(path)
     if not lang:
         return None
     if lang != "python":
@@ -359,7 +380,7 @@ def write_reject(path: str, before: str | None, content: str) -> str | None:
         return None
     if len(content) > _MAX_BYTES or (before is not None and len(before) > _MAX_BYTES):
         return None
-    lang = repomap.service().lang_for(path)
+    lang = _code_lang(path)
     if not lang:
         return None
     bash_hint = ("If this file is SUPPOSED to contain invalid syntax (a test fixture), "
@@ -568,7 +589,7 @@ def drift_warn(path: str, before: str | None, after: str) -> str | None:
         return None
     if before is None or len(before) > _MAX_BYTES or len(after) > _MAX_BYTES:
         return None
-    lang = repomap.service().lang_for(path)
+    lang = _code_lang(path)
     if not lang:
         return None
     dropped: list[str] = []

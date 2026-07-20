@@ -807,12 +807,18 @@ class Agent:
         # Turn-level cumulative think budget: distinct from self.think_tokens
         # (lifetime across the whole Agent instance, used for cross-turn telemetry) — this
         # is THIS turn's spend, reset every run_turn call, checked against a wall- and
-        # decode-speed-aware budget. turn_think_exhausted is a PERSISTENT latch (unlike
-        # capped_stall_streak's one-shot no_think_next above): once it fires, every
-        # remaining step in the turn decodes with thinking off.
+        # decode-speed-aware budget. turn_think_exhausted latches the once-only
+        # log/steer; past it, no-think steps are paid on a duty cycle
+        # (guardrails.turn_think_throttle) rather than muting the rest of the turn —
+        # the blanket mute regressed run1 passes with garbled no-think tails (plan 107).
+        # landing_no_think is the 103 landing's own unconditional latch: once the hard
+        # wrap-up fires, the landing and everything after it stay no-think regardless.
         turn_think_tokens = 0
         turn_think_half_fired = False
         turn_think_exhausted = False
+        turn_think_nothink_paid = 0
+        turn_think_budget_now = 0
+        landing_no_think = False
         # Runaway-turn governor state. turn_start drives the optional wall
         # budget; gov_band is the highest budget checkpoint already evaluated; gov_progress
         # tracks whether a change landed+verified within the CURRENT band (resets each time
@@ -845,6 +851,12 @@ class Agent:
         # where it also selects the plan-mode prefix.)
         action_task = self.mode != "plan" and _intent["action"]
         read_only_intent = _intent["read_only"]
+        # Run-task intent (start/boot/serve/… — system-state imperatives with no file
+        # deliverable): arms the anti-bail nudges alongside action_task but is kept OUT
+        # of the no-empty-diff done gates below, which demand a landed edit a run task
+        # legitimately never makes (plan 107 follow-up: qemu-startup classified as
+        # neither, so a prose give-up with 81% of the wall left took the weakest path).
+        run_task = self.mode != "plan" and _intent.get("run", False)
         # Progress-aware step cap (see guardrails.extend_step_cap): max_steps is the
         # WINDOW size, not a hard kill. A window that landed+verified a change earns
         # another window (warm cache — no re-prefill, unlike a governor rollover); a
@@ -963,9 +975,19 @@ class Agent:
             # <think> off so the model must act, then the flag clears and thinking restores.
             # Consumes the one-shot here; the render/decode/accounting below all key off
             # `step_thinking` rather than self.thinking for exactly this step.
-            # Turn-level think budget: once exhausted, thinking stays off for
-            # every remaining step — a persistent override, unlike no_think_next below.
-            step_thinking = self.thinking and not turn_think_exhausted
+            # Turn-level think budget: past exhaustion, forced no-think steps are
+            # paid on a duty cycle (one per TURN_THINK_REARM_TOK further think tokens)
+            # so thinking RESTORES once the model stops over-spending — a blanket
+            # rest-of-turn mute regressed run1 passes (plan 107 F1). The 103 landing's
+            # landing_no_think stays unconditional.
+            _tt_throttled = (turn_think_exhausted
+                             and guardrails.turn_think_throttle(
+                                 turn_think_tokens, turn_think_budget_now,
+                                 turn_think_nothink_paid))
+            if _tt_throttled:
+                turn_think_nothink_paid += 1
+            step_thinking = (self.thinking and not landing_no_think
+                             and not _tt_throttled)
             if no_think_next:
                 no_think_next = False
                 capped_stall_streak = 0
@@ -1203,9 +1225,15 @@ class Agent:
             # turns (a Q&A turn shouldn't be pushed to "act now") and without a configured
             # wall budget (interactive/unmetered runs, like wrapup_window above).
             turn_think_tokens += _think_delta
-            if (self._turn_budget_s and self.mode != "plan" and not read_only_intent
+            # Inert below TURN_THINK_MIN_WALL_S: a short auto-continue tail clamps to
+            # the LO budget and half-fires on its first step, churning against
+            # hard_wrapup's landing (plan 107 F2 — the regex-log relaunch signature).
+            if (self._turn_budget_s
+                    and self._turn_budget_s >= guardrails.TURN_THINK_MIN_WALL_S
+                    and self.mode != "plan" and not read_only_intent
                     and levers.enabled("turn_think_budget")):
                 _tt_budget = guardrails.turn_think_budget(self._turn_budget_s, self.tok_per_s)
+                turn_think_budget_now = _tt_budget
                 _tt_decision, turn_think_half_fired, turn_think_exhausted = (
                     guardrails.turn_think_budget_check(
                         turn_think_tokens, _tt_budget,
@@ -1217,10 +1245,11 @@ class Agent:
                                           "content": guardrails.TURN_THINK_BUDGET_STEER})
                 elif _tt_decision == "exhausted":
                     log.info("THINK-BUDGET exhausted at step %d: %d/%d cumulative think "
-                             "tok this turn — no-think for the rest of the turn", step,
-                             turn_think_tokens, _tt_budget)
+                             "tok this turn — throttling <think> (one action step per "
+                             "%d further think tok)", step, turn_think_tokens,
+                             _tt_budget, guardrails.TURN_THINK_REARM_TOK)
                     self._emit("info", "  [reasoning budget exhausted for this turn — "
-                                       "acting without further <think> for the rest of it]")
+                                       "throttling further <think>]")
 
             log.info("step %d: %d tok @ %.1f tok/s | prefill %d new + %d cached | "
                      "accept %.2f", step, stats.generated_tokens, stats.tok_per_s,
@@ -1277,7 +1306,7 @@ class Agent:
             # above) with its tokens in the KV cache. Force ONE time-boxed, no-think
             # landing turn so the model writes its best artifacts to the exact paths before
             # the harness kills the turn at the wall — instead of dying mid-token with
-            # nothing landed. turn_think_exhausted makes the landing (and any step after it)
+            # nothing landed. landing_no_think makes the landing (and any step after it)
             # no-think so it can't re-open a spiral; the latch disarms _deadline_stop, so
             # the landing generation runs to its token box, not another abort. deadline_fired
             # is exclusive with rep_fired / the think-cap below (it is checked first in
@@ -1286,7 +1315,7 @@ class Agent:
             # there is rarely one, and partial-tool-call surgery is not worth its risk here.
             if deadline_fired[0] and not hard_wrapup_fired:
                 hard_wrapup_fired = True
-                turn_think_exhausted = True
+                landing_no_think = True
                 _remaining = self._turn_budget_s - (time.monotonic() - turn_start)
                 log.info("HARD-WRAPUP abort at step %d: %.0fs left, gen was %d tok",
                          step, _remaining, stats.generated_tokens)
@@ -1374,8 +1403,8 @@ class Agent:
                            or "<function=" in _stripped_for_markers)
                 kind, nudge = guardrails.nudge_for_no_calls(
                     text, hit_cap, made_edit, unverified_edit, read_only_intent,
-                    action_task, truncation_nudges, answer_nudges, verify_nudges,
-                    _has_open_tool_call(text), garbled_call=garbled)
+                    action_task or run_task, truncation_nudges, answer_nudges,
+                    verify_nudges, _has_open_tool_call(text), garbled_call=garbled)
                 if kind == "truncated":
                     truncation_nudges += 1
                 elif kind == "no-edit":
@@ -1384,7 +1413,8 @@ class Agent:
                     verify_nudges += 1
                 if nudge:
                     log.info("END-ANSWER rejected step %d: %s (hit_cap=%s, has_code=%s, "
-                             "action_task=%s)", step, kind, hit_cap, has_code, action_task)
+                             "action_task=%s, run_task=%s)", step, kind, hit_cap,
+                             has_code, action_task, run_task)
                     self.messages.append({"role": "tool", "name": "edit", "content": nudge})
                     continue
                 # Iter-3 did-nothing gate: in auto/headless mode (every benchmark run), a
@@ -1405,7 +1435,9 @@ class Agent:
                     # and end as a hard stop, so --auto-continue (headless) or the
                     # user's 'continue' (TUI) relaunches a fresh attempt with the
                     # note instead of silently shipping nothing.
-                    self.budget_note = guardrails.progress_note(self.messages)
+                    self.budget_note = guardrails.progress_note(
+                        self.messages,
+                        rejected_claim=strip_think(text).strip())
                     log.info("END step %d: FINAL ANSWER blocked by no-empty-diff gate "
                              "(made_edit=%s, unverified_edit=%s) — progress note banked",
                              step, made_edit, unverified_edit)
@@ -1497,7 +1529,9 @@ class Agent:
                     # nudges ran out) becomes a resumable hard stop, not a success
                     # (matplotlib-25332 r3: done accepted at 84s with edits in tree
                     # and zero successful post-edit commands).
-                    self.budget_note = guardrails.progress_note(self.messages)
+                    self.budget_note = guardrails.progress_note(
+                        self.messages,
+                        rejected_claim=str(terminal.get("summary") or ""))
                     log.info("END step %d: DONE blocked by no-empty-diff gate "
                              "(made_edit=%s, unverified_edit=%s) — progress note banked",
                              step, made_edit, unverified_edit)

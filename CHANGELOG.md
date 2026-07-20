@@ -2,6 +2,36 @@
 
 Notable, user-visible changes.
 
+## [1.0.2] — 2026-07-20
+
+Reliability tuning for long, budgeted tasks, plus one interactive papercut fix.
+
+- **Syntax gate no longer flags prose & data files.** Plain-text deliverables — a
+  `.txt` answer file, `requirements.txt`, markdown, CSV/TSV — were being run through a
+  tree-sitter grammar (the language pack maps `.txt` → VIMDOC) and warned on, sometimes
+  reverted, at exactly the write that produced the deliverable. The gate now polices
+  code languages only; prose/data formats are skipped uniformly across warn, edit-revert,
+  and write-reject.
+- **`run`-style tasks no longer bail with prose.** System-state asks ("start the
+  service", "boot the image", "install X") are completable with zero file edits, and
+  used to fall through to the weakest completion path — a give-up in prose could ship
+  nothing (qemu-startup did, with most of the wall unspent). They now get their own
+  intent class that arms the anti-bail nudges, while still completing cleanly with zero
+  edits (the no-empty-diff "done" gate only ever applied to edit tasks).
+- **Reasoning budget throttles instead of muting.** Once a turn's cumulative
+  reasoning-token budget is spent, chad now forces one no-think action step per ~3k
+  further reasoning tokens (a duty cycle) rather than muting thinking for the rest of the
+  turn — thinking is restored as soon as the model stops over-spending, avoiding the
+  garbled tool-call tails a blanket mute produced.
+- **Wall-aware auto-continue.** When most of a task's wall budget is still unspent, an
+  exhausted turn is granted a fresh relaunch (bounded), instead of giving up after a
+  fixed two attempts with the clock barely touched.
+- **Rejected "done" no longer poisons the relaunch.** When a completion claim is
+  rejected for landing no verified change, the carried-forward progress note now leads
+  with a warning that the claim was rejected and drops any hypothesis that itself asserts
+  completion — so a relaunch stops inheriting "already complete and verified" as fact and
+  re-confirming it.
+
 ## [1.0.1] — 2026-07-19
 
 First complete release: a single-user coding agent that runs **entirely locally on

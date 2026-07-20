@@ -156,8 +156,33 @@ def test_indent_reject_names_enclosing_symbol():
     check("module-level: no enclosing symbol steer", "You're editing inside" not in msg2, msg2)
 
 
+def test_plain_text_never_policed():
+    # The language pack maps .txt to VIMDOC, so plain-text deliverable writes
+    # (answer.txt / secret.txt / requirements.txt — the TB2.1 run1 README finding,
+    # plan 107 follow-up) were grammar-checked and warned on exactly the
+    # deliverable-landing write. Prose/data formats are now excluded from every gate.
+    for name, content in (
+        ("answer.txt", "The flag is: ABC-123\nsecond line < > { weird ] chars\n"),
+        ("requirements.txt", "numpy>=1.24\nscipy==1.11.*\n"),
+        ("notes.md", "# heading\n<unclosed <tag [bracket\n"),
+        ("data.csv", 'a,b\n1,"unclosed quote\n'),
+    ):
+        p = _tmp(name, "")
+        res = tool_write(p, content)
+        check(f"{name} write lands", res.startswith("[wrote"), res)
+        check(f"{name} write has no syntax warning",
+              "warning" not in res and "rejected" not in res, res)
+        res = tool_edit(p, content.splitlines()[0], "replaced first line")
+        check(f"{name} edit lands without warning",
+              "warning" not in res and "rejected" not in res, res)
+    # Sanity: real code languages are still policed (guard against an over-broad list).
+    check("python still policed",
+          syntaxgate.write_reject("x.py", "", "def f(:\n") is not None)
+
+
 if __name__ == "__main__":
     test_python()
+    test_plain_text_never_policed()
     test_tree_sitter_delta()
     test_opt_out()
     test_symbol_edit()

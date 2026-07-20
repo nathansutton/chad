@@ -102,6 +102,32 @@ def test_intent():
           not arms_nudge("explain the slugify function"))
 
 
+def test_run_intent():
+    # Run-task class (plan 107 follow-up): system-state imperatives — completable with
+    # zero file edits — must classify `run` so the anti-bail nudges arm, WITHOUT
+    # feeding `action` (whose no-empty-diff done gate demands a landed edit).
+    qemu = ("Start the /app/alpine.iso image in qemu in such a way that I can connect "
+            "to it via `telnet 127.0.0.1 6665`. Start the image in the background and "
+            "leave it running. Block until it's ready.")
+    got = classify_intent(qemu)
+    check("qemu-startup is a run task", got["run"], got)
+    check("qemu-startup is NOT an action task (no edit demanded)",
+          not got["action"], got)
+    check("qemu-startup is not read-only", not got["read_only"], got)
+    check("service imperative is a run task",
+          classify_intent("install nginx and serve /var/www on port 80")["run"])
+    # Word boundary: 'restarting'/'rerun' style inflections must not leak via substring.
+    check("'brunch' does not classify as run",
+          not classify_intent("describe the brunch menu parser")["run"])
+    # Explanatory asks never classify run — 'explain how to start the server' ends in prose.
+    check("explain-how-to-start is not a run task",
+          not classify_intent("explain how to start the server")["run"])
+    # An edit ask that also says 'run the tests' keeps action AND gains run — harmless,
+    # the merged nudge predicate is already armed by action.
+    both = classify_intent("fix the bug in app.py and run the tests")
+    check("edit+run ask keeps action", both["action"] and both["run"], both)
+
+
 def test_open_tool_call():
     # truncated mid-call -> True (drives the "write it in parts" nudge)
     check("open <tool_call> detected",
@@ -266,6 +292,7 @@ def test_step_tool_cap():
 
 if __name__ == "__main__":
     test_intent()
+    test_run_intent()
     test_open_tool_call()
     test_mentions()
     test_detect_test_command()

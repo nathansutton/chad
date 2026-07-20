@@ -256,12 +256,14 @@ LEVERS: dict[str, Lever] = {
     #     off entirely in interactive/unmetered runs, like wrapup_window. -------------
     "turn_think_budget": Lever(
         "A cumulative per-turn reasoning-token budget (wall- and decode-speed-aware, "
-        "clamped 8k-24k): a one-shot soft steer at half spent, then a PERSISTENT "
-        "no-think for the rest of the turn once spent (every later step decodes with "
-        "<think> off — not one-shot, unlike no_think_escalation above). Acts only at "
-        "step boundaries on fresh generations, never an in-flight one (086's lesson). "
-        "Off in plan mode and for read-only-intent turns. Only active with a wall "
-        "budget configured.",
+        "clamped 8k-24k): a one-shot soft steer at half spent, then a no-think "
+        "THROTTLE once spent — one forced no-think action step per 3k further think "
+        "tokens (guardrails.turn_think_throttle), so thinking restores when the model "
+        "stops over-spending; a blanket rest-of-turn mute regressed run1 passes with "
+        "garbled no-think tails (plan 107). Acts only at step boundaries on fresh "
+        "generations, never an in-flight one (086's lesson). Off in plan mode, for "
+        "read-only-intent turns, and below a 300s wall budget (short relaunch tails "
+        "belong to hard_wrapup). Only active with a wall budget configured.",
         "iter11"),
 
     # --- (103 hard wrap-up): the 085 wrapup_window nudge only lands at a step
