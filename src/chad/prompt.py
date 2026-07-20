@@ -92,6 +92,16 @@ _ACTION_WORDS = (
     "handle", "patch", "correct", "write", "test", "build", "wire", "convert",
     "generate", "rewrite", "extend", "append", "document", "save",
 )
+# Run-task verbs: the ask is to put the SYSTEM in a state (start a service, boot an
+# image, install a package), not to land a file edit — completable with zero edits, so
+# these must NOT feed the `action` class (whose no-empty-diff done gate demands a landed
+# edit; arming it here would hard-block every legitimate zero-edit completion). They get
+# their own `run` class, which arms only the anti-bail nudges (TB2.1 qemu-startup,
+# plan 107 follow-up: classified neither action nor read-only, so a prose give-up with
+# 733s left sailed through the weakest path).
+_RUN_WORDS_RE = re.compile(
+    r"\b(start|launch|boot|run|serve|deploy|install|configure|mount|restart|enable"
+    r"|spin up|bring up|set up)\b")
 # Explanatory openers: an ask that legitimately ends in prose. Deliberately NARROW —
 # a bare trailing "?" doesn't count (too ambiguous), and "can/could/should you…" are
 # excluded because they're usually polite ACTION requests ("can you fix this?").
@@ -161,7 +171,11 @@ def classify_intent(user_text: str) -> dict:
                  or any(p in ut for p in _READ_ONLY_GLOBAL)
                  or any(_global_negation(p) for p in _READ_ONLY_NEGATIONS if p in ut))
     action = any(w in ut for w in _ACTION_WORDS)
-    return {"action": action, "read_only": read_only}
+    # `run`: a system-state imperative (start/boot/serve/…). Kept SEPARATE from
+    # `action` — run tasks are completable with zero file edits, so they arm the
+    # anti-bail nudges but never the edit-demanding no-empty-diff gates.
+    run = bool(_RUN_WORDS_RE.search(ut)) and not explanatory
+    return {"action": action, "read_only": read_only, "run": run}
 
 
 # Short base prompt for a spawned sub-agent. It runs in a fresh, isolated

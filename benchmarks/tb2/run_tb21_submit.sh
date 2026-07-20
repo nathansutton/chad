@@ -30,8 +30,10 @@
 #   CHAD_BACKEND      llama                     (default llama — thelio Q6_K)
 #   CHAD_TOKENIZER    HF repo for the tokenizer (default the Q6 MLX repo; Ornith's
 #                     vocab is quant-invariant so it matches every Ornith artifact)
-#   CHAD_MODEL_LABEL  harbor -m id — becomes the submission's model id, so name
-#                     the artifact actually served
+#   CHAD_MODEL_LABEL  harbor -m id — the submission's DISPLAYED model id (default
+#                     Ornith-1.0-35B-Q6_K, a bare model name — the agent column
+#                     already carries org=chad; cosmetic for --backend llama, no
+#                     weights load from it)
 #   CHAD_TB2_TEMP     sampling temperature (default 1.0, the reference recipe)
 #   TB21_NO_UPLOAD=1  skip --upload --public (local compliance dry-runs only —
 #                     a real submission run MUST upload)
@@ -43,8 +45,12 @@ export PYTHONPATH="$PWD"
 
 BASE_URL="${CHAD_BASE_URL:?set CHAD_BASE_URL to your model server as reachable from inside Docker}"
 BACKEND="${CHAD_BACKEND:-llama}"
+# Tokenizer stays the real MLX HF repo (nathansutton/…) — it's snapshot_download'd
+# into the upload, so it must resolve; its vocab is quant-invariant. MODEL_LABEL is
+# purely the leaderboard-displayed model id (cosmetic for --backend llama), so it reads
+# org=chad, model=Ornith rather than surfacing the personal HF namespace as the "org".
 TOKENIZER="${CHAD_TOKENIZER:-nathansutton/Ornith-1.0-35B-Q6-MLX}"
-MODEL_LABEL="${CHAD_MODEL_LABEL:-mlx/nathansutton/Ornith-1.0-35B-Q6-MLX}"
+MODEL_LABEL="${CHAD_MODEL_LABEL:-Ornith-1.0-35B-Q6_K}"
 TEMP="${CHAD_TB2_TEMP:-1.0}"
 REPEATS="${1:-5}"; ONLY="${2:-}"
 

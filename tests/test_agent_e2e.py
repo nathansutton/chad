@@ -758,34 +758,66 @@ class _BigThinkEngine(ScriptedEngine):
         return text, stats
 
 
-def _run_turn_think_budget(monkeypatch, *, ablated: bool):
+def _run_turn_think_budget(monkeypatch, *, ablated: bool, script=None,
+                           turn_budget_s=1e9):
     if ablated:
         monkeypatch.setenv("CHAD_DISABLE", "turn_think_budget")
     else:
         monkeypatch.delenv("CHAD_DISABLE", raising=False)
     stall = "<think>" + "reasoning " * 50 + "</think>"
-    eng = _BigThinkEngine([stall] * 6)
+    eng = _BigThinkEngine(script if script is not None else [stall] * 6)
     tok = _ThinkFlagTok()
     eng.tok = tok
     # A configured wall budget is required to arm the mechanism at all (like
     # wrapup_window); huge so the UNRELATED governor/wrapup checks never fire and
     # muddy the transcript this test inspects.
     agent = Agent(eng, mode="auto", thinking=True, max_gen_tokens=20000,
-                  turn_budget_s=1e9)
+                  turn_budget_s=turn_budget_s)
     agent.run_turn("change the config value")   # an action task, not read-only
     return tok.flags
 
 
-def test_turn_think_budget_forces_persistent_no_think_once_exhausted(monkeypatch):
+def test_turn_think_budget_throttles_no_think_while_overspending(monkeypatch):
     flags = _run_turn_think_budget(monkeypatch, ablated=False)
     # Each stall's ~14.7k-token think delta clears HALF (12k) on step 0 and EXHAUSTS
     # (24k) by step 1 — so step 0/1 still render thinking (the mechanism only acts on
-    # steps AFTER the threshold is crossed), then every later step is forced no-think.
+    # steps AFTER the threshold is crossed). The scripted engine keeps burning ~14.7k
+    # think tokens on EVERY later step too, so the throttle's debt (one no-think step
+    # per 3k further think tokens) grows faster than it is paid — every remaining step
+    # renders no-think, converging on the old persistent behavior for a model that
+    # never stops over-spending.
     assert flags[:2] == [True, True], flags
     assert flags[2:] and all(f is False for f in flags[2:]), flags
-    # Persistent, unlike no_think_escalation's one-shot: once it flips, it never
-    # flips back for the rest of the turn.
-    assert True not in flags[2:], flags
+
+
+def test_turn_think_budget_restores_thinking_once_debt_paid(monkeypatch):
+    # Two big-think stalls exhaust the budget (~29.4k vs 24k -> debt = 1 + 5.4k//3k
+    # = 2 no-think steps owed); the model then STOPS thinking (plain tool-call turns
+    # accrue zero think delta), so after the two owed steps are paid, thinking must
+    # RESTORE — the plan-107 fix over the v1.0.0 persistent mute, which stayed off for
+    # the rest of the turn (break-filter-js: 26 straight no-think steps, garbled
+    # landing calls, regressed a run1 pass).
+    stall = "<think>" + "reasoning " * 50 + "</think>"
+    tc = _tool_call("bash", command="echo ok")
+    flags = _run_turn_think_budget(
+        monkeypatch, ablated=False,
+        script=[stall, stall, tc, tc, tc, "All set — the config value is updated."])
+    assert flags[:2] == [True, True], flags
+    assert flags[2:4] == [False, False], flags       # paying the two owed steps
+    assert flags[4:] and all(f is True for f in flags[4:]), flags  # restored
+
+
+def test_turn_think_budget_inert_below_min_wall(monkeypatch):
+    # A short relaunch tail (wall budget under TURN_THINK_MIN_WALL_S=300) must leave
+    # the mechanism entirely inert — on the v1.0.0 run a 200s-class relaunch clamped
+    # to the LO budget and half-fired on its FIRST step, churning against the hard
+    # wrap-up landing (regex-log). The governor/wrapup paths may also act on such a
+    # short wall, so keep the script tiny.
+    stall = "<think>" + "reasoning " * 50 + "</think>"
+    flags = _run_turn_think_budget(monkeypatch, ablated=False,
+                                   script=[stall] * 3, turn_budget_s=200)
+    assert flags, "the turn should have taken at least one step"
+    assert False not in flags, flags
 
 
 def test_turn_think_budget_is_gone_when_ablated(monkeypatch):

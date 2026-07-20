@@ -637,9 +637,24 @@ def main():
         # ships as an empty diff (the NIGHT-7 bail signature).
         continues = args.auto_continue if args.auto_continue is not None \
             else (2 if run_mode == "auto" else 0)
-        while agent.budget_note and continues > 0:
+        used_continues = 0
+        while agent.budget_note:
+            # Base allowance first; past it, keep granting fresh attempts while most
+            # of the task wall is still unspent (bounded by AUTO_CONTINUE_TOTAL_CAP) —
+            # the fixed base is wall-blind: build-pov-ray (TB2.1 v1.0.0) gave up after
+            # 3 step-capped turns with 94.7% of a 12000s budget unused (plan 107 F3).
+            if continues > 0:
+                continues -= 1
+            elif (args.auto_continue is None and args.turn_budget_s
+                    and guardrails.replenish_continue(
+                        args.turn_budget_s, time.monotonic() - task_start,
+                        used_continues)):
+                sys.stderr.write("[governor] wall budget mostly unspent — granting an "
+                                 "extra continue\n")
+            else:
+                break
+            used_continues += 1
             note = agent.budget_note
-            continues -= 1
             # The wall budget is a TASK-level deadline (the harness SIGKILLs the whole chad
             # process), not a per-turn one: a relaunch must inherit only the wall time that
             # REMAINS, or the governor / wrap-up / hard-abort windows (measured from each

@@ -49,11 +49,13 @@ from chad.guardrails import (
     progress_note,
     relaunch_budget,
     repeat_stop_abort,
+    replenish_continue,
     review_pass_should_fire,
     think_budget,
     turn_governor,
     turn_think_budget,
     turn_think_budget_check,
+    turn_think_throttle,
     update_thrash,
     update_work_flags,
     wrapup_landing_steer,
@@ -652,6 +654,53 @@ def test_progress_note():
               + '<tool_call>{"name": "read", "arguments": {"path": "z.py"}}</tool_call>'}]
     ln = progress_note(loopy)
     check("degenerate reasoning not carried as hypothesis", "hypothesis" not in ln.lower(), ln)
+    # Rejected-completion-claim path (plan 107 follow-up — the build-pov-ray poisoning
+    # loop: the banked note carried "the build is already complete and verified" as its
+    # leading hypothesis, and all 6 relaunches re-confirmed it and re-done'd).
+    poisoned = [
+        {"role": "user", "content": "build povray"},
+        {"role": "assistant",
+         "content": ("The build is already complete and verified. Let me confirm.\n"
+                     '<tool_call>{"name": "bash", "arguments": {"command": "ls build"}}'
+                     "</tool_call>")},
+        {"role": "tool", "name": "bash", "content": "povray"},
+    ]
+    rejected = progress_note(poisoned, rejected_claim="POV-Ray 2.2 is already built")
+    check("rejected claim -> warning present", "REJECTED" in rejected, rejected)
+    check("rejected claim text is quoted (clipped)",
+          "already built" in rejected, rejected)
+    check("completion-claim hypothesis is dropped",
+          "already complete and verified" not in rejected, rejected)
+    # A genuine (non-completion) diagnosis survives even on the rejected path.
+    diagnosed = list(poisoned)
+    diagnosed[1] = {"role": "assistant",
+                    "content": ("The linker fails because unix.c is missing from build/.\n"
+                                '<tool_call>{"name": "bash", "arguments": '
+                                '{"command": "ls build"}}</tool_call>')}
+    kept = progress_note(diagnosed, rejected_claim="done")
+    check("real diagnosis survives the rejected path",
+          "unix.c is missing" in kept, kept)
+    # FP class the first regex dropped (eng-review outside-voice F1): a diagnosis that
+    # merely CONTAINS a success-ish substring is not a completion claim and must survive.
+    # "rebuild is failing" once matched bare `build\s+is\s`; "successfully reproduced"
+    # once matched the standalone verified/successful branch.
+    for diag_text, needle in (
+        ("The rebuild is failing because unix.c is missing from the target list.",
+         "rebuild is failing"),
+        ("I successfully reproduced the crash: it is an off-by-one in the parse loop.",
+         "off-by-one in the parse loop"),
+        ("Verified the repro; the bug is a null deref in frame_alloc.",
+         "null deref in frame_alloc"),
+    ):
+        d = list(poisoned)
+        d[1] = {"role": "assistant",
+                "content": (diag_text + '\n<tool_call>{"name": "bash", "arguments": '
+                            '{"command": "ls build"}}</tool_call>')}
+        note = progress_note(d, rejected_claim="task is done")
+        check(f"diagnosis survives rejected path: {needle!r}", needle in note, note)
+    # Without rejected_claim the note is unchanged from the old contract: no warning.
+    check("no rejected claim -> no warning line",
+          "REJECTED" not in progress_note(poisoned), progress_note(poisoned))
 
 
 def test_bash_result_verifies_ignores_trivial_checks():
@@ -900,6 +949,41 @@ def test_turn_think_budget_check():
     # escalate, unlike no_think_escalation's one-shot which resets after one action.
     d, half, exh = turn_think_budget_check(50000, 8000, True, True)
     check("exhausted is sticky", d is None and half and exh)
+
+
+def test_turn_think_throttle():
+    # Below budget: never throttled, regardless of paid count.
+    check("below budget -> no throttle", turn_think_throttle(7999, 8000, 0) is False)
+    # Crossing the budget owes exactly ONE no-think step until paid.
+    check("at budget, unpaid -> throttle", turn_think_throttle(8000, 8000, 0) is True)
+    check("at budget, paid -> restored", turn_think_throttle(8000, 8000, 1) is False)
+    # Every further `rearm` think tokens owes one more: 8000 + 2*3000 = 3 owed total.
+    check("2 rearm chunks past budget, 2 paid -> still owes one",
+          turn_think_throttle(14000, 8000, 2) is True)
+    check("2 rearm chunks past budget, 3 paid -> restored",
+          turn_think_throttle(14000, 8000, 3) is False)
+    # A model that keeps burning reasoning is throttled toward always-off; one that
+    # stops spending accrues no new debt and keeps its thinking once paid up.
+    check("huge overshoot, few paid -> throttle",
+          turn_think_throttle(50000, 8000, 5) is True)
+    # rearm=0 must not divide by zero (guarded to 1).
+    check("zero rearm guarded", turn_think_throttle(9000, 8000, 10**6, rearm=0) is False)
+
+
+def test_replenish_continue():
+    # More than half the wall unspent and under the cap -> grant.
+    check("early giveup, wall mostly unspent -> grant",
+          replenish_continue(12000, 637, 2) is True)
+    # Past the half-wall point -> no extras (the endgame belongs to wrap-up/landing).
+    check("more than half spent -> no grant", replenish_continue(900, 500, 2) is False)
+    # Exactly at the boundary is NOT more-than -> no grant.
+    check("exact half boundary -> no grant", replenish_continue(1000, 500, 2) is False)
+    # Absolute cap: never more than AUTO_CONTINUE_TOTAL_CAP total relaunches.
+    check("at the total cap -> no grant", replenish_continue(12000, 100, 6) is False)
+    check("just under the cap -> grant", replenish_continue(12000, 100, 5) is True)
+    # No wall budget (interactive) -> never; the explicit base allowance governs.
+    check("no wall budget -> never", replenish_continue(None, 0, 0) is False)
+    check("zero wall budget -> never", replenish_continue(0, 0, 0) is False)
 
 
 def test_review_pass_should_fire():

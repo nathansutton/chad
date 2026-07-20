@@ -924,7 +924,21 @@ PROGRESS_NOTE_HEADER = (
     "Progress so far (auto-summarized — the previous attempt ran out of budget):")
 
 
-def progress_note(messages, max_lines: int = 24) -> str:
+# Matches a hypothesis that ASSERTS the work is already finished (the poison a
+# rejected-done relaunch must not inherit as its leading "fact"), NOT a diagnosis that
+# merely contains a success-ish word. Every completion word is anchored to a subject or
+# to "already": a bare `build\s+is\s` matched "reBUILD IS failing", and a standalone
+# `verified`/`successful` matched "SUCCESSFULLY reproduced the crash" — both real
+# diagnoses, dropped on the exact path meant to preserve them (eng-review outside-voice
+# F1). \b on the subjects also stops "build" from matching inside "rebuild".
+_COMPLETION_CLAIM_RE = re.compile(
+    r"(already\s+(?:built|complete|done|installed|present|correct|verified|passe?[sd])"
+    r"|\b(?:build|task|project|everything|it)\s+is\s+"
+    r"(?:complete|done|built|ready|correct|passing)"
+    r"|task\s+is\s+(?:done|complete))", re.IGNORECASE)
+
+
+def progress_note(messages, max_lines: int = 24, rejected_claim: str | None = None) -> str:
     """Synthesize a ≤`max_lines` progress note from the transcript with NO model call, so
     a hard-stopped turn can seed a fresh relaunch (sheds the ramble AND the huge prefill
     the stuck model was dragging around). Deterministic: pulls the model's last working
@@ -933,7 +947,15 @@ def progress_note(messages, max_lines: int = 24) -> str:
     facts the executor CANNOT reconstruct from a clean context — the diagnosis it reached,
     what it already tried, and what failed last. The old note carried only file names, so
     a relaunch re-derived the whole investigation and re-spent the budget it was meant to
-    save (django-14007/-14404: the correct fix was stated in prose, then lost)."""
+    save (django-14007/-14404: the correct fix was stated in prose, then lost).
+
+    `rejected_claim` (plan 107 follow-up — the build-pov-ray poisoning loop): when the
+    turn ended via a REJECTED completion claim (done / final answer blocked by the
+    no-empty-diff gate), pass the claim text. The note then (a) leads with an explicit
+    warning that the claim was rejected, and (b) drops a working hypothesis that itself
+    asserts completion — otherwise every fresh relaunch inherits "the build is already
+    complete and verified" as its leading fact, re-confirms it, and re-dones (observed
+    6 relaunches in a row, task 0/1 with 86% of the wall unused)."""
     from .toolcall_parse import parse_tool_calls
     edited, commands, examined = [], [], []
     last_error = None
@@ -968,6 +990,17 @@ def progress_note(messages, max_lines: int = 24) -> str:
     # lever adds, and therefore what its delta measures.
     rich = levers.enabled("progress_note_rich")
     lines = [PROGRESS_NOTE_HEADER]
+    if rejected_claim:
+        lines.append(
+            "WARNING: the previous attempt ended by CLAIMING the task was complete "
+            f"(\"{rejected_claim.strip()[:160]}\") but the claim was REJECTED — it had "
+            "landed no verified change. Treat every success statement below as "
+            "unverified and likely wrong: re-verify against the task statement with "
+            "fresh commands and MAKE the required change before calling done.")
+        # A hypothesis that itself asserts completion is exactly the poison the
+        # warning exists for — never carry it forward as the leading "fact".
+        if hypothesis and _COMPLETION_CLAIM_RE.search(hypothesis):
+            hypothesis = None
     if rich and hypothesis:
         # The single most valuable thing to carry: the diagnosis the stuck attempt
         # reached. Keep the tail (the conclusion), clipped so it can't blow the budget.
@@ -1088,6 +1121,28 @@ def relaunch_budget(total_wall_s, task_elapsed_s) -> float | None:
     return remaining
 
 
+AUTO_CONTINUE_TOTAL_CAP = 6       # absolute relaunch ceiling per task (base + extras)
+AUTO_CONTINUE_REPLENISH_FRAC = 0.5  # grant extras only while this fraction of the task
+                                    # wall is still unspent
+
+
+def replenish_continue(total_wall_s, elapsed_s, used_continues,
+                       cap: int = AUTO_CONTINUE_TOTAL_CAP,
+                       frac: float = AUTO_CONTINUE_REPLENISH_FRAC) -> bool:
+    """Grant an auto-continue relaunch beyond the base allowance? The fixed base of 2
+    is wall-blind: build-pov-ray (TB2.1 v1.0.0 run) burned 3 step-capped turns in 637s
+    and gave up with 94.7% of a 12000s budget unused (plan 107 F3). While more than
+    `frac` of the task wall remains unspent, keep granting fresh attempts, bounded by
+    `cap` total relaunches so a pathological fast-stall loop still terminates well
+    before the harness SIGKILL. No wall budget -> never (interactive runs keep the
+    explicit base allowance only). Pure/testable; the caller counts usage."""
+    if not total_wall_s:
+        return False
+    if used_continues >= cap:
+        return False
+    return (total_wall_s - elapsed_s) > frac * total_wall_s
+
+
 def hard_wrapup_deadline(wall_budget_s, already_fired, plan_mode, read_only) -> float | None:
     """Should the hard wrap-up abort ARM for this step? Returns the land_margin (seconds
     before the wall at which to cut the generation) when it should, else None. Lever-gated
@@ -1116,6 +1171,12 @@ TURN_THINK_BUDGET_LO = 8000    # floor: a *turn* budget, not a per-generation on
                                # must clear passes' own median spend (10.7k) comfortably
 TURN_THINK_BUDGET_HI = 24000   # ceiling: clamp regardless of wall/decode-speed inputs
 TURN_THINK_BUDGET_FRAC = 0.35  # the budget's TIME cost should stay <= ~35% of the wall
+TURN_THINK_MIN_WALL_S = 300.0  # below this wall budget the mechanism is inert: a short
+                               # auto-continue tail clamps to LO and half-fires on its
+                               # first step, churning against hard_wrapup's landing
+                               # (plan 107 F2 — the regex-log relaunch signature)
+TURN_THINK_REARM_TOK = 3000    # past exhaustion, one forced no-think step is owed per
+                               # this many FURTHER think tokens spent (plan 107 F1)
 
 
 def turn_think_budget(wall_budget_s, decode_tps, frac: float = TURN_THINK_BUDGET_FRAC,
@@ -1139,12 +1200,12 @@ TURN_THINK_BUDGET_STEER = (
 def turn_think_budget_check(turn_think_tokens: int, budget: int, half_fired: bool,
                             exhausted: bool):
     """Threshold latch for the cumulative per-turn reasoning budget: 'half' fires ONCE as
-    a soft steer at budget/2; 'exhausted' fires ONCE as the transition into a PERSISTENT
-    no-think state the caller holds for the rest of the turn (every subsequent step
-    decodes with thinking off — not one-shot, unlike 086's capped-stall escalation, which
-    restores thinking after a single forced action). Once exhausted, always returns
-    (None, half_fired, True) — nothing further to escalate. Returns
-    (decision, half_fired, exhausted). Pure/testable; the caller owns the state."""
+    a soft steer at budget/2; 'exhausted' fires ONCE as the transition into the throttled
+    state (see turn_think_throttle — the TB2.1 v1.0.0 run showed a blanket rest-of-turn
+    no-think mute degrades Ornith's tool-call syntax and capability over long tails,
+    plan 107). Once exhausted, always returns (None, half_fired, True) — nothing further
+    to escalate. Returns (decision, half_fired, exhausted). Pure/testable; the caller
+    owns the state."""
     if exhausted:
         return None, half_fired, True
     if turn_think_tokens >= budget:
@@ -1152,6 +1213,24 @@ def turn_think_budget_check(turn_think_tokens: int, budget: int, half_fired: boo
     if not half_fired and turn_think_tokens >= budget / 2:
         return "half", True, False
     return None, half_fired, False
+
+
+def turn_think_throttle(turn_think_tokens: int, budget: int, nothink_paid: int,
+                        rearm: int = TURN_THINK_REARM_TOK) -> bool:
+    """Should THIS step render with thinking off? A duty-cycle throttle for the
+    post-exhaustion state: crossing the budget owes one forced no-think action step,
+    and every further `rearm` think tokens spent owes one more. The caller counts the
+    no-think steps it has already paid (`nothink_paid`). Self-correcting by design —
+    a model that keeps burning reasoning is throttled toward always-off (the old
+    persistent-mute behavior), while one that stops over-thinking gets its thinking
+    back once the owed steps are paid. The v1.0.0 full run's evidence for restoring
+    rather than muting: break-filter-js spent 26 straight no-think steps after
+    exhaustion and regressed a run1 pass with garbled landing tool calls (plan 107 F1).
+    Pure/testable; never touches an in-flight generation (086 contract)."""
+    if turn_think_tokens < budget:
+        return False
+    owed = 1 + (turn_think_tokens - budget) // max(1, rearm)
+    return nothink_paid < owed
 
 
 # Injected as the review turn's task preamble. A fresh Agent on a
