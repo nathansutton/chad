@@ -100,10 +100,13 @@ Fidelity notes, each load-bearing:
   *different serving stacks*: score whichever you like, but label it and don't blend it
   into another arm's numbers. The in-flight reference run serves `Q6_K`.
 - **Sampling.** chad sends `temperature` per-request (the runner defaults it to **1.0**,
-  Ornith's reported TB2.1 recipe), plus `min_p`/`top_p` only when explicitly armed
-  (`chad_min_p`/`chad_top_p`; unset = not sent); it never sends top-k. Neutralize the
-  server flags (`--top-p 1.0 --top-k 0 --min-p 0`) so unarmed knobs stay neutral for
-  full recipe fidelity.
+  Ornith's reported TB2.1 recipe) plus `min_p`/`top_p` when armed (`chad_min_p`/
+  `chad_top_p`); it never sends top-k. `run_tb21_submit.sh` arms **`min_p 0.05`** by
+  default (`CHAD_TB2_MINP`): temp stays 1.0 but the sub-noise-floor quantization
+  tail — a source of the garbled-tool-call/foreign-dialect derailments the bf16
+  reference recipe never sampled — is cut. `CHAD_TB2_MINP=0` restores the bare
+  recipe. Neutralize the server flags (`--top-p 1.0 --top-k 0 --min-p 0`) so
+  per-request knobs are the only sampler configuration.
 - **`--host 0.0.0.0`** is what lets the task containers reach the server through Docker
   Desktop's `host.docker.internal` (or use the box's LAN/tailnet IP for a separate host).
 - **`--parallel 1` + one task at a time.** The runner drives tasks serially

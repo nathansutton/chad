@@ -169,6 +169,96 @@ def reverts_working_tree(command: str) -> bool:
     return bool(command) and any(p.search(command) for p in _REVERT_PATTERNS)
 
 
+# Command heads that only OBSERVE state. Used by the investigation gate: a bash step
+# whose every segment starts with one of these (and redirects nothing to a file) is
+# investigation; anything else — `git merge`, `apt-get install`, `mkdir`, `tar x`,
+# a redirect — is ACTION and must reset the read-only streak (otherwise the gate can
+# count an entire git/ops workflow as "investigation" and demand an edit at a decision
+# point where there is nothing to edit yet).
+_READONLY_HEADS = frozenset((
+    "ls", "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg",
+    "find", "file", "stat", "wc", "which", "type", "pwd", "echo", "printf", "du",
+    "df", "ps", "env", "printenv", "sort", "uniq", "cut", "tr", "diff", "cmp",
+    "md5sum", "sha1sum", "sha256sum", "strings", "xxd", "hexdump", "od",
+    "readlink", "realpath", "basename", "dirname", "test", "[", "true", "false",
+    "date", "whoami", "id", "uname", "hostname", "tree", "awk", "sed", "jq",
+    "column", "nl", "tac", "sleep",
+))
+_READONLY_GIT_SUBS = frozenset((
+    "log", "status", "diff", "show", "describe", "rev-parse", "ls-files",
+    "ls-remote", "ls-tree", "blame", "reflog", "shortlog", "grep", "cat-file",
+    "rev-list", "name-rev", "var", "count-objects",
+))
+# Harmless stderr plumbing stripped before the "any redirect ⇒ mutating" check.
+_STDERR_REDIR_RE = re.compile(r"2>\s*&1|2>\s*/dev/null|&>\s*/dev/null|>\s*/dev/null")
+_SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[;|]")
+
+
+def is_readonly_bash(command: str) -> bool:
+    """Conservatively true when a bash command only OBSERVES state: every pipeline
+    segment's head is in the read-only allowlist (`cd`/`env`-style prefixes skipped;
+    `git <readonly-sub>` allowed; `sed -i` excluded) and nothing is redirected to a
+    file. Anything unrecognized is NOT read-only — for the investigation gate that
+    is the safe direction (an ops step wrongly counted as investigation harasses the
+    model; a read wrongly counted as action merely delays the gate)."""
+    if not command.strip():
+        return True
+    cleaned = _STDERR_REDIR_RE.sub("", command)
+    if ">" in cleaned or "<(" in cleaned:
+        return False
+    for seg in _SEGMENT_SPLIT_RE.split(cleaned):
+        words = seg.strip().split()
+        # skip wrappers/prefixes that don't decide the verb
+        while words and (words[0] == "cd" or "=" in words[0] or words[0] in
+                         ("env", "sudo", "command", "builtin", "time", "nice")):
+            if words[0] == "cd":  # `cd x && grep …`: drop `cd` + its argument
+                words = words[2:]
+            else:
+                words = words[1:]
+        if not words:
+            continue
+        head = words[0]
+        if head == "git":
+            if len(words) < 2 or words[1] not in _READONLY_GIT_SUBS:
+                return False
+        elif head not in _READONLY_HEADS:
+            return False
+        elif head == "sed" and any(w.startswith("-i") or w.startswith("--in-place")
+                                   for w in words[1:]):
+            return False
+    return True
+
+
+def audit_absent_paths(task_text, paths=None):
+    """The task-mentioned paths that do not currently exist — recorded at the first
+    done-audit bounce so `audit_rebounce` can later check exactly these (and nothing
+    else) at accept time."""
+    if paths is None:
+        paths = audit_extract_paths(task_text)
+    return [p for p in paths if not os.path.exists(p)]
+
+
+def audit_rebounce(absent_paths, runway_s):
+    """The one final done-audit bounce (levers.audit_absent_rebounce), or None to
+    accept. Fires only when a path the FIRST audit already reported absent is STILL
+    absent and there is real runway left — the miss it closes is a task-named
+    deliverable the audit stat'ed as absent, where the acceptance promise forced the
+    done through and the file was never written. Caller owns the 2-bounce cap and the
+    still-once-per-turn latch semantics."""
+    if not levers.enabled("audit_absent_rebounce") or not absent_paths:
+        return None
+    if runway_s is not None and runway_s <= AUDIT_MIN_RUNWAY_S:
+        return None
+    still = [p for p in absent_paths if not os.path.exists(p)]
+    if not still:
+        return None
+    return ("[final audit — the task statement names path(s) that still do not "
+            "exist:\n" + "\n".join(f"  - {p}" for p in still) +
+            "\nIf the task requires them, create them at exactly these paths now "
+            "(then re-verify). If the task genuinely wants them absent, call done "
+            "again. Your next `done` will be accepted unconditionally.]")
+
+
 def update_work_flags(name, args, result, did_work, made_edit, unverified_edit):
     """Update the (did_work, made_edit, unverified_edit) guardrail flags after one
     tool result; returns the new triple. A substantive tool counts as real work; a
@@ -416,8 +506,17 @@ def done_audit(task_text, turn_state):
     req_lines = audit_requirement_lines(task_text, paths)
     if not req_lines:
         return None
-    parts = ["[done-audit — one-time check before this `done` is accepted; your NEXT "
-             "`done` will be accepted without further audit. The hidden grader checks "
+    # The acceptance promise must stay truthful: with the absent-path re-bounce
+    # armed (levers.audit_absent_rebounce) one further existence-only check may run,
+    # so say so; otherwise keep the original unconditional promise (the anti-spiral
+    # latch depends on the model believing it).
+    if levers.enabled("audit_absent_rebounce"):
+        promise = ("your NEXT `done` will be accepted after at most one further "
+                   "check that the paths below exist.")
+    else:
+        promise = "your NEXT `done` will be accepted without further audit."
+    parts = ["[done-audit — one-time check before this `done` is accepted; " + promise
+             + " The hidden grader checks "
              "the task's OWN requirements, not the checks you happened to run. From the "
              "task statement:"]
     parts += [f"  > {ln}" for ln in req_lines]
@@ -431,48 +530,83 @@ def done_audit(task_text, turn_state):
     return "\n".join(parts)
 
 
+GARBLE_NUDGE_CAP = 6  # per-turn garble re-nudges (own counter, separate from truncation)
+
+# Placeholder that replaces a garbled assistant message body once the NEXT step
+# garbles too — the wrong dialect must not stay in context as a few-shot example
+# (repeated garbles in a row each condition on the last). Costs one prefix-cache
+# invalidation on a rare path.
+GARBLE_SCRUBBED = "[a malformed tool call was removed here — it did not run]"
+
+# Appended to the garble nudge from the 2nd consecutive garbled step: the model is
+# clearly stuck in a wrong dialect, so show the contract instead of describing it.
+TOOLCALL_EXEMPLAR = (
+    "\nThis is the ONLY valid format — copy its shape exactly:\n"
+    "<tool_call>\n"
+    '{"name": "bash", "arguments": {"command": "ls /app"}}\n'
+    "</tool_call>\n"
+    "No <function=...>, no <parameter=...> tags, nothing else inside the block.")
+
+
 def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_intent,
                        action_task, truncation_nudges, answer_nudges, verify_nudges,
-                       open_tool_call, garbled_call=False):
+                       open_tool_call, garbled_call=False, garble_nudges=0,
+                       consecutive_garbles=0):
     """Pick the nudge for a step that produced NO tool call, in the original priority
-    order: (1) TRUNCATED — hit the token cap mid-thought, so it isn't an answer;
-    (2) ANSWERED ON PAPER — produced/described code but never applied it; (3) UNVERIFIED
-    EDIT — edited but never ran the check. Pure: returns (kind, nudge_text) or
-    (None, None); the caller bumps the matching counter and appends the nudge. `kind`
-    is one of 'truncated' / 'no-edit' / 'unverified-edit'. (open_tool_call is run_turn's
-    _has_open_tool_call(text): an unbalanced <tool_call>/<function> that parsed to nothing.)"""
+    order: (1) GARBLE/TRUNCATED — a tool-call attempt that parsed to nothing, or the
+    token cap hit mid-thought, so it isn't an answer; (2) ANSWERED ON PAPER —
+    produced/described code but never applied it; (3) UNVERIFIED EDIT — edited but
+    never ran the check. Pure: returns (kind, nudge_text) or (None, None); the caller
+    bumps the matching counter and appends the nudge. `kind` is one of 'garble' /
+    'truncated' / 'no-edit' / 'unverified-edit'. (open_tool_call is run_turn's
+    _has_open_tool_call(text): an unbalanced <tool_call>/<function> that parsed to
+    nothing.)"""
     has_code = "```" in text
-    # An UNBALANCED tool-call attempt that parsed to zero calls is never a final answer,
-    # whether or not the token cap was hit. Two causes: (a) hit_cap — a `write` whose
-    # content overran the budget (guide it to write in bounded pieces); (b) NOT hit_cap —
-    # the model stopped mid-call for another reason (sampling glitch / premature EOS, e.g.
-    # TB2 vulnerable-secret died at 45s of 900 on a 28-token `{"name":"bash>` garble that
-    # the old code accepted as the final answer). Bounded by truncation_nudges. This fires
-    # before the bare-stall branch so a garbled call isn't misread as an empty stall.
-    if (open_tool_call or garbled_call) and truncation_nudges < 2:
-        if open_tool_call and hit_cap:
+    # A tool-call attempt that parsed to zero calls is never a final answer, whether
+    # or not the token cap was hit. Causes: (a) hit_cap — a `write` whose content
+    # overran the budget (guide it to write in bounded pieces); (b) an unclosed or
+    # closed-but-unparseable block — sampling glitch, premature EOS, or a slide into
+    # a foreign XML tool-call dialect. With the garble_never_final lever these use
+    # their OWN counter (garble_nudges, cap 6) — a shared `truncation_nudges < 2` lets
+    # an unrelated step-0 cap-hit spend the garble budget, after which a run of garbles
+    # can be ACCEPTED as the final answer with most of the wall budget still left. This
+    # fires before the bare-stall branch so a garbled call isn't misread as an empty
+    # stall.
+    if open_tool_call and hit_cap:
+        # A call cut off AT the token cap is a length problem (a too-long `write`),
+        # not a dialect garble — it stays in the truncation family/counter.
+        if truncation_nudges < 2:
             nudge = ("[your tool call was cut off at the length limit — the "
                      "content was too long to emit in one call. Do NOT retry it "
                      "whole. Create the file with `write` using only the FIRST "
                      "portion of the content, then append the rest with one or "
                      "more `edit` calls. Emit one complete tool call at a time.]")
-        elif open_tool_call:
-            nudge = ("[your last tool call was malformed and did not run — it opened a "
-                     "<tool_call> (or <function=…>) that was never properly closed, so no "
-                     "tool executed and nothing happened. Re-emit it now as ONE complete, "
-                     "well-formed <tool_call> block with valid JSON arguments.]")
-        else:
-            # garbled_call: the block WAS closed but nothing inside parsed — mixed
-            # JSON/XML dialects, invalid JSON the repair pass couldn't reconstruct,
-            # etc. Without this branch the garble is accepted as a final answer
-            # (TB2 count-dataset-tokens, 2026-07-12: `{"name": "bash", …
-            # </parameter></function></tool_call>` ended the task with budget left).
-            nudge = ("[your last tool call was malformed and did not run — the "
-                     "<tool_call> block did not contain one valid JSON object, so no "
-                     "tool executed and nothing happened. Re-emit it now as ONE "
-                     "complete <tool_call> block: a single JSON object with \"name\" "
-                     "and \"arguments\", no XML tags inside.]")
-        return "truncated", nudge
+            return "truncated", nudge
+    elif open_tool_call or garbled_call:
+        if levers.enabled("garble_never_final"):
+            allowed, kind = garble_nudges < GARBLE_NUDGE_CAP, "garble"
+        else:  # legacy (ablation arm): shared counter, kind counted as truncation
+            allowed, kind = truncation_nudges < 2, "truncated"
+        if allowed:
+            if open_tool_call:
+                nudge = ("[your last tool call was malformed and did not run — it opened a "
+                         "<tool_call> (or <function=…>) that was never properly closed, so no "
+                         "tool executed and nothing happened. Re-emit it now as ONE complete, "
+                         "well-formed <tool_call> block with valid JSON arguments.]")
+            else:
+                # garbled_call: the block WAS closed but nothing inside parsed — mixed
+                # JSON/XML dialects, invalid JSON the repair pass couldn't reconstruct,
+                # etc. Without this branch the garble is accepted as a final answer —
+                # e.g. a `{"name": "bash", … </parameter></function></tool_call>` mash
+                # that ends the task with budget still left.
+                nudge = ("[your last tool call was malformed and did not run — the "
+                         "<tool_call> block did not contain one valid JSON object, so no "
+                         "tool executed and nothing happened. Re-emit it now as ONE "
+                         "complete <tool_call> block: a single JSON object with \"name\" "
+                         "and \"arguments\", no XML tags inside.]")
+            if kind == "garble" and consecutive_garbles >= 2:
+                nudge = nudge[:-1] + TOOLCALL_EXEMPLAR + "]"
+            return kind, nudge
     if hit_cap and truncation_nudges < 2:
         # Cap hit but the call (if any) was balanced — a plain mid-thought truncation.
         nudge = ("[your reply was cut off at the length limit before you "
