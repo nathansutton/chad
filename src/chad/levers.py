@@ -277,6 +277,38 @@ LEVERS: dict[str, Lever] = {
         "Only active with a wall budget configured; inert in interactive/unmetered runs.",
         "iter12"),
 
+    # --- iter-13: lever *interactions*. Two otherwise-winnable tasks were lost not
+    #     to the model but to guardrails fighting each other — a garbled tool
+    #     call accepted as the final answer once the shared nudge counter and the
+    #     done-audit latch were both spent, and the investigation gate counting a
+    #     `git merge`/`apt-get` ops workflow as "investigation" and demanding an edit
+    #     at a point where there was nothing yet to edit. --------------------------
+    "garble_never_final": Lever(
+        "A step whose text contains tool-call markers is NEVER accepted as a final "
+        "answer and never reaches the done-audit final-answer twin: garbles get their "
+        "own nudge counter (cap 6, not shared with cap-truncations), a canonical "
+        "call exemplar from the 2nd consecutive garble, a scrub of the previous "
+        "garbled message body (so the model stops few-shotting its own broken "
+        "dialect), and — if nudges run out — a banked-note hard stop. OFF restores "
+        "the shared-counter failure: a run of garbles burns the shared counter + "
+        "audit latch and the last is accepted as the answer with most of the wall "
+        "budget still left.",
+        "iter13", REGRESSION_GUARD),
+    "audit_absent_rebounce": Lever(
+        "When the done-audit's first bounce stat'ed task-mentioned paths as ABSENT "
+        "and they are STILL absent at the accepting done/final-answer (runway > "
+        "120s), bounce one final time naming only the missing paths; the next done "
+        "is then accepted unconditionally (hard cap 2 bounces/turn). The first "
+        "audit's acceptance promise is reworded to stay truthful while this is on.",
+        "iter13"),
+    "gate_ops_exempt": Lever(
+        "A bash step whose command is not provably read-only counts as ACTION for "
+        "the investigation gate (resets the read-only streak): `git merge`, "
+        "`apt-get install`, redirects etc. are ops progress, not investigation. "
+        "The gate keeps firing on genuine grep/read loops. OFF restores the gate "
+        "harassing ops-heavy tasks that legitimately run many non-read commands.",
+        "iter13"),
+
     # --- from the LangChain harness-tuning playbook. -------------------------------
     "compact_notice": Lever(
         "After compaction, inject an in-band message telling the model its context was "

@@ -21,9 +21,11 @@ Run: `uv run python test_agent_guards.py`
 """
 
 from chad.guardrails import (
+    GARBLE_NUDGE_CAP,
     GOV_HARD_FRAC,
     GOV_SOFT_FRAC,
     STEP_CAP_CEILING,
+    TOOLCALL_EXEMPLAR,
     WRAPUP_FRAC,
     WRAPUP_MIN_S,
     advance_governor,
@@ -39,6 +41,7 @@ from chad.guardrails import (
     extend_step_cap,
     investigation_gate,
     is_destructive_bash,
+    is_readonly_bash,
     is_repeat_loop,
     land_margin,
     landing_max_tokens,
@@ -268,17 +271,21 @@ def test_nudge_for_no_calls():
     check("genuine final answer -> no nudge", kind6 is None and nudge6 is None)
 
     # A CLOSED but unparseable tool-call block (garbled_call) -> malformed nudge,
-    # never a final answer (TB2 count-dataset-tokens prose-quit class, 2026-07-12).
+    # never a final answer (the prose-quit class). Garbles carry their OWN kind +
+    # counter (see test_garble_invariant_nudges for the full behavior).
     kind6g, nudge6g = nudge_for_no_calls(
         '<tool_call>{"name": "bash", …</parameter></function></tool_call>',
         hit_cap=False, garbled_call=True, **base)
-    check("garbled closed block -> truncated kind", kind6g == "truncated")
+    check("garbled closed block -> garble kind", kind6g == "garble")
     check("garbled nudge text", "did not contain one valid JSON" in nudge6g)
-    # …and it is bounded by the same truncation counter as the open-call variant.
+    # …and it is bounded by its own counter, NOT the truncation counter.
     b6h = dict(base); b6h["truncation_nudges"] = 2
     kind6h, _ = nudge_for_no_calls("<tool_call>garbage</tool_call>", hit_cap=False,
                                    garbled_call=True, **b6h)
-    check("garbled nudge capped", kind6h != "truncated")
+    check("garble nudge survives spent truncation counter", kind6h == "garble")
+    kind6i, _ = nudge_for_no_calls("<tool_call>garbage</tool_call>", hit_cap=False,
+                                   garbled_call=True, garble_nudges=6, **base)
+    check("garble nudge capped by its own counter", kind6i != "garble")
 
     # Counter caps: truncation already nudged twice -> falls through to next branch.
     b7 = dict(base); b7["truncation_nudges"] = 2; b7["action_task"] = True
@@ -312,6 +319,74 @@ def test_nudge_for_no_calls():
     kind12, nudge12 = nudge_for_no_calls("The bug is a missing None check; let me know "
                                          "if you want the patch.", hit_cap=False, **base)
     check("'let me know' answer is not a bail", kind12 is None and nudge12 is None)
+
+
+def test_garble_invariant_nudges():
+    """Garbled tool calls get their own nudge budget (a step-0 cap-hit must not spend
+    it), an exemplar once the model is stuck in a wrong dialect, and — with the lever
+    off — exactly the legacy shared-counter behavior (the ablation arm that reproduces
+    the shared-counter garble-accept failure)."""
+    import os
+    base = dict(made_edit=True, unverified_edit=False, read_only_intent=False,
+                action_task=True, truncation_nudges=2, answer_nudges=0,
+                verify_nudges=0, open_tool_call=False)
+    garble = '<tool_call>\n<function=write"\n</parameter>\n</tool_call>'
+
+    # Own counter: nudges keep coming with the truncation budget fully spent…
+    for n in range(GARBLE_NUDGE_CAP):
+        kind, nudge = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
+                                         garble_nudges=n, **base)
+        check(f"garble nudge #{n + 1} available", kind == "garble" and nudge)
+    # …and stop at the cap.
+    kind, _ = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
+                                 garble_nudges=GARBLE_NUDGE_CAP, **base)
+    check("garble nudges stop at cap", kind is None)
+
+    # From the 2nd consecutive garble the nudge embeds the canonical exemplar.
+    _, n1 = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
+                               garble_nudges=0, consecutive_garbles=1, **base)
+    check("first garble: no exemplar", TOOLCALL_EXEMPLAR not in n1)
+    _, n2 = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
+                               garble_nudges=1, consecutive_garbles=2, **base)
+    check("second consecutive garble: exemplar shown", TOOLCALL_EXEMPLAR in n2)
+    check("exemplar shows the JSON contract", '"arguments"' in n2)
+
+    # Legacy arm (lever off): shared counter, kind counted as truncation — the OFF
+    # state must reproduce the legacy behavior exactly for the ablation to price it.
+    os.environ["CHAD_DISABLE"] = "garble_never_final"
+    try:
+        kind, _ = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
+                                     garble_nudges=0, **base)
+        check("lever off: spent truncation counter kills the garble nudge",
+              kind is None)
+        b = dict(base); b["truncation_nudges"] = 0
+        kind2, _ = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
+                                      garble_nudges=99, **b)
+        check("lever off: garble nudge rides the truncation counter",
+              kind2 == "truncated")
+    finally:
+        del os.environ["CHAD_DISABLE"]
+
+
+def test_is_readonly_bash():
+    ro = ["ls -la /app", "grep -rn foo src | head -20", "cat a.py; wc -l a.py",
+          "git log --oneline -5 && git diff HEAD~1", "find . -name '*.py' 2>/dev/null",
+          "cd /app && grep foo bar.py", "sed -n '1,20p' file.py",
+          "git status", "echo hi 2>&1", "stat /app/out.npy || ls /app"]
+    for c in ro:
+        check(f"read-only: {c}", is_readonly_bash(c))
+    action = ["git merge branch2 --no-edit", "apt-get install -y git",
+              "mkdir -p /app/repo && cd /app/repo && git init",
+              "python3 find_dist.py", "make test", "pip install numpy",
+              "echo x > /app/out.txt", "sed -i 's/a/b/' f.py",
+              "git fetch /app/b.bundle HEAD:branch1", "tar xf a.tar",
+              "cp a b", "rm -f x", "./run.sh", "curl -o f http://x",
+              "git checkout branch1"]
+    for c in action:
+        check(f"action: {c}", not is_readonly_bash(c))
+    # Unknown commands are conservatively ACTION (never harass ops with the gate).
+    check("unknown head is action", not is_readonly_bash("frobnicate --all"))
+    check("empty command is read-only", is_readonly_bash(""))
 
 
 def test_landing_nudge():
@@ -1066,6 +1141,8 @@ if __name__ == "__main__":
     test_loop_guard()
     test_loop_guard_resets_on_landed_edit()
     test_nudge_for_no_calls()
+    test_garble_invariant_nudges()
+    test_is_readonly_bash()
     test_landing_nudge()
     test_extend_step_cap()
     test_thrash_guard()

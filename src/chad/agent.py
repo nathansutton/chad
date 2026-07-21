@@ -786,6 +786,13 @@ class Agent:
         gate_nudges = 0       # times the investigation->edit gate fired this turn
         subagent_sigs = set() # (description, prompt) of sub-agents already spawned this turn
         truncation_nudges = 0  # times we pushed past a token-cap truncation this turn
+        garble_nudges = 0  # malformed-tool-call re-nudges (own counter, so a step-0
+                           # cap-hit can't spend the garble recovery budget)
+        consecutive_garbles = 0  # back-to-back garbled steps (drives exemplar + scrub)
+        last_garble_idx = None   # self.messages index of the previous garbled assistant
+                                 # message (scrubbed if the next step garbles too)
+        done_audit_bounces = 0   # total audit bounces this turn (hard cap 2)
+        audit_absent_list = []   # task-named paths the FIRST audit stat'ed as absent
         landing_nudges = 0  # one-shot "you're out of steps, land the edit" near the cap
         consecutive_failed_bash = 0  # back-to-back errored bash with no edit (thrash)
         thrash_nudges = 0
@@ -1400,12 +1407,33 @@ class Agent:
                 _stripped_for_markers = strip_think(text)
                 garbled = ("<tool_call>" in _stripped_for_markers
                            or "</function>" in _stripped_for_markers
-                           or "<function=" in _stripped_for_markers)
+                           or "<function=" in _stripped_for_markers
+                           or _has_open_tool_call(text))
+                if garbled:
+                    consecutive_garbles += 1
+                    # From the 2nd consecutive garble, scrub the PREVIOUS garbled
+                    # assistant body: the wrong dialect must not stay in context as a
+                    # few-shot example (repeated garbles in a row each condition on the
+                    # last). Costs one prefix-cache invalidation on this rare path.
+                    if (levers.enabled("garble_never_final")
+                            and consecutive_garbles >= 2 and last_garble_idx is not None):
+                        self.messages[last_garble_idx]["content"] = \
+                            guardrails.GARBLE_SCRUBBED
+                        log.info("GARBLE scrub at step %d: previous garbled message "
+                                 "body removed from context (consecutive=%d)",
+                                 step, consecutive_garbles)
+                    last_garble_idx = len(self.messages) - 1
+                else:
+                    consecutive_garbles = 0
                 kind, nudge = guardrails.nudge_for_no_calls(
                     text, hit_cap, made_edit, unverified_edit, read_only_intent,
                     action_task or run_task, truncation_nudges, answer_nudges,
-                    verify_nudges, _has_open_tool_call(text), garbled_call=garbled)
-                if kind == "truncated":
+                    verify_nudges, _has_open_tool_call(text), garbled_call=garbled,
+                    garble_nudges=garble_nudges,
+                    consecutive_garbles=consecutive_garbles)
+                if kind == "garble":
+                    garble_nudges += 1
+                elif kind == "truncated":
                     truncation_nudges += 1
                 elif kind == "no-edit":
                     answer_nudges += 1
@@ -1417,6 +1445,21 @@ class Agent:
                              has_code, action_task, run_task)
                     self.messages.append({"role": "tool", "name": "edit", "content": nudge})
                     continue
+                # Invariant: a step whose text contains tool-call markers is NEVER a
+                # final answer — the model was trying to act, not to finish. With the
+                # nudge budget spent, hard-stop with a banked note instead of accepting
+                # the garble (otherwise a run of garbles can burn the shared counter and
+                # the audit latch, and the last one ships as the answer with most of the
+                # wall budget still unspent).
+                if garbled and levers.enabled("garble_never_final"):
+                    self.budget_note = guardrails.progress_note(self.messages)
+                    log.info("END step %d: GARBLE hard-stop (%d garble nudges spent) — "
+                             "a garbled tool call is never a final answer",
+                             step, garble_nudges)
+                    self._emit("info", "  [turn stopped: repeated malformed tool calls "
+                                       "— progress note banked; say 'continue' to retry]")
+                    return ("[stopped: the model kept emitting malformed tool calls "
+                            "— say 'continue' to resume]")
                 # Iter-3 did-nothing gate: in auto/headless mode (every benchmark run), a
                 # turn that ends having executed ZERO real tools is never a legitimate
                 # completion — the keyword intent classifier misses tasks like "extract the
@@ -1465,6 +1508,8 @@ class Agent:
                     })
                     if audit:
                         done_audit_fired = True
+                        done_audit_bounces += 1
+                        audit_absent_list = guardrails.audit_absent_paths(audit_task)
                         _runway = ((self._turn_budget_s
                                     - (time.monotonic() - turn_start))
                                    if self._turn_budget_s else float("inf"))
@@ -1473,6 +1518,26 @@ class Agent:
                                  guardrails.audit_extract_paths(audit_task), _runway)
                         self.messages.append({"role": "tool", "name": "edit",
                                               "content": audit})
+                        continue
+                # Absent-path re-bounce: the first audit stat'ed task-named paths as
+                # ABSENT and promised acceptance anyway; if they are STILL absent with
+                # runway to spare, bounce one final time (cap 2/turn) — otherwise a
+                # task-named deliverable the audit already flagged absent can go
+                # unwritten and the accept still goes through.
+                if self.mode != "plan" and not self._subagent \
+                        and done_audit_fired and done_audit_bounces < 2 \
+                        and audit_absent_list:
+                    _runway = ((self._turn_budget_s
+                                - (time.monotonic() - turn_start))
+                               if self._turn_budget_s else None)
+                    rebounce = guardrails.audit_rebounce(audit_absent_list, _runway)
+                    if rebounce:
+                        done_audit_bounces += 1
+                        audit_absent_list = []
+                        log.info("DONE-AUDIT rebounce (final-answer): still-absent "
+                                 "task paths, runway=%s", _runway)
+                        self.messages.append({"role": "tool", "name": "edit",
+                                              "content": rebounce})
                         continue
                 log.info("END step %d: model produced a FINAL ANSWER, no tool calls "
                          "(did_work=%s, made_edit=%s, unverified_edit=%s)",
@@ -1483,6 +1548,8 @@ class Agent:
             # The step acted — the spiral broke on its own, so clear the no-think escalation
             # streak: escalation is only for consecutive capped/salvaged stalls.
             capped_stall_streak = 0
+            consecutive_garbles = 0  # a parsed call ends the garble streak
+            last_garble_idx = None
 
             # Terminal tool -> end the turn cleanly, but enforce verify-before-done
             # (forge's prerequisite idea): if files were changed and nothing has been
@@ -1574,6 +1641,8 @@ class Agent:
                         })
                         if audit:
                             done_audit_fired = True
+                            done_audit_bounces += 1
+                            audit_absent_list = guardrails.audit_absent_paths(audit_task)
                             _runway = ((self._turn_budget_s
                                         - (time.monotonic() - turn_start))
                                        if self._turn_budget_s else float("inf"))
@@ -1581,6 +1650,22 @@ class Agent:
                                      guardrails.audit_extract_paths(audit_task), _runway)
                             self.messages.append({"role": "tool", "name": "done",
                                                   "content": audit})
+                            continue
+                    # Absent-path re-bounce (see the final-answer twin above): a
+                    # still-absent task-named path at accept time gets ONE more bounce,
+                    # then the next done is accepted unconditionally.
+                    if done_audit_fired and done_audit_bounces < 2 and audit_absent_list:
+                        _runway = ((self._turn_budget_s
+                                    - (time.monotonic() - turn_start))
+                                   if self._turn_budget_s else None)
+                        rebounce = guardrails.audit_rebounce(audit_absent_list, _runway)
+                        if rebounce:
+                            done_audit_bounces += 1
+                            audit_absent_list = []
+                            log.info("DONE-AUDIT rebounce: still-absent task paths, "
+                                     "runway=%s", _runway)
+                            self.messages.append({"role": "tool", "name": "done",
+                                                  "content": rebounce})
                             continue
                 # Iter-3 deliverable recheck (levers.done_spec_recheck): one last self-check
                 # that the required outputs actually exist at the right path/format before
@@ -1854,7 +1939,18 @@ class Agent:
             if made_edit and not _gov_prev_made:
                 readonly_streak = 0
             elif did_work and not made_edit:
-                readonly_streak += 1
+                # A bash step that isn't provably read-only is ACTION, not
+                # investigation — `git merge`, `apt-get install`, redirects are ops
+                # progress. Otherwise the gate can count an entire git/ops workflow as
+                # "investigation" and demand an edit at a decision point where there is
+                # nothing to edit yet.
+                if levers.enabled("gate_ops_exempt") and any(
+                        n == "bash"
+                        and not guardrails.is_readonly_bash(str(a.get("command", "")))
+                        for n, a in calls):
+                    readonly_streak = 0
+                else:
+                    readonly_streak += 1
             if not read_only_intent:
                 gate = guardrails.investigation_gate(readonly_streak, made_edit, gate_nudges)
                 if gate:

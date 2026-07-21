@@ -2,6 +2,28 @@
 
 Notable, user-visible changes.
 
+## [1.0.3] — 2026-07-21
+
+Guardrail-interaction fixes: three cases where the model was doing fine but
+overlapping guardrails ended the turn early or accepted a non-answer.
+
+- **A malformed tool call is never accepted as a final answer.** When the model
+  slips into a wrong tool-call dialect, garbles now get their own re-nudge budget
+  (separate from the token-cap-truncation counter), a canonical call exemplar once
+  it's stuck, a scrub of the previous garbled message so the model stops
+  few-shotting its own broken dialect, and — if the budget runs out — a clean
+  hard stop with a banked progress note instead of shipping the garble as the
+  answer. On by default; reversible via `CHAD_DISABLE`.
+- **Done-audit re-bounce for still-missing deliverables.** If the audit flags a
+  task-named output path as absent and it's *still* absent when the model tries to
+  finish (with real time left on the budget), chad bounces once more naming only
+  the missing path, then accepts unconditionally. Stops a required file from going
+  unwritten while the turn ends "successfully."
+- **Investigation gate exempts ops commands.** A bash step that isn't provably
+  read-only (`git merge`, `apt-get install`, redirects, `make`, …) now counts as
+  action, not investigation, so the "you've only been looking, make an edit" gate
+  no longer fires in the middle of a legitimate ops workflow.
+
 ## [1.0.2] — 2026-07-20
 
 Reliability tuning for long, budgeted tasks, plus one interactive papercut fix.

@@ -406,3 +406,100 @@ def test_subagent_done_is_never_audited(tmp_path):
     assert not any("done-audit" in m.get("content", "") for m in agent.messages)
     assert any("every concrete deliverable" in m.get("content", "")
                for m in agent.messages)
+
+
+# --- absent-path re-bounce -----------------------------------------------------------
+
+
+def test_audit_rebounce_unit(tmp_path, monkeypatch):
+    """audit_rebounce fires only for a still-absent path with runway to spare, and its
+    lever gates it entirely."""
+    gone = str(tmp_path / "missing.npy")
+    there = tmp_path / "made.npy"
+    there.write_text("x")
+    # Still absent + unlimited runway -> the final-audit steer, naming the path.
+    msg = guardrails.audit_rebounce([gone], None)
+    assert msg and "final audit" in msg and gone in msg
+    # Recovered path -> accept.
+    assert guardrails.audit_rebounce([str(there)], None) is None
+    # Runway too small -> accept (an audit that pushes into the wall converts a
+    # wrong-done into a wall-death).
+    assert guardrails.audit_rebounce([gone], 100.0) is None
+    assert guardrails.audit_rebounce([gone], 500.0) is not None
+    # Nothing recorded absent -> accept.
+    assert guardrails.audit_rebounce([], None) is None
+    # Lever off -> accept.
+    monkeypatch.setenv("CHAD_DISABLE", "audit_absent_rebounce")
+    assert guardrails.audit_rebounce([gone], None) is None
+
+
+def test_audit_rebounces_done_when_task_path_still_absent(tmp_path):
+    """The absent-deliverable failure: the first audit stat'ed the task's deliverable
+    as ABSENT, promised acceptance anyway, and the file was never written. Now: one
+    final bounce naming the missing path, then unconditional acceptance."""
+    f = tmp_path / "out.py"   # named by the task, never written by the model
+    g = tmp_path / "helper.py"
+    script = [
+        _tool_call("write", path=str(g), content="print(1)\n"),  # edit lands, wrong file
+        _tool_call("bash", command=f"python {g}"),                # verified
+        _tool_call("done", summary="first done"),    # audit bounce (path absent)
+        _tool_call("done", summary="second done"),   # RE-bounce (still absent)
+        _tool_call("done", summary="gave up"),       # accepted (cap 2 honored)
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn(f"write a script at {f} that prints hi")
+
+    assert result == "gave up"
+    assert agent.engine._i == len(script)
+    tool_notes = [m["content"] for m in agent.messages if m.get("role") == "tool"]
+    assert sum("done-audit" in c for c in tool_notes) == 1
+    rebounces = [c for c in tool_notes if "final audit" in c]
+    assert len(rebounces) == 1 and str(f) in rebounces[0]
+    # The first audit's promise stays truthful about the extra check.
+    first = next(c for c in tool_notes if "done-audit" in c)
+    assert "at most one further check" in first
+
+
+def test_audit_no_rebounce_once_the_path_is_created(tmp_path):
+    """A model that actually fixes the missing deliverable after the first bounce is
+    accepted on its next done — no second interruption."""
+    f = tmp_path / "out.py"
+    g = tmp_path / "helper.py"
+    script = [
+        _tool_call("write", path=str(g), content="print(1)\n"),
+        _tool_call("bash", command=f"python {g}"),
+        _tool_call("done", summary="first done"),            # audit bounce (absent)
+        _tool_call("write", path=str(f), content="print('hi')\n"),
+        _tool_call("bash", command=f"python {f}"),           # verify the fix
+        _tool_call("done", summary="fixed and done"),        # accepted, no rebounce
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn(f"write a script at {f} that prints hi")
+
+    assert result == "fixed and done"
+    tool_notes = [m["content"] for m in agent.messages if m.get("role") == "tool"]
+    assert not any("final audit" in c for c in tool_notes)
+
+
+def test_audit_rebounce_lever_off_keeps_the_unconditional_promise(tmp_path, monkeypatch):
+    """OFF arm: legacy wording and exactly one bounce, absent path or not."""
+    monkeypatch.setenv("CHAD_DISABLE", "audit_absent_rebounce")
+    f = tmp_path / "out.py"
+    g = tmp_path / "helper.py"
+    script = [
+        _tool_call("write", path=str(g), content="print(1)\n"),
+        _tool_call("bash", command=f"python {g}"),
+        _tool_call("done", summary="first done"),    # audit bounce
+        _tool_call("done", summary="second done"),   # accepted despite absent path
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn(f"write a script at {f} that prints hi")
+
+    assert result == "second done"
+    tool_notes = [m["content"] for m in agent.messages if m.get("role") == "tool"]
+    first = next(c for c in tool_notes if "done-audit" in c)
+    assert "without further audit" in first
+    assert not any("final audit" in c for c in tool_notes)

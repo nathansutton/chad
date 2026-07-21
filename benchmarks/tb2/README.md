@@ -1,8 +1,8 @@
-# Reproducing chad's Terminal-Bench 2.0 run
+# Reproducing chad's Terminal-Bench 2.1 run
 
-*Sonnet on your laptop — and you don't have to take our word for it.*
+*Frontier scores at laptop cost — and you don't have to take our word for it.*
 
-This directory is the complete, public kit behind the Terminal-Bench 2.0 chart in the
+This directory is the complete, public kit behind the Terminal-Bench 2.1 chart in the
 [top-level README](../../README.md): the exact Harbor agent adapter that produced the
 runs, the runner script, and the trajectory validator. Nothing here is a cleaned-up
 reenactment — `harbor_chad_tb2.py` is the artifact, published.
@@ -14,7 +14,7 @@ reenactment — `harbor_chad_tb2.py` is the artifact, published.
 
 ## What gets measured
 
-[Terminal-Bench 2.0](https://www.tbench.ai/leaderboard) is the standard benchmark for
+[Terminal-Bench 2.1](https://www.tbench.ai/leaderboard) is the standard benchmark for
 CLI coding agents: 89 tasks of real terminal work (build a Cython extension, recover a
 WAL'd SQLite database, configure a git webserver, boot a QEMU VM…), each run in its own
 Docker container and verified by the *container's end state*, with a hard per-task time
@@ -100,10 +100,13 @@ Fidelity notes, each load-bearing:
   *different serving stacks*: score whichever you like, but label it and don't blend it
   into another arm's numbers. The in-flight reference run serves `Q6_K`.
 - **Sampling.** chad sends `temperature` per-request (the runner defaults it to **1.0**,
-  Ornith's reported TB2.1 recipe), plus `min_p`/`top_p` only when explicitly armed
-  (`chad_min_p`/`chad_top_p`; unset = not sent); it never sends top-k. Neutralize the
-  server flags (`--top-p 1.0 --top-k 0 --min-p 0`) so unarmed knobs stay neutral for
-  full recipe fidelity.
+  Ornith's reported TB2.1 recipe) plus `min_p`/`top_p` when armed (`chad_min_p`/
+  `chad_top_p`); it never sends top-k. `run_tb21_submit.sh` arms **`min_p 0.05`** by
+  default (`CHAD_TB2_MINP`): temp stays 1.0 but the sub-noise-floor quantization
+  tail — a source of the garbled-tool-call/foreign-dialect derailments the bf16
+  reference recipe never sampled — is cut. `CHAD_TB2_MINP=0` restores the bare
+  recipe. Neutralize the server flags (`--top-p 1.0 --top-k 0 --min-p 0`) so
+  per-request knobs are the only sampler configuration.
 - **`--host 0.0.0.0`** is what lets the task containers reach the server through Docker
   Desktop's `host.docker.internal` (or use the box's LAN/tailnet IP for a separate host).
 - **`--parallel 1` + one task at a time.** The runner drives tasks serially

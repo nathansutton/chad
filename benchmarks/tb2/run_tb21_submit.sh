@@ -35,6 +35,7 @@
 #                     already carries org=chad; cosmetic for --backend llama, no
 #                     weights load from it)
 #   CHAD_TB2_TEMP     sampling temperature (default 1.0, the reference recipe)
+#   CHAD_TB2_MINP     min_p quant-tail filter (default 0.05; 0 = off)
 #   TB21_NO_UPLOAD=1  skip --upload --public (local compliance dry-runs only —
 #                     a real submission run MUST upload)
 # Args: REPEATS (harbor -k; default 5 — the leaderboard minimum)
@@ -52,6 +53,10 @@ BACKEND="${CHAD_BACKEND:-llama}"
 TOKENIZER="${CHAD_TOKENIZER:-nathansutton/Ornith-1.0-35B-Q6-MLX}"
 MODEL_LABEL="${CHAD_MODEL_LABEL:-Ornith-1.0-35B-Q6_K}"
 TEMP="${CHAD_TB2_TEMP:-1.0}"
+# Quant-tail filter: temp stays 1.0 but sub-noise-floor tail mass — a source of
+# garbled-tool-call / foreign-dialect derailments the bf16 reference recipe never
+# sampled — is cut. 0 turns it back off.
+MINP="${CHAD_TB2_MINP:-0.05}"
 REPEATS="${1:-5}"; ONLY="${2:-}"
 
 DATASET="terminal-bench/terminal-bench-2-1"
@@ -107,13 +112,14 @@ json.dump({"agents": [{
         "chad_backend": "$BACKEND",
         "chad_tokenizer": "$TOKENIZER",
         "chad_temp": "$TEMP",
+        "chad_min_p": "$MINP",
         "chad_timeout_sec": $cap,
     },
 }]}, open(sys.argv[1], "w"), indent=1)
 PYEOF
   out=$(harbor run -c "$CFG" -d "$DATASET" --n-concurrent-agents 1 \
     --include-task-name "${DATASET%%/*}/$t" \
-    "${UPLOAD_FLAGS[@]}" -k "$REPEATS" 2>&1)
+    ${UPLOAD_FLAGS[@]+"${UPLOAD_FLAGS[@]}"} -k "$REPEATS" 2>&1)
   reward=$(printf '%s' "$out" | grep -oiE "Mean: [01]\.[0-9]+" | tail -1 | grep -oE "[01]\.[0-9]+")
   job_link=$(printf '%s' "$out" | grep -oE "https://hub\.harborframework\.com/jobs/[a-f0-9-]+" | tail -1)
   wall=$(( $(date +%s) - t0 ))

@@ -101,17 +101,64 @@ def test_recheck_spiral():
 def test_open_tool_call_nudged_without_cap():
     """Iter-3: an unbalanced tool-call attempt that parsed to zero calls is never a final
     answer — even when the token cap was NOT hit (a sampling glitch / premature EOS, e.g.
-    TB2 vulnerable-secret's 28-token `{"name":"bash>` garble). It must be nudged, not
-    accepted, and the message must name the malformed-call cause (not the length limit)."""
+    a short `{"name":"bash>` garble). It must be nudged, not accepted, and the message
+    must name the malformed-call cause (not the length limit). The no-cap case is kind
+    "garble" with its own counter."""
     kind, msg = _nudge('<tool_call>{"name": "bash>', hit_cap=False, open_tool_call=True)
-    assert kind == "truncated" and "malformed" in msg
-    # hit_cap + open call still gets the write-in-parts guidance (length limit).
+    assert kind == "garble" and "malformed" in msg
+    # hit_cap + open call still gets the write-in-parts guidance (length limit),
+    # in the truncation family (a too-long write is not a dialect garble).
     kind2, msg2 = _nudge("<tool_call>{...", hit_cap=True, open_tool_call=True)
     assert kind2 == "truncated" and "length limit" in msg2
-    # bounded: once truncation_nudges hits 2, stop nudging.
+    # bounded by its OWN counter, not the truncation one.
     kind3, _ = _nudge('<tool_call>{"name": "bash>', hit_cap=False,
                       open_tool_call=True, truncation_nudges=2)
-    assert kind3 != "truncated"
+    assert kind3 == "garble"
+    kind4, _ = _nudge('<tool_call>{"name": "bash>', hit_cap=False,
+                      open_tool_call=True, garble_nudges=guardrails.GARBLE_NUDGE_CAP)
+    assert kind4 != "garble"  # falls through to the next nudge family
+
+
+# === iter-13 ====================================================
+
+def test_garble_never_final(monkeypatch):
+    """Garbles ride their own counter when ON; the OFF arm restores the shared
+    truncation counter (the shared-counter garble-accept failure)."""
+    n = bite("garble_never_final")
+    on(monkeypatch)
+    kind, _ = _nudge("<tool_call>garbage</tool_call>", garbled_call=True,
+                     truncation_nudges=2)
+    assert kind == "garble"
+    off(monkeypatch, n)
+    kind2, _ = _nudge("<tool_call>garbage</tool_call>", garbled_call=True,
+                      truncation_nudges=2, made_edit=True)
+    assert kind2 is None  # shared counter spent -> no nudge (legacy acceptance path)
+    kind3, _ = _nudge("<tool_call>garbage</tool_call>", garbled_call=True,
+                      truncation_nudges=0)
+    assert kind3 == "truncated"
+
+
+def test_audit_absent_rebounce(monkeypatch):
+    """A still-absent task path re-bounces the accepting done when ON; OFF accepts."""
+    n = bite("audit_absent_rebounce")
+    on(monkeypatch)
+    assert guardrails.audit_rebounce(["/nonexistent/path/x.npy"], None)
+    off(monkeypatch, n)
+    assert guardrails.audit_rebounce(["/nonexistent/path/x.npy"], None) is None
+
+
+def test_gate_ops_exempt(monkeypatch):
+    """is_readonly_bash feeds the gate's streak only when the lever is ON; the lever
+    guard itself lives at the agent.py streak-update site, so the bite pair here is
+    the classifier the site consults (the site is exercised in test_garble_invariant/
+    e2e suites)."""
+    n = bite("gate_ops_exempt")
+    on(monkeypatch)
+    assert levers.enabled(n)
+    assert not guardrails.is_readonly_bash("git merge branch2")
+    assert guardrails.is_readonly_bash("grep -rn foo src")
+    off(monkeypatch, n)
+    assert not levers.enabled(n)
 
 
 def test_investigation_gate(monkeypatch):

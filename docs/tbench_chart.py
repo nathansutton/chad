@@ -1,117 +1,137 @@
-"""Generate docs/tbench-size-vs-score.png — the Terminal-Bench 2.0 size-vs-accuracy chart.
+"""Generate docs/tbench-size-vs-score.png — the Terminal-Bench 2.1 cost-vs-accuracy chart.
 
 Run:  uv run --with matplotlib python docs/tbench_chart.py
 
+The story TB2.1 tells is cost, not size: every verified entry is a proprietary
+frontier model whose parameter count is undisclosed, so there is nothing to plot on a
+size axis — but every entry's dollar cost for a full run IS published. chad is the only
+point on the board with no API cost at all (a local MLX/llama.cpp model on an Apple
+Silicon laptop) and it clears 57% while the paid field runs $130–$2,000 per run.
+
 Data provenance (update the tables below, then re-run):
-- Open-weight points: tbench.ai Terminal-Bench 2.0 leaderboard (verified, best entry
-  per model), positioned by total parameters.
-- Claude reference lines: the leaderboard's own "Claude Code" rows ONLY — Opus 4.6,
-  Sonnet 4.5, Haiku 4.5 (proprietary — parameter count undisclosed, hence lines not
-  points). Newer Claude models (Opus 4.8, Fable 5) have no public leaderboard entry,
-  so they are deliberately not shown.
-- Ornith point: provisional in-house run (k=1) — full verified run in flight.
+- All 17 frontier entries: tbench.ai Terminal-Bench 2.1 leaderboard (verified, k=5),
+  each as (cost_usd, accuracy_%). Accuracy and cost are read straight off the board.
+- "Claude Code" rows are emphasized in ink (the harness-vs-harness reference thread);
+  every other agent is a light background point.
+- chad point: provisional in-house run (k=1, self-run, unverified) — 51/89 = 57.3%.
+  Cost is electricity only (no API/token cost); it is placed in the far-left "local"
+  band at a nominal position, NOT a measured dollar figure.
 """
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FixedLocator, NullFormatter
 
-GRAY = "#8b95a1"
-INK = "#1f2d3d"
-ORANGE = "#e8590c"
+GRAY = "#c2c9d1"       # non-Claude frontier entries (background field)
+GRAY_LBL = "#8b95a1"
+INK = "#1f2d3d"        # Claude Code entries (emphasized)
+ORANGE = "#e8590c"     # chad
 BAND = "#fdf1e3"
 
-# (params_B, score_%, label, label_dx_pts, label_dy_pts, ha)
-# label=None → unlabeled secondary entry for the same/nearby model family.
-POINTS = [
-    (9,    9.3,  "little-coder + Qwen3.5-9B",      10,  0,  "left"),
-    (20,   3.5,  None,                              0,  0,  "left"),
-    (32,   19.4, "Bash Agent + TermiGen-32B",     -10,  0,  "right"),
-    (35,   24.6, "little-coder + Qwen3.6-35B",     10,  0,  "left"),
-    (120,  19.0, "Terminus 2 + GPT-OSS-120B",      10, -4,  "left"),
-    (230,  45.0, "IndusAGI + MiniMax M2.7",       -10,  8,  "right"),
-    (230,  42.7, None,                              0,  0,  "left"),
-    (360,  52.4, "Terminus 2 + GLM 5",             12,  6,  "left"),
-    (360,  33.3, None,                              0,  0,  "left"),
-    (360,  24.4, None,                              0,  0,  "left"),
-    (480,  27.1, "Dakou + Qwen3-Coder-480B",       12, -14, "left"),
-    (685,  39.5, None,                              0,  0,  "left"),
-    (1000, 35.6, "Terminus 2 + DeepSeek-V3.2",    -12,  8,  "right"),
-    (1000, 43.2, "Terminus 2 + Kimi K2.5",        -12, 10,  "right"),
+# TB2.1 leaderboard, verified k=5. (cost_usd, accuracy_%, label, is_claude_code)
+# label=None → plotted but unlabeled (keeps the dense field readable).
+ENTRIES = [
+    (552.67, 83.8, "Fable 5",   True),
+    (2059.19, 83.1, "GPT-5.5",  False),
+    (438.64, 80.4, None,        False),  # Terminus 2 · Fable 5
+    (134.09, 79.3, "Grok 4.5",  False),  # cheapest paid entry
+    (286.94, 78.9, "Opus 4.8",  True),
+    (421.15, 78.4, None,        False),  # Codex · GPT-5.6 Terra
+    (493.85, 78.0, None,        False),  # Terminus 2 · GPT-5.5
+    (198.05, 76.2, None,        False),  # mini-SWE-agent · Muse Spark 1.1
+    (241.45, 75.7, None,        False),  # Codex · GPT-5.6 Luna
+    (288.18, 74.6, "Sonnet 5",  True),
+    (224.44, 73.9, None,        False),  # Terminus 2 · Gemini 3 Pro
+    (599.52, 68.9, "Opus 4.7",  True),
+    (582.26, 66.1, None,        False),  # Terminus 2 · Opus 4.7
+    (247.76, 65.8, None,        False),  # Gemini CLI · Gemini 3 Pro
+    (236.49, 65.8, None,        False),  # Gemini CLI · Gemini 3.1 Pro
+    (229.99, 65.6, None,        False),  # Terminus 2 · Gemini 3.1 Pro
+    (277.14, 58.7, "GLM-5.1",   True),   # the paid floor
 ]
 
-CHAD = (35, 40.0)   # provisional — full verified run in flight
+# per-label placement: (dx_pts, dy_pts, ha, va) — hand-tuned to clear the cluster.
+LABEL_POS = {
+    "Fable 5":   (0, 13, "center", "bottom"),
+    "GPT-5.5":   (0, -14, "center", "top"),
+    "Grok 4.5":  (-12, 0, "right", "center"),   # into the open mid-left space
+    "Opus 4.8":  (12, 2, "left", "center"),
+    "Sonnet 5":  (12, 0, "left", "center"),
+    "Opus 4.7":  (12, 0, "left", "center"),
+    "GLM-5.1":   (12, 0, "left", "center"),
+}
 
-# (score_%, label, emphasized) — leaderboard "Claude Code" rows only
-REFERENCE_LINES = [
-    (58.0, "Claude Opus 4.6", False),
-    (40.1, "Claude Sonnet 4.5", True),
-    (27.5, "Claude Haiku 4.5", False),
-]
+# chad — provisional (k=1, self-run). No API cost; nominal x inside the "local" band.
+CHAD_X, CHAD_Y = 2.4, 57.3
 
-fig, ax = plt.subplots(figsize=(10.6, 6.1), dpi=200)
-fig.subplots_adjust(left=0.075, right=0.97, top=0.82, bottom=0.14)
+fig, ax = plt.subplots(figsize=(11.0, 6.7), dpi=200)
+fig.subplots_adjust(left=0.072, right=0.975, top=0.79, bottom=0.195)
 
 ax.set_xscale("log")
-ax.set_xlim(6, 3000)
-ax.set_ylim(0, 62)
+ax.set_xlim(1.2, 4600)
+ax.set_ylim(52, 88)
 
-# laptop-class band
-ax.axvspan(6, 42, color=BAND, zorder=0)
-ax.text(11, 59, "laptop-class  ≤ 40B", color="#c2410c", fontsize=11)
+# "local · no API cost" band at the far left, where chad lives alone.
+ax.axvspan(1.2, 9, color=BAND, zorder=0)
+ax.text(1.5, 86.4, "local · no API cost", color="#c2410c", fontsize=10.5)
 
-# reference lines. Label side flips per line so a label never collides with a
-# nearby point (Sonnet's sits below its line, clear of the Kimi K2.5 point).
-LABEL_BELOW = {"Claude Sonnet 4.5"}
-for score, label, emph in REFERENCE_LINES:
-    below = label in LABEL_BELOW
-    ty, va = (score - 1.0, "top") if below else (score + 0.8, "bottom")
-    if emph:
-        ax.axhline(score, color=INK, lw=2.2, ls=(0, (9, 5)), zorder=2)
-        ax.text(2900, ty, label, ha="right", va=va, color=INK, fontsize=13)
+# cost-gap annotation: chad's electricity vs the cheapest PAID entry ($134).
+ax.annotate("", xy=(115, 55.0), xytext=(CHAD_X + 0.7, 55.0),
+            arrowprops=dict(arrowstyle="-|>", color="#c2410c", lw=1.3))
+ax.text(19, 54.0, "every paid entry: \\$130–\\$2,000 / run", color="#c2410c",
+        fontsize=10.5, ha="center", style="italic")
+
+# inline legend (top-left open space, above the cluster)
+ax.plot(11, 87.0, "o", ms=8, color=INK, mec="white", mew=1.0)
+ax.text(13.5, 87.0, "Claude Code", color=INK, fontsize=10, va="center")
+ax.plot(11, 84.9, "o", ms=7, color=GRAY, mec="none")
+ax.text(13.5, 84.9, "other agents", color=GRAY_LBL, fontsize=10, va="center")
+
+# frontier field
+for cost, acc, label, claude in ENTRIES:
+    if claude:
+        ax.plot(cost, acc, "o", ms=8.5, color=INK, mec="white", mew=1.0, zorder=4)
     else:
-        ax.axhline(score, color="#6b7684", lw=1.2, ls=(0, (6, 4)), zorder=2)
-        ax.text(2900, ty, label, ha="right", va=va, color="#4b5563", fontsize=11.5)
-
-# open-weight points
-for x, y, label, dx, dy, ha in POINTS:
-    ax.plot(x, y, "o", ms=7, color=GRAY, mec="none", zorder=3)
+        ax.plot(cost, acc, "o", ms=7, color=GRAY, mec="none", zorder=3)
     if label:
-        ax.annotate(label, (x, y), textcoords="offset points", xytext=(dx, dy),
-                    ha=ha, va="center", color="#6b7684", fontsize=10.5)
+        dx, dy, ha, va = LABEL_POS[label]
+        col = INK if claude else GRAY_LBL
+        ax.annotate(label, (cost, acc), textcoords="offset points", xytext=(dx, dy),
+                    ha=ha, va=va, color=col, fontsize=11 if claude else 10.5)
 
-# chad + Ornith (label above-LEFT, inside the empty part of the laptop band — below is
-# Qwen3.6-35B's label, right is MiniMax's)
-ax.plot(*CHAD, "o", ms=16, color=ORANGE, mec="white", mew=1.5, zorder=4)
-ax.annotate("chad + Ornith 35B\n~40%  (provisional)", CHAD,
-            textcoords="offset points", xytext=(-14, 16), ha="right", va="bottom",
-            color=ORANGE, fontsize=13.5, zorder=4)
+# chad
+ax.plot(CHAD_X, CHAD_Y, "o", ms=17, color=ORANGE, mec="white", mew=1.6, zorder=6)
+ax.annotate("chad + Ornith 35B\n57%  ·  a laptop + electricity", (CHAD_X, CHAD_Y),
+            textcoords="offset points", xytext=(17, 5), ha="left", va="center",
+            color=ORANGE, fontsize=13, fontweight="bold", zorder=6)
 
 # axes cosmetics
-ax.set_xticks([10, 30, 100, 300, 1000])
-ax.set_xticklabels(["10B", "30B", "100B", "300B", "1T"], fontsize=12)
+ax.set_xticks([10, 100, 1000])
+ax.set_xticklabels(["\\$10", "\\$100", "\\$1,000"], fontsize=12)
 ax.xaxis.set_minor_locator(FixedLocator([]))
 ax.xaxis.set_minor_formatter(NullFormatter())
-ax.set_yticks(range(0, 61, 10))
-ax.set_yticklabels(["0", "10", "20", "30", "40", "50", "60%"], fontsize=12)
+ax.set_yticks(range(55, 86, 5))
+ax.set_yticklabels(["55", "60", "65", "70", "75", "80", "85%"], fontsize=12)
 ax.grid(axis="y", color="#e5e7eb", lw=0.8, zorder=1)
 for side in ("top", "right", "left"):
     ax.spines[side].set_visible(False)
 ax.spines["bottom"].set_color("#d1d5db")
 ax.tick_params(length=0)
-ax.set_xlabel("Total parameters  (log scale)", fontsize=13, color=INK, labelpad=8)
-ax.set_ylabel("Terminal-Bench 2.0 accuracy", fontsize=13, color=INK)
+ax.set_xlabel("Cost per full benchmark run  (log scale, USD)", fontsize=13,
+              color=INK, labelpad=7)
+ax.set_ylabel("Terminal-Bench 2.1 accuracy", fontsize=13, color=INK)
 
-fig.text(0.055, 0.945, "Sonnet on your laptop", fontsize=21, color=INK)
-fig.text(0.075, 0.845,
-         "chad + Ornith (a 35B MoE) lands at the Claude Sonnet 4.5 line on "
-         "Terminal-Bench 2.0\n— matching open models many times its size.",
+fig.text(0.055, 0.925, "Frontier scores, laptop cost", fontsize=21, color=INK)
+fig.text(0.072, 0.825,
+         "On Terminal-Bench 2.1 every verified entry is a proprietary model in a "
+         "datacenter, costing\n\\$130–\\$2,000 per run. chad + Ornith (a 35B MoE) clears "
+         "57% on an Apple Silicon laptop — for the electricity.",
          fontsize=12.5, color="#4b5563", va="bottom", linespacing=1.4)
-fig.text(0.055, 0.015,
-         "Open-weight entries positioned by size (verified, best per model). Claude shown as "
-         "reference lines, via Claude Code (proprietary — size undisclosed).\n"
-         "All entries: tbench.ai Terminal-Bench 2.0 leaderboard. "
-         "Ornith: provisional in-house (k=1).",
+fig.text(0.055, 0.02,
+         "Frontier entries: tbench.ai Terminal-Bench 2.1 leaderboard (verified, k=5), "
+         "plotted at their published run cost. Claude Code rows in ink.\n"
+         "chad: provisional in-house run (k=1, self-run, unverified) — 51/89. No API "
+         "cost; placed in the local band at a nominal position (electricity only).",
          fontsize=8.5, color="#9aa3ad", va="bottom", linespacing=1.5)
 
 fig.savefig("docs/tbench-size-vs-score.png")
