@@ -1,8 +1,8 @@
-# Reproducing chad's Terminal-Bench 2.0 run
+# Reproducing chad's Terminal-Bench 2.1 run
 
-*Sonnet on your laptop — and you don't have to take our word for it.*
+*Frontier scores at laptop cost — and you don't have to take our word for it.*
 
-This directory is the complete, public kit behind the Terminal-Bench 2.0 chart in the
+This directory is the complete, public kit behind the Terminal-Bench 2.1 chart in the
 [top-level README](../../README.md): the exact Harbor agent adapter that produced the
 runs, the runner script, and the trajectory validator. Nothing here is a cleaned-up
 reenactment — `harbor_chad_tb2.py` is the artifact, published.
@@ -14,7 +14,7 @@ reenactment — `harbor_chad_tb2.py` is the artifact, published.
 
 ## What gets measured
 
-[Terminal-Bench 2.0](https://www.tbench.ai/leaderboard) is the standard benchmark for
+[Terminal-Bench 2.1](https://www.tbench.ai/leaderboard) is the standard benchmark for
 CLI coding agents: 89 tasks of real terminal work (build a Cython extension, recover a
 WAL'd SQLite database, configure a git webserver, boot a QEMU VM…), each run in its own
 Docker container and verified by the *container's end state*, with a hard per-task time

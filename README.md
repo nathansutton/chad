@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/nathansutton/chad/actions/workflows/tests.yml/badge.svg)](https://github.com/nathansutton/chad/actions/workflows/tests.yml)
 
-<img src="docs/tbench-size-vs-score.png" width="840" alt="Terminal-Bench 2.0: accuracy vs. model size. chad + Ornith (a 35B MoE) lands on the Claude Sonnet 4.5 line, matching open models many times its size and standing alone in the laptop-class ≤40B band.">
+<img src="docs/tbench-size-vs-score.png" width="840" alt="Terminal-Bench 2.1: accuracy vs. cost per run. Every verified entry is a proprietary frontier model in a datacenter, costing $130–$2,000 per run. chad + Ornith (a 35B MoE) clears 57% on an Apple Silicon laptop for the electricity — the only no-API-cost point on the board.">
 
 > Claude can do anything, for anyone, anywhere. chad does one thing. 🗿
 > *Coding under supervision.*
@@ -49,20 +49,20 @@ instrument:
 > Real session, unedited (cold model load cut): a local 35B reasons through the failure,
 > edits the file, reruns the tests, confirms green.
 
-## Sonnet on your laptop
+## Frontier scores, laptop cost
 
 The exam is [Terminal-Bench](https://www.tbench.ai/leaderboard), the standard benchmark for
-CLI coding agents. chad won't top it — the A students are frontier models in datacenters.
-The number worth looking at is **how much capability chad wrings out of 35B parameters**:
-on Terminal-Bench 2.1, chad + Ornith lands around the **Claude Sonnet 4.5** line, matching
-open models many times its size and beating every open model in its own weight class by a
-wide margin. On a laptop, *capability per parameter* is the axis you actually compete on —
-and that's where chad + Ornith is out on the frontier alone.
+CLI coding agents. chad won't top it — every verified entry on Terminal-Bench 2.1 is a
+frontier model in a datacenter, scoring 59–84%. The number worth looking at is what that
+capability **costs**: the paid field spends **$130–$2,000 in API fees per run**. chad +
+Ornith clears **57%** on an Apple Silicon laptop, for the electricity — no API, no tokens,
+no datacenter. On a laptop, *capability per dollar* is the axis you actually compete on, and
+chad is the only point on the board that runs there.
 
-> **Placeholder number** — the full verified run is still in flight (`≈50%`, k=1). The whole
-> benchmark is **publicly reproducible from a Mac**: the exact Harbor adapter, the runner,
-> and the recipe live in [`benchmarks/tb2/`](benchmarks/tb2/README.md). Check it, don't
-> trust it.
+> **Provisional number** — `57%` (51/89, k=1, self-run, not yet leaderboard-verified). The
+> whole benchmark is **publicly reproducible from a Mac**: the exact Harbor adapter, the
+> runner, and the recipe live in [`benchmarks/tb2/`](benchmarks/tb2/README.md). Check it,
+> don't trust it.
 
 ## The bet: at this end of the report card, the harness beats the model
 
@@ -177,7 +177,7 @@ Both are covered in full in the [Configuration reference](docs/configuration.md)
   cache, the trimmable/append-only trade, and the ideas borrowed from other agents.
 - **[Throughput & performance](docs/benchmarks.md)** — prefill / decode / warm-step numbers
   you can reproduce with `chad-bench`.
-- **[Terminal-Bench 2.0 reproduction](benchmarks/tb2/README.md)** — the exact Harbor adapter
+- **[Terminal-Bench 2.1 reproduction](benchmarks/tb2/README.md)** — the exact Harbor adapter
   and runner behind the chart; serve Ornith yourself and check the number.
 - **[Configuration reference](docs/configuration.md)** — Agent Skills, MCP servers, the
   context window, every environment variable, and the safety opt-outs.

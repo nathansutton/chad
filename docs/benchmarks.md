@@ -2,7 +2,7 @@
 
 *The numbers that decide whether a local agent feels responsive — prefill speed, decode
 speed, and the per-step cost once the cache is warm. All of them are reproducible on your
-own Mac with `chad-bench`. Task pass-rates (Terminal-Bench 2.0) are reproducible too —
+own Mac with `chad-bench`. Task pass-rates (Terminal-Bench 2.1) are reproducible too —
 they have their own kit in [`benchmarks/tb2/`](../benchmarks/tb2/README.md). For the
 engineering behind them, see [Design & internals](design.md).*
 
@@ -91,9 +91,9 @@ edit-heavy work. The full reason is in
 
 ---
 
-## Task pass-rates: Terminal-Bench 2.0 (reproducible)
+## Task pass-rates: Terminal-Bench 2.1 (reproducible)
 
-Capability is measured on [Terminal-Bench 2.0](https://www.tbench.ai/leaderboard), the
+Capability is measured on [Terminal-Bench 2.1](https://www.tbench.ai/leaderboard), the
 public benchmark behind the chart in the [README](../README.md) — and the whole run is
 reproducible **from a Mac**: the exact Harbor agent adapter, the runner script, and the
 serving recipe live in [`benchmarks/tb2/`](../benchmarks/tb2/README.md). Serve the
