@@ -77,30 +77,55 @@ def test_leaves_normal_text_unchanged():
         check(f"unchanged: {normal!r}", _redact(normal) == normal)
 
 
-def test_session_log_opt_out():
-    # CHAD_NO_SESSION_LOG opts out of the diagnostic file log. diag installs its handler
-    # at import time, so test in a fresh subprocess (reload would leave the first import's
-    # RotatingFileHandler attached to the shared named logger). Assert only a NullHandler
-    # is attached and that redact/args_preview still work without the file handler.
+def _diag_handler_names(**env_overrides):
+    # diag installs its handler at import time, so probe in a fresh subprocess (reload
+    # would leave the first import's RotatingFileHandler attached to the shared named
+    # logger). Returns the list of handler type names on diag.log, and asserts redact/
+    # args_preview still work regardless of whether the file handler is installed.
     import os
     import subprocess
     import sys
+    import tempfile
 
     script = (
         "from chad import diag\n"
-        "import logging\n"
         "diag.log.info('x')\n"
         "names = [type(h).__name__ for h in diag.log.handlers]\n"
-        "assert names == ['NullHandler'], names\n"
         "assert diag.redact('a' * 32) == '<redacted:32>'\n"
         "assert diag.args_preview({'k': 'v'})\n"
-        "print('OK', names)\n"
+        "print('NAMES', names)\n"
     )
-    env = dict(os.environ, CHAD_NO_SESSION_LOG="1")
-    out = subprocess.run([sys.executable, "-c", script], env=env,
-                         capture_output=True, text=True)
-    check(f"opt-out subprocess OK (stderr={out.stderr})", out.returncode == 0)
-    check("only NullHandler attached", "OK ['NullHandler']" in out.stdout)
+    # Point HOME at a throwaway dir so an *enabled* run can't touch the real ~/.chad.
+    with tempfile.TemporaryDirectory() as home:
+        env = dict(os.environ, HOME=home)
+        for k in ("CHAD_SESSION_LOG", "CHAD_NO_SESSION_LOG"):
+            env.pop(k, None)
+        env.update(env_overrides)
+        out = subprocess.run([sys.executable, "-c", script], env=env,
+                             capture_output=True, text=True)
+    check(f"subprocess OK (stderr={out.stderr})", out.returncode == 0)
+    line = next(ln for ln in out.stdout.splitlines() if ln.startswith("NAMES "))
+    import ast
+    return ast.literal_eval(line[len("NAMES "):])
+
+
+def test_session_log_off_by_default():
+    # Privacy-first: with neither env var set, the diagnostic file log is OFF — only a
+    # NullHandler is attached and ~/.chad is never created for the log's sake.
+    check("default off → only NullHandler", _diag_handler_names() == ["NullHandler"])
+
+
+def test_session_log_opt_in():
+    # CHAD_SESSION_LOG opts in: the RotatingFileHandler is installed.
+    names = _diag_handler_names(CHAD_SESSION_LOG="1")
+    check(f"opt-in → RotatingFileHandler attached ({names})",
+          "RotatingFileHandler" in names)
+
+
+def test_no_session_log_overrides_opt_in():
+    # CHAD_NO_SESSION_LOG is a hard kill switch: it wins even when the opt-in is also set.
+    names = _diag_handler_names(CHAD_SESSION_LOG="1", CHAD_NO_SESSION_LOG="1")
+    check(f"force-off wins over opt-in → NullHandler ({names})", names == ["NullHandler"])
 
 
 if __name__ == "__main__":

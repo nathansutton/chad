@@ -430,12 +430,21 @@ CHAD_LSP_MAX_RSS_MB=2048 uv run chad  # recycle a language server past this proc
 
 ### Session log & privacy
 
-Diagnostics log: each session appends throughput numbers and a readable trace —
-the user query, tool-call args (including bash commands and write/edit content),
-and result previews — to `~/.chad/session.log`. It's now size-bounded (rotated,
-5 MB × 3) and passes previews through a best-effort secret redactor, but it still
-records command/file previews in plaintext outside the repo, so treat it as
-sensitive. Set **`CHAD_NO_SESSION_LOG=1`** (any truthy value) to disable the session
-log entirely — chad installs a null handler and won't create `~/.chad` for the log's
-sake. (For the same privacy reason, the resumable conversation store under
-`~/.chad/sessions/` — which holds full tool args and results — is created mode `0600`.)
+Diagnostics log: when enabled, each session appends throughput numbers and a readable
+trace — the user query, tool-call args (including bash commands and write/edit content),
+and result previews — to `~/.chad/session.log`. It's size-bounded (rotated, 5 MB × 3)
+and passes previews through a best-effort secret redactor, but it still records
+command/file previews in plaintext outside the repo, so treat it as sensitive.
+
+**Privacy-first default: the trace is OFF.** chad is a local, single-user agent, so
+nothing leaves your machine — but because the log lands plaintext previews under
+`~/.chad`, it is opt-in. Set **`CHAD_SESSION_LOG=1`** (any truthy value) to turn it on;
+the same flag also enables the persistent input history at `~/.chad/history` (mode
+`0600`). When it's off, chad installs a null handler and won't create `~/.chad` for the
+log's or history's sake.
+
+**`CHAD_NO_SESSION_LOG=1`** remains a hard kill switch: if set it forces both the log
+and the history off, and wins even when `CHAD_SESSION_LOG` is also set. (For the same
+privacy reason, the resumable conversation store under `~/.chad/sessions/` — which holds
+full tool args and results, and is written only when you use `-c`/`--resume` — is created
+mode `0600`.)

@@ -26,6 +26,16 @@ Tool-result economics: three additions, each individually reversible via `CHAD_D
   a re-spawn doubles the local GPU cost, and a wrongly-rejected report breaks the
   turn while a wrongly-accepted one merely restores the old behavior.
 
+Plus a privacy default flip:
+
+- **Local diagnostic traces are now opt-in (privacy-first default: off).** The
+  readable `~/.chad/session.log` trace — user query, tool-call args (bash commands,
+  write/edit content), and result previews — and the persistent input history at
+  `~/.chad/history` are no longer written by default. chad is a local, single-user
+  agent so nothing ever left the machine, but the log still landed plaintext previews
+  under `~/.chad`, so it's now enabled only when you opt in with **`CHAD_SESSION_LOG=1`**.
+  `CHAD_NO_SESSION_LOG=1` still works as a hard kill switch and wins over the opt-in.
+
 ## [1.0.3] — 2026-07-21
 
 Guardrail-interaction fixes: three cases where the model was doing fine but

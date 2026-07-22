@@ -239,9 +239,10 @@ class _ChadCompleter(Completer):
 
 def _make_history():
     """Persistent input history: `FileHistory` at ~/.chad/history (mode 0600 — it can
-    hold typed paths/snippets, like the session store), or `InMemoryHistory` when
-    CHAD_NO_SESSION_LOG is set. Falls back to in-memory on any filesystem error."""
-    if config.flag("CHAD_NO_SESSION_LOG"):
+    hold typed paths/snippets, like the session store), or `InMemoryHistory` when local
+    traces are not opted in (see config.traces_enabled). Falls back to in-memory on any
+    filesystem error."""
+    if not config.traces_enabled():
         return InMemoryHistory()
     path = os.path.expanduser("~/.chad/history")
     try:
