@@ -674,6 +674,43 @@ def test_playbook_levers_have_dedicated_suites(monkeypatch):
     assert profiles.prompt_block(None) == ""
 
 
+# === iter-14 ===============================================================
+
+def test_edit_typo_match_bite(monkeypatch, tmp_path):
+    """ASCII-fied `old` against a typographic file lands only while the rung is on."""
+    n = bite("edit_typo_match")
+    src = 'MSG = "cache — warm"\n'
+    p = tmp_path / "f.py"
+    on(monkeypatch)
+    p.write_text(src)
+    assert tools.tool_edit(
+        str(p), 'MSG = "cache - warm"', 'MSG = "cache - hot"').startswith("[edited")
+    off(monkeypatch, n)
+    p.write_text(src)
+    assert "not found" in tools.tool_edit(
+        str(p), 'MSG = "cache - warm"', 'MSG = "cache - hot"')
+
+
+def test_dup_result_elide_bite(monkeypatch):
+    """An identical read-only result is elided only while the lever is on."""
+    n = bite("dup_result_elide")
+    body = "z" * 500
+    msgs = [{"role": "tool", "name": "read", "content": body}]
+    on(monkeypatch)
+    assert guardrails.elide_duplicate_result("read", body, msgs) is not None
+    off(monkeypatch, n)
+    assert guardrails.elide_duplicate_result("read", body, msgs) is None
+
+
+def test_subagent_evidence_warn_bite(monkeypatch):
+    """A zero-dispatch confident report is warned only while the lever is on."""
+    n = bite("subagent_evidence_warn")
+    on(monkeypatch)
+    assert guardrails.subagent_evidence_warning("found it in a.py:1", 0) is not None
+    off(monkeypatch, n)
+    assert guardrails.subagent_evidence_warning("found it in a.py:1", 0) is None
+
+
 # === the coverage contract =================================================
 
 def test_every_registered_lever_has_a_bite_test():

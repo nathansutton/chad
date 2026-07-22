@@ -1412,3 +1412,64 @@ def is_repeat_loop(seen_before: int) -> bool:
 def loop_should_abort(loop_nudges: int) -> bool:
     """After incrementing the loop-nudge counter, more than 2 nudges -> abort."""
     return loop_nudges > 2
+
+
+# --- iter-14: duplicate read-only result elision. Small models re-read files and
+# re-run searches they have already loaded; on a non-trimmable prefix cache every
+# duplicate body is appended prefill paid on every later step. Hosted harnesses solve
+# this with an opt-in changed-since parameter the model must remember to pass; here
+# the harness does it automatically. Byte-equality against the
+# LIVE transcript is the whole safety argument: a changed file, different args, or a
+# compaction rewrite/drop of the earlier message all break equality, so content is only
+# elided while a verbatim copy is provably still in the model's context.
+
+DUP_ELIDE_MIN_CHARS = 400  # below this the pointer saves nothing over the body
+
+# Read-only builtins whose output is a pure function of (args, workspace state). bash is
+# excluded even when read-only (env-dependent, side-effectful); task is excluded (a
+# sub-agent run is expensive but never byte-identical in spirit — and re-spawns already
+# have their own guard); MCP tools are excluded (openWorld results may legitimately
+# repeat, e.g. polling).
+DUP_ELIDABLE = {"read", "grep", "glob", "repo_map", "overview", "view_symbol",
+                "find_symbol", "find_refs"}
+
+
+def elide_duplicate_result(name, result, messages):
+    """The short replacement result when `result` is byte-identical to an earlier tool
+    message still in the transcript, else None. Compare AFTER clipping — the transcript
+    stores clipped content, and equality must be against what the model actually has."""
+    if not levers.enabled("dup_result_elide"):
+        return None
+    if name not in DUP_ELIDABLE or len(result) < DUP_ELIDE_MIN_CHARS:
+        return None
+    if not any(m.get("role") == "tool" and m.get("name") == name
+               and m.get("content") == result for m in messages):
+        return None
+    return (f"[identical output elided: this {name} returned exactly the same result "
+            f"as your earlier {name} above — nothing has changed. That content is "
+            f"still in your context; use it from there instead of re-running the "
+            f"call.]")
+
+
+# The zero-evidence sub-agent tell (iter-14): a confident, non-empty report produced
+# with no tool dispatches came from model memory, not the repo. Warn-not-reject: a
+# local re-spawn doubles GPU cost, a false reject breaks the turn, and a false accept
+# merely restores the pre-warning status quo.
+
+SUBAGENT_EVIDENCE_WARNING = (
+    "\n[warning: the sub-agent answered WITHOUT reading any files or running any "
+    "searches — this report is from model memory, not this repository. Verify the "
+    "claims with grep/read before relying on them.]")
+
+
+def subagent_evidence_warning(result, tool_dispatches):
+    """The result with the zero-evidence warning appended, or None when no warning is
+    due (the sub-agent did real work, the result is already a failure sentinel the
+    salvage path owns, or the lever is off)."""
+    if not levers.enabled("subagent_evidence_warn"):
+        return None
+    if tool_dispatches > 0:
+        return None
+    if not result or not result.strip() or result.startswith(("[task", "[stopped:")):
+        return None
+    return result.rstrip() + SUBAGENT_EVIDENCE_WARNING

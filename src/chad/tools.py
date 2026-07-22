@@ -382,10 +382,30 @@ def _line_offsets(data: str):
     return offs
 
 
-def _ws_flexible_spans(data: str, old: str):
+# Typographic punctuation folded to ASCII for the last-resort edit match (iter-14).
+# Only characters a model plausibly re-types the other way when
+# quoting prose/docstrings it saw rendered: quotes, dashes, ellipsis, nbsp. Deliberately
+# NOT general unicode normalization — identifiers and string literals in code must not
+# be conflated beyond this list.
+_TYPO_MAP = str.maketrans({
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",   # single quotes
+    "“": '"', "”": '"', "„": '"',                  # double quotes
+    "–": "-", "—": "-", "―": "-",                  # en/em/horizontal dash
+    " ": " ",                                                # non-breaking space
+})
+
+
+def _norm_typo(s: str) -> str:
+    return s.translate(_TYPO_MAP).replace("…", "...")
+
+
+def _ws_flexible_spans(data: str, old: str, typo: bool = False):
     """Char spans (start, end) where `old` matches a run of lines in `data` ignoring
-    each line's leading/trailing whitespace. Skips all-blank patterns (too ambiguous)."""
-    norm = [l.strip() for l in old.strip("\n").split("\n")]
+    each line's leading/trailing whitespace. Skips all-blank patterns (too ambiguous).
+    With `typo=True`, additionally folds typographic punctuation to ASCII on both
+    sides before comparing (the match is still line-exact otherwise)."""
+    fold = (lambda l: _norm_typo(l).strip()) if typo else (lambda l: l.strip())
+    norm = [fold(l) for l in old.strip("\n").split("\n")]
     if not any(norm):
         return []
     dlines = data.split("\n")
@@ -393,7 +413,7 @@ def _ws_flexible_spans(data: str, old: str):
     n = len(norm)
     spans = []
     for i in range(len(dlines) - n + 1):
-        if [dlines[i + j].strip() for j in range(n)] == norm:
+        if [fold(dlines[i + j]) for j in range(n)] == norm:
             spans.append((offs[i], offs[i + n - 1] + len(dlines[i + n - 1])))
     return spans
 
@@ -647,8 +667,16 @@ def tool_edit(path: str, old: str, new: str) -> str:
             return f"[old string appears {c} times; make it unique by including more surrounding lines]"
 
     # (3) whitespace-flexible: indentation / trailing-space drift, still requiring uniqueness.
+    # (4) typography-normalized: same match with curly quotes / en–em dashes / ellipsis /
+    #     nbsp folded to ASCII on both sides — the drift when the model re-types prose it
+    #     saw rendered (or the file uses typographic punctuation the model ASCII-fied).
+    #     Tried only when rung 3 found nothing, and still requires a unique match.
     probe = uold if uold != old else old
     spans = _ws_flexible_spans(data, probe)
+    how = "indentation/whitespace"
+    if not spans and levers.enabled("edit_typo_match"):
+        spans = _ws_flexible_spans(data, probe, typo=True)
+        how = "typographic quotes/dashes and whitespace"
     if len(spans) == 1:
         s, e = spans[0]
         head = data[s:e].split("\n")[0]
@@ -669,7 +697,7 @@ def tool_edit(path: str, old: str, new: str) -> str:
             landed = raw
         else:
             res = _apply_edit(path, data, data[:s] + repl + data[e:],
-                              " (recovered: matched ignoring indentation/whitespace)"
+                              f" (recovered: matched ignoring {how})"
                               + (note_new if used_unew else ""))
             landed = repl
         # Echo the landed region with visible whitespace (ky-timeoutMessage, session
@@ -678,7 +706,7 @@ def tool_edit(path: str, old: str, new: str) -> str:
         # `_apply_edit` can return a syntaxgate rejection or drift warning instead.
         return res + _landed_hint(landed) if res.startswith("[edited") else res
     if len(spans) > 1:
-        return (f"[old string matches {len(spans)} places ignoring whitespace; include "
+        return (f"[old string matches {len(spans)} places ignoring {how}; include "
                 f"more surrounding lines to make it unique]")
 
     return (f"[old string not found; no change made.{_closest_hint(data, old)}]"

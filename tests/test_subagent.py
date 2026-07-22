@@ -345,7 +345,14 @@ def test_normal_parent_never_spawns_mutating_subagent(monkeypatch):
     default read-only request stays silent. run_turn is stubbed class-level so no model
     or real sub-agent turn is needed."""
     from chad.agent import Agent
-    monkeypatch.setattr(Agent, "run_turn", lambda self, prompt, stream=True: "ok")
+
+    def _stub_run_turn(self, prompt, stream=True):
+        # Simulate a sub-agent that did real work: without a dispatch the (on-topic
+        # elsewhere) zero-evidence warning would append to "ok" and muddy this check.
+        self.tool_dispatches += 1
+        return "ok"
+
+    monkeypatch.setattr(Agent, "run_turn", _stub_run_turn)
     agent = _mk_agent(mode="normal")
     agent.engine.push_cache = lambda: None
     agent.engine.pop_cache = lambda: None
