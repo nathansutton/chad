@@ -711,6 +711,18 @@ def test_subagent_evidence_warn_bite(monkeypatch):
     assert guardrails.subagent_evidence_warning("found it in a.py:1", 0) is None
 
 
+def test_workspace_map_bite(monkeypatch):
+    """The system prompt carries the ranked repo_map digest only while the lever is on;
+    off, it falls back to the flat file listing."""
+    from chad import prompt
+    n = bite("workspace_map")
+    on(monkeypatch)
+    assert "# Workspace map" in prompt.build_system_prompt("ornith")
+    off(monkeypatch, n)
+    p = prompt.build_system_prompt("ornith")
+    assert "# Workspace map" not in p and "# Workspace files" in p
+
+
 # === the coverage contract =================================================
 
 def test_every_registered_lever_has_a_bite_test():

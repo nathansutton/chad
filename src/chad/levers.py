@@ -355,6 +355,14 @@ LEVERS: dict[str, Lever] = {
         "Append the active model profile's prompt block to the system prompt "
         "(model-specific accommodations; see profiles.py).",
         "playbook"),
+
+    # --- from the ai-codex teardown: an index the model already has beats one it must
+    #     fetch. chad had the ranked map but only as a tool; this puts a digest in-prompt.
+    "workspace_map": Lever(
+        "Inject a ranked repo_map digest into the system-prompt dynamic tail instead of "
+        "a flat file listing, so the model orients without a reflexive step-1 repo_map "
+        "call. Degrades to the flat listing when repomap is unavailable (see prompt.py).",
+        "ai-codex"),
 }
 
 
