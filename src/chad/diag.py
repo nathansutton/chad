@@ -9,8 +9,10 @@ declare done, which cache served the turn. This module is that trace.
 
 The log is bounded (5 MB x3 rotation) and previews pass through a best-effort secret
 redactor, but it still records command/file previews in plaintext outside the repo, so
-treat it as sensitive. None of this touches the model-facing transcript or the tool
-results the model sees — it is the diagnostic trace only.
+treat it as sensitive. For that reason it is **opt-in**: privacy-first, chad writes no
+trace under ~/.chad unless CHAD_SESSION_LOG is set (see config.traces_enabled). None of
+this touches the model-facing transcript or the tool results the model sees — it is the
+diagnostic trace only.
 """
 import json
 import logging
@@ -22,11 +24,12 @@ from . import config
 
 _LOG_DIR = os.path.expanduser("~/.chad")
 log = logging.getLogger("chad")
-# Local privacy opt-out: set CHAD_NO_SESSION_LOG (any truthy value) to disable the
-# diagnostic session log entirely, matching the CHAD_NO_VALIDATE convention. When opted
-# out we install a NullHandler (so the many log.info calls stay cheap no-ops and Python
-# never warns about missing handlers) and never create ~/.chad for the log's sake.
-_DISABLED = config.flag("CHAD_NO_SESSION_LOG")
+# Privacy-first default: the diagnostic session log is OFF unless opted in. Set
+# CHAD_SESSION_LOG (any truthy value) to enable it; CHAD_NO_SESSION_LOG still forces it
+# off (see config.traces_enabled). When disabled we install a NullHandler (so the many
+# log.info calls stay cheap no-ops and Python never warns about missing handlers) and
+# never create ~/.chad for the log's sake.
+_DISABLED = not config.traces_enabled()
 if _DISABLED:
     log.addHandler(logging.NullHandler())
     log.propagate = False

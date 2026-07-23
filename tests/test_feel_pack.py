@@ -5,8 +5,8 @@ pin the *logic*:
 
   * item 2 — slash-command matching, `@`-token extraction, and IGNORE_DIRS-aware path
     completion (the completer itself just forwards to these);
-  * item 3 — FileHistory at ~/.chad/history is created 0600 and CHAD_NO_SESSION_LOG
-    falls back to in-memory;
+  * item 3 — FileHistory at ~/.chad/history is created 0600 only when opted in
+    (CHAD_SESSION_LOG); off by default and under CHAD_NO_SESSION_LOG it stays in-memory;
   * item 4 — pygments highlighting is byte-identical to the plain path when the import is
     unavailable (monkeypatched off) and adds color when present, with the +/- diff
     coloring left as the outer layer.
@@ -68,8 +68,11 @@ def test_path_matches_respects_ignore_dirs(tmp_path):
 
 # -- item 3: persistent history ---------------------------------------------
 
-def test_file_history_is_created_0600(tmp_path, monkeypatch):
+def test_file_history_opt_in_is_created_0600(tmp_path, monkeypatch):
+    # Persistent history is a local trace, so it follows the same opt-in gate as the
+    # session log: only written when CHAD_SESSION_LOG is set.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CHAD_SESSION_LOG", "1")
     monkeypatch.delenv("CHAD_NO_SESSION_LOG", raising=False)
     h = _make_history()
     p = tmp_path / ".chad" / "history"
@@ -78,8 +81,21 @@ def test_file_history_is_created_0600(tmp_path, monkeypatch):
     assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
 
 
-def test_history_opt_out_is_in_memory(tmp_path, monkeypatch):
+def test_history_off_by_default_is_in_memory(tmp_path, monkeypatch):
+    # Privacy-first default: with no opt-in, history stays in memory and ~/.chad/history
+    # is never written.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CHAD_SESSION_LOG", raising=False)
+    monkeypatch.delenv("CHAD_NO_SESSION_LOG", raising=False)
+    h = _make_history()
+    assert type(h).__name__ == "InMemoryHistory"
+    assert not (tmp_path / ".chad" / "history").exists()
+
+
+def test_history_no_session_log_overrides_opt_in(tmp_path, monkeypatch):
+    # The hard kill switch wins even when the opt-in is set.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CHAD_SESSION_LOG", "1")
     monkeypatch.setenv("CHAD_NO_SESSION_LOG", "1")
     h = _make_history()
     assert type(h).__name__ == "InMemoryHistory"

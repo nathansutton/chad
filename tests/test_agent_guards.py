@@ -1163,3 +1163,66 @@ if __name__ == "__main__":
     test_classify_sync_kind()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
+
+
+def test_dup_result_elide():
+    # iter-14: a read-only result byte-identical to a tool message
+    # still in the transcript is elided to a short pointer; anything that breaks
+    # byte-equality (changed file, different args, compaction rewrite) flows through.
+    from chad.guardrails import DUP_ELIDE_MIN_CHARS, elide_duplicate_result
+    body = "1  line\n" * 200  # comfortably over the threshold
+    check("dup: body over threshold", len(body) >= DUP_ELIDE_MIN_CHARS)
+    msgs = [{"role": "tool", "name": "read", "content": body}]
+    hit = elide_duplicate_result("read", body, msgs)
+    check("dup: identical read elided", hit is not None and "elided" in hit, hit)
+    check("dup: pointer is short", hit is not None and len(hit) < 300, hit)
+    check("dup: changed content flows through",
+          elide_duplicate_result("read", body + "x", msgs) is None)
+    check("dup: name mismatch flows through",
+          elide_duplicate_result("grep", body, msgs) is None)
+    check("dup: bash never elided",
+          elide_duplicate_result(
+              "bash", body, [{"role": "tool", "name": "bash", "content": body}]) is None)
+    check("dup: short result flows through",
+          elide_duplicate_result(
+              "read", "[empty]", [{"role": "tool", "name": "read", "content": "[empty]"}]) is None)
+    # a compaction rewrite (head/tail collapse) breaks equality -> full result again
+    collapsed = body[:100] + "\n[...collapsed...]\n" + body[-50:]
+    check("dup: collapsed prior flows through",
+          elide_duplicate_result(
+              "read", body, [{"role": "tool", "name": "read", "content": collapsed}]) is None)
+
+
+def test_dup_result_elide_lever_off(monkeypatch):
+    from chad.guardrails import elide_duplicate_result
+    monkeypatch.setenv("CHAD_DISABLE", "dup_result_elide")
+    body = "y" * 500
+    check("dup lever off: no elision",
+          elide_duplicate_result(
+              "read", body, [{"role": "tool", "name": "read", "content": body}]) is None)
+
+
+def test_subagent_evidence_warning():
+    # iter-14: a confident report with zero tool dispatches is the answered-from-memory
+    # tell; it gets a verify warning appended. Real work, failure sentinels (the salvage
+    # path owns those), and empty results are left alone.
+    from chad.guardrails import SUBAGENT_EVIDENCE_WARNING, subagent_evidence_warning
+    report = "The bug is in utils.py line 40: off-by-one in the loop bound."
+    warned = subagent_evidence_warning(report, 0)
+    check("evidence: zero-dispatch report is warned",
+          warned == report + SUBAGENT_EVIDENCE_WARNING, warned)
+    check("evidence: real work passes clean",
+          subagent_evidence_warning(report, 3) is None)
+    check("evidence: failure sentinel untouched",
+          subagent_evidence_warning("[task returned nothing]", 0) is None)
+    check("evidence: stopped sentinel untouched",
+          subagent_evidence_warning("[stopped: loop]", 0) is None)
+    check("evidence: empty result untouched",
+          subagent_evidence_warning("   ", 0) is None)
+
+
+def test_subagent_evidence_warning_lever_off(monkeypatch):
+    from chad.guardrails import subagent_evidence_warning
+    monkeypatch.setenv("CHAD_DISABLE", "subagent_evidence_warn")
+    check("evidence lever off: no warning",
+          subagent_evidence_warning("confident memory answer", 0) is None)

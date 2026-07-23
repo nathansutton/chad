@@ -245,3 +245,38 @@ if __name__ == "__main__":
     test_ws_only_edit_result_echoes_landed_indentation()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
+
+
+def test_typo_recovery_file_has_unicode_model_sends_ascii():
+    # iter-14: file uses typographic punctuation, the model
+    # re-types it ASCII-fied. Rungs 1-3 miss; the typo-normalized rung must land.
+    before = 'MSG = "cache — warm start"\nprint(MSG)\n'
+    res, after = run(before, 'MSG = "cache - warm start"', 'MSG = "cache - hot start"')
+    check("typo(ascii old): edit landed", res.startswith("[edited"), res)
+    check("typo(ascii old): note names the rung", "typographic" in res, res)
+    check("typo(ascii old): new text is verbatim", 'MSG = "cache - hot start"' in after, after)
+    check("typo(ascii old): rest untouched", "print(MSG)" in after, after)
+
+
+def test_typo_recovery_model_sends_unicode_file_has_ascii():
+    # Opposite direction: the model quotes with curly punctuation, file is ASCII.
+    before = "note = 'it is fine...'\nx = 1\n"
+    res, after = run(before, "note = ‘it is fine…’", "note = 'all good...'")
+    check("typo(unicode old): edit landed", res.startswith("[edited"), res)
+    check("typo(unicode old): replacement present", "note = 'all good...'" in after, after)
+
+
+def test_typo_recovery_requires_unique_match():
+    # SAFETY: two lines that both match after folding must be rejected, file untouched.
+    before = 'a = "x — y"\nb = "x — y"\n'
+    res, after = run(before, '"x - y"', '"z"')
+    check("typo ambiguous: rejected", not res.startswith("[edited"), res)
+    check("typo ambiguous: file untouched", after == before, after)
+
+
+def test_typo_recovery_lever_off(monkeypatch):
+    monkeypatch.setenv("CHAD_DISABLE", "edit_typo_match")
+    before = 'MSG = "cache — warm start"\nprint(MSG)\n'
+    res, after = run(before, 'MSG = "cache - warm start"', 'MSG = "x"')
+    check("typo lever off: not found", "not found" in res, res)
+    check("typo lever off: file untouched", after == before, after)

@@ -31,6 +31,21 @@ def eq(name: str, expected: str) -> bool:
     return os.environ.get(name) == expected
 
 
+def traces_enabled() -> bool:
+    """Whether chad may write local diagnostic traces under ~/.chad — the readable
+    `session.log` (user query, tool-call args, bash/write/edit previews, result previews)
+    and the persistent input history at ~/.chad/history.
+
+    Privacy-first default: **OFF**. chad is a local, single-user agent, so these traces
+    never leave the machine, but they still record command/file previews in plaintext
+    outside the repo — so they are opt-in. Set **`CHAD_SESSION_LOG`** (any truthy value)
+    to turn them on. `CHAD_NO_SESSION_LOG`, if set, forces them OFF and wins over the
+    opt-in (a hard kill switch, kept for compatibility with the pre-opt-in default)."""
+    if flag("CHAD_NO_SESSION_LOG"):
+        return False
+    return flag("CHAD_SESSION_LOG")
+
+
 def env_str(name, default=None):
     """The env value if set to a non-empty string, else `default`. Mirrors the common
     `os.environ.get(name) or <fallback>` idiom (empty string collapses to the default)."""

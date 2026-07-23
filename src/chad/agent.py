@@ -435,6 +435,11 @@ class Agent:
         self.draft_accepted = 0
         self.think_tokens = 0   # tokens spent inside <think> blocks (reasoning overhead)
         self.think_capped = 0   # times the soft think-cap force-closed a step
+        # Real tool dispatches this agent has executed (fn actually ran — excludes
+        # terminal `done`, validation rejects, and harness-injected nudge messages,
+        # which reuse real tool names in the transcript). The evidence signal behind
+        # the sub-agent zero-evidence warning in _run_subagent.
+        self.tool_dispatches = 0
         # prefill accounting: the master cost for a local model is how many *new*
         # tokens it has to prefill across a turn (context bloat -> big prefills).
         # This is the metric symbolic/repo-map retrieval is meant to shrink.
@@ -689,12 +694,22 @@ class Agent:
             elif (not result or result.startswith("[stopped:")
                     or result.startswith("[task failed:")):
                 result = _salvage(result or "[task returned nothing]")
-        # tool_calls (not `forwards`, a speculative-decoding counter that is 0 on the
-        # normal path) is the number that diagnoses a sub-agent returning nothing: it
-        # separates "never got to search" from "searched and lost its findings".
-        log.info("TASK end | desc=%r | %.1fs | tool_calls=%d gen=%d prefill=%d | -> %s",
+            else:
+                # A confident, non-empty report produced with ZERO tool dispatches came
+                # from model memory, not this repo — the one sub-agent failure the empty/
+                # crashed salvage above cannot see, and the most dangerous fold-back: it
+                # reads as evidence (guardrails.subagent_evidence_warning).
+                warned = guardrails.subagent_evidence_warning(result, sub.tool_dispatches)
+                if warned is not None:
+                    log.info("TASK zero-evidence warning appended | desc=%r", description)
+                    result = warned
+        # tool_dispatches (not a transcript count — harness nudges reuse real tool names
+        # in tool-role messages) is the number that diagnoses a sub-agent returning
+        # nothing: it separates "never got to search" from "searched and lost its
+        # findings", and 0 with a confident report is the answered-from-memory tell.
+        log.info("TASK end | desc=%r | %.1fs | tool_dispatches=%d gen=%d prefill=%d | -> %s",
                  description, time.perf_counter() - _t0,
-                 sum(1 for m in sub.messages if m.get("role") == "tool") if sub else 0,
+                 sub.tool_dispatches if sub else 0,
                  sub.gen_tokens if sub else 0,
                  sub.prefill_tokens if sub else 0, result_preview(result or ""))
         return result or "[task returned nothing]"
@@ -1810,6 +1825,7 @@ class Agent:
                     result = "[denied by user]"
                 else:
                     _t0 = time.perf_counter()
+                    self.tool_dispatches += 1
                     try:
                         result = fn(args, self._should_stop)
                         if plan_write and result.startswith("[wrote"):
@@ -1821,6 +1837,15 @@ class Agent:
                     # whole — several calls in one step stack into one prefill, so later
                     # results only get what's left of the step budget (floor-protected).
                     result = _clip_tool_result(result, cap=_step_tool_cap(step_tool_chars))
+                    # Duplicate read-only output: if this (clipped) result is
+                    # byte-identical to a tool message still in the transcript, append a
+                    # short pointer instead of paying the body's prefill again — see
+                    # guardrails.elide_duplicate_result for the safety argument.
+                    _elided = guardrails.elide_duplicate_result(name, result, self.messages)
+                    if _elided is not None:
+                        log.info("TOOL %s duplicate result elided (%d chars)",
+                                 name, len(result))
+                        result = _elided
                     step_tool_chars += len(result)
                     if _PREFILL_TRACE:
                         self._trace_tools_pending.append([name, round(_tool_s, 4)])

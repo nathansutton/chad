@@ -2,6 +2,40 @@
 
 Notable, user-visible changes.
 
+## [1.0.4] — 2026-07-22
+
+Tool-result economics: three additions, each individually reversible via `CHAD_DISABLE`.
+
+- **Edits survive typographic-punctuation drift.** A fourth edit-match rung: when
+  exact, escape-normalized, and whitespace-flexible matching all miss, the edit
+  retries with curly quotes, en/em dashes, ellipsis, and non-breaking spaces folded
+  to ASCII on both sides — the drift when the model re-types prose or docstrings it
+  saw rendered (in either direction). A unique match is still required, and the
+  result discloses the recovery.
+- **Duplicate read-only output is elided.** When a `read`/`grep`/`glob`/symbol-tool
+  result comes back byte-identical to a result still in the transcript, chad appends
+  a short pointer to the earlier copy instead of re-sending the full body — on a
+  non-trimmable prefix cache every duplicate body is prefill paid again on every
+  later step. Byte-equality against the live transcript is the safety proof: a
+  changed file, different arguments, or a compaction rewrite all break equality, so
+  content is only elided while a verbatim copy is provably still in context.
+- **Sub-agent reports with no evidence are flagged.** A `task` sub-agent that
+  returns a confident, non-empty report having dispatched zero tools answered from
+  model memory, not this repository; its folded result now carries an explicit
+  "verify with grep/read before relying on it" warning. Warn-not-reject on purpose:
+  a re-spawn doubles the local GPU cost, and a wrongly-rejected report breaks the
+  turn while a wrongly-accepted one merely restores the old behavior.
+
+Plus a privacy default flip:
+
+- **Local diagnostic traces are now opt-in (privacy-first default: off).** The
+  readable `~/.chad/session.log` trace — user query, tool-call args (bash commands,
+  write/edit content), and result previews — and the persistent input history at
+  `~/.chad/history` are no longer written by default. chad is a local, single-user
+  agent so nothing ever left the machine, but the log still landed plaintext previews
+  under `~/.chad`, so it's now enabled only when you opt in with **`CHAD_SESSION_LOG=1`**.
+  `CHAD_NO_SESSION_LOG=1` still works as a hard kill switch and wins over the opt-in.
+
 ## [1.0.3] — 2026-07-21
 
 Guardrail-interaction fixes: three cases where the model was doing fine but

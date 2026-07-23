@@ -309,6 +309,35 @@ LEVERS: dict[str, Lever] = {
         "harassing ops-heavy tasks that legitimately run many non-read commands.",
         "iter13"),
 
+    # --- iter-14: tool-result economics (2026-07). Two ideas from a teardown of a
+    #     token-optimizing agent harness: normalize typographic unicode when matching
+    #     edits, and never re-send file content the model provably already has; both
+    #     map cleanly onto a prefill-dominated local loop. ---------------------------
+    "edit_typo_match": Lever(
+        "Fourth edit-match rung: when exact / escape-normalized / whitespace-flexible "
+        "matching all miss, retry the whitespace-flexible match with typographic "
+        "punctuation folded to ASCII on BOTH sides (curly quotes, en/em dashes, "
+        "ellipsis, non-breaking space) — the drift when a model re-types prose or "
+        "docstrings it saw rendered. Still requires a unique match; never fires on "
+        "code that matched an earlier rung. OFF loses only the recovery.",
+        "iter14"),
+    "subagent_evidence_warn": Lever(
+        "A sub-agent that returns a confident, non-empty report having dispatched ZERO "
+        "tools answered from model memory, not the repo; its folded result gets an "
+        "explicit verify-before-relying warning appended. Warn-not-reject on purpose: "
+        "a local re-spawn doubles GPU cost, and a false reject breaks the turn while a "
+        "false accept merely restores the pre-warning status quo. OFF folds the "
+        "unverified report back silently.",
+        "iter14"),
+    "dup_result_elide": Lever(
+        "A read-only tool result byte-identical to a tool message still in the "
+        "transcript is replaced with a short pointer to the earlier copy instead of "
+        "re-appending the full body to the prefill. Equality against the LIVE "
+        "transcript is the safety proof: compaction rewrites or drops old messages, "
+        "which breaks equality, so content is only elided while it is genuinely "
+        "still in context. OFF re-appends duplicate output verbatim.",
+        "iter14"),
+
     # --- from the LangChain harness-tuning playbook. -------------------------------
     "compact_notice": Lever(
         "After compaction, inject an in-band message telling the model its context was "
@@ -326,6 +355,14 @@ LEVERS: dict[str, Lever] = {
         "Append the active model profile's prompt block to the system prompt "
         "(model-specific accommodations; see profiles.py).",
         "playbook"),
+
+    # --- from the ai-codex teardown: an index the model already has beats one it must
+    #     fetch. chad had the ranked map but only as a tool; this puts a digest in-prompt.
+    "workspace_map": Lever(
+        "Inject a ranked repo_map digest into the system-prompt dynamic tail instead of "
+        "a flat file listing, so the model orients without a reflexive step-1 repo_map "
+        "call. Degrades to the flat listing when repomap is unavailable (see prompt.py).",
+        "ai-codex"),
 }
 
 

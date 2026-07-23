@@ -209,12 +209,20 @@ def _dynamic_context() -> list:
         f"- Shell: {os.environ.get('SHELL', 'unknown')}",
         f"- Working directory: {os.getcwd()}",
     ]
-    snapshot = _workspace_snapshot()
-    if snapshot:
+    ranked = _workspace_map()
+    if ranked:
         dynamic.append(
-            "\n# Workspace files (a real project — use grep/read to inspect before answering)\n"
-            + snapshot
+            "\n# Workspace map (ranked by reference centrality; signatures only — "
+            "call repo_map for a wider/focused map, view_symbol/read for bodies)\n"
+            + ranked
         )
+    else:
+        snapshot = _workspace_snapshot()
+        if snapshot:
+            dynamic.append(
+                "\n# Workspace files (a real project — use grep/read to inspect before answering)\n"
+                + snapshot
+            )
     test_cmd = _detect_test_command()
     if test_cmd:
         dynamic.append(
@@ -332,6 +340,30 @@ def _detect_test_command() -> str:
         except OSError:
             pass
     return ""
+
+
+def _workspace_map(budget: int = 600) -> str:
+    """A small, ranked repo_map digest for the system-prompt tail, so the model orients
+    structurally at session start instead of burning a reflexive step-1 repo_map call
+    (chad already pays for the ranked index; the tool stays for a wider/focused map).
+
+    Built once per session (build_system_prompt runs once in Agent.__init__) and reuses
+    the on-disk mtime cache, so it doesn't churn the KV prefix or add per-turn cost.
+    Returns "" on any failure so _dynamic_context falls back to the flat file listing —
+    keeping behavior identical on wheel-less platforms where repomap degrades to empty."""
+    from . import levers
+    if not levers.enabled("workspace_map"):
+        return ""
+    try:
+        from . import repomap
+        digest = repomap.service().repo_map(budget_tokens=budget)
+    except Exception:  # noqa: BLE001 - orientation is best-effort; degrade to snapshot
+        return ""
+    # repo_map's non-map sentinels ("[no source files found]", "[interrupted]") and any
+    # empty/whitespace result mean "no usable map" — fall back rather than inject noise.
+    if not digest or not digest.strip() or digest.strip().startswith("["):
+        return ""
+    return digest
 
 
 def _workspace_snapshot(limit: int = 60) -> str:
