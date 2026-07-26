@@ -260,10 +260,11 @@ def _install_layer_fastpath(model) -> None:
                         and cache[0] is not None and cache[1] is not None
                         and cache.lengths is None):
                     h, new_conv, new_rec = self._gdn_fast(x, cache[0], cache[1])
+                    out = self._moe_fast(h)
                     cache[0] = new_conv
                     cache[1] = new_rec
                     cache.advance(1)
-                    return self._moe_fast(h)
+                    return out
             else:
                 r = self.self_attn(self.input_layernorm(x), mask, cache)
                 return self._moe_fast(x + r)
@@ -273,7 +274,25 @@ def _install_layer_fastpath(model) -> None:
 
 
 def _compile_moe_step(layer):
-    """post_attention_layernorm + full MoE block + residual as one compiled fn."""
+    import mlx.core as mx
+    return mx.compile(_moe_body(layer))
+
+
+def _compile_gdn_step(layer):
+    import mlx.core as mx
+    return mx.compile(_gdn_body(layer))
+
+
+def _moe_body(layer):
+    """post_attention_layernorm + full MoE block + residual, UNCOMPILED so the
+    caller decides the compile region.
+
+    A single fused GDN+MoE region per layer (one mx.compile over both bodies) was
+    built and measured on the real 35B: 1.001x+-0.002 at 8k, 1.002x+-0.003 at 32k,
+    interleaved in one process — indistinguishable from the two-call path, so it
+    was removed rather than shipped as dead opt-in code. The compiler evidently
+    already keeps the boundary cheap; don't re-derive the idea without a new
+    measurement showing otherwise."""
     import mlx.core as mx
     import mlx.nn as nn
 
@@ -313,12 +332,12 @@ def _compile_moe_step(layer):
         sh = qmm(nn.silu(qmm(x, se.gate_proj)) * qmm(x, se.up_proj), se.down_proj)
         return h + y + mx.sigmoid(qmm(x, seg)) * sh
 
-    return mx.compile(fwd)
+    return fwd
 
 
-def _compile_gdn_step(layer):
-    """input_layernorm + full GDN forward + residual as one compiled pure fn
-    with explicit (conv_state, recurrent_state) threading."""
+def _gdn_body(layer):
+    """input_layernorm + full GDN forward + residual, UNCOMPILED, with explicit
+    (conv_state, recurrent_state) threading."""
     import mlx.core as mx
     import mlx.nn as nn
     from mlx_lm.models.qwen3_5 import gated_delta_update
@@ -367,4 +386,4 @@ def _compile_gdn_step(layer):
                                   bits=op.bits)
         return xin + out, new_conv, new_rec
 
-    return mx.compile(fwd)
+    return fwd

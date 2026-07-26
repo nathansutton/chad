@@ -97,7 +97,7 @@ def _agentic(model_id: str, why: str, context_tokens: int, apply_fix: bool):
     from .agent import build_system_prompt, close_unclosed_think
     from .engine import Engine
 
-    eng = Engine(model_id=model_id, draft_id=None, cache_dir=None)
+    eng = Engine(model_id=model_id, cache_dir=None)
     eng.load()
     tok = eng.tok
 
@@ -203,7 +203,7 @@ def main(argv=None) -> int:
 
     # cache_dir=None so the on-disk warm-prefix can't pre-load and skew the *cold* prefill
     # number; this benchmark measures from a genuinely cold cache.
-    eng = Engine(model_id=model_id, draft_id=None, cache_dir=None)
+    eng = Engine(model_id=model_id, cache_dir=None)
     sys.stderr.write(f"loading {model_id} [{why}] ...\n")
     load_s = eng.load()
 

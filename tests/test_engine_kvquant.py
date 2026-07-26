@@ -40,7 +40,6 @@ def build_tiny():
 def _bare_engine(model=None, kv_bits=None):
     eng = object.__new__(Engine)  # bypass __init__ (no weights to load)
     eng.model = model
-    eng.draft = None
     eng.kv_bits = kv_bits
     eng._cached_ids = []
     eng._rewind_snap = None
@@ -72,13 +71,6 @@ def test_kv_bits_explicit_wins():
     assert _resolve(256, 16, 2, 0) is None      # forced off
     assert _resolve(128, 16, 2, 8) == 8         # forced on, uncovered: honored
 
-
-def test_kv_bits_auto_off_with_draft():
-    eng = _bare_engine(kv_bits=None)
-    eng.draft = object()
-    eng._n_attn_heads, eng._n_kv_heads, eng._head_dim = 16, 2, 256
-    eng._resolve_kv_bits(True)
-    assert eng.kv_bits is None
 
 
 # ---- cache build / accounting / trim / rewind on the tiny hybrid -----------

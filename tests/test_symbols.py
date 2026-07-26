@@ -9,7 +9,7 @@ targeting works, insert keeps the file parseable, and the not-found / empty-cont
 guards leave the file untouched. jedi is a hard dependency so these always run — no
 model gate.
 
-Run: `uv run python test_symbols.py`
+Run: `uv run python tests/test_symbols.py`
 """
 
 import os

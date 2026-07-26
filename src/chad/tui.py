@@ -289,7 +289,7 @@ class TUI:
         self._cur_prompt_tokens = 0        # last rendered prompt size (context gauge)
         self._tick = 0                     # animation frame counter (spinner)
         self._phase = "Thinking"           # current activity verb shown by the spinner
-        # Live activity readouts for the bottom status line (plans 033/034). Reset per
+        # Live activity readouts for the bottom status line. Reset per
         # turn in _worker; updated by the agent's gen/prefill emits. Display-only.
         self._turn_start = 0.0             # time.monotonic() at turn start (elapsed timer)
         self._gen_tokens = 0               # ↓ generated this step (live)
@@ -480,7 +480,7 @@ class TUI:
         mode = self.agent.mode
         pct = int(100 * self._cur_prompt_tokens / self.ctx_limit) if self.ctx_limit else 0
         qn = len(self._queue)
-        # Left: an animated activity indicator. Plans 033/034 reverse the old "verb only"
+        # Left: an animated activity indicator, reversing the old "verb only"
         # choice for THIS live line only (session.log still carries the rate diagnostics):
         # a state glyph + the verb, then the two numbers that are reassurance not noise —
         # elapsed seconds and ↑prefilled/↓generated counts — plus an advancing % while a

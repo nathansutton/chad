@@ -96,8 +96,8 @@ _ACTION_WORDS = (
 # image, install a package), not to land a file edit — completable with zero edits, so
 # these must NOT feed the `action` class (whose no-empty-diff done gate demands a landed
 # edit; arming it here would hard-block every legitimate zero-edit completion). They get
-# their own `run` class, which arms only the anti-bail nudges (TB2.1 qemu-startup,
-# plan 107 follow-up: classified neither action nor read-only, so a prose give-up with
+# their own `run` class, which arms only the anti-bail nudges (a qemu-startup task
+# was classified neither action nor read-only, so a prose give-up with
 # 733s left sailed through the weakest path).
 _RUN_WORDS_RE = re.compile(
     r"\b(start|launch|boot|run|serve|deploy|install|configure|mount|restart|enable"
@@ -121,7 +121,7 @@ _READ_ONLY_NEGATIONS = (
 _READ_ONLY_GLOBAL = ("just explain", "only explain", "read-only", "read only")
 _READ_ONLY_PHRASES = _READ_ONLY_NEGATIONS + _READ_ONLY_GLOBAL
 # …unless the negation names a SPECIFIC file/object — then it's a scope constraint on
-# an action task, not a read-only ask. TB2.1 overfull-hbox ("Do not edit main.tex or
+# an action task, not a read-only ask. A LaTeX task ("Do not edit main.tex or
 # synonyms.txt" — the task is to edit input.tex) and query-optimize ("Do not modify the
 # database file in any way" — the task writes /app/sol.sql) were both classified
 # read_only, which disarmed the no-empty-diff gate, the deliverable recheck, and the
@@ -134,10 +134,10 @@ _SCOPED_NEGATION_RE = re.compile(
     r"\b(?:files?|database|db|repo|repository|director(?:y|ies)|folders?|tables?|"
     r"scripts?)\b)")
 # A demand to deliver the answer INTO a file ("write the number … to /app/answer.txt",
-# "save the results to a file") — overrides an explanatory opener. TB2
-# count-dataset-tokens (2026-07-12): "Tell me how many … write the integer to the file
-# /app/answer.txt" classified read_only, which disarmed every no-progress gate and let
-# a garbled final step end the task with an empty diff. Explicit negations
+# "save the results to a file") — overrides an explanatory opener. The measured miss:
+# "Tell me how many … write the integer to the file /app/answer.txt" classified
+# read_only, which disarmed every no-progress gate and let a garbled final step end the
+# task with an empty diff. Explicit negations
 # (_READ_ONLY_PHRASES) still win: they are OR'd in separately below.
 # Periods are allowed in the gap (abbreviations like `e.g.` and quoted examples sit
 # mid-sentence in real task text); newlines and ?/! still bound the match.
@@ -258,7 +258,39 @@ def build_system_prompt(model_id: str | None = None) -> str:
     # prefix KV cache reuses it. Volatile per-session context (cwd, project docs) goes
     # below, where re-prefilling a few hundred tokens is cheap. The profile block is
     # static for a given model, so it sits above the boundary with the base prompt.
-    return _BASE_PROMPT + profiles.prompt_block(model_id) + "\n".join(_dynamic_context())
+    return (_BASE_PROMPT + _bash_bg_block() + _verify_specific_block()
+            + profiles.prompt_block(model_id) + "\n".join(_dynamic_context()))
+
+
+def _bash_bg_block() -> str:
+    """One line about auto-background, only while the lever is on — describing a
+    behavior the harness isn't exhibiting would teach the model to wait on files that
+    never appear. Static for the session, so it sits above the cache boundary."""
+    from . import levers
+    if not levers.enabled("bash_auto_background"):
+        return ""
+    return ("\n- A `bash` command that outruns its timeout is NOT killed: it keeps "
+            "running and its output streams to a file named in the result. Read or "
+            "grep that file to check on it, and do other work while it runs — never "
+            "sit in a loop re-reading it.\n")
+
+
+def _verify_specific_block() -> str:
+    """Steer the final verification at the task's OWN stated check instead of a proxy.
+    The measured class: runs that re-verified after a done bounce with a weaker check
+    than the task named (file-exists for a content requirement, a hand-rolled probe for
+    a stated test command) and shipped a wrong solution with most of the wall unused.
+    Static for the session, so it sits above the cache boundary."""
+    from . import levers
+    if not levers.enabled("steer_verify_specific"):
+        return ""
+    return ("\n- When the task states its own acceptance check (an exact command, a "
+            "test, a required output), your final verification must RUN that stated "
+            "check and read its output — not a stand-in. WRONG: `ls /app/out.json` "
+            "then done (existence proves nothing about contents). CORRECT: run the "
+            "command the task names end-to-end, confirm the output matches every "
+            "stated requirement, then call done. If a done was rejected with quoted "
+            "requirement lines, re-run the exact check those lines describe.\n")
 
 
 def build_subagent_prompt(model_id: str | None = None) -> str:

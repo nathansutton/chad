@@ -4,7 +4,7 @@ WHAT THIS IS
 ------------
 chad's one remote backend: the same agent loop (guardrails, validate/repair, symbolic
 tools, edit cascade) driving a llama.cpp server instead of the in-process MLX engine —
-the arm used when chad runs inside a Linux benchmark container against a GGUF served on a
+the arm used when chad runs inside a Linux container against a GGUF served on a
 GPU box, where MLX can't run. It talks to llama.cpp's native `/completion` endpoint
 rather than a generic `/v1/chat/completions` one, which avoids the two costs a chat
 endpoint would force — DETOKENIZING chad's rendered ids into text the server then
@@ -38,6 +38,15 @@ WHAT IS STILL DEGRADED (inherent to any remote boundary)
 - No cache quarantine (`push_cache`/`pop_cache` are no-ops): a single-slot server
   has ONE prefix cache, so a sub-agent's prompt evicts the main transcript's prefix
   and the return trip re-prefills it. Correctness is unaffected; latency pays.
+
+…UNLESS THE SERVER IS `chad serve`
+-----------------------------------
+The last two are only unavoidable against a server that can't be asked. `serve.py`
+exposes the local MLX engine over this exact protocol and advertises the two missing
+capabilities in its `/props` under a `chad` block; when `load()` sees them, the
+no-ops below become real calls and quarantine + warm-start come back. Stock llama.cpp
+sends no such block, so nothing changes there — and because both are latency and not
+correctness, a failed call degrades silently to the no-op rather than losing a run.
 """
 
 import http.client
@@ -47,7 +56,17 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Iterator, Optional
 
-from .base_engine import THINK_CLOSE, BackendError, GenStats, think_ceiling_hit
+from .base_engine import THINK_CLOSE, BackendError, GenStats, TailWatch, think_ceiling_hit
+
+# The capability names are the wire contract between this client and `chad serve`;
+# they live with the server so there is exactly one spelling of each. `serve` imports
+# nothing heavier than the stdlib at module scope, so this stays safe in a container
+# where MLX (and everything it drags in) is absent.
+from .serve import CAP_CACHE_QUARANTINE, CAP_WARM_PREFIX
+
+# Stands in for a local KV directory when the SERVER owns the disk cache. Never opened
+# here — it exists to answer "yes, a warm start is possible" truthily (see cache_dir).
+REMOTE_CACHE = "<served by chad serve>"
 
 
 def parse_sse_chunk(line: str) -> Optional[dict]:
@@ -148,25 +167,65 @@ class CompletionEngine:
         self._tokenizer_id = tokenizer_id or model_id
         # --- BaseEngine / drop-in data members ---
         self.tok: Any = None            # loaded in load()
-        self.cache_dir: Optional[str] = None   # KV lives in the server, not on our disk
         self._cached_ids: list = []     # mirror of the server's cached prompt+generation
-        self.draft = None               # no draft model (repl status line reads this)
+        # Capabilities the server advertised (see `serve.py`). Empty against stock
+        # llama.cpp, which is what keeps the cache calls below no-ops there.
+        self._caps: set = set()
+        self._props_probed: bool = False
+        self._cache_stack: list = []    # mirror of the server's quarantine stack
         self.kv_bytes_per_token: float = 0.0   # cli's RAM-aware ctx sizing reads this
+
+    # A truthy `cache_dir` is the agent's ONE test for "is a disk KV cache reachable?"
+    # (agent.py gates its warm-start on it, and nothing else reads it). Against stock
+    # llama.cpp the answer is genuinely no — the checkpoint would live on the server's
+    # disk, out of our reach — so this stays None and the warm start is skipped, exactly
+    # as before. A `chad serve` server advertising `warm_prefix` CAN do it on our behalf,
+    # and this is what opens that gate. A property, not a field, because the capability
+    # handshake is lazy: reading it is the first thing that needs the answer, so the
+    # probe belongs here rather than in load() (which must stay probe-free when the
+    # operator pinned the window).
+    @property
+    def cache_dir(self) -> Optional[str]:
+        self._ensure_caps()
+        return REMOTE_CACHE if CAP_WARM_PREFIX in self._caps else None
 
     # -- lifecycle --------------------------------------------------------
 
     def load(self) -> float:
         """Load ONLY the tokenizer (no weights) so `Agent._render` can template
         prompts, then size the context window from the server's own /props (the wall
-        it will actually enforce). Returns elapsed seconds (mirrors Engine.load)."""
+        it will actually enforce) and record any capabilities it advertises. Returns
+        elapsed seconds (mirrors Engine.load)."""
         t0 = time.time()
         from transformers import AutoTokenizer  # heavy import; defer to actual use
         self.tok = AutoTokenizer.from_pretrained(self._tokenizer_id)
         if not self.effective_ctx:
-            props = self._fetch_props() or {}
+            # An explicitly pinned window still means NO probe: an operator who pinned
+            # everything shouldn't wait on a socket timeout to start. The capability
+            # handshake reuses this response when it happens, and pays for its own
+            # probe lazily otherwise (see _ensure_caps).
+            self._absorb_props(self._fetch_props() or {})
+        return time.time() - t0
+
+    def _absorb_props(self, props: dict) -> None:
+        """Read one `/props` response: the context wall to respect, and the `chad`
+        capability block (absent on stock llama.cpp — that absence IS the signal)."""
+        self._props_probed = True
+        if not self.effective_ctx:
             n_ctx = (props.get("default_generation_settings") or {}).get("n_ctx")
             self.effective_ctx = int(n_ctx) if n_ctx else 32768
-        return time.time() - t0
+        caps = (props.get("chad") or {}).get("capabilities")
+        if isinstance(caps, list):
+            self._caps = {c for c in caps if isinstance(c, str)}
+
+    def _ensure_caps(self) -> None:
+        """Handshake on first use of an extension, at most once per process. Lazy
+        because the common case — a pinned window against stock llama.cpp — should not
+        pay for a probe during load; the extensions are the only thing that needs it,
+        and the first one is already off the hot path."""
+        if self._props_probed:
+            return
+        self._absorb_props(self._fetch_props() or {})
 
     def reset(self) -> None:
         """Forget the mirrored cache state. The server keeps its slot cache, but the
@@ -178,18 +237,84 @@ class CompletionEngine:
 
     def warm_prefix(self, prefix_ids: list,
                     should_stop: Optional[Callable[[], bool]] = None) -> tuple[str, int]:
-        """No disk KV warm-start — the cache lives in the server process. 'skip'."""
-        return ("skip", 0)
+        """Warm-start the stable prefix. Against stock llama.cpp there is nothing to do
+        — the KV checkpoint would live on the SERVER's disk, which we can't reach — so
+        this stays 'skip'. A `chad serve` server advertising `warm_prefix` does the
+        real thing on our behalf and reports ('hit'|'miss', n)."""
+        if not prefix_ids:
+            return ("skip", 0)
+        self._ensure_caps()
+        if CAP_WARM_PREFIX not in self._caps:
+            return ("skip", 0)
+        resp = self._post_json("/warm", {"prefix": list(prefix_ids)})
+        if not resp:
+            return ("skip", 0)
+        status = str(resp.get("status") or "skip")
+        fed = int(resp.get("fed") or 0)
+        if status in ("hit", "miss") and fed:
+            # Mirror what the server now holds, so the first turn's prefill estimate
+            # accounts for the prefix we just warmed instead of assuming a cold cache.
+            self._cached_ids = list(prefix_ids[:fed])
+        return (status, fed)
 
     def push_cache(self) -> None:
-        """No quarantine on a single-slot server: a sub-agent's prompt evicts the main
-        prefix and the return trip re-prefills it (latency, not correctness)."""
-        return None
+        """Quarantine the current prefix. On a single-slot llama.cpp server there is no
+        such thing — a sub-agent's prompt evicts the main transcript's prefix and the
+        return trip re-prefills it (latency, not correctness) — so this is a no-op
+        there. A `chad serve` server advertising `cache_quarantine` pushes for real."""
+        self._cache_op("push")
 
     def pop_cache(self) -> None:
+        self._cache_op("pop")
+
+    def _cache_op(self, which: str) -> None:
+        """One quarantine call, best-effort, keeping our cache mirror in step with the
+        server's. A server that doesn't advertise the capability, or a call that fails,
+        leaves us in exactly the no-op behavior this backend always had — never a failed
+        turn over a latency optimization."""
+        self._ensure_caps()
+        if CAP_CACHE_QUARANTINE not in self._caps:
+            return None
+        if which == "push":
+            resp = self._post_json("/cache/push", {})
+            if resp and resp.get("ok"):
+                # The server stacked the live prefix and reset its cache; the sub-agent
+                # starts cold against it, so the mirror starts empty. We keep the frame
+                # to restore on pop — the server has it too, but only WE can put it back
+                # in the mirror the prefill estimate reads.
+                self._cache_stack.append(list(self._cached_ids))
+                self._cached_ids = []
+            return None
+        resp = self._post_json("/cache/pop", {})
+        if resp and resp.get("ok"):
+            # The server restored the exact prefix that was live at push time.
+            self._cached_ids = self._cache_stack.pop() if self._cache_stack else []
+        elif self._cache_stack:
+            # Pop failed: the server's cache state is unknown, so drop the frame and
+            # mirror a cold cache. The estimate goes conservative; the server's own
+            # prefix diff, which is what actually decides the prefill, stays exact.
+            self._cache_stack.pop()
+            self._cached_ids = []
         return None
 
     # -- HTTP (isolated so tests can stub it; no network in tests) ---------
+
+    def _post_json(self, path: str, body: dict) -> Optional[dict]:
+        """POST a small JSON control message to a `chad serve` extension endpoint and
+        return the decoded reply. Best-effort by design: EVERY caller treats None as
+        'the optimization didn't happen', so an unreachable or stock server costs a
+        connection attempt, never a turn."""
+        data = json.dumps(body).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(self._origin + path, data=data, headers=headers,
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001 — degrade to the no-op, never fail the run
+            return None
 
     def _fetch_props(self) -> Optional[dict]:
         """GET the server's /props (read-only) for n_ctx discovery. Best-effort:
@@ -275,6 +400,15 @@ class CompletionEngine:
         gen_ms_from_timings = 0.0       # summed predicted_ms — only trusted if EVERY request
                                         # in the step reported it (see all_requests_timed below)
         all_requests_timed = True
+        # Incremental stop-marker detection. Both of these used to re-scan the ENTIRE
+        # accumulated text after every single token, which is quadratic in the length of
+        # the turn: 777ms of pure CPU on a 16k-token generation, spent on the very thread
+        # that has to drain the token stream. Watchers carry only the few characters a
+        # match could straddle. They live outside the request loop because `text` keeps
+        # accumulating across a salvage continuation.
+        stop_watch = TailWatch(stop_texts or [])
+        think_watch = TailWatch(["</think>"] if think_ceiling else [])
+        cache_reset = False             # server dropped its cache mid-turn (Metal OOM)
         t0 = time.time()
         first_at: Optional[float] = None
         cur_prompt_ids = prompt_ids
@@ -307,6 +441,11 @@ class CompletionEngine:
                                                transient=code >= 500)
                         if chunk.get("timings"):   # final stop-chunk carries real telemetry
                             timings = chunk["timings"]
+                        if chunk.get("cache_reset"):
+                            # `chad serve` telling us its prefix cache was dropped (OOM
+                            # recovery): NOTHING is resident on the server now, so the
+                            # mirror must go empty rather than record prompt+generation.
+                            cache_reset = True
                         gen_ids.extend(chunk.get("tokens") or [])
                         seg = chunk_text(chunk)
                         if not seg:
@@ -315,18 +454,23 @@ class CompletionEngine:
                             first_at = time.time()
                             stats.prefill_s = first_at - t0
                         text += seg
+                        # Feed both watchers before any early exit, so neither can miss a
+                        # marker that lands in the same segment as a break.
+                        stop_hit = stop_watch.feed(seg)
+                        think_closed = think_watch.feed(seg)
                         n_chunks += 1
                         n_out += 1
                         if on_token:
                             on_token(seg)
-                        if stop_texts and any(s in text for s in stop_texts):
+                        if stop_hit:
                             should_stop = lambda: True  # noqa: E731 — bail on next outer read
                             break
                         # Close-and-continue: still inside <think> past the ceiling. Stop
                         # this request and re-request with the force-closed ids appended
                         # (below). Checked before stop_condition so the high pathological
                         # ceiling salvages rather than ending the step.
-                        if think_ceiling_hit(text, n_out, think_ceiling):
+                        if think_ceiling_hit(text, n_out, think_ceiling,
+                                             think_closed=think_closed):
                             salvage_here = True
                             break
                         if stop_condition is not None and stop_condition(text, n_out):
@@ -370,6 +514,10 @@ class CompletionEngine:
             # reuses the common prefix (no detokenize — this backend is token-native).
             close_ids = list(self.tok.encode(THINK_CLOSE, add_special_tokens=False))
             text += THINK_CLOSE
+            # The injected close is part of the text the watchers are tracking; feed it
+            # or the continuation re-trips the ceiling it was meant to resolve.
+            think_watch.feed(THINK_CLOSE)
+            stop_watch.feed(THINK_CLOSE)
             all_gen_ids.extend(close_ids)
             n_out += len(close_ids)
             stats.salvaged = True
@@ -387,10 +535,15 @@ class CompletionEngine:
             # estimate and say so.
             stats.gen_s = time.time() - (first_at or t0)
             stats.approximate = True
+        stats.gen_ids = list(all_gen_ids)
         # Mirror the server's slot cache (prompt + generation), exactly like the MLX
         # engine's `_cached_ids = prompt_ids + gen_ids` — this is what makes the next
         # turn's pre-generation estimate accurate in append-only transcripts. Correct
         # across a salvage too: `all_gen_ids` already carries gen1 + THINK_CLOSE + gen2,
         # which is exactly what the server's own slot cache holds after the continuation.
-        self._cached_ids = prompt_ids + all_gen_ids
+        # …unless the server told us it dropped the cache: then it holds nothing, and
+        # mirroring prompt+generation would make the next prefill estimate confidently
+        # wrong instead of merely conservative.
+        stats.cache_reset = cache_reset
+        self._cached_ids = [] if cache_reset else prompt_ids + all_gen_ids
         return text, stats

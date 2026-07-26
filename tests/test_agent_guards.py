@@ -17,7 +17,7 @@ characterizes them: the done-gating predicate, the tool-result bookkeeping
 repeated-call loop guard, and the no-tool-call nudge selection. The predicates are
 imported from `guardrails` (their real home).
 
-Run: `uv run python test_agent_guards.py`
+Run: `uv run python tests/test_agent_guards.py`
 """
 
 from chad.guardrails import (
@@ -161,7 +161,7 @@ def test_update_work_flags():
     check("write_todos leaves edit flags clean", me4 is False and ue4 is False)
 
     # A clean working-tree REVERT un-lands the edit: made_edit AND unverified_edit both
-    # go False so the no-empty-diff gate re-fires (matplotlib-20676 empty-diff hole).
+    # go False so the no-empty-diff gate re-fires (the measured empty-diff hole).
     for cmd in ("git checkout .", "git checkout -- foo/bar.py", "git restore .",
                 "git reset --hard HEAD", "git stash", "git checkout src/mod/x.py"):
         _, me_r, ue_r = update_work_flags(
@@ -492,6 +492,54 @@ def test_destructive_bash_guard():
         check(f"safe does NOT fire: {cmd!r}", not is_destructive_bash(cmd))
 
 
+def test_destructive_guard_scoped_rm():
+    import os
+    # scoped_destructive_guard ON (default): a recursive delete of a DEEP absolute
+    # path is a scoped delete, not a catastrophe — the measured false-positive class
+    # (152 '[denied by user]' results across 26 container trials, every real path
+    # absolute; one turn re-phrased the same /tmp cleanup 30 times).
+    for cmd in [
+        "rm -rf /tmp/test-deploy",
+        "rm -rf /app/c4_resharded && ls /app",
+        "rm -rf /tmp/vrepo /tmp/run_verify.sh /tmp/full_verify.sh",
+        "rm -rf /var/www/html/dev/cache",
+        "rm -rf /opt/build/output/*",
+    ]:
+        check(f"scoped delete allowed: {cmd!r}", not is_destructive_bash(cmd))
+
+    # Catastrophic targets still fire: roots, depth-1, home trees, cwd/parent, and a
+    # glob that empties a top-level dir.
+    for cmd in [
+        "rm -rf /etc",
+        "rm -rf /usr/",
+        "rm -rf /home/user/project",
+        "rm -rf /Users/nate/repo",
+        "rm -rf /root/.ssh",
+        "rm -rf /app/*",
+        "rm -rf ..",
+        "rm -rf ${HOME}/x",
+    ]:
+        check(f"protected target fires: {cmd!r}", is_destructive_bash(cmd))
+
+    # Every target of every rm is screened — legacy's single-target regex saw only
+    # the first token and missed a protected one hiding behind a safe one.
+    check("second target / fires", is_destructive_bash("rm -rf /tmp/x /"))
+    check("rm after separator fires",
+          is_destructive_bash("rm -rf /tmp/x; rm -rf /etc"))
+    # A recursive flag on one rm must not condemn a different, non-recursive rm.
+    check("non-recursive rm of / does not fire (no -r)",
+          not is_destructive_bash("rm -f /tmp/x"))
+
+    # Lever OFF restores the legacy any-absolute-path shape exactly.
+    os.environ["CHAD_DISABLE"] = "scoped_destructive_guard"
+    try:
+        check("lever OFF: /tmp delete fires again",
+              is_destructive_bash("rm -rf /tmp/test-deploy"))
+        check("lever OFF: home still fires", is_destructive_bash("rm -rf ~"))
+    finally:
+        del os.environ["CHAD_DISABLE"]
+
+
 def test_think_budget():
     # Soft think-cap escalation ramp. stuck_level 0 => base (cheap default).
     check("stuck 0 => base", think_budget(0) == 512, think_budget(0))
@@ -542,7 +590,7 @@ def test_degenerate_tail():
     big_unit = ("x" * 300 + " different filler words here ") * 20
     check("over-long short-text unit out of scope", not degenerate_tail(big_unit))
     # Coarse tier: a block whose period is BETWEEN the fine cap (256) and the coarse cap
-    # (3072), repeated to fill the 12KB+ tail, IS caught — the django-14404 reasoning-loop
+    # (3072), repeated to fill the 12KB+ tail, IS caught — the measured reasoning-loop
     # the fine tier was blind to. The block has no short internal period, so only the
     # coarse tier can see it.
     block = " ".join(f"clause {i} of one paragraph with no short internal repeat"
@@ -729,7 +777,7 @@ def test_progress_note():
               + '<tool_call>{"name": "read", "arguments": {"path": "z.py"}}</tool_call>'}]
     ln = progress_note(loopy)
     check("degenerate reasoning not carried as hypothesis", "hypothesis" not in ln.lower(), ln)
-    # Rejected-completion-claim path (plan 107 follow-up — the build-pov-ray poisoning
+    # Rejected-completion-claim path (the long-build poisoning
     # loop: the banked note carried "the build is already complete and verified" as its
     # leading hypothesis, and all 6 relaunches re-confirmed it and re-done'd).
     poisoned = [
@@ -798,7 +846,7 @@ def test_bash_result_verifies_ignores_trivial_checks():
 
 def test_bash_result_verifies_requires_executing_command():
     """Iter-2: only a command that plausibly RUNS code can clear
-    unverified_edit. The sphinx-7440 false-green: `sed -n '307,308p' std.py | cat -A`
+    unverified_edit. The measured false-green: `sed -n '307,308p' std.py | cat -A`
     exited 0 with output and 'verified' an edit that didn't even parse — disarming
     the verify nudge, the done rejection AND the landing nudge at once."""
     # Display/plumbing commands never verify, however cleanly they exit.
@@ -1046,13 +1094,31 @@ def test_turn_think_throttle():
 
 
 def test_replenish_continue():
-    # More than half the wall unspent and under the cap -> grant.
+    import os
+    # More than half the wall unspent and under the cap -> grant (either lever state).
     check("early giveup, wall mostly unspent -> grant",
           replenish_continue(12000, 637, 2) is True)
-    # Past the half-wall point -> no extras (the endgame belongs to wrap-up/landing).
-    check("more than half spent -> no grant", replenish_continue(900, 500, 2) is False)
-    # Exactly at the boundary is NOT more-than -> no grant.
-    check("exact half boundary -> no grant", replenish_continue(1000, 500, 2) is False)
+    # late_continue_replenish ON (default): extras keep flowing down to the quarter-
+    # wall line — the measured stranding was step-capped tasks ending with 12-50% of
+    # wall unspent once the old half-wall line passed.
+    check("44% remaining -> grant (late replenish)",
+          replenish_continue(900, 500, 2) is True)
+    check("30% remaining -> grant (late replenish)",
+          replenish_continue(1000, 700, 2) is True)
+    # Exactly at the quarter boundary is NOT more-than -> no grant.
+    check("exact quarter boundary -> no grant", replenish_continue(1000, 750, 2) is False)
+    check("under a quarter left -> no grant", replenish_continue(1000, 800, 2) is False)
+    # Lever OFF restores the half-wall threshold exactly.
+    os.environ["CHAD_DISABLE"] = "late_continue_replenish"
+    try:
+        check("lever OFF: more than half spent -> no grant",
+              replenish_continue(900, 500, 2) is False)
+        check("lever OFF: exact half boundary -> no grant",
+              replenish_continue(1000, 500, 2) is False)
+    finally:
+        del os.environ["CHAD_DISABLE"]
+    # An explicit frac bypasses the lever entirely (pure-parameter callers).
+    check("explicit frac honored", replenish_continue(1000, 700, 2, frac=0.5) is False)
     # Absolute cap: never more than AUTO_CONTINUE_TOTAL_CAP total relaunches.
     check("at the total cap -> no grant", replenish_continue(12000, 100, 6) is False)
     check("just under the cap -> grant", replenish_continue(12000, 100, 5) is True)
@@ -1085,7 +1151,7 @@ def test_classify_sync_kind():
 
     # The openai backend used to report usage.prompt_tokens (the FULL prompt)
     # where the contract says NEW-tokens-only, inflating prev_total and mis-tagging a
-    # perfectly-appending server session as 'warm-reload' on nearly every TB2 step.
+    # perfectly-appending server session as 'warm-reload' on nearly every benchmark step.
     # These sequences simulate the agent's accumulation (prev_total = cached + new + gen)
     # under BOTH semantics to pin the fixed behavior.
 
@@ -1166,7 +1232,7 @@ if __name__ == "__main__":
 
 
 def test_dup_result_elide():
-    # iter-14: a read-only result byte-identical to a tool message
+    # A read-only result byte-identical to a tool message
     # still in the transcript is elided to a short pointer; anything that breaks
     # byte-equality (changed file, different args, compaction rewrite) flows through.
     from chad.guardrails import DUP_ELIDE_MIN_CHARS, elide_duplicate_result
@@ -1203,7 +1269,7 @@ def test_dup_result_elide_lever_off(monkeypatch):
 
 
 def test_subagent_evidence_warning():
-    # iter-14: a confident report with zero tool dispatches is the answered-from-memory
+    # A confident report with zero tool dispatches is the answered-from-memory
     # tell; it gets a verify warning appended. Real work, failure sentinels (the salvage
     # path owns those), and empty results are left alone.
     from chad.guardrails import SUBAGENT_EVIDENCE_WARNING, subagent_evidence_warning

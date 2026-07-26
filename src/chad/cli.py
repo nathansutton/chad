@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """chad — a local, MLX-backed, Claude-Code-style coding agent.
 
-One model (Ornith — 35B on big Macs, 9B on small), one entrypoint, run with uv:
+One model (Ornith — 35B on most Macs, 9B on small), one entrypoint, run with uv:
 
     uv run chad                                # interactive full-screen TUI
     uv run chad "fix the bug in greet.py"      # one-shot, headless
     uv run chad -c                             # resume this directory's conversation
+    uv run chad --model 9b                     # force the small model
+
+Plus three subcommands, each with its own `--help`: `chad serve`, `chad prove`,
+`chad levers`.
 
 Rare long-session knobs live in env vars — see README "Advanced".
 """
@@ -20,6 +24,7 @@ import time
 
 from . import config, guardrails, levers
 from .agent import Agent, repl
+from .base_engine import BackendError
 from .engine import Engine
 
 # Package dir is src/chad/; the project root (two levels up) is the dev clone. If a
@@ -42,12 +47,17 @@ _HF_9B = "nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX"     # low-RAM fallback, ~5 
 _LOCAL_35B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-35B-dyn2-q2_down3")
 _LOCAL_9B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-9B-4bit-awq")
 # The 35B (2-bit experts, 3-bit expert down-projections, 6-bit backbone) is ~13.4 GB
-# resident + KV + runtime, and the KV grows across a long agentic turn. On a 24 GB Mac
-# the Metal wired limit (~2/3 RAM ≈ 16 GB) minus the OS and whatever else is open
-# leaves too little headroom — dogfooding SIGKILLed the 35B mid-turn there before the
-# Clamps/governor landed. The floor stays 32 GB until the 24 GB profile is
-# proven end-to-end; 24 GB and below fall back to the 9B.
-_BIG_RAM_GB = 31.5
+# resident + KV + runtime, and the KV grows across a long agentic turn. That used to
+# SIGKILL mid-turn on a 24 GB Mac, where the Metal wired limit (~2/3 RAM ≈ 16 GB) minus
+# the OS leaves little headroom — so the floor sat at 32 GB. The fused attention kernel
+# (mlx_qsdpa) plus the 8-bit-from-the-start KV cache it enables cut the per-token cache
+# cost enough to give that headroom back, and `ram_aware_ctx_limit` now sizes the
+# compaction trigger from the live Metal budget rather than a blind constant, so a
+# tight box self-limits its window instead of dying. 24 GB gets the 35B; 16 GB and
+# below still fall back to the 9B.
+_BIG_RAM_GB = 23.5
+# `--model` shorthands. Anything else is passed through as an HF repo id or local dir.
+_MODEL_ALIASES = {"35b": (_LOCAL_35B, _HF_35B), "9b": (_LOCAL_9B, _HF_9B)}
 
 
 # These are the STRICT siblings of config.env_int/env_float: a non-numeric value raises
@@ -63,6 +73,39 @@ def _env_int(name):
 def _env_float(name):
     val = os.environ.get(name)
     return float(val) if val else None
+
+
+# The three sampler knobs travel TOGETHER, as one call, deliberately.
+#
+# They used to be three sibling blocks inlined in `main()`, which meant every serve path
+# that builds its own engine had to remember to copy all three — and `chad serve` didn't
+# copy any, so a server started with CHAD_MIN_P ran without it and nothing said so. The
+# failure shape is that sibling settings drift ONE AT A TIME: a later fix honors the field
+# it touched, looks complete, and leaves its neighbours silently dead. There is one
+# function now, so a caller cannot honor `temp` and forget `min_p`.
+SAMPLER_ENV = (("temp", "CHAD_TEMP"), ("min_p", "CHAD_MIN_P"), ("top_p", "CHAD_TOP_P"))
+
+
+def apply_sampler_env(eng):
+    """Apply the sampler-knob environment overrides to `eng`, in place.
+
+    CHAD_TEMP: sampling temperature, all backends. The default stays 0.0 (greedy —
+    reproducible, and the MLX prompt-lookup fast path requires it), but greedy has a
+    failure mode measured in the field: a stall/garbled call replays itself byte-identically
+    on every retry and across "independent" bench reps. Benchmarks and unattended runs
+    should set e.g. CHAD_TEMP=0.7 (what the field harnesses run) so retries can take a
+    different path.
+
+    CHAD_MIN_P / CHAD_TOP_P: quant-tail anti-confabulation knobs, off (0.0) by default —
+    trim the sub-noise-floor logit tail without touching temp."""
+    for attr, var in SAMPLER_ENV:
+        raw = config.env_str(var)
+        if not raw:
+            continue
+        try:
+            setattr(eng, attr, float(raw))
+        except ValueError:
+            sys.stderr.write(f"[ignoring {var}={raw!r}: not a number]\n")
 
 
 def _version_string():
@@ -139,7 +182,7 @@ def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
     # Peak memory grows FASTER than the KV cache alone: prefill/decode scratch also
     # scales with resident context (2026-07-12 ram_safety_check fit on the 35B, fused
     # wheel: 35.7 KB/token all-in vs 20.5 KB/token KV — the raw KV divisor picked a
-    # 175k trigger that extrapolated to 102.9% of budget, the WS1.6 FAIL). The fixed
+    # 175k trigger that extrapolated to 102.9% of budget — over the wall). The fixed
     # `reserve_gb` cannot cover a term that grows per-token, so fold it into the
     # divisor. 1.75 is the 35B measurement; unmeasured on the 9B, where it errs safe
     # (over-compaction costs a re-prefill, undershoot costs a jetsam kill).
@@ -183,7 +226,7 @@ def _preflight(backend="mlx"):
     """chad's default in-process engine runs only on Apple Silicon — MLX has no CPU/CUDA
     build. Hard-stop with a human message instead of letting `uv sync`/import fail
     cryptically elsewhere. The remote backend (`--backend llama`) loads NO MLX —
-    only a tokenizer plus HTTP — so it runs anywhere (e.g. inside a Linux benchmark
+    only a tokenizer plus HTTP — so it runs anywhere (e.g. inside a Linux
     container reaching a remote server); skip the Apple-Silicon gate for it."""
     if backend == "llama":
         return
@@ -210,37 +253,35 @@ def _resolve(local, repo):
     return local if os.path.isdir(local) else repo
 
 
-def _pick_model(override=None):
+def _pick_model(spec=None):
     """Resolve the model id and a human label for *why* it was chosen.
 
-    Precedence: --model override (the `override` arg) → CHAD_MODEL env → RAM-aware
-    default (35B on big boxes, 9B on small). Size aliases '9b'/'35b' force that size;
-    'auto' forces the RAM pick even when CHAD_MODEL is set; anything else is a literal
-    HF repo id / local dir. For every resolved size, prefer a locally-built models/
-    dir over the HF repo.
+    Order: explicit `--model` (`spec`) → CHAD_MODEL → RAM-aware default (35B unless the
+    box is small). A resolved shorthand prefers a locally-built models/ dir over the HF
+    repo when one exists; an arbitrary spec is passed through untouched.
 
-    An override that forces the 35B where RAM would not (small or undetectable RAM)
-    warns on stderr and proceeds — the harness advises, the caller decides.
+    Forcing `35b` where the RAM check would not have chosen it (small or undetectable
+    RAM) is honored, but warns on stderr first: chad advises, the caller decides.
     """
-    # --model wins over CHAD_MODEL; default=None on the flag distinguishes "not passed"
-    # from an explicit "auto" (which forces the RAM pick, ignoring the env).
-    choice = override if override is not None else config.env_str("CHAD_MODEL")
-    source = "--model" if override is not None else "CHAD_MODEL"
-    if choice and choice.strip().lower() != "auto":
-        c = choice.strip().lower()
-        if c in ("9b", "35b"):
-            model_id = (_resolve(_LOCAL_9B, _HF_9B) if c == "9b"
-                        else _resolve(_LOCAL_35B, _HF_35B))
-            if c == "35b":
-                ram = _detect_ram_gb()
-                if ram is None or ram < _BIG_RAM_GB:
-                    got = "undetectable" if ram is None else f"{ram:.0f} GB"
-                    sys.stderr.write(
-                        f"chad: --model 35b forced (RAM {got} < ~{_BIG_RAM_GB:.0f} GB "
-                        f"recommended); the 35B needs ~32 GB resident and may OOM or "
-                        f"thrash. Proceeding as asked.\n")
-            return model_id, f"{c.upper()} ({source} override)"
-        return choice, f"{source} override"  # literal repo/dir — unchanged behavior
+    # Name the winning source in the reason: it is only ever ambiguous when both the
+    # flag and the env var are set, which is exactly when the user needs to be told.
+    source = "--model" if spec is not None else "CHAD_MODEL"
+    spec = spec or config.env_str("CHAD_MODEL")
+    if spec and spec.strip().lower() != "auto":
+        key = spec.strip().lower()
+        alias = _MODEL_ALIASES.get(key)
+        if not alias:
+            return spec, f"explicitly requested ({source} override)"
+        local, repo = alias
+        if key == "35b":
+            ram = _detect_ram_gb()
+            if ram is None or ram < _BIG_RAM_GB:
+                got = "undetectable" if ram is None else f"{ram:.0f} GB"
+                sys.stderr.write(
+                    f"chad: 35b forced via {source} (RAM {got} < ~{_BIG_RAM_GB:.0f} GB "
+                    f"recommended); the 35B needs ~16 GB resident with its KV cache and "
+                    f"may OOM or thrash here. Proceeding as asked.\n")
+        return _resolve(local, repo), f"{key} (requested via {source})"
     ram = _detect_ram_gb()
     if ram is None:
         # RAM unreadable -> the safe (smaller) model: a wrong 9B costs capability, a
@@ -349,6 +390,32 @@ def _fail_model_load(model_id, err):
     sys.exit(1)
 
 
+def _fail_backend(err, base_url):
+    """A remote backend that dies mid-run used to exit through a bare traceback ending in
+    `chad.base_engine.BackendError`, which reads as a chad crash rather than "the server
+    you pointed me at isn't answering". Same problem/cause/fix shape as the model-load
+    and download failures."""
+    msg = str(err)
+    sys.stderr.write("\nchad: the remote backend stopped answering\n")
+    sys.stderr.write(f"  cause: {msg}\n")
+    if "connection failed" in msg.lower():
+        sys.stderr.write(
+            f"  fix:   nothing is listening at {base_url or 'the base URL'}. Start the\n"
+            "         server, check the host/port, and confirm it is reachable from here\n"
+            "         (a container needs the server bound to 0.0.0.0, not 127.0.0.1).\n"
+            "         To serve this Mac's own model: `chad serve --host 0.0.0.0`.\n")
+    elif "HTTP 401" in msg or "HTTP 403" in msg:
+        sys.stderr.write(
+            "  fix:   the server rejected the credentials. Pass --api-key-env NAME "
+            "naming\n         the env var that holds the key.\n")
+    else:
+        sys.stderr.write(
+            "  fix:   check the server's own logs — it accepted the connection and then\n"
+            "         failed the request. A model/tokenizer vocab mismatch is the usual\n"
+            "         cause; --tokenizer must name a repo sharing the served vocab.\n")
+    sys.exit(1)
+
+
 def _maybe_home_dir_note():
     """chad snapshots the working directory into context at startup, so the home dir is
     rarely the intended workspace. Nudge once — no exit, no behavior change. Home-dir
@@ -385,10 +452,35 @@ def _pick_session(items):
     return None
 
 
-def main():
+# Real subcommands, dispatched on argv[1] rather than through argparse subparsers.
+# The default invocation's positional is a free-form task string, and a subparser layout
+# would either shadow it or force `chad -- "some task"`; matching argv[1] exactly keeps
+# `chad "serve the API from cache"` a task and `chad serve` a subcommand, which is the
+# same rule the old literal-positional dispatch used.
+_SUBCOMMANDS = ("serve", "prove", "levers")
+
+# Set by `_main` once the remote backend's URL is resolved, so the top-level BackendError
+# handler can name the host that stopped answering. Only the remote backend can raise
+# one, and only one engine exists per process, so a module-level value is exact.
+_resolved_base_url = None
+
+
+def _add_model_arg(ap):
+    """`--model`, shared by the agent and `chad serve` — both load a local model and both
+    need the same escape hatch from the RAM-aware default."""
+    ap.add_argument("--model", default=None,
+                    help="which model to load: '35b' (big, default on most Macs), '9b' "
+                         "(small, low-RAM), 'auto' (choose by RAM), or any Hugging Face "
+                         "repo id / local model dir. Also CHAD_MODEL.")
+
+
+def _agent_parser():
     ap = argparse.ArgumentParser(
         prog="chad",
         description="Local MLX-backed coding agent (Ornith). Run with `uv run chad`.",
+        epilog="subcommands (each takes --help): chad serve · chad prove · chad levers. "
+               "Long-session and unattended-run knobs live in CHAD_* env vars — "
+               "see README \"Advanced\".",
     )
     ap.add_argument("--version", action="version", version=_version_string())
     ap.add_argument("task", nargs="?",
@@ -408,43 +500,15 @@ def main():
                     help="soft-cap each step's <think> run at N tokens, then force-close "
                          "it and continue (escalates when stuck); off by default. Also "
                          "settable via CHAD_THINK_BUDGET.")
-    ap.add_argument("--think-ceiling", type=int, default=None, dest="think_ceiling",
-                    help="close-and-continue: force-close a runaway <think> past "
-                         "N tokens and keep decoding the action IN THE SAME STEP (vs "
-                         "--think-budget, which ends the step). A high pathological cap "
-                         "(~6000); off by default. Also settable via CHAD_THINK_CEILING.")
-    ap.add_argument("--turn-budget-tokens", type=int, default=None, dest="turn_budget_tokens",
-                    help="runaway-turn governor: end a turn once it has burned N cumulative "
-                         "prefill tokens WITHOUT landing+verifying a change (nudges at ~50%%, "
-                         "banks a progress note and stops at ~80%%). Defaults to 3× the context "
-                         "limit; CHAD_NO_GOVERNOR=1 disables. Also CHAD_TURN_BUDGET_TOKENS.")
-    ap.add_argument("--turn-budget-s", type=float, default=None, dest="turn_budget_s",
-                    help="wall-clock variant of --turn-budget-tokens (seconds); off by "
-                         "default (interactive: the human is the wall clock). Also "
-                         "CHAD_TURN_BUDGET_S.")
-    ap.add_argument("--auto-continue", type=int, default=None, dest="auto_continue",
-                    help="on a one-shot run, if the governor or a guardrail hard-stops a "
-                         "turn, relaunch a FRESH turn (cleared context) seeded with the "
-                         "progress note, up to N times. Default: 2 on an unattended "
-                         "(auto-approve) run, 0 otherwise; pass 0 to disable.")
-    ap.add_argument("--review-pass", action="store_true", dest="review_pass",
-                    help="early-finish self-review: on a one-shot run that ends "
-                         "CLEANLY with >30%% of --turn-budget-s still unspent, relaunch ONE "
-                         "fresh-context turn to independently verify the deliverables and fix "
-                         "any mismatch. Off by default (needs --turn-budget-s to arm); also "
-                         "CHAD_REVIEW_PASS=1.")
-    # Model override. chad picks a size RAM-aware by default (the harness knows best);
-    # this is the escape hatch, the CLI twin of CHAD_MODEL with friendly size aliases.
-    ap.add_argument("--model", default=None,
-                    help="override the RAM-aware model pick: 'auto' (default behavior), "
-                         "'9b', '35b', or any HF repo id / local dir. The CLI twin of "
-                         "CHAD_MODEL; --model wins if both are set, and '--model auto' "
-                         "forces the RAM pick even when CHAD_MODEL is set. The harness "
-                         "picks well by default — reach for this only to force a size.")
+    # The unattended-run governor cluster (think ceiling, turn budgets, auto-continue,
+    # review pass) is env-only: CHAD_THINK_CEILING / CHAD_TURN_BUDGET_TOKENS /
+    # CHAD_TURN_BUDGET_S / CHAD_AUTO_CONTINUE / CHAD_REVIEW_PASS. The only thing that ever
+    # sets them is an automated runner, which already builds a CHAD_* env dict, and five
+    # knobs no interactive user has wanted were most of what made `--help` unreadable.
     # Backend selection. Default 'mlx' is the in-process engine and the whole point of
     # chad; 'llama' drives a llama.cpp server's raw /completion with token-id prompts +
     # real cache telemetry (see completion_engine.py) — the arm used when chad runs inside
-    # a Linux benchmark container against a remote server. The MLX path below is untouched
+    # a Linux container against a remote server. The MLX path below is untouched
     # when --backend is unset.
     ap.add_argument("--backend", choices=("mlx", "llama"), default="mlx",
                     help="inference backend: 'mlx' (default, in-process KV cache) or "
@@ -460,21 +524,96 @@ def main():
     ap.add_argument("--api-key-env", dest="api_key_env", default=None,
                     help="name of the env var holding the API key for a remote backend; the "
                          "key is read from that var, never passed on the command line.")
+    _add_model_arg(ap)
     ap.add_argument("--repl", action="store_true",
                     help="plain line REPL instead of the full-screen TUI")
-    # Back-compat: -p/--prompt was the old one-shot spelling, now the positional task.
+    # Back-compat: -p/--prompt was the old one-shot spelling, now the positional task;
+    # --levers is now `chad levers`.
     ap.add_argument("-p", "--prompt", dest="prompt_flag", help=argparse.SUPPRESS)
-    ap.add_argument("--levers", action="store_true",
-                    help="print the harness lever registry as JSON and exit (the "
-                         "ablation driver enumerates this instead of hardcoding names)")
-    args = ap.parse_args()
+    ap.add_argument("--levers", action="store_true", help=argparse.SUPPRESS)
+    return ap
 
-    # Before _preflight: an ablation driver enumerating levers should not need an
-    # Apple-Silicon box or a loadable model just to read the registry.
-    if args.levers:
-        print(json.dumps({"levers": levers.as_dict(), "groups": levers.groups(),
-                          "active": levers.active()}, indent=2))
-        return
+
+def _serve_parser():
+    """`chad serve` — expose this machine's MLX engine over the same llama.cpp
+    /completion protocol the remote backend speaks, so a chad that can't run MLX
+    (a Linux container) drives the local model instead of a remote GGUF."""
+    ap = argparse.ArgumentParser(
+        prog="chad serve",
+        description="Serve this machine's local MLX engine over the llama.cpp "
+                    "/completion protocol. Point a client at it with "
+                    "`chad \"…\" --backend llama --base-url http://<host>:<port>`.",
+    )
+    ap.add_argument("--host", default=None,
+                    help="bind address (default 127.0.0.1; use 0.0.0.0 to accept clients "
+                         "from containers or the LAN — set CHAD_SERVE_API_KEY if you do). "
+                         "Also CHAD_SERVE_HOST.")
+    ap.add_argument("--port", type=int, default=None,
+                    help="TCP port (default 8081). Also CHAD_SERVE_PORT.")
+    _add_model_arg(ap)
+    # Hidden, and rejected by serve.run: without it `chad serve --backend llama` would
+    # die on "unrecognized arguments" instead of explaining why serving a remote client
+    # backend is incoherent.
+    ap.add_argument("--backend", choices=("mlx", "llama"), default="mlx",
+                    help=argparse.SUPPRESS)
+    return ap
+
+
+def _prove_parser():
+    ap = argparse.ArgumentParser(
+        prog="chad prove",
+        description="Run the bundled end-to-end smoke test against the pinned 9B model: "
+                    "downloads it if needed, drives a real task, and reports what worked.",
+    )
+    ap.add_argument("--backend", choices=("mlx", "llama"), default="mlx",
+                    help=argparse.SUPPRESS)  # see _serve_parser
+    return ap
+
+
+def _levers_parser():
+    return argparse.ArgumentParser(
+        prog="chad levers",
+        description="Print the harness lever registry as JSON and exit. The ablation "
+                    "driver enumerates this instead of hardcoding lever names; "
+                    "CHAD_DISABLE=a,b turns individual levers off.",
+    )
+
+
+def _run_levers():
+    """No _preflight and no model: an ablation driver enumerating levers should not need
+    an Apple-Silicon box or a loadable model just to read the registry."""
+    print(json.dumps({"levers": levers.as_dict(), "groups": levers.groups(),
+                      "active": levers.active()}, indent=2))
+    return 0
+
+
+def main(argv=None):
+    """Console entrypoint. Wraps `_main` only to turn a backend fault that escaped the
+    agent's retry loop into guidance — it can surface from the one-shot, --repl, or TUI
+    path alike, and all three would otherwise exit through a raw traceback."""
+    try:
+        return _main(argv)
+    except BackendError as e:
+        _fail_backend(e, _resolved_base_url)
+
+
+def _main(argv=None):
+    global _resolved_base_url
+    argv = list(sys.argv[1:] if argv is None else argv)
+    sub = argv[0] if argv and argv[0] in _SUBCOMMANDS else None
+    if sub == "levers":
+        _levers_parser().parse_args(argv[1:])
+        sys.exit(_run_levers())
+    if sub == "serve":
+        from . import serve
+        sys.exit(serve.run(_serve_parser().parse_args(argv[1:])))
+    if sub == "prove":
+        from . import prove
+        sys.exit(prove.run(_prove_parser().parse_args(argv[1:])))
+
+    args = _agent_parser().parse_args(argv)
+    if args.levers:  # deprecated spelling of `chad levers`
+        sys.exit(_run_levers())
 
     # Fail fast on a typo'd CHAD_DISABLE, not mid-run: an unrecognized lever means the
     # harness would run unmodified while an ablation reports the delta as "no effect".
@@ -488,23 +627,13 @@ def main():
     # their __init__ reads, so the flag works on every entrypoint, not just headless.
     if args.think_budget is not None:
         os.environ["CHAD_THINK_BUDGET"] = str(args.think_budget)
-    if args.think_ceiling is not None:
-        os.environ["CHAD_THINK_CEILING"] = str(args.think_ceiling)
-    # --turn-budget-* reach the TUI/REPL Agents through the same env knobs
-    # their __init__ reads, so the governor is configurable on every entrypoint.
-    if args.turn_budget_tokens is not None:
-        os.environ["CHAD_TURN_BUDGET_TOKENS"] = str(args.turn_budget_tokens)
-    if args.turn_budget_s is not None:
-        os.environ["CHAD_TURN_BUDGET_S"] = str(args.turn_budget_s)
+    # The wall budget is read here as well as in Agent.__init__ because the one-shot
+    # relaunch/review logic below does its own arithmetic against it (how much of the
+    # TASK deadline is left), not just per-turn enforcement.
+    turn_budget_s = config.env_float("CHAD_TURN_BUDGET_S")
     task = args.task or args.prompt_flag
-    # `chad prove` — the bundled smoke test (prove.py). Dispatched on the literal
-    # positional so the CLI stays a single entrypoint; a real task named "prove"
-    # is vanishingly unlikely and can always be phrased longer.
-    if task == "prove":
-        from . import prove
-        sys.exit(prove.run(args))
-    # Ornith; no draft, ever. RAM-aware default, local-dir-preferred, HF fallback.
-    # --model (or CHAD_MODEL) overrides the RAM pick; see _pick_model.
+    # Ornith. --model / CHAD_MODEL, else the RAM-aware default; local-dir-preferred,
+    # HF fallback.
     model_id, why = _pick_model(args.model)
 
     # Advanced, rarely-touched knobs live in env vars to keep the CLI sane:
@@ -514,10 +643,13 @@ def main():
     #                          fused kernel covers the model — both shipped Ornith
     #                          models). 0 forces the fp16 cache.
     #   CHAD_KV_CACHE_MAX_GB   cap the on-disk KV cache (LRU-evict above it); 0 = unlimited
+    # Unattended-run governor (harness-only; the matching flags are hidden):
+    #   CHAD_THINK_CEILING  CHAD_TURN_BUDGET_TOKENS  CHAD_TURN_BUDGET_S
+    #   CHAD_AUTO_CONTINUE  CHAD_REVIEW_PASS
     max_context = _env_int("CHAD_MAX_CONTEXT")
     kv_bits = _env_int("CHAD_KV_BITS")
 
-    # ds4-style on-disk KV warm-start of the stable system+tools prefix.
+    # On-disk KV warm-start of the stable system+tools prefix.
     cache_dir = os.path.expanduser("~/.cache/chad/kv")
     kv_cache_max_gb = _env_int("CHAD_KV_CACHE_MAX_GB")
     kv_cache_max_bytes = (kv_cache_max_gb if kv_cache_max_gb is not None else 8) * 1024**3
@@ -528,7 +660,7 @@ def main():
     sweep_orphan_spills(cache_dir, max_age_s=6 * 3600)
 
     if args.backend == "llama":
-        # /047 spike: drive the chad harness against a remote llama.cpp server instead
+        # Drive the chad harness against a remote llama.cpp server instead
         # of the in-process MLX engine. Only a tokenizer is loaded locally (to render
         # prompts); generation is proxied over HTTP. Weights are NOT downloaded (we
         # don't run them here). The MLX default path is untouched.
@@ -540,6 +672,7 @@ def main():
             sys.stderr.write("chad --backend llama needs --base-url (or "
                              "CHAD_LLAMA_BASE_URL), e.g. http://<host>:8081\n")
             sys.exit(1)
+        _resolved_base_url = base_url
         # effective_ctx 0 = auto: load() reads the server's /props n_ctx so chad's
         # window matches the wall the server actually enforces.
         eng = CompletionEngine(model_id=model_id, base_url=base_url, api_key=api_key,
@@ -551,41 +684,13 @@ def main():
         _ensure_model(model_id)  # first-run download-on-consent if it's an uncached HF repo
         eng = Engine(
             model_id=model_id,
-            draft_id=None,
             kv_bits=kv_bits,
             max_context=max_context,
             cache_dir=cache_dir,
             kv_cache_max_bytes=kv_cache_max_bytes,
         )
 
-    # CHAD_TEMP: sampling temperature override, all backends. The default stays 0.0
-    # (greedy — reproducible, and the MLX prompt-lookup fast path requires it), but
-    # greedy has a failure mode measured in NIGHT-7: a stall/garbled call replays
-    # itself byte-identically on every retry and across "independent" bench reps.
-    # Benchmarks and unattended runs should set e.g. CHAD_TEMP=0.7 (what the field
-    # harnesses run) so retries can take a different path.
-    _temp = config.env_str("CHAD_TEMP")
-    if _temp:
-        try:
-            eng.temp = float(_temp)
-        except ValueError:
-            sys.stderr.write(f"[ignoring CHAD_TEMP={_temp!r}: not a number]\n")
-
-    # CHAD_MIN_P / CHAD_TOP_P: quant-tail anti-confabulation knobs, off
-    # (0.0) by default — trim sub-noise-floor logit tail without touching temp.
-    _min_p = config.env_str("CHAD_MIN_P")
-    if _min_p:
-        try:
-            eng.min_p = float(_min_p)
-        except ValueError:
-            sys.stderr.write(f"[ignoring CHAD_MIN_P={_min_p!r}: not a number]\n")
-
-    _top_p = config.env_str("CHAD_TOP_P")
-    if _top_p:
-        try:
-            eng.top_p = float(_top_p)
-        except ValueError:
-            sys.stderr.write(f"[ignoring CHAD_TOP_P={_top_p!r}: not a number]\n")
+    apply_sampler_env(eng)
 
     # The full-screen TUI loads the 11 GB of weights on a BACKGROUND thread so the banner
     # + input come up in ~0.6 s and you can read/queue while it loads (the load itself is
@@ -657,33 +762,33 @@ def main():
             sys.stderr.write("[headless: auto-approving tools (use --plan for read-only)]\n")
         agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
                       mode=run_mode, thinking=thinking, resume=resume, persist=True,
-                      think_budget=args.think_budget, think_ceiling=args.think_ceiling,
-                      turn_budget_tokens=args.turn_budget_tokens,
-                      turn_budget_s=args.turn_budget_s, ctx_limit_fn=ctx_limit_fn)
+                      think_budget=args.think_budget,
+                      turn_budget_s=turn_budget_s, ctx_limit_fn=ctx_limit_fn)
         # Wall time across ALL of this task's turns (initial + any auto-continue
         # relaunches), measured against the wall budget to decide the early-finish review.
         task_start = time.monotonic()
         agent.run_turn(task)
         # If the turn hard-stopped on a budget (governor token/wall budget, the
-        # step cap's final window landing nothing, or the iter-2 no-empty-diff gate),
+        # step cap's final window landing nothing, or the no-empty-diff gate),
         # optionally relaunch a FRESH turn (new context + reset KV cache) seeded with the
         # deterministic progress note — shedding both the ramble and the huge prefill the
         # stuck model dragged. Unattended runs default to 2 relaunches: headless is
         # exactly where nobody can say 'continue', and a banked half-done task otherwise
-        # ships as an empty diff (the NIGHT-7 bail signature).
-        continues = args.auto_continue if args.auto_continue is not None \
+        # ships as an empty diff — the measured bail signature.
+        auto_continue = config.env_int("CHAD_AUTO_CONTINUE")
+        continues = auto_continue if auto_continue is not None \
             else (2 if run_mode == "auto" else 0)
         used_continues = 0
         while agent.budget_note:
             # Base allowance first; past it, keep granting fresh attempts while most
             # of the task wall is still unspent (bounded by AUTO_CONTINUE_TOTAL_CAP) —
-            # the fixed base is wall-blind: build-pov-ray (TB2.1 v1.0.0) gave up after
-            # 3 step-capped turns with 94.7% of a 12000s budget unused (plan 107 F3).
+            # the fixed base is wall-blind: a long build task gave up after 3
+            # step-capped turns with 94.7% of a 12000s budget still unused.
             if continues > 0:
                 continues -= 1
-            elif (args.auto_continue is None and args.turn_budget_s
+            elif (auto_continue is None and turn_budget_s
                     and guardrails.replenish_continue(
-                        args.turn_budget_s, time.monotonic() - task_start,
+                        turn_budget_s, time.monotonic() - task_start,
                         used_continues)):
                 sys.stderr.write("[governor] wall budget mostly unspent — granting an "
                                  "extra continue\n")
@@ -697,9 +802,9 @@ def main():
             # turn's own start) never open before the process is killed — the relaunched
             # turn rides to a mid-work SIGKILL with nothing landed. With no wall budget set
             # (interactive/unmetered), there is no deadline: keep the old fresh-None budget.
-            if args.turn_budget_s:
+            if turn_budget_s:
                 relaunch_s = guardrails.relaunch_budget(
-                    args.turn_budget_s, time.monotonic() - task_start)
+                    turn_budget_s, time.monotonic() - task_start)
                 if relaunch_s is None:
                     sys.stderr.write("[governor] previous turn ran out of budget; too "
                                      "little wall left to relaunch — stopping\n")
@@ -709,7 +814,7 @@ def main():
             sys.stderr.write("[governor] previous turn ran out of budget/steps; continuing "
                              "fresh with a progress note\n")
             # A deterministic (temp-0) stall replays itself verbatim on retry — the
-            # NIGHT-7 evidence: 3/3 byte-identical failing reps. Give the relaunch a
+            # measured 3/3 byte-identical failing reps. Give the relaunch a
             # sampling distribution so it can take a different path.
             if getattr(eng, "temp", None) is not None:
                 eng.temp = max(eng.temp, 0.6)
@@ -717,8 +822,6 @@ def main():
             agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
                           mode=run_mode, thinking=thinking, persist=True,
                           think_budget=args.think_budget,
-                          think_ceiling=args.think_ceiling,
-                          turn_budget_tokens=args.turn_budget_tokens,
                           turn_budget_s=relaunch_s, ctx_limit_fn=ctx_limit_fn)
             agent.run_turn(f"{task}\n\n[{note}]")
         # Early-finish self-review: if the task settled CLEANLY (no
@@ -728,21 +831,19 @@ def main():
         # catching the confident-wrong `done`. Off unless armed (--review-pass /
         # CHAD_REVIEW_PASS) and a wall budget is set, so interactive/unmetered runs and
         # clean A/B baselines never trigger it.
-        review_armed = args.review_pass or config.flag("CHAD_REVIEW_PASS")
+        review_armed = config.flag("CHAD_REVIEW_PASS")
         elapsed = time.monotonic() - task_start
         if review_armed and guardrails.review_pass_should_fire(
-                not agent.budget_note, args.turn_budget_s, elapsed):
+                not agent.budget_note, turn_budget_s, elapsed):
             # The review turn respects the SAME task deadline: give it only the wall time
             # that remains, floored, so its own governor/wrap-up can't blow past the cap.
-            review_budget = max(30.0, args.turn_budget_s - elapsed)
-            sys.stderr.write(f"[review] task finished with {args.turn_budget_s - elapsed:.0f}s "
+            review_budget = max(30.0, turn_budget_s - elapsed)
+            sys.stderr.write(f"[review] task finished with {turn_budget_s - elapsed:.0f}s "
                              "of budget left; running one fresh-context verification pass\n")
             eng.reset()
             agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
                           mode=run_mode, thinking=thinking, persist=True,
                           think_budget=args.think_budget,
-                          think_ceiling=args.think_ceiling,
-                          turn_budget_tokens=args.turn_budget_tokens,
                           turn_budget_s=review_budget, ctx_limit_fn=ctx_limit_fn)
             agent.run_turn(task + guardrails.REVIEW_PASS_PROMPT)
         agent.save()  # persist so a follow-up `chad -c "..."` picks up the thread

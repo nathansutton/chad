@@ -6,7 +6,7 @@ pinning), `eq` strict, the int/float helpers lenient (warn + default, never rais
 table-tests lock those contracts so a future edit can't silently loosen `flag` into `eq`
 or make a garbled budget knob crash startup.
 
-Run: `uv run python test_config.py`
+Run: `uv run python tests/test_config.py`
 """
 
 import pytest

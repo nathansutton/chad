@@ -21,7 +21,7 @@ uvx chad-code          # runs chad anywhere — the command is still `chad`
 uvx chad-code prove    # 2-min offline smoke test: 4 tiny fix-it tasks, verified, timed 🗿
 ```
 
-First run picks the right Ornith model for your RAM (9B under 32 GB, 35B at 32 GB+), asks,
+First run picks the right Ornith model for your RAM (9B under 24 GB, 35B at 24 GB+), asks,
 and downloads it once (~5 GB / ~13 GB, resumable) into the shared Hugging Face cache. While
 it downloads, `cd` into a project and think of a scoped first ask — *"fix the failing test
 in `tests/test_x.py`"* lands; *"improve my codebase"* flails.
@@ -102,16 +102,20 @@ uv run chad -c               # resume this directory's last conversation
 ```
 
 **The model.** chad picks one for you by RAM and downloads it once into the shared Hugging
-Face cache (`~/.cache/huggingface`, reused across every project). No picker, no flags —
-override with `CHAD_MODEL=<repo or local dir>` if you must.
+Face cache (`~/.cache/huggingface`, reused across every project). Override with
+`--model 9b` / `--model 35b`, or `--model <repo or local dir>` for anything else.
 
 | Your Mac | Model | Footprint |
 |---|---|---|
-| **≥ 32 GB** | [Ornith-1.0-35B `UD-Q2_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX) — 35B MoE, 2-bit experts | ~13 GB resident (~16 GB with KV) |
-| **16 / 18 / 24 GB** | [Ornith-1.0-9B `UD-Q4_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX) — 4-bit AWQ | ~5 GB |
+| **≥ 24 GB** | [Ornith-1.0-35B `UD-Q2_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX) — 35B MoE, 2-bit experts | ~13 GB resident (~16 GB with KV) |
+| **16 / 18 GB** | [Ornith-1.0-9B `UD-Q4_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX) — 4-bit AWQ | ~5 GB |
 
-The 35B's working set needs headroom a 24 GB Mac doesn't have (it SIGKILLs mid-turn), so its
-floor is **32 GB**; 24 GB and below run the 9B. Quant names follow
+The 35B's floor used to be 32 GB — its working set SIGKILLed a 24 GB Mac mid-turn. The
+fused attention kernel and the 8-bit-from-the-start KV cache it enables cut the per-token
+cache cost enough to give that headroom back, and the compaction trigger now sizes itself
+from the live Metal budget, so a tight box narrows its context window instead of dying.
+24 GB runs the 35B; 16/18 GB still get the 9B. If a 24 GB machine feels tight next to your
+other apps, `--model 9b` puts it back. Quant names follow
 [Unsloth's dynamic-quant convention](https://docs.unsloth.ai/) (`UD-…`).
 
 **Upgrading** — depends on how you installed: `uv tool upgrade chad-code`; `uvx --refresh
@@ -150,7 +154,16 @@ it chad uses the tree-sitter fallback automatically.
 | `--plan` | start in read-only plan mode (investigate + propose, edits blocked) |
 | `--yolo` | auto-approve bash/write/edit (skip confirm prompts) |
 | `--no-think` | skip Ornith's `<think>` blocks — faster on well-scoped work |
+| `--model` | `35b`, `9b`, `auto`, or any HF repo id / local model dir |
 | `--repl` | plain line REPL instead of the TUI |
+
+Plus three subcommands, each with its own `--help`:
+
+| Command | What it does |
+|---|---|
+| `chad serve` | serve this Mac's model to a container or the LAN ([Configuration](docs/configuration.md#serving-the-local-model-to-a-container-chad-serve)) |
+| `chad prove` | 2-minute offline smoke test: 4 tiny fix-it tasks, verified, timed |
+| `chad levers` | print the harness lever registry as JSON (ablation driver) |
 
 A headless task (positional, or piped with no TTY) auto-approves mutating tools; the model
 runs greedy (temp 0). Every conversation is persisted under `~/.chad/sessions/`, and every

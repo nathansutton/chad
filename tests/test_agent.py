@@ -8,7 +8,7 @@ A bug in `expand_mentions` resolves an email (`foo@bar.com`) as a path, or pulls
 file the user never referenced; a bug in `_has_open_tool_call` misreads a truncated
 turn. These pin the current contract.
 
-Run: `uv run python test_agent.py`
+Run: `uv run python tests/test_agent.py`
 """
 
 import os

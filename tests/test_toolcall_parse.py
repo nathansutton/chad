@@ -153,7 +153,7 @@ def test_hybrid_name_parameter_dialect():
     """Iter-3: quantized Ornith at temp 1.0 emits a HYBRID dialect — a JSON `{"name":"X"}`
     opener (often with no closing brace) followed by XML `<parameter=…>` blocks. It matches
     neither the `<function=…>` XML path nor the brace-matched JSON path, so 30 fully-formed
-    calls were dropped silently in one TB2 run. Recover them (see _parse_hybrid_calls)."""
+    calls were dropped silently in one benchmark run. Recover them (see _parse_hybrid_calls)."""
     from chad.toolcall_parse import _parse_hybrid_calls
 
     # 1. The exact observed shape: unclosed `{"name": "bash"` + one <parameter>, wrapped in
@@ -193,7 +193,7 @@ def test_hybrid_name_parameter_dialect():
 
 
 def test_salvage_closed_block_unclosed_json():
-    """TB2 count-dataset-tokens (2026-07-12 canary): the model re-emitted a complete
+    """A token-counting task (2026-07-12 canary): the model re-emitted a complete
     bash call whose JSON args never closed, finished with XML-dialect closers, and
     properly closed the <tool_call> tag. _TAG_RE requires a trailing `}` so the block
     never reached repair_json; the call was dropped and the garble was accepted as a

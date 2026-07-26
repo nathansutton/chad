@@ -13,26 +13,73 @@ by a backend that never loads mlx. `GenStats` lives here (not `engine.py`) preci
 the remote adapter can build one without dragging in `mlx.core`.
 """
 
-from dataclasses import dataclass
-from typing import Any, Callable, Optional, Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Optional, Protocol, runtime_checkable
 
 # Close-and-continue salvage: the marker injected to force-close a <think> run
 # that has blown past the ceiling, so decoding continues into the ACTION *in the same step*
 # — vs the soft think-cap, which ends the step and lets the next one re-derive the whole
-# reasoning (the 084 anti-fix: force-close-then-new-step measured 3.8x total think). Both
+# reasoning (the measured anti-fix: force-close-then-new-step cost 3.8x total think). Both
 # engines inject this same string: the MLX path tokenizes it and feeds the ids through the
 # append-only cache; the llama path hands it back as an assistant-prefix continuation.
 THINK_CLOSE = "\n</think>\n\n"
 
 
-def think_ceiling_hit(text: str, n_tokens: int, ceiling: Optional[int]) -> bool:
+def think_ceiling_hit(text: str, n_tokens: int, ceiling: Optional[int],
+                      think_closed: Optional[bool] = None) -> bool:
     """True when generation is still inside the auto-opened <think> block (no </think>
     emitted yet) and has run past `ceiling` tokens — the close-and-continue trigger
 `ceiling` None/0 disables it (byte-identical to no ceiling). Pure so both
-    engines share one definition and it is unit-testable without a model."""
-    if not ceiling:
+    engines share one definition and it is unit-testable without a model.
+
+    Called once per decoded token by both engines, so the cheap token-count test runs
+    FIRST: below the ceiling — which is almost always — this never touches `text` at all.
+    `think_closed` lets a caller that already tracks the marker incrementally (see
+    `TailWatch`) skip the scan entirely; None means "work it out from `text`", which is
+    the original behavior and what the unit tests exercise."""
+    if not ceiling or n_tokens < ceiling:
         return False
-    return n_tokens >= ceiling and "</think>" not in text
+    if think_closed is None:
+        think_closed = "</think>" in text
+    return not think_closed
+
+
+class TailWatch:
+    """Has any of these needles appeared yet in an append-only text? Answered per
+    segment, in constant time, without re-reading the text.
+
+    The naive spelling — `any(n in text for n in needles)` after every decoded token —
+    is quadratic in the generated length, because every token re-scans everything
+    generated so far. Measured on the streaming client: 500 tokens costs 6ms, 2k costs
+    41ms, 8k costs 242ms, 16k costs 777ms of pure CPU spent re-reading. That CPU is on
+    the thread draining the token stream, so it is also what decides how fast the
+    stream gets drained.
+
+    A needle can only become newly complete if it straddles the segment just appended,
+    so only `len(needle) - 1` characters of carry-over are ever relevant:
+
+        …already scanned…│ tail │ new segment │
+                          └──────┬──────────┘
+                          the only window a new match can live in
+
+    Latching: once found, always found (the text only grows), so `hit` never goes back
+    to False and later feeds short-circuit."""
+
+    def __init__(self, needles: Iterable[str]):
+        self._needles = [n for n in (needles or []) if n]
+        self._carry = max((len(n) for n in self._needles), default=1) - 1
+        self._tail = ""
+        self.hit = False
+
+    def feed(self, seg: str) -> bool:
+        """Absorb the next segment; return whether any needle has been seen yet."""
+        if self.hit or not self._needles or not seg:
+            return self.hit
+        window = self._tail + seg
+        if any(n in window for n in self._needles):
+            self.hit = True
+        self._tail = window[-self._carry:] if self._carry else ""
+        return self.hit
 
 
 class BackendError(RuntimeError):
@@ -82,6 +129,19 @@ class GenStats:
                                     # that can't report cached_tokens / per-forward
                                     # accounting sets this so callers know the
                                     # throughput/prefill numbers are estimates.
+    gen_ids: list = field(default_factory=list)
+                                    # the token ids generated this turn. The engine knows
+                                    # them exactly; a caller must never re-derive them by
+                                    # slicing `_cached_ids`, whose shape differs per decode
+                                    # path (the prompt-lookup path stores what it FED the
+                                    # cache, which omits the final pending token, and an
+                                    # OOM empties it). `chad serve` puts these on the wire
+                                    # so a remote client can mirror the server's cache.
+    cache_reset: bool = False       # the prefix cache was DROPPED during this turn (Metal
+                                    # OOM recovery), so nothing is resident afterwards —
+                                    # not even the prompt. A caller mirroring cache state
+                                    # must clear its mirror rather than assume prompt+gen,
+                                    # which is the one thing `gen_ids` alone cannot say.
 
     @property
     def tok_per_s(self) -> float:

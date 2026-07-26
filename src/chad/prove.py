@@ -332,7 +332,7 @@ def run(args):
     # Same engine configuration chad ships: the on-disk KV checkpoint of the stable
     # system+tools prefix (~/.cache/chad/kv) is part of the product's first-token
     # story — prove without it would report a cold prefill no real session pays.
-    eng = Engine(model_id=model_id, draft_id=None,
+    eng = Engine(model_id=model_id,
                  cache_dir=os.path.expanduser("~/.cache/chad/kv"))
     sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} "
                      "[prove: pinned 9B] ...\n")

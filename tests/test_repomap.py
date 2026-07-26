@@ -363,7 +363,7 @@ if __name__ == "__main__":
 
 
 # --- wheel-less platforms ------------------------------------------
-# tree-sitter-language-pack is a native wheel. On a TB2 container (emulated amd64) uv
+# tree-sitter-language-pack is a native wheel. On a benchmark container (emulated amd64) uv
 # fell back to a Rust source build, it failed, and the module-level import took ALL of
 # chad down -- the qemu-startup trial errored before the agent ran one step.
 

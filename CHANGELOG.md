@@ -2,14 +2,180 @@
 
 Notable, user-visible changes.
 
-## [Unreleased]
+## [1.0.5] — 2026-07-26
 
-- **`--model` size override.** chad still picks a model RAM-aware by default; the new
-  `--model` flag is the escape hatch — `--model 9b` / `--model 35b` force a size,
-  `--model auto` forces the RAM pick, and any HF repo id / local dir works too. It's the
-  CLI twin of `CHAD_MODEL` and wins over it when both are set. Forcing the 35B where RAM
-  looks too small (or is undetectable) is honored but warns first — the harness advises,
-  you decide. Not a model picker: launch-time only, nothing persisted.
+The release that makes a 24 GB Mac a first-class target: it runs the 35B now, a Linux
+container can drive the real local MLX model through `chad serve` instead of a different
+quantization on a remote box, and the CLI surface is smaller and honest — `serve`, `prove`
+and `levers` are real subcommands, and five harness-only governor flags became `CHAD_*`
+env vars. Plus completion and reasoning-budget accuracy, long-running commands that
+survive their timeout, a destructive-command guard that stops crying wolf, and
+long-context decode throughput that ships to a `uvx` install — measured end-to-end on
+stock PyPI mlx, no custom wheel anywhere. Each behavior change is individually reversible
+via `CHAD_DISABLE`.
+
+- **24 GB Macs now get the 35B.** The 35B's floor was 32 GB because its working set
+  SIGKILLed a 24 GB machine mid-turn. The fused attention kernel and the
+  8-bit-from-the-start KV cache it enables cut the per-token cache cost enough to give the
+  headroom back, and the compaction trigger sizes itself from the live Metal budget rather
+  than a fixed constant, so a tight box narrows its window instead of dying. 16/18 GB
+  still get the 9B, and `--model 9b` puts a 24 GB box back on the small model.
+- **`--model` replaces reaching for an env var to change model.** Takes `35b`, `9b`,
+  `auto`, or any Hugging Face repo id / local model dir; works on `chad` and `chad serve`.
+  `CHAD_MODEL` still works and the flag outranks it, so a globally exported var can't pin
+  every run, and `--model auto` forces the RAM-aware pick even when the env var is set.
+  Forcing `35b` on a box whose RAM is too small (or unreadable) is honored but warns
+  first — chad advises, you decide.
+- **`serve`, `prove` and `levers` are real subcommands** with their own `--help`. They
+  were dispatched on the literal task string, so `chad --help` never mentioned them while
+  still listing `--host`/`--port` as "`chad serve` only" — flags that parsed fine and were
+  then silently ignored on every other invocation. `--host`/`--port` now belong to
+  `chad serve` and are rejected elsewhere. `chad --levers` still works as an alias.
+- **`chad --help` lists 12 flags instead of 19.** The unattended-run governor knobs
+  (`--think-ceiling`, `--turn-budget-tokens`, `--turn-budget-s`, `--auto-continue`,
+  `--review-pass`) are set by benchmark harnesses, never by hand, and every one already
+  had a `CHAD_*` twin, so the flags are **removed** rather than hidden — passing one is now
+  an error instead of a silent no-op. `CHAD_AUTO_CONTINUE` fills in the one twin that was
+  missing, and the bundled TB2 adapter (`benchmarks/tb2/harbor_chad_tb2.py`) sets all three
+  it used through the `CHAD_*` env dict it was already building. `--think-budget` stays on
+  the CLI: unlike the rest it is a capability trade a person reaches for interactively.
+- **A dead remote backend explains itself.** An unreachable `--base-url` exited through a
+  22-line traceback ending in `chad.base_engine.BackendError`, which reads as a chad crash
+  rather than "the server you pointed me at isn't up". Now problem/cause/fix, like the
+  model-load and download failures.
+- **Removed the draft-model code path.** chad has been single-model since before 1.0;
+  `Engine(draft_id=...)` was never set by any caller, but its branches still shaped cache
+  construction, KV-quant resolution, warm-prefix eligibility and prefill. Prompt-lookup
+  decoding is unaffected — it shares the word "draft" and none of the machinery.
+- **`chad serve` — drive the local MLX model from a Linux container.** chad's remote arm
+  (`--backend llama`) exists because MLX can't run in a benchmark container, which in
+  practice meant measuring a *different quantization* of the model on a remote GPU box.
+  `chad serve` exposes the in-process MLX engine — real prefix cache and all — over the
+  same llama.cpp `/completion` protocol that arm already speaks, so the container drives
+  the model people actually run, unchanged and with exact server-side timings.
+  `--host`/`--port` (`CHAD_SERVE_HOST`/`CHAD_SERVE_PORT`), loopback and unauthenticated by
+  default; `CHAD_SERVE_API_KEY` guards a wider bind. One KV cache means one agent at a
+  time; concurrent clients queue.
+- **Cache quarantine and warm-prefix come back over the wire.** Against a stock llama.cpp
+  server these are unavoidable no-ops (its cache is opaque and its disk isn't ours). A
+  `chad serve` server advertises both in `/props` and the client feature-detects, so a
+  sub-agent no longer evicts the main transcript's prefix and the stable system+tools
+  prefix warm-starts from disk. Nothing changes against a real llama-server, and a failed
+  call degrades to the old no-op — these are latency, never correctness.
+- **A client that stops reading can no longer take the server down.** Streaming wrote
+  each token to the socket from the one thread allowed to touch MLX, with no timeout on
+  it — so a client that stopped draining without disconnecting (a suspended container, a
+  slept laptop) blocked that thread indefinitely and no other request could be served,
+  while `/health` still answered `ok`. A blocked write never raises, so the hung-up-client
+  cancel couldn't fire either. Generation now hands SSE lines to the request's own thread
+  through a bounded queue: the engine runs ahead of a slow reader instead of being paced
+  by it, and a peer that stops reading is written off the same way a disconnected one is.
+- **A request no longer silently zeroes the server's sampler config.** `min_p`, `top_p`
+  and `temperature` absent from a `/completion` body were defaulted to 0.0 and applied
+  anyway, wiping a server started with `CHAD_MIN_P`/`CHAD_TOP_P` on essentially every
+  request (the client only sends those knobs when they're armed) and forcing greedy
+  decoding. Absent now means "leave it alone"; an explicit `0.0` still disarms a knob for
+  that request only.
+- **Generated token ids on the wire are the engine's own.** They were recovered by
+  slicing the engine's cache past the prompt, which only holds on the main decode path —
+  the prompt-lookup path came up one token short every turn, and after a Metal OOM the
+  client was told a prefix was resident when the cache had been dropped. The engine now
+  reports what it generated, and says so when it reset the cache, so the client's mirror
+  and its prefill estimates stay honest on every path.
+- **Long turns stopped paying quadratic CPU to watch for stop markers.** The remote
+  backend re-scanned the entire generated text after every token; at 16k tokens that was
+  846ms of pure scanning on the thread draining the stream. Now incremental: 4.5ms.
+- **A long cold prefill no longer kills the turn it is working on.** The stream stayed
+  byte-silent from the response headers until the first token, and HTTP clients measure a
+  stall in bytes, not in your progress — chad's own passes its timeout to `urlopen`, which
+  applies it per read. A big prefill therefore timed out just before the first token, and
+  because a socket timeout looks transient the agent re-issued the step and paid for the
+  same prefill again. The stream now sends an SSE comment during silence; stock clients
+  discard it, so nothing on the wire changes for llama.cpp.
+- **A prompt that cannot fit is a 400, not a Metal OOM.** Nothing compared the prompt
+  against the context window before prefilling it, and `n_predict` was never clamped to
+  the room left beside the prompt — so a client that mis-budgeted (a stale pinned context,
+  a plain `curl`) walked the engine into an allocation it might not survive, taking every
+  other client with it. `/completion` and `/warm` now refuse an oversized prompt up front
+  and clamp the generation budget to what the window can hold. The admission wall is
+  **live**, not the number pinned at load: the Metal budget is blind to other processes,
+  so a docker stack or a second model started afterwards takes physical pages the KV cache
+  needs 1:1, and a prompt that fit an hour ago no longer does. `/props` keeps advertising
+  the stable window clients budget against; `/health` reports `safe_ctx` and
+  `ctx_pressure` so a tightened wall is visible before a request bounces off it.
+- **`chad serve` honors `CHAD_TEMP` / `CHAD_MIN_P` / `CHAD_TOP_P`.** It built its own
+  engine and read none of them, so a server started with a sampler config sampled as if
+  it had none — the one drift the server exists to eliminate. The three now travel as a
+  single shared call the CLI and the server both make, so they cannot drift apart again.
+- **Long-context decode is faster on both models.** The fused attention kernel's
+  split factor now widens past 16k context instead of staying flat: measured
+  end-to-end (one process, interleaved arms, adopted only where the spread cleared
+  1.000), the 35B decodes **+1.5% at 32k** and +0.6% at 16k, the 9B **+0.5% at
+  32k**, both unchanged at 8k where flat was already optimal. It is the same math
+  on a different grid — the split only regroups the partials pass 2 combines — and
+  the widened tier gets its own kernel-vs-reference test plus a retile-agreement
+  case at that size.
+- **`CHAD_FUSED_LAYER` is removed.** The opt-in fused GDN+MoE compiled region was
+  measured on real weights against the two-call path it replaced and moved decode
+  1.001x-1.002x — indistinguishable from noise — so the code is gone rather than
+  shipped as a dead knob. The measurement lives in the source so the idea isn't
+  re-derived. Setting the var now does nothing.
+- **`CHAD_NO_MLX_TUNING` is removed, along with the tuning it disabled.** The `MLX_*`
+  runtime knobs (`MLX_METAL_FAST_SYNCH`, `MLX_MAX_OPS_PER_BUFFER`,
+  `MLX_MAX_MB_PER_BUFFER`) were swept on the 35B and every arm lost 1-4% at both 8k
+  and 32k, so chad now sets none of them and the module that applied them is gone
+  rather than shipped as an empty table with a flag to switch it off. mlx reads
+  these vars directly if you want to experiment.
+- **A `done` with nothing landed gets the task's own requirements back, once.**
+  Previously, ending a turn with no landed-and-verified change stopped the turn
+  immediately and banked a progress note — so the done-audit, which quotes the task
+  statement's requirement lines and reports what actually exists on disk, never ran
+  on exactly the turns that needed it most. That ending now hands off to a single
+  audit bounce first, in context with the work the turn already did; a second empty
+  ending stops as before. (`audit_churn_handoff`)
+- **Reasoning truncated at the token cap now counts against the reasoning budget.**
+  A generation that hit the raw output cap while still inside `<think>` credited
+  zero reasoning tokens, so the per-turn budget was blind to the largest thinks
+  there are — one full cap each — and its throttle never engaged on the turns that
+  overspent the most. Those tokens are now counted. No threshold or clamp changed;
+  only what the budget can see. (`capped_think_credit`)
+- **A `bash` command that outruns its timeout keeps running instead of being killed.**
+  It moves to the background rather than having its process group killed: output keeps
+  streaming to a file named in the result, ending with an `[exit <code> at HH:MM:SS]`
+  footer when it finishes, so a long install, build, or download is not thrown away
+  and re-run from zero. Bounded by design — at most two at a time, an absolute
+  lifetime each, and all of them terminated when chad exits or is signalled. A user
+  interrupt still kills outright. (`bash_auto_background`)
+- **The destructive-command guard screens catastrophes, not cleanups.** The
+  recursive-delete check matched *any* absolute path, and in a headless container run
+  every real path is absolute — so ordinary scoped deletes like
+  `rm -rf /tmp/test-deploy` were refused, over and over, while the result claimed
+  `[denied by user]` when no user was there. The screen now fires on targets whose
+  loss is actually catastrophic — the filesystem root, top-level directories, home
+  trees at any depth, the whole cwd or its parent, a glob that empties a top-level
+  directory — and passes deeper scoped paths. It also screens every target of every
+  `rm` in a compound command, where the old single-target check saw only the first.
+  When it does block with nobody to ask, the result now says the guard (not a person)
+  refused, and how to narrow the delete. mkfs / dd-to-device / fork-bomb / `curl|sh`
+  screens are unchanged. (`scoped_destructive_guard`)
+- **Unattended runs no longer strand a third of their time budget.** Extra fresh
+  attempts after a stalled turn were only granted while more than half the wall
+  budget remained, so a task whose turns kept hitting the step cap ended for good
+  with 25-50% of its time unspent. Extras now keep flowing while more than a quarter
+  remains; the absolute relaunch ceiling and the minimum-remaining-time floor for
+  any relaunch are unchanged. (`late_continue_replenish`)
+- **The system prompt steers final verification at the task's own stated check.** A
+  model that was bounced for unverified work would usually re-verify — with a weaker
+  check than the task named (file-exists for a content requirement, a hand-rolled
+  probe instead of the stated command) — then finish wrong with most of its time
+  unused. One prompt block now says: run the named check end-to-end, read its output,
+  and treat existence as proof of nothing, with a WRONG/CORRECT pair.
+  (`steer_verify_specific`)
+
+Also fixed:
+
+- **`chad --version` reported the wrong version.** `__version__` had drifted from the
+  packaged version, so 1.0.3 and 1.0.4 both identified themselves as 1.0.2.
 
 ## [1.0.4] — 2026-07-22
 

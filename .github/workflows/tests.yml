@@ -32,7 +32,7 @@ jobs:
           enable-cache: true
       - run: uv sync
       - name: ruff (lint + import order)
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests benchmarks
       - name: mypy (src only; config pins python 3.11)
         run: uv run mypy src/chad
 

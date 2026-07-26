@@ -4,7 +4,7 @@ Each case is a real weak-model edit miss from the dogfooding logs (~1 in 6 edits
 literal "\\n" in `old`, indentation drift) or a SAFETY case (an ambiguous or wrong `old`
 must NOT change the file). Pure + fast — no model load.
 
-Run: `uv run python test_edit.py`
+Run: `uv run python tests/test_edit.py`
 """
 
 import os
@@ -102,7 +102,7 @@ def test_edit():
 
 
 def test_ws_recovery_prefers_file_indentation():
-    """Iter-2 (sphinx-7440): on the whitespace-flexible path the model's
+    """Iter-2: on the whitespace-flexible path the model's
     RELATIVE indents are the least trustworthy part of the edit. A same-line-count
     replacement takes each replaced line's indent from the FILE, so a garbled-indent
     `new` can no longer land a SyntaxError."""
@@ -118,7 +118,7 @@ def test_ws_recovery_prefers_file_indentation():
 
 
 def test_ws_only_edit_applies_verbatim():
-    """Iter-2 (sphinx-7440): an indentation-ONLY fix used to normalize to
+    """Iter-2: an indentation-ONLY fix used to normalize to
     '[no-op edit]' — a broken indent was literally unrepairable through this tool
     and the model fell back to blind sed. When reindenting reproduces the file
     byte-for-byte but the model's `new` differs, trust its whitespace verbatim."""
@@ -148,7 +148,7 @@ def test_indent_break_is_rejected_and_reverted():
 
 def test_non_indent_break_rejected(monkeypatch):
     """(supersedes the warn-only scope): a NON-indentation syntax
-    break (unclosed paren) is also REVERTED. The 073 dogfood measured what warn-only
+    break (unclosed paren) is also REVERTED. Dogfooding measured what warn-only
     costs a small model: ten ignored "no longer parses" warnings while stale line edits
     compounded on a severed def signature, ending in LOOP ABORT with the file broken.
     Multi-step changes that must pass through a broken state route through `write`
@@ -166,7 +166,7 @@ def test_non_indent_break_rejected(monkeypatch):
 def test_already_broken_file_stays_editable():
     """Prong 1 boundary: when `before` is ALREADY broken, indent_reject stays out of the
     way (parse of `before` fails), so a fix that passes through a still-broken state is
-    never stranded — the sphinx-7440 repair path keeps working."""
+    never stranded — the already-broken repair path keeps working."""
     before = "def f():\n    a = 1\n      b = 2\n"      # b over-indented: already broken
     res, after = run(before, "    a = 1", "    a = 111")  # edit unrelated line
     check("broken-file edit lands", res.startswith("[edited") and "a = 111" in after, res)
@@ -248,7 +248,7 @@ if __name__ == "__main__":
 
 
 def test_typo_recovery_file_has_unicode_model_sends_ascii():
-    # iter-14: file uses typographic punctuation, the model
+    # File uses typographic punctuation, the model
     # re-types it ASCII-fied. Rungs 1-3 miss; the typo-normalized rung must land.
     before = 'MSG = "cache — warm start"\nprint(MSG)\n'
     res, after = run(before, 'MSG = "cache - warm start"', 'MSG = "cache - hot start"')

@@ -21,10 +21,11 @@ that balloons: every step appends the model's reply, the tool call, and the tool
 output to the transcript, so a naive backend re-reads an ever-longer prompt *every
 step*. That is O(n) work per step and O(n²) over a session.
 
-Concretely, on a 24 GB M4 Pro at Ornith's ~500 tok/s prefill: by step 20 a real coding
-session is ~5,000 tokens of transcript. Re-prefilling all of it is **~15 seconds of
-dead air before the model says anything — every step, and growing.** Over a 40-step
-task, prefill (not generation) is where the minutes vanish.
+Concretely, on a 24 GB M4 Pro: by step 20 a real coding session is ~5,000 tokens of
+transcript, which Ornith prefills in ~6.8 s. Re-reading it every step is **~7 seconds of
+dead air before the model says anything — every step, and growing faster than linearly**,
+since the prefill *rate* also falls as the prompt lengthens (~730 tok/s at 5k, ~500 by
+32k). Over a 40-step task, prefill (not generation) is where the minutes vanish.
 
 chad's answer is a **persistent prefix KV cache**: keep the KV state alive across turns
 and diff each new prompt against what's already cached, so you only prefill the handful
@@ -84,7 +85,7 @@ three reasons:
    the experience being copied, and every menu before the first task is a place to
    lose someone.
 
-The escape hatches exist and are honest about what they cost: `CHAD_MODEL=<repo or
+The escape hatches exist and are honest about what they cost: `--model <repo or
 local dir>` forces specific weights through the same in-process engine (you keep the
 cache, you lose the tuning fit), and `--backend llama` runs the harness against a remote
 llama.cpp server as a measured ablation arm (you lose the on-disk warm-prefix checkpoint

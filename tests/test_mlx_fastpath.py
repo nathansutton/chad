@@ -126,3 +126,5 @@ def test_wrong_architecture_is_noop():
         pass
 
     assert mlx_fastpath.install(NotAModel()) is False
+
+

@@ -1,6 +1,6 @@
 """Unit tests for session persistence (session.py) — save/load round-trip + isolation.
 
-Run: `uv run python test_session.py`
+Run: `uv run python tests/test_session.py`
 """
 import json
 import os

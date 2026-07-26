@@ -8,13 +8,27 @@ with it off and the governor's ctx_limit pays full fp16 KV rates (~20.5
 KB/token on the 35B).
 
 This module JIT-compiles (mx.fast.metal_kernel — no wheel rebuild) a fused
-online-softmax scan over the 8-bit group-64 affine QuantizedKVCache layout,
-structured like mlx's sdpa_vector_2pass with one addition: each threadgroup
-cooperatively dequantizes a CHUNK of 8 positions into threadgroup memory
-ONCE, double-buffered so the next chunk's packed loads overlap the current
-chunk's math, and the 8 GQA q-head simdgroups consume cheap staged rows.
-(A naive port that dequantized per-head was ALU-bound and lost to fp16;
-sharing the dequant is what flips it.)
+online-softmax scan over the 8-bit group-64 affine QuantizedKVCache layout.
+There are two pass-1 schedules of the same math, sharing one pass 2:
+
+- **per-head** (`_P1_SGM_SRC`'s predecessor, `_P1_SRC`): structured like mlx's
+  sdpa_vector_2pass with one addition — each threadgroup cooperatively
+  dequantizes a CHUNK of 8 positions into threadgroup memory ONCE, double-
+  buffered so the next chunk's packed loads overlap the current chunk's math,
+  and the GQA q-head simdgroups consume cheap staged rows. (A naive port that
+  dequantized per-head was ALU-bound and lost to fp16; sharing the dequant is
+  what flips it.) Used below `_SGM_MIN_N`, and at gqa 4 always.
+
+- **simdgroup_matrix retile** (`_P1_SGM_SRC`): a simdgroup owns a
+  (position-stream, output-dim-quarter) instead of a q head, so each staged row
+  is consumed once instead of GQA times and the products become matrix ops.
+  Worth 1.26-1.30x over the per-head kernel at >= 8k on the 35B shape. gqa 8
+  only — see the gate in `qsdpa()`.
+
+Profiling that motivated the retile: ablating the math phase left the per-head
+kernel streaming at 331 GB/s, at the measured roofline, with 68% of its runtime
+in the math. The cost was GQA reuse through threadgroup memory (~8 KB/position
+against ~500 B/position of device traffic), not the fetch.
 
 Measured on the target shape (q 16h x 256d, kv 2h, GQA-8, bf16, M4 Pro):
 vs stock fused fp16 sdpa_vector: 1.17x @8k, 1.31x @32k, 1.36x @98k faster —
@@ -250,6 +264,220 @@ _P2_SRC = """
   }
 """
 
+_HEADER_SGM = """
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+#include <metal_math>
+using namespace metal;
+constant constexpr float FIN_MIN = -3.402823466e38f;
+"""
+
+# Pass 1, simdgroup_matrix form. Same math and same output contract as _P1_SRC;
+# the difference is who owns what.
+#
+# _P1_SRC maps simdgroup -> q head, so all GQA simdgroups re-read the same staged
+# K/V rows: ~8 KB/position of threadgroup traffic against ~500 B/position of
+# device traffic. Ablation put 68% of that kernel in the math phase while the
+# device side alone ran at 331 GB/s -- i.e. at the streaming roofline, with no
+# bandwidth left to recover. The cost was the reuse, not the fetch.
+#
+# Here a simdgroup owns (position-stream, output-dim-quarter):
+#
+#     sg -> pg = sg >> 2   which of NPG position streams
+#           dq = sg & 3    which 64 of the 256 output dims
+#
+# so each staged row is consumed once by the simdgroup that staged it, and the
+# QK/V products become simdgroup_matrix ops. The quarter split is a register
+# budget, not a tiling preference: an earlier revision let one simdgroup own all
+# 256 output dims (32 simdgroup_float8x8 accumulators, 64 floats/lane) and spilled
+# hard. Measured at n=32768 with the matrix-op count held constant --
+# O[8] 0.215 ms, O[12] 0.396, O[16] 0.576, O[32] 1.068 -- so 8 tiles is the cliff
+# edge and 64 dims is what fits.
+#
+# The 4 quarters of a position stream each produce a PARTIAL score tile over
+# their own dims; those are summed through threadgroup memory. dq==0 owns the
+# group's online-softmax state and publishes the exp weights and the diagonal
+# rescale factor. Barriers are threadgroup-wide, so every simdgroup runs the same
+# uniform trip count and masks out-of-range work rather than exiting early.
+_P1_SGM_SRC = """
+  constexpr int DD  = 256;
+  constexpr int PW  = DD / 4;    // 64 packed uint32 per row (8-bit)
+  constexpr int GW  = DD / 64;   // 4 affine groups per row
+  constexpr int CH  = 8;         // positions per chunk
+  constexpr int SL  = 64;        // dims owned by one simdgroup
+  constexpr int NT  = SL / 8;    // 8 accumulator tiles -- the register budget
+  constexpr int NPG = GQA / 4;   // position streams per threadgroup
+
+  const int N      = params[0];
+  const int NP     = params[1];
+  const int blocks = params[2];
+
+  const int kv_head_idx  = threadgroup_position_in_grid.x;
+  const int batch_idx    = threadgroup_position_in_grid.y;
+  const int block_idx    = threadgroup_position_in_grid.z;
+  const int num_kv_heads = threadgroups_per_grid.x;
+  const int lane = thread_index_in_simdgroup;
+  const int sg   = simdgroup_index_in_threadgroup;
+  const int pg   = sg >> 2;
+  const int dq   = sg & 3;
+
+  const int num_q_heads = num_kv_heads * GQA;
+  const size_t kv_row0 = (size_t)(batch_idx * num_kv_heads + kv_head_idx) * NP;
+
+  threadgroup half  Qsh[GQA * DD];        // staged once, pre-scaled
+  threadgroup half  Stg[GQA * CH * SL];   // per-simdgroup K then V slice
+  threadgroup float Spart[NPG * 4 * 64];  // partial score tiles
+  threadgroup half  Psh[NPG * 64];        // exp weights (matrix A operand)
+  threadgroup half  Fsh[NPG * 64];        // diag(factor) for the O rescale
+  threadgroup float RunM[NPG * 8];
+  threadgroup float RunS[NPG * 8];
+
+  const float qscale = scale[0];
+  for (int i = sg * 32 + lane; i < GQA * DD; i += 32 * GQA) {
+    const int h = i / DD, d = i % DD;
+    const size_t qi = ((size_t)(batch_idx * num_q_heads + kv_head_idx * GQA + h)) * DD + d;
+    Qsh[i] = half(qscale * float(q[qi]));
+  }
+  if (sg < NPG && lane < 8) {
+    RunM[sg * 8 + lane] = FIN_MIN;
+    RunS[sg * 8 + lane] = 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  threadgroup half*  Sl = Stg + sg * CH * SL;
+  threadgroup float* Sp = Spart + (pg * 4 + dq) * 64;
+  threadgroup half*  Pc = Psh + pg * 64;
+  threadgroup half*  Fc = Fsh + pg * 64;
+  threadgroup float* Rm = RunM + pg * 8;
+  threadgroup float* Rs = RunS + pg * 8;
+
+  simdgroup_float8x8 O[NT];
+  for (int t = 0; t < NT; t++) O[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+  const int VB = blocks * NPG;
+  const int vblk = block_idx * NPG + pg;
+  const int total_chunks = (N + CH - 1) / CH;
+  const int iters = (total_chunks + VB - 1) / VB;
+
+  for (int it = 0; it < iters; it++) {
+    const int i0 = (vblk + it * VB) * CH;
+    const int valid = (i0 < N) ? min(CH, N - i0) : 0;
+
+    // stage this quarter's K: 8 positions x 64 dims, 16 halfs per lane
+    {
+      const int pl = lane >> 2, doff = (lane & 3) * 16;
+      threadgroup half4* dst = (threadgroup half4*)(Sl + pl * SL + doff);
+      if (pl < valid) {
+        const size_t row = kv_row0 + i0 + pl;
+        const device uint32_t* src = kw + row * PW + dq * 16 + (lane & 3) * 4;
+        const float sc = float(ks[row * GW + dq]);
+        const float bi = float(kb[row * GW + dq]);
+        for (int u = 0; u < 4; u++) dst[u] = half4(sc * float4(as_type<uchar4>(src[u])) + bi);
+      } else {
+        for (int u = 0; u < 4; u++) dst[u] = half4(0.0h);
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    // partial S(8h x 8p) over this quarter's dims
+    simdgroup_float8x8 St = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int j = 0; j < NT; j++) {
+      simdgroup_half8x8 A, Bm;
+      simdgroup_load(A, Qsh + dq * SL + j * 8, DD);              // 8h x 8d
+      simdgroup_load(Bm, Sl + j * 8, SL, ulong2(0, 0), true);    // 8d x 8p
+      simdgroup_multiply_accumulate(St, A, Bm, St);
+    }
+    simdgroup_store(St, Sp, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // dq==0 owns the stream's online softmax
+    if (dq == 0 && lane < 8) {
+      const threadgroup float* q0 = Spart + pg * 4 * 64;
+      float s[8];
+      float cmax = FIN_MIN;
+      for (int p = 0; p < 8; p++) {
+        float acc = q0[lane * 8 + p] + q0[64 + lane * 8 + p]
+                  + q0[128 + lane * 8 + p] + q0[192 + lane * 8 + p];
+        s[p] = acc;
+        if (p < valid) cmax = max(cmax, acc);
+      }
+      const float run_max = Rm[lane];
+      const float new_max = max(run_max, cmax);
+      const float factor = (run_max == FIN_MIN) ? 0.0f : fast::exp(run_max - new_max);
+      float esum = 0.0f;
+      for (int p = 0; p < 8; p++) {
+        const float e = (p < valid && new_max > FIN_MIN) ? fast::exp(s[p] - new_max) : 0.0f;
+        Pc[lane * 8 + p] = half(e);
+        esum += e;
+        Fc[lane * 8 + p] = half(p == lane ? factor : 0.0f);
+      }
+      Rs[lane] = Rs[lane] * factor + esum;
+      Rm[lane] = new_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // rescale O by diag(factor): simdgroup_float8x8 has no row indexing
+    {
+      simdgroup_half8x8 F;
+      simdgroup_load(F, Fc, 8);
+      for (int t = 0; t < NT; t++) {
+        simdgroup_float8x8 tmp;
+        simdgroup_multiply(tmp, F, O[t]);
+        O[t] = tmp;
+      }
+    }
+
+    // stage this quarter's V, then O(8h x 64d) += P(8h x 8p) @ V(8p x 64d)
+    {
+      const int pl = lane >> 2, doff = (lane & 3) * 16;
+      threadgroup half4* dst = (threadgroup half4*)(Sl + pl * SL + doff);
+      if (pl < valid) {
+        const size_t row = kv_row0 + i0 + pl;
+        const device uint32_t* src = vw + row * PW + dq * 16 + (lane & 3) * 4;
+        const float sc = float(vs[row * GW + dq]);
+        const float bi = float(vb[row * GW + dq]);
+        for (int u = 0; u < 4; u++) dst[u] = half4(sc * float4(as_type<uchar4>(src[u])) + bi);
+      } else {
+        for (int u = 0; u < 4; u++) dst[u] = half4(0.0h);
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_half8x8 Pm;
+    simdgroup_load(Pm, Pc, 8);
+    for (int t = 0; t < NT; t++) {
+      simdgroup_half8x8 Vm;
+      simdgroup_load(Vm, Sl + t * 8, SL);                        // 8p x 8d
+      simdgroup_multiply_accumulate(O[t], Pm, Vm, O[t]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // emit: this simdgroup owns dims [dq*64, dq*64+64) of virtual block vb
+  for (int t = 0; t < NT; t++) {
+    simdgroup_store(O[t], Sp, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 8) {
+      const size_t hq = (size_t)(batch_idx * num_q_heads + kv_head_idx * GQA + lane);
+      device float* dst = partials + (hq * VB + vblk) * DD + dq * SL + t * 8;
+      for (int d = 0; d < 8; d++) dst[d] = Sp[lane * 8 + d];
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (dq == 0 && lane < 8) {
+    const size_t hq = (size_t)(batch_idx * num_q_heads + kv_head_idx * GQA + lane);
+    sums[hq * VB + vblk] = Rs[lane];
+    maxs[hq * VB + vblk] = Rm[lane];
+  }
+"""
+
+# Below this many valid positions the retile's extra barriers and its wider
+# partials slab (VB = blocks * NPG) cost more than the reuse it saves, and the
+# per-head kernel wins. Measured crossover on the 35B shape, interleaved arms:
+# n=1024 0.95x, 2048 1.04x, 4096 1.12x, 8192 1.18x, 16384 1.22x, 98304 1.30x.
+_SGM_MIN_N = 2048
+
 _GQAS = (4, 8)   # 35B is 16q/2kv (gqa 8); 9B is 16q/4kv (gqa 4)
 _D = 256
 
@@ -284,16 +512,61 @@ def _kernels():
     return _p1, _p2
 
 
-def _pick_blocks(n: int) -> int:
-    """Stock sdpa_vector_2pass block table for 's'-class devices (M4 family)
-    at n_simds=8; also keeps blocks a multiple of 32 for pass 2."""
-    if n <= 8192:
-        return 128
-    if n <= 32768:
-        return 256
-    if n <= 65536:
-        return 512
-    return 1024
+_p1_sgm = None
+
+
+def _kernel_sgm():
+    """Pass 1 in simdgroup_matrix form; pass 2 is shared (same partials contract,
+    just VB = blocks * NPG entries instead of blocks)."""
+    global _p1_sgm
+    if _p1_sgm is None:
+        import mlx.core as mx
+        _p1_sgm = mx.fast.metal_kernel(
+            name="chad_qsdpa_p1_sgm",
+            input_names=["q", "kw", "ks", "kb", "vw", "vs", "vb", "scale", "params"],
+            output_names=["partials", "sums", "maxs"],
+            header=_HEADER_SGM,
+            source=_P1_SGM_SRC,
+        )
+    return _p1_sgm
+
+
+def _pick_blocks(n: int, gqa: int = 8) -> int:
+    """Split factor for the 2-pass scan. Pass 2 combines `blocks` partials per
+    head, so this must stay a multiple of its BN=32.
+
+    Deliberately NOT mlx's sdpa_vector_2pass table, which this kernel used to
+    inherit. That table is tuned for an fp16 cache, which reads twice the bytes
+    per position and so needs more blocks to saturate; here the extra blocks buy
+    no occupancy (32 blocks x 2 kv heads already fills the GPU) and cost a
+    (heads, blocks, 256) fp32 partials slab that pass 1 writes and pass 2 reads
+    back. At blocks=256 that slab is a fifth of the kernel's whole memory
+    traffic. Measured on the 35B shape, min-of-interleaved-arms, M4 Pro:
+
+        n       blocks 32   stock table   delta
+        8192      0.171 ms   0.179 (128)  -4.5%
+        32768     0.354 ms   0.369 (256)  -4.1%
+        98304     0.990 ms   1.078 (1024) -8.2%
+
+    Fewer than 32 is not available (pass 2's BN), and the isolated curve is
+    monotone up to it — but the isolated curve is not the decision criterion
+    (see the module maxim), and end-to-end the answer moved when the retile
+    landed: the flat 32 above was tuned against the PER-HEAD kernel, while at
+    gqa 8, n >= _SGM_MIN_N the kernel is now the simdgroup retile, whose pass-1
+    partials are cheaper per block. Measured end-to-end on the real models (one
+    load, interleaved arms, median-of-4 paired rounds, spread clearing 1.000):
+
+        gqa 8 (35B): 64 is 1.006x+-0.002 @16k, 1.015x+-0.001 @32k; 1.000 @8k;
+                     128 is 0.995 @16k — worse than 64 everywhere it was tried.
+        gqa 4 (9B):  128 is 1.005x+-0.002 @32k; exactly 1.000 @16k; noise @8k.
+
+    Both tiers widen at n >= 16384: the largest measured-neutral point is 16000
+    and the wins start at the next measured context, so the boundary sits just
+    above the neutral evidence.
+    """
+    if n >= 16384:
+        return 128 if gqa == 4 else 64
+    return 32
 
 
 def qsdpa(q: Any, k_quant: tuple, v_quant: tuple, scale: float, n: int) -> Any:
@@ -310,22 +583,44 @@ def qsdpa(q: Any, k_quant: tuple, v_quant: tuple, scale: float, n: int) -> Any:
     B, HQ, S, D = q.shape
     HKV, NP = kw.shape[1], kw.shape[2]
     gqa = HQ // HKV
-    blocks = _pick_blocks(n)
-    params = mx.array([n, NP, blocks], dtype=mx.int32)
+    blocks = _pick_blocks(n, gqa)
     scale_arr = mx.array([scale], dtype=mx.float32)
-    p1, p2 = _kernels()
+    _, p2 = _kernels()
 
-    partials, sums, maxs = p1(
-        inputs=[q, kw, ks, kb, vw, vs, vb, scale_arr, params],
-        template=[("T", q.dtype), ("D", D), ("GQA", gqa)],
-        grid=(32 * HKV, gqa * B, blocks),
-        threadgroup=(32, gqa, 1),
-        output_shapes=[(B, HQ, S, blocks, D), (B, HQ, S, blocks),
-                       (B, HQ, S, blocks)],
-        output_dtypes=[mx.float32, mx.float32, mx.float32],
-    )
+    # The retile emits one partial per (block, position-stream), so pass 2 has to
+    # be told VB rather than blocks. Below _SGM_MIN_N the per-head kernel wins.
+    # gqa==8 only: the score tile is a fixed 8x8, so the retile needs 8 real q
+    # head rows to fill it. At gqa==4 (the 9B) rows 4-7 would read past Qsh and
+    # poison the softmax with NaN, so that tier keeps the per-head kernel.
+    use_sgm = (n >= _SGM_MIN_N and gqa == 8
+               and not config.flag("CHAD_NO_QSDPA_SGM"))
+    npg = (gqa // 4) if use_sgm else 1
+    vb_count = blocks * npg
+
+    params = mx.array([n, NP, blocks], dtype=mx.int32)
+    if use_sgm:
+        partials, sums, maxs = _kernel_sgm()(
+            inputs=[q, kw, ks, kb, vw, vs, vb, scale_arr, params],
+            template=[("T", q.dtype), ("GQA", gqa)],
+            grid=(32 * HKV, gqa * B, blocks),
+            threadgroup=(32, gqa, 1),
+            output_shapes=[(B, HQ, S, vb_count, D), (B, HQ, S, vb_count),
+                           (B, HQ, S, vb_count)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+        )
+    else:
+        partials, sums, maxs = _kernels()[0](
+            inputs=[q, kw, ks, kb, vw, vs, vb, scale_arr, params],
+            template=[("T", q.dtype), ("D", D), ("GQA", gqa)],
+            grid=(32 * HKV, gqa * B, blocks),
+            threadgroup=(32, gqa, 1),
+            output_shapes=[(B, HQ, S, blocks, D), (B, HQ, S, blocks),
+                           (B, HQ, S, blocks)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+        )
     (out,) = p2(
-        inputs=[partials, sums, maxs, params],
+        inputs=[partials, sums, maxs,
+                mx.array([n, NP, vb_count], dtype=mx.int32)],
         template=[("T", q.dtype), ("D", D)],
         grid=(1024 * B * HQ * S, 1, 1),
         threadgroup=(1024, 1, 1),
@@ -387,8 +682,14 @@ def kernel_healthy() -> bool:
         return False
     scale = _D ** -0.5
     try:
+        # The last two are >= _SGM_MIN_N at gqa 8, so they exercise the
+        # simdgroup_matrix retile rather than the per-head kernel; without them a
+        # GPU could pass this check and still poison every real decode step,
+        # since real contexts are never as short as the n=3/n=100 probes.
         for hkv, n, dtype, tol in ((2, 3, mx.float16, 4e-3), (2, 3, mx.bfloat16, 1.6e-2),
-                                   (4, 3, mx.float16, 4e-3), (2, 100, mx.float16, 4e-3)):
+                                   (4, 3, mx.float16, 4e-3), (2, 100, mx.float16, 4e-3),
+                                   (2, 2570, mx.float16, 4e-3),
+                                   (2, 2570, mx.bfloat16, 1.6e-2)):
             mx.random.seed(7)
             q = mx.random.normal((1, 16, 1, _D)).astype(dtype)
             k = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)

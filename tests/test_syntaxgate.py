@@ -2,7 +2,7 @@
 
 The gate rides a warning along in the SAME tool result when a write/edit *introduces* a
 syntax error — never blocking, never touching a valid edit or a pre-existing parse error.
-Pure + fast: no model load. Run: `uv run python test_syntaxgate.py`
+Pure + fast: no model load. Run: `uv run python tests/test_syntaxgate.py`
 """
 
 import os
@@ -117,7 +117,7 @@ def test_opt_out():
 
 def test_symbol_edit():
     # A symbol replacement that produces invalid Python is REJECTED and reverted (plan
-    # 073), and the message says the error is in the model's own code.
+    # the line-addressed class), and the message says the error is in the model's own code.
     p = _tmp("mod.py", "def area(w, h):\n    return w * h\n")
     res = tools.symbols.service().replace_symbol("area", "def area(w, h):\n    return w *", path=p)
     check("symbol bad replace rejected", res.startswith("[edit rejected"), res)
@@ -158,8 +158,8 @@ def test_indent_reject_names_enclosing_symbol():
 
 def test_plain_text_never_policed():
     # The language pack maps .txt to VIMDOC, so plain-text deliverable writes
-    # (answer.txt / secret.txt / requirements.txt — the TB2.1 run1 README finding,
-    # plan 107 follow-up) were grammar-checked and warned on exactly the
+    # (answer.txt / secret.txt / requirements.txt — the benchmark README finding)
+    # were grammar-checked and warned on exactly the
     # deliverable-landing write. Prose/data formats are now excluded from every gate.
     for name, content in (
         ("answer.txt", "The flag is: ABC-123\nsecond line < > { weird ] chars\n"),

@@ -176,7 +176,6 @@ def test_interrupted_prefill_records_only_fed_tokens():
     eng = object.__new__(Engine)           # bypass __init__ (no weights)
     eng._cache = [_FakeCacheItem(), _FakeCacheItem()]
     eng.model = lambda arr, cache=None: forwards.append(int(arr.shape[1]))
-    eng.draft = None                       # single-model cache -> warm_prefix is valid
     eng.cache_dir = "/tmp/chad-test-nonexistent"   # truthy so warm_prefix doesn't 'skip'
     eng._cached_ids = []                            # cold: nothing resident yet
     eng._reset_cache = lambda: None                 # keep our fake _cache in place
@@ -242,7 +241,6 @@ def test_stop_condition_soft_close():
 
     def _mk_engine():
         eng = object.__new__(Engine)  # bypass __init__ (no weights)
-        eng.draft = None
         eng.prompt_lookup = False      # force the standard (non-PLD) generate path
         eng.temp = 0.0
         eng.kv_bits = None
@@ -322,7 +320,6 @@ def _build_engine(model_id=TIER2_MODEL, enable_pld_hybrid=False):
         from chad.engine import Engine
         eng = Engine(
             model_id=model_id,
-            draft_id=None,            # draft-less: PLD only engages when draft is None
             prompt_lookup=True,
             temp=0.0,
             kv_bits=None,
@@ -933,9 +930,8 @@ def test_bounded_rewind_orchestration():
         eng._pld_hybrid = True
         eng._trimmable = False
         eng.kv_bits = None
-        eng.draft = None
         eng._cache = [_NoTrim()]
-        eng.model = type("M", (), {"layers": [0]})()  # _sub_caches slices by layer count
+        eng.model = type("M", (), {"layers": [0]})()
         eng._cached_ids = list(range(100, 110)) + list(range(200, 205))  # P0..P9+G0..G4
         eng._rewind_snap = ({"pos": snap_pos, "recurrent": "SNAP"}
                             if snap_pos is not None else None)
@@ -1086,7 +1082,7 @@ def test_keyed_sampler_worker_thread_entropy():
 
 def test_keyed_sampler_min_p_trims_sub_floor_tail():
     """Min_p must actually bind inside `_KeyedSampler` (the temp>0 hot
-    path TB2 uses — `make_sampler`'s own min_p is dead code there, see engine.py's
+    path the benchmark uses — `make_sampler`'s own min_p is dead code there, see engine.py's
     guarded import comment). Token 1 (logit -3.0) sits below the min_p=0.1 floor
     relative to token 0's max logit (threshold = 0 + ln(0.1) ~= -2.3) but is NOT
     astronomically rare (~4.5% unfiltered) — over 300 draws it would show up with
@@ -1126,11 +1122,11 @@ def test_keyed_sampler_top_p_trims_tail():
 
 
 def test_keyed_sampler_default_off_is_full_support():
-    """Regression guard (086/084-style): _KeyedSampler with no min_p/top_p (the
+    """Regression guard: _KeyedSampler with no min_p/top_p (the
     shipped default, 0.0 == no-op) must sample the FULL support — including a
     low-probability-but-nonzero token that a bound min_p=0.1 would exclude (see
     test_keyed_sampler_min_p_trims_sub_floor_tail's same logit vector). If this
-    regresses to filtering by default, TB2's on-policy distribution silently
+    regresses to filtering by default, the on-policy distribution silently
     narrows with no operator opt-in."""
     try:
         import mlx.core as mx

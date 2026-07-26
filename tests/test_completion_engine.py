@@ -8,7 +8,7 @@ tests/test_openai_engine.py; the deltas ARE the point: token-id prompts go over 
 wire verbatim (no decode), and server timings produce exact (non-approximate) stats.
 """
 
-from chad.base_engine import BaseEngine
+from chad.base_engine import THINK_CLOSE, BaseEngine, TailWatch, think_ceiling_hit
 from chad.completion_engine import (
     CompletionEngine,
     build_completion_body,
@@ -196,7 +196,7 @@ def test_client_error_chunk_is_not_transient():
 def test_server_error_chunk_is_transient():
     """llama.cpp answers 500 'does not match the expected Content-only format' when its
     chat parser can't reconcile a completion. That is sampling-dependent, so the agent is
-    allowed to re-roll it (TB2 make-mips-interpreter died on exactly this)."""
+    allowed to re-roll it (a benchmark task died on exactly this)."""
     import pytest
 
     from chad.base_engine import BackendError
@@ -367,3 +367,85 @@ def test_load_keeps_explicit_ctx_and_survives_offline_props(monkeypatch):
     ad2._fetch_props = lambda: None      # offline / older server
     ad2.load()
     assert ad2.effective_ctx == 32768    # safe fallback
+
+
+# --- incremental stop-marker scanning -------------------------------------
+#
+# `TailWatch` replaced `any(needle in text for needle in needles)` run after every
+# decoded token. That spelling is quadratic in the length of the turn — every token
+# re-reads everything generated so far — and it sits on the thread that drains the
+# token stream, so it is also what decides how fast the stream gets drained.
+# Measured before: 500 tokens 5.9ms, 2k 41ms, 8k 242ms, 16k 777ms of pure CPU.
+# These pin the behavior that had to survive the optimization.
+
+def test_tailwatch_finds_a_needle_split_across_segments():
+    """The whole reason a carry-over tail exists: a marker rarely arrives whole. The
+    naive full-text scan caught this for free; a windowed one only does if the window
+    is sized to the longest needle."""
+    w = TailWatch(["</tool_call>"])
+    for seg in ["</to", "ol_c", "all", ">"]:
+        last = w.feed(seg)
+    assert last is True
+
+
+def test_tailwatch_latches_and_ignores_earlier_text():
+    w = TailWatch(["STOP"])
+    assert w.feed("nothing here ") is False
+    assert w.feed("STOP") is True
+    assert w.feed(" and more after") is True     # append-only: never un-finds
+
+
+def test_tailwatch_matches_the_naive_scan_token_by_token():
+    """Equivalence, not vibes: for the same stream the watcher must flip on exactly the
+    same token the full-text scan would have."""
+    needles = ["</think>", "<|im_end|>", "\nUser:"]
+    segs = ["hel", "lo ", "wor", "ld", "\nUs", "er:", " more"]
+    w, text, naive_at, watch_at = TailWatch(needles), "", None, None
+    for i, seg in enumerate(segs):
+        text += seg
+        if naive_at is None and any(n in text for n in needles):
+            naive_at = i
+        if watch_at is None and w.feed(seg):
+            watch_at = i
+    assert naive_at == watch_at == 5
+
+
+def test_tailwatch_no_needles_is_a_no_op():
+    w = TailWatch([])
+    assert w.feed("anything at all") is False
+    assert TailWatch(["", None]).feed("x") is False
+
+
+def test_think_ceiling_checks_the_cheap_condition_first():
+    """Below the ceiling — the overwhelmingly common case — this must not touch `text`
+    at all. Both engines call it once per decoded token."""
+    class Boom(str):
+        def __contains__(self, other):
+            raise AssertionError("scanned the text below the ceiling")
+    assert think_ceiling_hit(Boom("x"), 10, 999) is False
+    assert think_ceiling_hit(Boom("x"), 10, None) is False
+    # at/over the ceiling it does look, and an explicit answer skips the scan entirely
+    assert think_ceiling_hit("still thinking", 10, 5) is True
+    assert think_ceiling_hit("... </think> done", 10, 5) is False
+    assert think_ceiling_hit(Boom("x"), 10, 5, think_closed=True) is False
+    assert think_ceiling_hit(Boom("x"), 10, 5, think_closed=False) is True
+
+
+def test_generate_salvage_does_not_refire_on_the_injected_close():
+    """The salvage injects THINK_CLOSE into `text`. The watcher has to see it, or the
+    continuation request trips the same ceiling the injection just resolved."""
+    first = list(_sse(
+        {"content": "think ", "tokens": [1], "stop": False},
+        {"content": "more ", "tokens": [2], "stop": False},
+    ))
+    second = list(_sse(
+        {"content": "answer", "tokens": [3], "stop": False},
+        {"content": "", "tokens": [], "stop": True,
+         "timings": {"prompt_n": 1, "prompt_ms": 1.0, "predicted_n": 1,
+                     "predicted_ms": 1.0}},
+    ))
+    ad, bodies = _salvage_adapter(first, second)
+    text, stats = ad.generate([1], max_tokens=50, think_ceiling=2)
+    assert stats.salvaged is True
+    assert len(bodies) == 2, "salvaged more than once — the injected close was missed"
+    assert THINK_CLOSE in text

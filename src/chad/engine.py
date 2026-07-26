@@ -17,8 +17,8 @@ Two decode-speed levers were investigated (see the README's throughput section):
 2. **Thinking budget** — `--no-think` drops Ornith's `<think>` overhead; the most
    effective real speedup for time-to-done, since decode is bandwidth-bound (~47 tok/s).
 
-Earlier revisions used a main+draft *speculative* layout; chad now ships a single model
-with no draft. PLD reuses the same accept/rollback machinery without a second model.
+chad is single-model by construction: there is no second "draft" model anywhere in the
+engine. PLD gets speculative decoding's accept/rollback benefit from the context itself.
 """
 
 import hashlib
@@ -33,7 +33,7 @@ import numpy as np
 # But two module-level helpers here — `sweep_orphan_spills` and `peek_context_window` —
 # are MLX-free and ARE needed on the remote `--backend llama` path, which loads no
 # MLX at all. Guard the imports so `import chad.engine` succeeds on a non-Apple host (e.g.
-# inside a Linux benchmark container that runs chad against a remote server). `Engine`
+# inside a Linux container that runs chad against a remote server). `Engine`
 # itself is only ever CONSTRUCTED on the default MLX path, where these are present; if a
 # remote-only host somehow builds one, it fails fast on the first `mx.` use.
 try:
@@ -69,6 +69,30 @@ from .diag import log
 # ephemeral push-spills without touching durable warm-prefix files.
 _CKPT_WARM = "warm"
 _CKPT_PUSH = "push"
+
+
+def _log_mlx_provenance() -> None:
+    """Record whether mlx is the PyPI build a `uvx chad-code` user gets, or a
+    locally built one.
+
+    Perf work on this repo has twice been measured against a patched local wheel
+    whose kernels no PyPI user receives (chad-code depends on `mlx>=0.32,<0.33`
+    from PyPI, and `uvx --from git+...` resolves fresh and ignores uv.lock). A
+    local build shows up as a PEP 440 local version segment ('+<sha>'). Logging
+    it means a throughput number can always be traced to the build that produced
+    it, instead of silently describing a configuration we do not ship.
+    """
+    try:
+        import mlx.core as mx
+        ver = str(mx.__version__)
+    except Exception:  # noqa: BLE001 — diagnostics must never break loading
+        return
+    if "+" in ver:
+        log.warning("mlx %s is a LOCAL build, not the PyPI wheel users get — "
+                    "throughput measured here may not be reproducible via "
+                    "`uvx chad-code`", ver)
+    else:
+        log.info("mlx %s (PyPI build — matches what uvx installs)", ver)
 
 
 def _local_path(model_id: str) -> str:
@@ -217,7 +241,7 @@ class _KeyedSampler:
     mx.random.categorical() there reuses the same frozen noise, so temp>0
     "sampling" replays one draw per position — byte-identical responses across
     identical requests AND loop-prone quasi-greedy decoding (any worker-thread
-    generation hits it; the night-7 replay class). Per-request
+    generation hits it; the deterministic replay class). Per-request
     mx.random.seed() cannot fix it because the seeded state is never consumed
     off the main thread. Splitting an explicit key per draw sidesteps global
     RNG state entirely and behaves identically on every thread. Measured on
@@ -245,11 +269,6 @@ class _KeyedSampler:
 @dataclass
 class Engine:
     model_id: str = "mlx-community/Qwen2.5-Coder-3B-Instruct-4bit"
-    # No draft model on the shipped path (cli.py passes None explicitly; the old
-    # 0.5B default predates the single-model design and was a footgun waiting for
-    # a caller that forgot to override it).
-    draft_id: Optional[str] = None
-    num_draft_tokens: int = 3
     temp: float = 0.0
     # Sub-noise-floor tail filters: quantized weights have a higher logit
     # noise floor than the bf16 reference this temp=1.0 recipe was validated on, so
@@ -279,13 +298,12 @@ class Engine:
     # forwards/token. It only wins on quote-heavy spans (re-emitting a just-read file).
     # Opt in for that workload; the default standard path is faster for general use.
     enable_pld_hybrid: bool = False
-    cache_dir: Optional[str] = None # ds4-style on-disk KV checkpoints; None disables
+    cache_dir: Optional[str] = None # on-disk KV checkpoints; None disables
     kv_cache_max_bytes: int = 8 * 1024**3  # LRU-evict the on-disk KV cache above this; 0 disables
 
     # mlx model/tokenizer/cache are loaded dynamically (mlx_lm has no stubs); annotate
     # as Any so the gate doesn't chase attributes/calls on objects mypy can't see.
     model: Any = field(init=False, default=None)
-    draft: Any = field(init=False, default=None)
     tok: Any = field(init=False, default=None)
     effective_ctx: int = field(init=False, default=32768)
     _cache: Any = field(init=False, default=None)
@@ -388,15 +406,11 @@ class Engine:
         if override is not None:
             # reload main with YaRN extension applied
             self.model, self.tok = load(path, model_config=override)
-        if self.draft_id:
-            dpath = _local_path(self.draft_id)
-            d_override, _ = self._ctx_override(dpath)
-            self.draft, _ = load(dpath, model_config=d_override) if d_override \
-                else load(dpath)
         self._read_model_shape(path)
         # Decode fast-path (fused projections + compiled S=1 layer step) for the
         # hybrid MoE checkpoint; silent no-op on any other model or on failure.
         from . import mlx_fastpath
+        _log_mlx_provenance()
         mlx_fastpath.install(self.model)
         # Fused quantized-KV decode attention: makes kv_bits=8 a speed win
         # instead of a loss. Patches mlx_lm's quantized SDPA branch
@@ -442,7 +456,7 @@ class Engine:
         gqa = self._n_attn_heads // self._n_kv_heads if self._n_kv_heads else 0
         covered = qsdpa_ok and mlx_qsdpa.covers(self._head_dim, gqa)
         if self.kv_bits is None:
-            self.kv_bits = 8 if (covered and self.draft is None) else None
+            self.kv_bits = 8 if covered else None
             if self.kv_bits:
                 log.info("KV cache: quantized 8-bit group-64 by default (fused "
                          "decode kernel covers head_dim=%d gqa=%d); "
@@ -522,7 +536,7 @@ class Engine:
 
     def _reset_cache(self):
         self._cache = cache_utils.make_prompt_cache(self.model)
-        if self.kv_bits and self.draft is None:
+        if self.kv_bits:
             # Quantized-from-start attention cache (follow-on): the
             # layer types never change mid-session, so trim/rewind stay valid
             # (QuantizedKVCache trims by offset; realloc rebinds but never
@@ -534,8 +548,6 @@ class Engine:
                 if type(c) is cache_utils.KVCache else c
                 for c in self._cache
             ]
-        if self.draft is not None:
-            self._cache += cache_utils.make_prompt_cache(self.draft)
         self._cached_ids = []
         # Hybrid SSM/attention models (e.g. Ornith/qwen3_5) keep recurrent state
         # that cannot be rewound, so their cache is not trimmable. KV-trim tricks
@@ -556,13 +568,13 @@ class Engine:
         # rather than mutating them in place, so we can snapshot/restore those layers
         # by *reference* (free) and roll a speculative draft back exactly — restore
         # recurrent + native-trim the attention KV + re-feed the accepted prefix.
-        # (The trimmable PLD path's bit-exact equivalence is regression-tested in
-        # test_engine.py tier 2; this hybrid recurrent-snapshot rollback has no
-        # automated case yet — no hybrid model is loaded in the test env.) That
+        # (Bit-exactness of this rollback is regression-tested in
+        # test_engine_pld_hybrid.py against a synthetic unquantized hybrid, with the
+        # draft quality injected so accept, partial-accept and total-rejection are all
+        # exercised; the trimmable PLD path is covered in test_engine.py tier 2.) That
         # un-gates PLD on a cache `can_trim_prompt_cache` calls non-trimmable.
         self._pld_hybrid = (
             not self._trimmable
-            and self.draft is None
             and bool(self._cache)
             and all(isinstance(c, (cache_utils.KVCache, cache_utils.ArraysCache,
                                    cache_utils.QuantizedKVCache))
@@ -571,11 +583,11 @@ class Engine:
                     for c in self._cache)
         )
 
-    # -- ds4-style on-disk KV checkpoints ---------------------------------
+    # -- on-disk KV checkpoints -------------------------------------------
     # Ornith's hybrid SSM cache is NOT trimmable, so we can never partially reuse
     # a divergent prefix in RAM. But a STABLE prefix — the system prompt + tool
     # schemas, byte-identical every session (~3.2k tokens) — is pure dead-weight
-    # prefill on every cold start and `/reset`. ds4 (antirez) avoids that by
+    # prefill on every cold start and `/reset`. Persisting the cache avoids that by
     # persisting the KV state to disk keyed by the rendered prefix and reloading it
     # instead of re-prefilling. We do the same with mlx_lm's save/load_prompt_cache:
     # the recurrent SSM state serializes fine (a fixed ~51MB floor; cheap for one
@@ -602,10 +614,9 @@ class Engine:
     def warm_prefix(self, prefix_ids: list, should_stop=None):
         """Make a cold session start warm. If a disk checkpoint for exactly these
         prefix tokens exists, load it into the live cache (ZERO prefill); otherwise
-        prefill the prefix once and persist it for next time. Only valid on a cold,
-        single-model (no-draft) cache — Ornith's normal configuration. Returns
-        (status, n_tokens) where status is 'hit' | 'miss' | 'skip'."""
-        if not self.cache_dir or not prefix_ids or self.draft is not None:
+        prefill the prefix once and persist it for next time. Only valid on a cold
+        cache. Returns (status, n_tokens) where status is 'hit' | 'miss' | 'skip'."""
+        if not self.cache_dir or not prefix_ids:
             return ("skip", 0)
         if self._cached_ids:               # cache already populated this session
             return ("skip", 0)
@@ -640,10 +651,6 @@ class Engine:
 
     def _n_model_layers(self) -> int:
         return len(self.model.layers)
-
-    def _sub_caches(self):
-        n = self._n_model_layers()
-        return self._cache[:n], self._cache[n:]
 
     # -- hybrid (qwen3_5) speculative rollback primitives ------------------
     # The recurrent (Gated-DeltaNet) layers can't be trimmed, but they reassign
@@ -724,11 +731,8 @@ class Engine:
 
         extra = len(self._cached_ids) - common
         if extra > 0:
-            model_cache, draft_cache = self._sub_caches()
-            if cache_utils.can_trim_prompt_cache(model_cache):
-                cache_utils.trim_prompt_cache(model_cache, extra)
-                if draft_cache:
-                    cache_utils.trim_prompt_cache(draft_cache, extra)
+            if cache_utils.can_trim_prompt_cache(self._cache):
+                cache_utils.trim_prompt_cache(self._cache, extra)
                 self._cached_ids = self._cached_ids[:common]
             elif self._rewind_to(target_ids, common) is not None:
                 # Bounded rewind: the divergence sits inside the last
@@ -1027,13 +1031,13 @@ class Engine:
         if config.flag("CHAD_NO_PREFIX_CACHE"):
             self._reset_cache()
 
-        # Prompt-lookup decoding path: needs no draft model, greedy decoding (exact),
+        # Prompt-lookup decoding path: needs greedy decoding (exact),
         # an unquantized cache, and a trimmable cache (cheap rollback). A qwen3_5-style
         # hybrid (Ornith) CAN also roll back, via recurrent-snapshot + KV-trim + re-feed
         # (self._pld_hybrid), but the re-feed makes it ~2x slower on realistic agentic
         # generation, so it's behind enable_pld_hybrid (opt-in, off by default). PLD
         # shines on trimmable models doing edit-heavy work that re-quotes read files.
-        if (self.draft is None and self.prompt_lookup and self.temp == 0.0
+        if (self.prompt_lookup and self.temp == 0.0
                 and not self.kv_bits
                 and (self._trimmable or (self._pld_hybrid and self.enable_pld_hybrid))):
             return self._generate_prompt_lookup(prompt_ids, max_tokens, on_token,
@@ -1094,17 +1098,13 @@ class Engine:
                      else make_sampler(temp=self.temp, min_p=self.min_p, top_p=self.top_p)),
             prompt_cache=self._cache,
         )
-        if self.draft is not None:
-            kwargs["draft_model"] = self.draft
-            kwargs["num_draft_tokens"] = self.num_draft_tokens
-
         t0 = time.time()
-        # Interruptible prefill (single-model): feed everything
-        # but the last token ourselves so should_stop is honored between chunks.
-        # stream_generate then only has to prefill the final token before decoding.
+        # Interruptible prefill: feed everything but the last token ourselves so
+        # should_stop is honored between chunks. stream_generate then only has to
+        # prefill the final token before decoding.
         gen_prompt = suffix
         resident = common
-        if self.draft is None and len(suffix) > 1:
+        if len(suffix) > 1:
             fed = self._prefill(suffix[:-1], should_stop, on_progress=on_prefill_progress)
             if fed < len(suffix) - 1:  # interrupted mid-prefill
                 self._cached_ids = prompt_ids[: common + fed]
@@ -1173,10 +1173,15 @@ class Engine:
             oom_degraded = True
         stats.gen_s = time.time() - (first_token_at or t0)
         stats.generated_tokens = len(gen_ids)
+        stats.gen_ids = list(gen_ids)
 
         if oom_degraded:
             self._reset_cache()
             mx.clear_cache()
+            # Nothing is resident now, not even the prompt. Say so: a caller mirroring
+            # our cache (chad serve's remote client) would otherwise assume prompt+gen
+            # and estimate its next prefill against a cache that no longer exists.
+            stats.cache_reset = True
             return text, stats
         # The cache now holds prefix + the tokens we generated.
         self._cached_ids = prompt_ids + gen_ids
@@ -1209,15 +1214,15 @@ class Engine:
 
         `think_ceiling` is accepted for signature parity but NOT wired here: this path
         is greedy (temp==0) only, whereas the think-spiral close-and-continue targets a
-        temp>0 sampling pathology — the TB2 arm runs the llama backend, and
-        the interactive MLX default falls to the main `generate` decode loop above."""
+        temp>0 sampling pathology — that arm runs the llama backend, and the
+        interactive MLX default falls to the main `generate` decode loop above."""
         common = self._sync_to(prompt_ids)
         suffix = prompt_ids[common:]
         stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
         if on_prefill:
             on_prefill(stats.prompt_tokens, stats.cached_tokens)
 
-        mc = self._cache  # model-only cache (no draft model on this path)
+        mc = self._cache
         eos = self._eos_ids()
         prefill_step = None  # None -> env override or adaptive sizing (see _prefill)
         # On a hybrid cache we roll drafts back by snapshot/restore instead of trim.
@@ -1377,6 +1382,10 @@ class Engine:
             on_token(detok.last_segment)
         stats.gen_s = time.time() - (first_token_at or t0)
         stats.generated_tokens = len(out_ids)
+        # What we GENERATED, which is not what we FED: `fed_ids` below deliberately
+        # excludes the final pending token, so it is the wrong list to report to a
+        # caller asking what this turn produced.
+        stats.gen_ids = list(out_ids)
 
         # fed_ids is exactly what's resident in the KV cache, so it's the correct
         # prefix to diff against next turn.

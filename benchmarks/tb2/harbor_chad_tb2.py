@@ -61,11 +61,11 @@ Agent kwargs (--ak key=value):
     chad_think=true|false    reasoning channel (default true)
     chad_think_ceiling=6000  close-and-continue think ceiling; unset (default) =
                              feature OFF, byte-identical to pre-086 chad. Passed through as
-                             --think-ceiling.
+                             CHAD_THINK_CEILING.
     chad_timeout_sec=1500    host-side wall on the chad process (default 1500; keep < the
                              task's [agent] timeout so chad is killed cleanly, not by harbor)
     chad_deadline_margin_s=60  seconds of headroom between chad's own wall budget
-                             (--turn-budget-s = timeout - margin) and the exec SIGKILL, so
+                             (CHAD_TURN_BUDGET_S = timeout - margin) and the exec SIGKILL, so
                              the governor/wrap-up window can land a partial before the kill
 0 disables the deadline plumbing.
     chad_review_pass=false   arm the early-finish self-review: a clean
@@ -464,6 +464,11 @@ class ChadAgent(BaseAgent):
         env = {
             "CHAD_MODEL": model or "",
             "CHAD_NO_SKILLS": "1",          # no personal-skill leakage into benchmark prompts
+            # The diagnostic session log is opt-in (config.traces_enabled: privacy-first OFF
+            # for a local single-user agent). Evals must opt in explicitly, or `session_c`
+            # below downloads a file chad never wrote and every mechanism metric silently
+            # reads zero. Safe here: the container is throwaway and the log is redacted.
+            "CHAD_SESSION_LOG": "1",
             "CHAD_PREFILL_TRACE": trace,
             "CHAD_TRAJECTORY_JSON": traj_c,   # ATIF-v1.7; required for passing trials
             "CHAD_TEMP": self._temp,        # TB2 reference sampling temperature
@@ -500,23 +505,27 @@ class ChadAgent(BaseAgent):
             env["HF_TOKEN"] = _hf
             env["HUGGING_FACE_HUB_TOKEN"] = _hf
 
-        parts = [f"{_CHAD_SRC}/.venv/bin/chad", shlex.quote(str(instruction)), "--yolo",
-                 "--backend", self._backend, "--base-url", shlex.quote(self._base_url or "")]
-        if self._tokenizer:
-            parts += ["--tokenizer", shlex.quote(self._tokenizer)]
-        if not self._think:
-            parts.append("--no-think")
+        # The unattended-governor knobs go through the env, not argv: they are hidden from
+        # `chad --help` precisely because a harness is the only thing that sets them, and
+        # every one of them reads its CHAD_* twin first.
         if self._think_ceiling is not None:
-            parts += ["--think-ceiling", str(self._think_ceiling)]
+            env["CHAD_THINK_CEILING"] = str(self._think_ceiling)
         # Hand chad a wall budget under the exec timeout so its governor + wrap-up
         # window arm (and, when armed, its early-finish review pass has a budget to measure
         # against). Leave `_deadline_margin_s` of headroom for chad to land a partial before
         # `environment.exec` SIGKILLs it at `self._timeout`.
         turn_budget_s = self._timeout - self._deadline_margin_s
         if turn_budget_s > 0:
-            parts += ["--turn-budget-s", str(turn_budget_s)]
+            env["CHAD_TURN_BUDGET_S"] = str(turn_budget_s)
             if self._review_pass:
-                parts.append("--review-pass")
+                env["CHAD_REVIEW_PASS"] = "1"
+
+        parts = [f"{_CHAD_SRC}/.venv/bin/chad", shlex.quote(str(instruction)), "--yolo",
+                 "--backend", self._backend, "--base-url", shlex.quote(self._base_url or "")]
+        if self._tokenizer:
+            parts += ["--tokenizer", shlex.quote(self._tokenizer)]
+        if not self._think:
+            parts.append("--no-think")
         # Redirect chad's stdout to a FILE INSIDE THE CONTAINER (not exec's return value):
         # on the timeout path `environment.exec` raises before returning, so a return-value
         # capture loses the whole trajectory on exactly the trials we most need to see (the

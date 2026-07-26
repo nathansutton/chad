@@ -14,6 +14,7 @@ import glob as _glob
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -104,17 +105,30 @@ def test_bash():
     res = tools.tool_bash("printf oops; exit 3")
     check("bash: exit prefix", res.startswith("[exit 3]\n") and "oops" in res, res)
 
-    # timeout with no output before the kill -> bare sentinel (0s deadline fires
-    # immediately, before `sleep` prints anything)
-    check("bash: timeout no output", tools.tool_bash("sleep 5", timeout=0)
-          == "[timed out after 0s; no output before it was killed]")
+    # The timeout-KILL path. Since bash_auto_background landed, the default timeout
+    # behavior is to background instead (test_bash_auto_background covers that), so
+    # these assertions ablate the lever. The kill path is still very much live: an
+    # interrupt takes it, so does a timeout once the background slots are full.
+    old_dis = os.environ.get("CHAD_DISABLE")
+    os.environ["CHAD_DISABLE"] = "bash_auto_background"
+    try:
+        # timeout with no output before the kill -> bare sentinel (0s deadline fires
+        # immediately, before `sleep` prints anything)
+        check("bash: timeout no output", tools.tool_bash("sleep 5", timeout=0)
+              == "[timed out after 0s; no output before it was killed]")
 
-    # timeout WITH partial output -> the output the process printed before the kill is
-    # preserved (the whole point: a killed build/train still printed how far it got).
-    # Print a marker, then sleep past a short deadline so the kill lands mid-run.
-    partial = tools.tool_bash("printf 'PROGRESS_50_PERCENT\\n'; sleep 5", timeout=1)
-    check("bash: timeout keeps partial", "PROGRESS_50_PERCENT" in partial, partial)
-    check("bash: timeout names the kill", partial.startswith("[timed out after 1s;"), partial[:60])
+        # timeout WITH partial output -> the output the process printed before the kill
+        # is preserved (the whole point: a killed build/train still printed how far it
+        # got). Print a marker, then sleep past a short deadline so the kill lands
+        # mid-run.
+        partial = tools.tool_bash("printf 'PROGRESS_50_PERCENT\\n'; sleep 5", timeout=1)
+        check("bash: timeout keeps partial", "PROGRESS_50_PERCENT" in partial, partial)
+        check("bash: timeout names the kill", partial.startswith("[timed out after 1s;"),
+              partial[:60])
+    finally:
+        os.environ.pop("CHAD_DISABLE", None)
+        if old_dis is not None:
+            os.environ["CHAD_DISABLE"] = old_dis
 
     # interrupt (should_stop) also preserves partial output
     stop = {"n": 0}
@@ -182,10 +196,19 @@ def test_bash_spill():
               len(os.listdir(session_dir)) == before, os.listdir(session_dir))
 
         # killed command with a large partial -> same spill, and the [timed out
-        # prefix guardrails.py keys on stays FIRST (the notice lives mid-string)
-        killed = tools.tool_bash(
-            "head -c 15000 /dev/zero | tr '\\0' 'x'; printf 'KILLED_MID'; "
-            "head -c 15000 /dev/zero | tr '\\0' 'y'; sleep 5", timeout=1)
+        # prefix guardrails.py keys on stays FIRST (the notice lives mid-string).
+        # Lever ablated: the kill path is what this asserts, and the default timeout
+        # path now backgrounds instead (test_bash_auto_background covers that).
+        old_dis = os.environ.get("CHAD_DISABLE")
+        os.environ["CHAD_DISABLE"] = "bash_auto_background"
+        try:
+            killed = tools.tool_bash(
+                "head -c 15000 /dev/zero | tr '\\0' 'x'; printf 'KILLED_MID'; "
+                "head -c 15000 /dev/zero | tr '\\0' 'y'; sleep 5", timeout=1)
+        finally:
+            os.environ.pop("CHAD_DISABLE", None)
+            if old_dis is not None:
+                os.environ["CHAD_DISABLE"] = old_dis
         check("spill: killed keeps prefix", killed.startswith("[timed out after 1s;"),
               killed[:60])
         check("spill: killed gets a path", "FULL output saved to " in killed, killed[:400])
@@ -321,8 +344,8 @@ def test_grep_path_not_found():
 
 def test_grep_dirs_do_not_starve_file_cap():
     """The GREP_MAX_FILES budget must count only files we'd actually SEARCH — not the
-    directories (and skipped blobs) the walk passes through. The demonstrated starvation
-    (django-16454): a dir-heavy tree exhausted the cap on directories before the walk
+    directories (and skipped blobs) the walk passes through. The demonstrated
+    starvation: a dir-heavy tree exhausted the cap on directories before the walk
     reached the file holding the target symbol. Here we seed many empty subdirs ahead of
     the one real match and shrink the cap below the dir count: the match must still land,
     and truncation must NOT be reported (no real file was dropped)."""
@@ -469,9 +492,173 @@ def test_write():
         os.chdir(cwd)
 
 
+# --- auto-background on timeout (lever: bash_auto_background) --------------------
+
+def _bg_env(armed=True):
+    """Give auto-background a private spill dir; `armed=False` ablates the lever (the
+    only off-switch — levers default ON). Returns the dir."""
+    d = tempfile.mkdtemp(prefix="bgspill_")
+    os.environ["CHAD_SPILL_DIR"] = d
+    if armed:
+        os.environ.pop("CHAD_DISABLE", None)
+    else:
+        os.environ["CHAD_DISABLE"] = "bash_auto_background"
+    return d
+
+
+def _bg_path_from(result):
+    return result.split("stream to ", 1)[1].split(" —", 1)[0]
+
+
+def test_bash_auto_background():
+    """A timed-out command is handed to the background with its output streaming to a
+    file, instead of being killed and its work thrown away."""
+    old_spill = os.environ.get("CHAD_SPILL_DIR")
+    old_dis = os.environ.get("CHAD_DISABLE")
+    try:
+        _bg_env(armed=True)
+        res = tools.tool_bash(
+            "printf 'BUILD_STEP_1\n'; sleep 1.5; printf 'BUILD_STEP_2\n'", timeout=1)
+        check("bg: says backgrounded", res.startswith("[still running after 1s"), res[:80])
+        check("bg: not the kill result", not res.startswith("[timed out"), res[:120])
+        path = _bg_path_from(res)
+        check("bg: path absolute", os.path.isabs(path), path)
+        check("bg: partial output shown", "BUILD_STEP_1" in res, res[:300])
+        check("bg: registered while live", len(tools._bg_live) == 1, tools._bg_live)
+
+        # The command keeps running and finishes on its own; the footer is the
+        # completion signal the model greps for — no polling API needed.
+        deadline = time.time() + 10
+        while tools._bg_live and time.time() < deadline:
+            time.sleep(0.05)
+        check("bg: deregistered on exit", not tools._bg_live, tools._bg_live)
+        with open(path) as f:
+            full = f.read()
+        check("bg: pre-timeout output kept", "BUILD_STEP_1" in full, full)
+        check("bg: post-timeout output captured", "BUILD_STEP_2" in full, full)
+        check("bg: exit footer written", "[exit 0 at" in full, full)
+        check("bg: spill file is 0600", os.stat(path).st_mode & 0o777 == 0o600,
+              oct(os.stat(path).st_mode))
+
+        # A stalled command re-read twice returns byte-identical text — the signal the
+        # loop guard keys on, so polling a file that never grows still trips it.
+        a = tools.tool_read(path)
+        b = tools.tool_read(path)
+        check("bg: stalled re-read is identical", a == b)
+    finally:
+        tools.bash_shutdown()
+        for k, v in (("CHAD_DISABLE", old_dis), ("CHAD_SPILL_DIR", old_spill)):
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_bash_auto_background_bounds():
+    """The lifecycle bounds: a concurrency cap, and no survivors after shutdown."""
+    old_spill = os.environ.get("CHAD_SPILL_DIR")
+    old_dis = os.environ.get("CHAD_DISABLE")
+    try:
+        _bg_env(armed=True)
+        pgids = []
+        for _ in range(tools.BASH_BG_MAX):
+            r = tools.tool_bash("sleep 30", timeout=1)
+            check("bg cap: within cap backgrounds", r.startswith("[still running"), r[:60])
+            pgids.append(int(r.split("pgid ", 1)[1].split(")", 1)[0]))
+        check("bg cap: at cap", len(tools._bg_live) == tools.BASH_BG_MAX, tools._bg_live)
+
+        # One past the cap is killed as before, and the result says why.
+        over = tools.tool_bash("sleep 30", timeout=1)
+        check("bg cap: past cap is killed", over.startswith("[timed out after 1s"), over[:80])
+        check("bg cap: says why", "running in the background" in over, over[:160])
+        check("bg cap: cap not exceeded", len(tools._bg_live) == tools.BASH_BG_MAX,
+              tools._bg_live)
+
+        # Shutdown must leave nothing running — a coding agent that leaks builds is
+        # worse than one that kills them.
+        tools.bash_shutdown()
+        check("bg: registry empty after shutdown", not tools._bg_live, tools._bg_live)
+        time.sleep(0.3)
+        for pgid in pgids:
+            try:
+                os.killpg(pgid, 0)
+                alive = True
+            except OSError:
+                alive = False
+            check("bg: no orphaned process group", not alive, pgid)
+    finally:
+        tools.bash_shutdown()
+        for k, v in (("CHAD_DISABLE", old_dis), ("CHAD_SPILL_DIR", old_spill)):
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_bash_auto_background_ceiling():
+    """The absolute lifetime bound: a backgrounded command that never finishes is
+    killed and says so in its own log, so it cannot outlive the session unnoticed."""
+    old_spill = os.environ.get("CHAD_SPILL_DIR")
+    old_dis = os.environ.get("CHAD_DISABLE")
+    old_ceiling = tools.BASH_BG_CEILING_S
+    try:
+        _bg_env(armed=True)
+        tools.BASH_BG_CEILING_S = 1
+        res = tools.tool_bash("sleep 60", timeout=1)
+        check("ceiling: backgrounded first", res.startswith("[still running"), res[:60])
+        path = _bg_path_from(res)
+        pgid = int(res.split("pgid ", 1)[1].split(")", 1)[0])
+        deadline = time.time() + 10
+        while tools._bg_live and time.time() < deadline:
+            time.sleep(0.05)
+        check("ceiling: deregistered", not tools._bg_live, tools._bg_live)
+        try:
+            os.killpg(pgid, 0)
+            alive = True
+        except OSError:
+            alive = False
+        check("ceiling: process group killed", not alive, pgid)
+        with open(path) as f:
+            check("ceiling: footer names the reason",
+                  "[killed: background ceiling]" in f.read(), path)
+    finally:
+        tools.BASH_BG_CEILING_S = old_ceiling
+        tools.bash_shutdown()
+        for k, v in (("CHAD_DISABLE", old_dis), ("CHAD_SPILL_DIR", old_spill)):
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_bash_auto_background_off_is_unchanged():
+    """The OFF arm (ablation): the kill-and-advise path, verbatim — including the
+    advice to background by hand, which is only honest while chad isn't doing it."""
+    old_spill = os.environ.get("CHAD_SPILL_DIR")
+    old_dis = os.environ.get("CHAD_DISABLE")
+    try:
+        _bg_env(armed=False)
+        res = tools.tool_bash("printf 'X\n'; sleep 5", timeout=1)
+        check("bg off: killed as before", res.startswith("[timed out after 1s;"), res[:80])
+        check("bg off: advises backgrounding", "background it" in res, res[:200])
+        check("bg off: nothing registered", not tools._bg_live, tools._bg_live)
+        # The prompt must not describe a behavior the harness isn't exhibiting.
+        from chad import prompt
+        check("bg off: prompt says nothing", prompt._bash_bg_block() == "")
+        _bg_env(armed=True)
+        check("bg on: prompt describes it", "streams to a file" in prompt._bash_bg_block())
+    finally:
+        tools.bash_shutdown()
+        for k, v in (("CHAD_DISABLE", old_dis), ("CHAD_SPILL_DIR", old_spill)):
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
 if __name__ == "__main__":
     test_edit_truth_table()
     test_bash()
+    test_bash_auto_background()
+    test_bash_auto_background_bounds()
+    test_bash_auto_background_ceiling()
+    test_bash_auto_background_off_is_unchanged()
     test_grep()
     test_grep_default_byte_identical()
     test_grep_line_cap()

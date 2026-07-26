@@ -4,7 +4,7 @@ Each case is a known weak-model failure mode (the typia taxonomy). We assert the
 harness either REPAIRS it to a dispatchable call or REJECTS it with a precise,
 field-level error — never silently drops or silently dispatches garbage.
 
-Run: `uv run python test_validate.py`
+Run: `uv run python tests/test_validate.py`
 """
 
 import os

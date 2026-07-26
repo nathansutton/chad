@@ -1,17 +1,16 @@
-"""Deterministic mutation syntax gate (hardened by).
+"""Deterministic mutation syntax gate.
 
 The contract (unified it across every mutation tool): no tool call may take a
 file that parses to one that doesn't — a mutation that would newly break the parse is
 REFUSED with the file untouched (`edit_reject` for the targeted edit/symbol tools,
 `write_reject` for whole-file `write`), and only mutations the gate can't judge ride a
-warning along in the SAME tool result instead (`check_syntax`). The 073 dogfood showed
+warning along in the SAME tool result instead (`check_syntax`). Dogfooding showed
 why warning alone is insufficient for a small model: it ignored ~10 consecutive "no
 longer parses" warnings while line-addressed edits severed a multi-line `def` signature,
-and every later edit was surgery on garbage. The 079 trace sweep (320 dogfood sessions +
-304 benchmark trajectories) then showed the revert's per-tool opt-in was the remaining
-corruption engine: broken code LANDED 4x more often than it was rejected, 51 of 55
-benchmark landings came through warn-only `write`, and non-Python files (no revert at
-all) compounded to reward-zero tasks (vm.js, ars.R).
+and every later edit was surgery on garbage. A 624-session trace sweep then showed
+the revert's per-tool opt-in was the remaining corruption engine: broken code LANDED 4x
+more often than it was rejected, 51 of 55 landed breaks came through warn-only `write`,
+and non-Python files (no revert at all) compounded into unrecoverable trees.
 
 A file that was ALREADY broken stays mutable (a real fix passes through still-broken
 states) — that, not `write`, is the sanctioned escape hatch; a file that must be
@@ -22,7 +21,7 @@ tree-sitter ERROR/MISSING-node delta: act only when the edit ADDED nodes, since 
 real files carry baseline parse errors tree-sitter can't fully recover (and we must
 never flag a pre-existing one) — and for tree-sitter langs a brand-NEW file only warns,
 never rejects, because a grammar quirk on valid code must not block file creation.
-Gated by CHAD_NO_SYNTAX_GATE for run_evals --ab.
+Gated by CHAD_NO_SYNTAX_GATE for A/B evaluation.
 """
 
 import ast
@@ -96,7 +95,7 @@ def _ts_error_loc(text: str, line: int) -> str:
 
 # Consecutive landed-while-broken mutations per file. With the reject gates
 # holding the clean->broken line, a still-broken file can only keep accumulating landings
-# on the sanctioned already-broken path — and the 079 dogfood sweep measured a model
+# on the sanctioned already-broken path — and the dogfood sweep measured a model
 # riding that path for 14 consecutive landings without once restoring the parse. After
 # the second consecutive one the warning escalates from "fix this" to "stop patching:
 # rewrite the whole file / restore a good version". Keyed by abspath; reset the moment
@@ -106,10 +105,10 @@ _BROKEN_STREAK: dict[str, int] = {}
 
 # Prose/data formats whose tree-sitter grammars exist but whose "syntax errors" are
 # noise for this gate: the language pack maps `.txt` to VIMDOC, so plain-text
-# deliverable writes (answer.txt, secret.txt, requirements.txt — the TB2.1 run1 README
-# finding, plan 107 follow-up) got grammar-checked and warned on exactly the
-# deliverable-landing write. A missing entry here costs a spurious warning, never a
-# missed real one — code languages are not listed.
+# deliverable writes (a task's answer.txt or requirements.txt output) got
+# grammar-checked and warned on exactly the deliverable-landing write. A missing entry
+# here costs a spurious warning, never a missed real one — code languages are not
+# listed.
 _NON_CODE_LANGS = frozenset({
     "vimdoc", "markdown", "markdown_inline", "csv", "tsv", "psv", "text", "rst",
     "org", "diff", "gitcommit", "git_rebase", "gitattributes", "gitignore",
@@ -252,7 +251,7 @@ def edit_reject(path: str, before: str, after: str,
     one that no longer parses, else None — the edit path uses this to REVERT rather
     than let the break land.
 
-    check_syntax only warns and lets the edit stand. But the 073 dogfood measured what
+    check_syntax only warns and lets the edit stand. But dogfooding measured what
     a landed break costs a small model: it can't reliably repair a file it broke — it
     ignored ten consecutive parse warnings while stale line-range edits severed a
     multi-line `def` signature, then LOOP-ABORTed with the file broken. So for the
@@ -263,8 +262,8 @@ def edit_reject(path: str, before: str, after: str,
     IndentationError keeps its own lever (`syntaxgate_revert`) and message;
     the generalization to any SyntaxError is levered as `syntax_revert`; the
     extension beyond Python is levered as `ts_edit_revert` (the measured
-    gap: a landed vm.js/ars.R break compounded through 6-20 follow-up edits to a
-    reward-zero task, because non-Python only ever warned). `edit_range` = the 1-based
+    gap: a landed break in a JS/R file compounded through 6-20 follow-up edits into an
+    unrecoverable tree, because non-Python only ever warned). `edit_range` = the 1-based
     [start, end] the edit replaced (start = end+1 for an insertion boundary), used to
     name the severed statement and echo the region.
     """
@@ -305,7 +304,7 @@ def edit_reject(path: str, before: str, after: str,
                 f"fit indentation for you — instead of hand-quoting whitespace.]")
     except SyntaxError as e:
         # Ablating this restores warn-and-land for non-indent breaks — the corruption
-        # engine of the 073 dogfood (severed signature landed, then compounded).
+        # engine of that dogfood run (severed signature landed, then compounded).
         if not levers.enabled("syntax_revert"):
             return None
         lines = after.splitlines()
@@ -365,7 +364,7 @@ def _ts_reject(path: str, lang: str, before: str, after: str,
 def write_reject(path: str, before: str | None, content: str) -> str | None:
     """A rejection when a whole-file `write` would newly break the file's parse, else
     None — `tool_write` refuses the disk write entirely. `write` was the
-    warn-only escape hatch of the 073 contract, and the benchmark sweep measured the
+    warn-only escape hatch of the warn contract, and the trace sweep measured the
     price: 51 of 55 landed syntax breaks arrived through it. The gate keeps both
     don't-strand outlets: an ALREADY-broken file may be overwritten with still-broken
     content (that is the repair path — and the reject text steers there), and for
@@ -430,7 +429,7 @@ def indent_reject(path: str, before: str, after: str) -> str | None:
 # `drift_warn` diffs the before/after ASTs and warns, in the same tool result, when
 # the edit dropped something the rest of the file still uses. Warn, not reject: a
 # reject would make legitimate remove-a-feature edits order-dependent (you couldn't
-# delete a definition before its consumers). See plans/074 for the escalation path.
+# delete a definition before its consumers).
 
 _NOISE = frozenset(keyword.kwlist) | frozenset(dir(builtins)) \
     | frozenset({"self", "cls", "args", "kwargs"})

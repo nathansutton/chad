@@ -138,7 +138,7 @@ the task containers** — `host.docker.internal` when the server runs on the sam
 a LAN/tailnet IP for a separate box.
 
 Deadline awareness is on by default: the adapter hands chad a wall budget
-(`chad_timeout_sec − chad_deadline_margin_s`, margin 60s) via `--turn-budget-s`, so the
+(`chad_timeout_sec − chad_deadline_margin_s`, margin 60s) via `CHAD_TURN_BUDGET_S`, so the
 runaway-turn governor arms on every trial and a one-shot wrap-up nudge fires in the
 final stretch ("land your best answer now") instead of letting the SIGKILL eat
 half-applied work. `--ak chad_deadline_margin_s=0` disables the whole path for A/Bs.

@@ -1,6 +1,6 @@
 """Line-addressed edits must not corrupt multi-line structures.
 
-Each case reproduces a measured failure from the 073 dogfood session (9B/35B on the
+Each case reproduces a measured failure from a dogfood session (9B/35B on the
 CHAD_PREFILL_CHUNK task): stale line numbers reused after the file shifted, a fragment
 replacing one physical line of a multi-line def signature, ten ignored "no longer
 parses" warnings compounding into a broken tree, and the loop guard escalating only

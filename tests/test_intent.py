@@ -6,7 +6,7 @@ crux of the "help me write test cases → answers on paper then stops" bug: the 
 keyword list had no "write"/"test", so the nudge never fired. These cases pin the
 classification down without needing to load a model.
 
-Run: `uv run python test_intent.py`
+Run: `uv run python tests/test_intent.py`
 """
 
 import os
@@ -52,7 +52,7 @@ CASES = [
     # overrides so the nudge is suppressed anyway.
     ("walk me through auth.py, but do not edit anything", True, True),
     ("just explain how the retry loop works", False, True),
-    # File-demand override (TB2 count-dataset-tokens): an explanatory opener that
+    # File-demand override: an explanatory opener that
     # ALSO demands the answer be written to a file is an action task, not read-only —
     # read_only=True here disarmed every no-progress gate and let a garbled final
     # step end the task with an empty diff.
@@ -66,7 +66,7 @@ CASES = [
     ("how does save_session write to the file? don't change anything", True, True),
     # Scoped negation: a change-verb negation aimed at a SPECIFIC file or
     # definite object is a scope constraint on an action task, not a read-only ask —
-    # TB2.1 overfull-hbox and query-optimize were classified read_only by these,
+    # Two benchmark tasks were classified read_only by these,
     # which disarmed the no-empty-diff gate, the recheck, and the done-audit on two
     # real wrong-done failures.
     ("Ensure that the LaTeX document main.tex compiles with no warnings. "
@@ -103,7 +103,7 @@ def test_intent():
 
 
 def test_run_intent():
-    # Run-task class (plan 107 follow-up): system-state imperatives — completable with
+    # Run-task class: system-state imperatives — completable with
     # zero file edits — must classify `run` so the anti-bail nudges arm, WITHOUT
     # feeding `action` (whose no-empty-diff done gate demands a landed edit).
     qemu = ("Start the /app/alpine.iso image in qemu in such a way that I can connect "

@@ -35,7 +35,7 @@ def on(monkeypatch):
     monkeypatch.delenv("CHAD_DISABLE", raising=False)
 
 
-# === iter-2 ================================================================
+# === group "iter2" ================================================================
 
 def test_verify_requires_execution(monkeypatch):
     """A display-only command exiting 0 is not verification — unless ablated."""
@@ -119,7 +119,7 @@ def test_open_tool_call_nudged_without_cap():
     assert kind4 != "garble"  # falls through to the next nudge family
 
 
-# === iter-13 ====================================================
+# === group "iter13" ====================================================
 
 def test_garble_never_final(monkeypatch):
     """Garbles ride their own counter when ON; the OFF arm restores the shared
@@ -216,10 +216,10 @@ def test_structural_reindent(monkeypatch, tmp_path):
         "ablated: no structural reindent, and fit/snap can't fix a multi-level block"
 
 
-# === iter-6 =====================================================
+# === group "iter6" =====================================================
 
 def test_syntax_revert(monkeypatch, tmp_path):
-    """The 073 corruption engine: replacing ONE physical line of a multi-line def
+    """The line-addressed corruption engine: replacing ONE physical line of a multi-line def
     signature with a fragment. ON: rejected, file intact. OFF: warn-and-land."""
     n = bite("syntax_revert")
     p = str(tmp_path / "s.py")
@@ -273,7 +273,7 @@ def test_stale_file_guard(monkeypatch, tmp_path):
         "ablated: the stale edit goes straight through"
 
 
-# === iter-7 =====================================================
+# === group "iter7" =====================================================
 
 def test_edit_drift_warn(monkeypatch):
     """The measured drift: a rewrite drops a def still called elsewhere. ON: the
@@ -288,7 +288,7 @@ def test_edit_drift_warn(monkeypatch):
     assert syntaxgate.drift_warn("m.py", before, after) is None
 
 
-# === iter-3 ================================================================
+# === group "iter3" ================================================================
 
 def test_progress_note_rich(monkeypatch):
     n = bite("progress_note_rich")
@@ -346,7 +346,7 @@ def test_edit_fail_kind(monkeypatch):
     assert "identical" in hot and "will not help" in hot
     off(monkeypatch, n)
     cold = guardrails.edit_loop_break(2, 0, kind="noop")
-    assert "verbatim" in cold, "ablated: the pre-iter-3 conflation returns"
+    assert "verbatim" in cold, "ablated: the old conflation returns"
     assert cold != hot
 
 
@@ -502,12 +502,12 @@ def test_subagent_budget_note(monkeypatch, tmp_path):
     assert "sub-agent progress" not in cold, "ablated: the findings die with the sub-agent"
 
 
-# === iter-8 =====================================================
+# === group "iter8" =====================================================
 
 def test_ts_edit_revert(monkeypatch, tmp_path):
-    """The vm.js/ars.R class: a targeted edit breaks a clean non-Python file. ON:
-    rejected, file intact. OFF: warn-and-land — the corruption that compounded through
-    6-20 follow-up edits to reward-zero benchmark tasks."""
+    """A targeted edit breaks a clean non-Python file. ON: rejected, file intact.
+    OFF: warn-and-land — the corruption that compounded through 6-20 follow-up edits
+    into an unrecoverable tree."""
     n = bite("ts_edit_revert")
     before = "int main(){ return 0; }\n"
     on(monkeypatch)
@@ -581,7 +581,7 @@ def test_write_diff_note(monkeypatch, tmp_path):
     assert res.startswith("[wrote") and "lines vs previous" not in res
 
 
-# === TB2 deadline awareness =====================================
+# === deadline awareness =========================================
 
 def test_wrapup_window(monkeypatch):
     """Inside the final wall-clock stretch, the wrap-up nudge fires — unless ablated.
@@ -606,7 +606,7 @@ def test_no_think_escalation(monkeypatch):
     assert not levers.enabled(n)
 
 
-# === iter-10 ================================================================
+# === group "iter10" ================================================================
 
 def test_done_audit(monkeypatch):
     """The audit's behavioral bite (a done bounced once with quoted requirements, gone —
@@ -619,6 +619,58 @@ def test_done_audit(monkeypatch):
         "You must write the answer to /app/out.txt exactly.",
         {"turn_start_epoch": 0.0, "wall_s": 0.0, "wall_budget_s": None,
          "step_walls": []}) is not None
+    off(monkeypatch, n)
+    assert not levers.enabled(n)
+
+
+# === group "iter15" ================================================================
+
+def test_audit_churn_handoff(monkeypatch):
+    """The handoff's behavioral bite (an empty-diff done bounced once with the audit
+    steer before the no-empty-diff hard stop, gone when ablated) lives in
+    test_done_audit.py's e2e pair. Here assert the gate flips and the handoff entry
+    swaps the promise for the truthful conditional one — a false unconditional
+    promise on this path would spend the audit's anti-spiral credibility."""
+    n = bite("audit_churn_handoff")
+    on(monkeypatch)
+    assert levers.enabled(n)
+    steer = guardrails.done_audit(
+        "You must write the answer to /app/out.txt exactly.",
+        {"turn_start_epoch": 0.0, "wall_s": 0.0, "wall_budget_s": None,
+         "step_walls": []}, entry="handoff")
+    assert "cannot be accepted yet" in steer
+    assert "Then call done again; it will be accepted" not in steer
+    off(monkeypatch, n)
+    assert not levers.enabled(n)
+
+
+def test_bash_auto_background(monkeypatch, tmp_path):
+    """ON, a timed-out command is handed to the background with its output streaming
+    to a named file; OFF, its process group is killed and the result advises doing it
+    by hand. The fuller lifecycle pair (footer, caps, no orphans) is in test_tools.py."""
+    n = bite("bash_auto_background")
+    monkeypatch.setenv("CHAD_SPILL_DIR", str(tmp_path))
+    try:
+        on(monkeypatch)
+        assert levers.enabled(n)
+        res = tools.tool_bash("printf 'X\n'; sleep 5", timeout=1)
+        assert res.startswith("[still running after 1s"), res[:80]
+        off(monkeypatch, n)
+        killed = tools.tool_bash("printf 'X\n'; sleep 5", timeout=1)
+        assert killed.startswith("[timed out after 1s;"), killed[:80]
+        assert "background it" in killed
+    finally:
+        tools.bash_shutdown()
+
+
+def test_capped_think_credit(monkeypatch):
+    """The credit's behavioral bite (a turn of cap-truncated thinks engages the
+    throttle with it on and never with it off) lives in test_agent_e2e.py's
+    _run_capped_think pair — the accounting is inline in run_turn, so the loop is
+    the only place it is observable. Here assert the gate itself flips."""
+    n = bite("capped_think_credit")
+    on(monkeypatch)
+    assert levers.enabled(n)
     off(monkeypatch, n)
     assert not levers.enabled(n)
 
@@ -674,7 +726,7 @@ def test_playbook_levers_have_dedicated_suites(monkeypatch):
     assert profiles.prompt_block(None) == ""
 
 
-# === iter-14 ===============================================================
+# === group "iter14" ===============================================================
 
 def test_edit_typo_match_bite(monkeypatch, tmp_path):
     """ASCII-fied `old` against a typographic file lands only while the rung is on."""
@@ -721,6 +773,40 @@ def test_workspace_map_bite(monkeypatch):
     off(monkeypatch, n)
     p = prompt.build_system_prompt("ornith")
     assert "# Workspace map" not in p and "# Workspace files" in p
+
+
+# === iter15: destructive-guard scoping + late continue replenish ===========
+
+def test_steer_verify_specific(monkeypatch):
+    """The verify-the-stated-check block appears in the system prompt with the lever
+    on and vanishes byte-exactly with it off."""
+    from chad import prompt
+    n = bite("steer_verify_specific")
+    on(monkeypatch)
+    assert "your final verification must RUN that stated" in prompt.build_system_prompt("ornith")
+    off(monkeypatch, n)
+    assert "your final verification must RUN that stated" not in prompt.build_system_prompt("ornith")
+
+
+def test_scoped_destructive_guard(monkeypatch):
+    """A recursive delete of a deep absolute path (a scoped container cleanup) passes
+    with the lever on; ablated, the legacy any-absolute-path shape denies it again."""
+    n = bite("scoped_destructive_guard")
+    on(monkeypatch)
+    assert not guardrails.is_destructive_bash("rm -rf /tmp/test-deploy")
+    assert guardrails.is_destructive_bash("rm -rf /home/user/project")
+    off(monkeypatch, n)
+    assert guardrails.is_destructive_bash("rm -rf /tmp/test-deploy")
+
+
+def test_late_continue_replenish(monkeypatch):
+    """With 44% of the wall remaining an extra continue is granted on (past the legacy
+    half-wall line), and refused with the lever off."""
+    n = bite("late_continue_replenish")
+    on(monkeypatch)
+    assert guardrails.replenish_continue(900, 500, 2) is True
+    off(monkeypatch, n)
+    assert guardrails.replenish_continue(900, 500, 2) is False
 
 
 # === the coverage contract =================================================

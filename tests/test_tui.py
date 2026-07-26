@@ -1,4 +1,4 @@
-"""Tier-1 (no model) tests for the live status line (plans 033/034).
+"""Tier-1 (no model) tests for the live status line.
 
 Covers the pure display helpers (`_kfmt`, `_phase_glyph`) and the contract that the
 live-readout emit kinds — `gen` (↓ generated), `prefill` (↑ progress), `ctx` (gauge) —

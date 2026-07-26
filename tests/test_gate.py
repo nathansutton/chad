@@ -171,6 +171,26 @@ def test_confirm_destructive_consults_callback(monkeypatch):
     check("callback was actually consulted", calls == [("bash", {"command": _RM_HOME})], calls)
 
 
+def test_confirm_headless_block_sets_truthful_deny_reason(monkeypatch):
+    """The headless guard block must hand the MODEL a truthful explanation via
+    `_deny_reason` (the dispatch site substitutes it for '[denied by user]'): the bare
+    denial reads as a human refusal, and the measured trace is a model re-phrasing the
+    same delete 30 times against it. Lever OFF restores the bare text (reason unset)."""
+    monkeypatch.delenv("CHAD_NO_DESTRUCTIVE_GUARD", raising=False)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    agent = _mk_agent(mode="auto")
+    check("block still blocks", agent._confirm("bash", {"command": _RM_HOME}) is False)
+    check("deny reason names the guard, not the user",
+          agent._deny_reason is not None and "destructive-command guard" in agent._deny_reason,
+          agent._deny_reason)
+    monkeypatch.setenv("CHAD_DISABLE", "scoped_destructive_guard")
+    agent2 = _mk_agent(mode="auto")
+    check("lever OFF: still blocks", agent2._confirm("bash", {"command": _RM_HOME}) is False)
+    check("lever OFF: bare '[denied by user]' preserved (no reason set)",
+          agent2._deny_reason is None, agent2._deny_reason)
+
+
 def test_confirm_guard_opt_out(monkeypatch):
     """CHAD_NO_DESTRUCTIVE_GUARD=1 disables the seatbelt: the same catastrophic command in
     auto mode with no channel now runs (returns True) instead of blocking."""

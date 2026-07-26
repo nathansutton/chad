@@ -8,7 +8,7 @@ first line, so a `read`/grep of `[`-leading multi-line content (a JSON array, a
 TOML/markdown doc) can't smuggle an error keyword in from line 2. These snapshot the
 current contract: real chad diagnostics flag, ordinary bracket-leading content doesn't.
 
-Run: `uv run python test_render.py`
+Run: `uv run python tests/test_render.py`
 """
 
 import os

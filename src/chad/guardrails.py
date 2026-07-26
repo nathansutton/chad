@@ -57,10 +57,6 @@ def _announces_unfulfilled_action(stripped: str) -> bool:
 # CHAD_NO_DESTRUCTIVE_GUARD=1 to disable. NOT a security boundary — a sandbox is —
 # just a seatbelt against the obvious catastrophe.
 _DESTRUCTIVE_BASH = (
-    # recursive force-rm whose target is rooted at / or ~ or $HOME (any depth), or
-    # is a bare `*` / `.` (whole-cwd). A relative path like `build/` or `./out` is
-    # NOT matched — only roots and home subtrees, where an injected delete is fatal.
-    re.compile(r"\brm\s+(?:-\w+\s+)*-\w*[rR]\w*\s+(?:-\w+\s+)*(?:[/~]\S*|\$HOME\S*|[.*](?:\s|$))"),
     re.compile(r"\b(mkfs|fdisk|parted)\b"),
     re.compile(r"\bdd\b[^\n]*\bof=/dev/"),
     re.compile(r">\s*/dev/(sd|disk|nvme|hd)"),
@@ -68,11 +64,65 @@ _DESTRUCTIVE_BASH = (
     re.compile(r"\b(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba)?sh\b"),  # curl … | sh
 )
 
+# Legacy recursive-rm shape (lever OFF): any absolute path, ~ or $HOME (any depth), or
+# a bare `*` / `.`. In a headless container run every real path IS absolute, so this
+# denied ordinary scoped deletes like `rm -rf /tmp/test-deploy` — the measured cost.
+_RM_LEGACY = re.compile(
+    r"\brm\s+(?:-\w+\s+)*-\w*[rR]\w*\s+(?:-\w+\s+)*(?:[/~]\S*|\$HOME\S*|[.*](?:\s|$))")
+
+# One rm invocation and its argument span (stops at a command separator, so each rm in
+# a compound command is screened on its own targets).
+_RM_CALL = re.compile(r"\brm\s+([^;&|\n]*)")
+_RM_RECURSIVE_FLAG = re.compile(r"^-\w*[rR]|^--recursive$")
+
+
+def _rm_target_protected(tok: str) -> bool:
+    """A recursive-rm target whose loss is catastrophic rather than scoped: the
+    filesystem root, any top-level directory (`/etc`, `/usr`, `/*` …), a home tree at
+    any depth (`~…`, `$HOME…`, `/home/…`, `/Users/…`, `/root…`), the whole cwd or its
+    parent (`.`, `..`, `*`), or a glob that empties a top-level directory (`/app/*`).
+    Deeper absolute paths (`/tmp/test-deploy`, `/app/c4_resharded`) are scoped deletes,
+    not catastrophes — the guard must not eat them."""
+    tok = tok.strip("'\"")
+    if not tok:
+        return False
+    if tok in ("*", ".", "..", "./"):
+        return True
+    if tok.startswith(("~", "$HOME", "${HOME}")):
+        return True
+    if not tok.startswith("/"):
+        return False
+    segs = tok[1:].rstrip("/").split("/")
+    if segs == [""] or len(segs) == 1:          # "/" itself or depth-1 (/etc, /*)
+        return True
+    if segs[0] in ("home", "Users", "root"):    # home trees, any depth
+        return True
+    return len(segs) == 2 and segs[1] == "*"    # /app/* — empties a top-level dir
+
+
+def _rm_hits_protected(command: str) -> bool:
+    """Scoped recursive-rm screen (lever ON): checks EVERY target of every rm in the
+    command (the legacy single-target regex only saw the first)."""
+    for m in _RM_CALL.finditer(command):
+        toks = m.group(1).split()
+        if not any(_RM_RECURSIVE_FLAG.match(t) for t in toks if t.startswith("-")):
+            continue
+        if any(_rm_target_protected(t) for t in toks if not t.startswith("-")):
+            return True
+    return False
+
 
 def is_destructive_bash(command: str) -> bool:
-    """True if a bash command matches the catastrophic denylist (see _DESTRUCTIVE_BASH).
-    Pure and testable. Caller decides what to do (force-confirm / block)."""
-    return any(p.search(command) for p in _DESTRUCTIVE_BASH)
+    """True if a bash command matches the catastrophic denylist. Pure and testable.
+    Caller decides what to do (force-confirm / block). Non-rm shapes (mkfs, dd-to-
+    device, fork bomb, curl|sh) are always screened; the recursive-rm screen is
+    target-scoped under `scoped_destructive_guard` (see _rm_target_protected) and
+    the any-absolute-path legacy shape with the lever off."""
+    if any(p.search(command) for p in _DESTRUCTIVE_BASH):
+        return True
+    if levers.enabled("scoped_destructive_guard"):
+        return _rm_hits_protected(command)
+    return bool(_RM_LEGACY.search(command))
 
 
 # A shell command that proves NOTHING about runtime behavior — a syntax/compile check,
@@ -93,7 +143,7 @@ def _is_trivial_check(command: str) -> bool:
 
 # Commands that plausibly EXECUTE the project — a test runner, an interpreter, a build
 # that runs code, a script. Only these can clear unverified_edit. The demonstrated
-# failure (sphinx-7440): after an edit broke the file, `sed -n '307,308p' … | cat -A`
+# failure: after an edit broke the file, `sed -n '307,308p' … | cat -A`
 # exited 0 with output and "verified" the edit — disarming the verify nudge, the done
 # rejection AND the landing nudge at once; the patch shipped with an IndentationError.
 # Display/plumbing commands (sed/cat/ls/grep/echo/find/git…) prove nothing about
@@ -122,11 +172,11 @@ def bash_result_verifies(result: str, command: str = "") -> bool:
     ctrl-c, launch failure); (2) the command is not a trivial syntax/compile/version
     probe (`_is_trivial_check`) — parsing clean is not the tests passing; (3) the
     command actually EXECUTES something (`_is_executing_command`) — a display command
-    like `sed -n | cat -A` or `ls` exiting 0 is not verification (the sphinx-7440
+    like `sed -n | cat -A` or `ls` exiting 0 is not verification (the measured
     false-green: it disarmed every guard while the file didn't even parse)."""
     if result.startswith(("[exit", "[timed out", "[interrupted", "[failed to launch")):
         return False
-    # Gates (2) and (3) together ARE the iter-2 anti-spoof fix; ablating it means
+    # Gates (2) and (3) together ARE the anti-spoof fix; ablating it means
     # accepting any clean exit as verification, which is the pre-fix behavior.
     if not levers.enabled("verify_requires_execution"):
         return True
@@ -145,7 +195,7 @@ SUBSTANTIVE_TOOLS = ("grep", "glob", "read", "write", "edit", "bash",
 
 
 # Working-tree DISCARD commands: after one of these runs cleanly, the edits the model
-# made are gone and the tree is clean again. The demonstrated hole (matplotlib-20676):
+# made are gone and the tree is clean again. The demonstrated hole:
 # the model edited → ran pytest (clearing unverified_edit) → `git checkout .` reverted
 # the file → answered in prose, and the no-empty-diff done-gate (which keys on made_edit)
 # waved it through with an EMPTY diff — the exact outcome the gate exists to stop. So a
@@ -267,7 +317,7 @@ def update_work_flags(name, args, result, did_work, made_edit, unverified_edit):
     clears it (a failing test keeps it dirty so the model re-runs). A bash command that
     cleanly REVERTS the working tree (`reverts_working_tree`) un-sets made_edit AND
     unverified_edit — the edit is gone, so the done-gate must treat the turn as having
-    landed nothing (matplotlib-20676: revert-then-prose shipped an empty diff)."""
+    landed nothing — the measured revert-then-prose that shipped an empty diff."""
     if name in SUBSTANTIVE_TOOLS:
         did_work = True
     landed_edit = (
@@ -311,10 +361,10 @@ def done_rejection(did_work, unverified_edit, empty_done_nudges, verify_nudges):
 
 
 # Injected once before the first `done` is accepted (levers.done_spec_recheck). The
-# hidden verifier scores container end-state, so a model that "finished" but wrote its
-# output to the wrong path or in the wrong shape fails silently with budget to spare —
-# the single largest wrong-done bucket (TB2 sam-cell-seg wrote directories where files
-# were required; bn-fit-modify passed 8/9 on a format mismatch). This asks the model to
+# work is judged on the end state of the filesystem, so a model that "finished" but
+# wrote its output to the wrong path or in the wrong shape fails silently with budget to
+# spare — the single largest wrong-done bucket (writing directories where files were
+# required; passing 8 of 9 checks on a format mismatch). This asks the model to
 # self-check deliverables against the literal task text before it stops.
 DONE_SPEC_RECHECK = (
     "[before you finish — one verification pass, read-only. Re-read the ORIGINAL task "
@@ -358,22 +408,23 @@ def recheck_spiral(post_recheck_edits):
 
 # --- Done-audit ----------------------------------------------------------
 #
-# The TB2.1 autopsy's largest fail bucket (20/43) was `done`s whose final message claimed
-# SPECIFIC verification the hidden checker then rejected — kv-store-grpc done at 84s of
-# 900 ("confirmed via socket test"), overfull-hbox at 205/750 ("zero overfull warnings").
+# The largest measured fail bucket (20/43) was `done`s whose final message claimed
+# SPECIFIC verification the hidden checker then rejected — one task done at 84s of 900
+# ("confirmed via socket test"), another at 205/750 ("zero overfull warnings").
 # The model runs *a* check, but a weaker predicate than the task's own wording, and the
 # generic done_spec_recheck steer above was ON for every one of them. The audit is the
 # task-grounded successor: quote the task statement's own requirement lines back (quoting
 # beats paraphrase — it re-anchors on the real predicate and is deterministic), plus
 # stat-level facts about every path the task names. One bounce per turn, ever; the next
-# `done` is accepted unconditionally (the 070 anti-spiral lesson).
+# `done` is accepted unconditionally (the anti-spiral lesson: a gate that can bounce
+# twice teaches the model to argue with it instead of complying).
 
 AUDIT_MIN_RUNWAY_S = 120.0   # never start an audit with less wall runway than this
 AUDIT_MAX_PATHS = 8          # paths statted/quoted in the steer
 AUDIT_MAX_REQ_LINES = 8      # requirement lines quoted in the steer
-AUDIT_LINE_CHARS = 400       # per quoted line — several corpus tasks are ONE long
-                             # paragraph-line (overfull-hbox 366 chars, mteb-retrieve
-                             # 398) whose acceptance criteria sit past 240
+AUDIT_LINE_CHARS = 400       # per quoted line — a whole task often arrives as ONE
+                             # long paragraph-line (350-400 chars observed) whose
+                             # acceptance criteria sit past char 240
 
 # Absolute paths (/app/server.py). The lookbehind rejects s/…/ regex bodies, URL //,
 # :/ and expression contexts (argv[1]/2, f(x)/2) so none of those read as deliverables.
@@ -397,23 +448,32 @@ _AUDIT_REQ_RE = re.compile(
     r"requir(?:e|es|ed|ements)|do not|don'?t|only|byte-for-byte|run|runs|running|keep)"
     r"\b", re.IGNORECASE)
 # Structural cue: a numbered/bulleted line in a task statement is almost always a
-# requirement item, keywords or not (kv-store-grpc "5. Run the server.py file…",
-# sparql-university's three numbered criteria).
+# requirement item, keywords or not ("5. Run the server file and keep it running…", or
+# a bare list of numbered acceptance criteria).
 _AUDIT_LIST_ITEM_RE = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+\S")
 
-DONE_AUDIT_DEMAND = (
+_DONE_AUDIT_DEMAND_BODY = (
     "Re-verify each requirement above against the ACTUAL files/system with fresh "
     "commands — do not rely on your memory of earlier checks, and check the task's "
     "exact wording (right path, right format, right behavior), not a weaker version "
-    "of it. Fix anything that fails. Then call done again; it will be accepted.")
+    "of it. Fix anything that fails. ")
+DONE_AUDIT_DEMAND = (_DONE_AUDIT_DEMAND_BODY
+                     + "Then call done again; it will be accepted.")
+# Churn-handoff variant: entered from the no-empty-diff hard stop, where
+# acceptance additionally requires a landed+verified change — promising
+# unconditional acceptance there would be false, and the promise's credibility
+# is what keeps a bounced model from spiraling instead of complying.
+DONE_AUDIT_DEMAND_HANDOFF = (
+    _DONE_AUDIT_DEMAND_BODY
+    + "Then apply the fix, verify it by running it with bash, and call done again.")
 
 
 def audit_task_text(user_text: str) -> str:
     """The pristine task statement for audit extraction. cli.py appends harness notes to
     the task on auto-continue relaunches (the banked progress note) and on the review
     pass (REVIEW_PASS_PROMPT); their paths and `$ command` lines are session noise, not
-    task requirements — Part B's build-pmars on.1 bounce quoted `/bin/sh` and
-    `/dev/null` straight out of the note. Both appendices open with a fixed marker;
+    task requirements — left in, a bounce quotes `/bin/sh` and `/dev/null` back at the
+    model as if they were deliverables. Both appendices open with a fixed marker;
     truncate at the first one found."""
     for marker in ("\n\n[" + PROGRESS_NOTE_HEADER, REVIEW_PASS_PROMPT):
         i = user_text.find(marker)
@@ -485,12 +545,17 @@ def audit_path_facts(paths, turn_start_epoch):
     return facts
 
 
-def done_audit(task_text, turn_state):
+def done_audit(task_text, turn_state, entry="accept"):
     """The one-shot done-audit steer, or None to accept the done untouched. Fires only
     with wall runway to spare — an audit that pushes the task into the wall converts a
     wrong-done into a wall-death (same score, worse autopsy) — and only when the task
     text yields something concrete to audit against. The caller owns the once-per-turn
     latch, the action-task/plan-mode scoping, and the message append.
+
+    entry: "accept" (a done every gate would otherwise accept) or "handoff" (a done
+    the no-empty-diff gate was about to hard-stop; the steer's framing and promise
+    change because acceptance there still requires a landed+verified change, and a
+    false promise burns the anti-spiral credibility).
 
     turn_state: turn_start_epoch (time.time() at turn start, for mtime facts), wall_s
     (elapsed), wall_budget_s (None when no budget is configured — runway then unlimited),
@@ -509,13 +574,26 @@ def done_audit(task_text, turn_state):
     # The acceptance promise must stay truthful: with the absent-path re-bounce
     # armed (levers.audit_absent_rebounce) one further existence-only check may run,
     # so say so; otherwise keep the original unconditional promise (the anti-spiral
-    # latch depends on the model believing it).
-    if levers.enabled("audit_absent_rebounce"):
-        promise = ("your NEXT `done` will be accepted after at most one further "
-                   "check that the paths below exist.")
+    # latch depends on the model believing it). On the handoff entry acceptance is
+    # additionally conditioned on a landed+verified change — say that instead.
+    rebounce = levers.enabled("audit_absent_rebounce")
+    if entry == "handoff":
+        lead = ("[done-audit — this `done` cannot be accepted yet: no change has "
+                "landed and been verified this turn; ")
+        promise = ("once a change is landed and verified, your next `done` will be "
+                   + ("accepted after at most one further check that the paths "
+                      "below exist." if rebounce
+                      else "accepted without further audit."))
+        demand = DONE_AUDIT_DEMAND_HANDOFF
     else:
-        promise = "your NEXT `done` will be accepted without further audit."
-    parts = ["[done-audit — one-time check before this `done` is accepted; " + promise
+        lead = "[done-audit — one-time check before this `done` is accepted; "
+        if rebounce:
+            promise = ("your NEXT `done` will be accepted after at most one further "
+                       "check that the paths below exist.")
+        else:
+            promise = "your NEXT `done` will be accepted without further audit."
+        demand = DONE_AUDIT_DEMAND
+    parts = [lead + promise
              + " The hidden grader checks "
              "the task's OWN requirements, not the checks you happened to run. From the "
              "task statement:"]
@@ -526,7 +604,7 @@ def done_audit(task_text, turn_state):
                      "evidence to weigh, not verdicts; a path the task removes may "
                      "rightly be absent):")
         parts += [f"  - {f}" for f in facts]
-    parts.append(DONE_AUDIT_DEMAND + "]")
+    parts.append(demand + "]")
     return "\n".join(parts)
 
 
@@ -782,7 +860,7 @@ def edit_loop_break(noop_edit_streak, break_nudges, kind=None):
     if noop_edit_streak < 2 or break_nudges >= 2:
         return None
     # Ablating the classifier means every failure gets the nomatch remedy, which is the
-    # pre-iter-3 conflation: a model that pasted `old == new` is told to go re-read and
+    # The old conflation: a model that pasted `old == new` is told to go re-read and
     # paste verbatim — precisely what it just did.
     if not levers.enabled("edit_fail_kind"):
         kind = None
@@ -878,7 +956,7 @@ REPEAT_TAIL_CHARS = 2048    # window that must be fully periodic — long enough
                             # a few hundred tokens into a runaway, not 8k tokens in
 REPEAT_MAX_PERIOD = 256     # unit ≤ this ⇒ the window holds ≥ 8 repeats
 # Coarse tier: catches paragraph/block-scale loops the fine tier's 256-char period can't
-# see. The demonstrated miss (django-14404): a ~2–3KB reasoning paragraph repeated ~90×
+# see. The demonstrated miss: a ~2–3KB reasoning paragraph repeated ~90×
 # across five dead 8192-token completions — period far over 256, so the fine detector
 # never fired and the loop burned the whole turn's budget. A much larger window with a
 # proportionally larger period demands ≥4 exact repeats before firing, so it stays clear
@@ -1027,8 +1105,8 @@ Progress is consumed (reset to False) once any band is crossed, so the next
 # deterministically (no model call) from the transcript.
 _EDIT_TOOLS = ("write", "edit", "replace_symbol", "insert_symbol", "rename_symbol")
 # Read/search tools whose target the note records as "already examined" so a relaunch
-# doesn't re-walk the tree it already mapped (the demonstrated leak: django-14007/-14404
-# reps burned their whole budget re-exploring because the note carried only edited files).
+# doesn't re-walk the tree it already mapped (the demonstrated leak: repeated attempts
+# burned their whole budget re-exploring because the note carried only edited files).
 _READ_TOOLS = ("read", "grep", "glob", "view_symbol", "find_symbol", "find_refs",
                "repo_map", "overview")
 _ERROR_PREFIXES = ("[exit", "[timed out", "[failed to launch", "[tool error", "[denied")
@@ -1081,9 +1159,9 @@ def progress_note(messages, max_lines: int = 24, rejected_claim: str | None = No
     facts the executor CANNOT reconstruct from a clean context — the diagnosis it reached,
     what it already tried, and what failed last. The old note carried only file names, so
     a relaunch re-derived the whole investigation and re-spent the budget it was meant to
-    save (django-14007/-14404: the correct fix was stated in prose, then lost).
+    save — in the measured cases the correct fix was stated in prose, then lost.
 
-    `rejected_claim` (plan 107 follow-up — the build-pov-ray poisoning loop): when the
+    `rejected_claim` (the long-build poisoning loop): when the
     turn ended via a REJECTED completion claim (done / final answer blocked by the
     no-empty-diff gate), pass the claim text. The note then (a) leads with an explicit
     warning that the claim was rejected, and (b) drops a working hypothesis that itself
@@ -1118,7 +1196,7 @@ def progress_note(messages, max_lines: int = 24, rejected_claim: str | None = No
         elif role == "tool":
             if content.startswith(_ERROR_PREFIXES) or "Traceback" in content:
                 last_error = content
-    # Ablating `progress_note_rich` reverts to the pre-iter-3 note: file names and
+    # Ablating `progress_note_rich` reverts to the older, thinner note: file names and
     # commands only. Everything the executor cannot reconstruct from a clean context —
     # the diagnosis, the failing signature, what was already looked at — is what the
     # lever adds, and therefore what its delta measures.
@@ -1159,12 +1237,13 @@ def progress_note(messages, max_lines: int = 24, rejected_claim: str | None = No
 
 # --- deadline wrap-up window + early-finish review -----------------------
 # The governor's HARD stop (above) only fires on a NO-PROGRESS band — a turn that keeps
-# landing+verifying is never interrupted. But TB2 scores container end-state, and a
-# still-working turn that gets SIGKILLed at the wall ships whatever half-applied mess it
-# was mid-edit on. The wrap-up window is the complementary lever: a one-shot WALL-CLOCK
-# nudge, fired regardless of progress, once the turn is inside its final stretch — "land
-# your best answer NOW, then call done" — so a productive-but-slow turn commits a scored
-# partial instead of being cut off mid-think. It sits beside the governor check and is
+# landing+verifying is never interrupted. But what survives a turn is the end state of
+# the filesystem, and a still-working turn that gets SIGKILLed at the wall ships whatever
+# half-applied mess it was mid-edit on. The wrap-up window is the complementary lever: a
+# one-shot WALL-CLOCK nudge, fired regardless of progress, once the turn is inside its
+# final stretch — "land your best answer NOW, then call done" — so a productive-but-slow
+# turn commits a usable partial instead of being cut off mid-think. It sits beside the
+# governor check and is
 # only meaningful when a wall budget (turn_budget_s) is configured (evals / one-shot).
 WRAPUP_MIN_S = 120.0     # never start the wrap-up window with less than this much runway
 WRAPUP_FRAC = 0.15       # or the last 15% of the wall budget, whichever is larger
@@ -1187,8 +1266,8 @@ def wrapup_window_nudge(wall_s, wall_budget_s, wrapup_fired) -> str | None:
 
 
 def _wrapup_text(secs: int) -> str:
-    """The final-stretch landing steer, shared by the 085 soft nudge (wrapup_window_nudge)
-    and the 103 hard-deadline landing (wrapup_landing_steer) so both say exactly the same
+    """The final-stretch landing steer, shared by the soft nudge (wrapup_window_nudge)
+    and the hard-deadline landing (wrapup_landing_steer) so both say exactly the same
     thing — write each deliverable to its exact path, imperfect is fine, one check, done."""
     return (f"[about {secs}s left before this turn is force-stopped. STOP exploring and "
             "STOP reading now — you are out of time to investigate further. Save your "
@@ -1198,10 +1277,10 @@ def _wrapup_text(secs: int) -> str:
             "nothing.]")
 
 
-# --- hard wrap-up abort (103) ---------------------------------------------
+# --- hard wrap-up abort ---------------------------------------------------
 # wrapup_window_nudge above is a SOFT nudge that only lands if a step boundary happens to
-# fall inside the window; the TB2.1 autopsy showed the model is usually buried inside one
-# 80-100s generation when the window opens, so it fired 3/89 and rescued 0. This is the
+# fall inside the window; the autopsy showed the model is usually buried inside one
+# 80-100s generation when the window opens, so it fired 3 times and rescued none. This is the
 # backstop: a wall-clock stop_condition (agent.py) cuts the in-flight generation INSIDE
 # the margin, then forces one time-boxed no-think landing turn. The margin must fit: close
 # the cut generation + one landing generation + a couple of fast tool calls.
@@ -1245,7 +1324,7 @@ def relaunch_budget(total_wall_s, task_elapsed_s) -> float | None:
     process at the task deadline, so a relaunch that inherits the full budget calibrates its
     governor / wrap-up / hard-abort windows against a clock that never elapses before the
     kill — the relaunched turn then rides to a mid-work SIGKILL with nothing landed (the
-    exact 3/89-wrapup-fired blind spot). Returns the remaining seconds, or None when too
+    exact blind spot the soft nudge left). Returns the remaining seconds, or None when too
     little remains to bother relaunching (or no wall budget is configured). Pure/testable."""
     if not total_wall_s:
         return None
@@ -1258,22 +1337,32 @@ def relaunch_budget(total_wall_s, task_elapsed_s) -> float | None:
 AUTO_CONTINUE_TOTAL_CAP = 6       # absolute relaunch ceiling per task (base + extras)
 AUTO_CONTINUE_REPLENISH_FRAC = 0.5  # grant extras only while this fraction of the task
                                     # wall is still unspent
+AUTO_CONTINUE_REPLENISH_FRAC_LATE = 0.25  # late_continue_replenish: keep granting down
+                                          # to a quarter of the wall remaining
 
 
 def replenish_continue(total_wall_s, elapsed_s, used_continues,
                        cap: int = AUTO_CONTINUE_TOTAL_CAP,
-                       frac: float = AUTO_CONTINUE_REPLENISH_FRAC) -> bool:
+                       frac: float | None = None) -> bool:
     """Grant an auto-continue relaunch beyond the base allowance? The fixed base of 2
-    is wall-blind: build-pov-ray (TB2.1 v1.0.0 run) burned 3 step-capped turns in 637s
-    and gave up with 94.7% of a 12000s budget unused (plan 107 F3). While more than
+    is wall-blind: a long build task burned 3 step-capped turns in 637s and gave up
+    with 94.7% of a 12000s budget still unused. While more than
     `frac` of the task wall remains unspent, keep granting fresh attempts, bounded by
     `cap` total relaunches so a pathological fast-stall loop still terminates well
     before the harness SIGKILL. No wall budget -> never (interactive runs keep the
-    explicit base allowance only). Pure/testable; the caller counts usage."""
+    explicit base allowance only). `frac=None` resolves the threshold from the
+    `late_continue_replenish` lever: 0.25 with it on (the measured stranding — step-
+    capped runs ended with 12-50% of wall unspent because extras stopped at the 0.5
+    line), 0.5 with it off. `relaunch_budget`'s MIN_RELAUNCH_WALL_S floor still vetoes
+    a relaunch too close to the deadline. Pure/testable; the caller counts usage."""
     if not total_wall_s:
         return False
     if used_continues >= cap:
         return False
+    if frac is None:
+        frac = (AUTO_CONTINUE_REPLENISH_FRAC_LATE
+                if levers.enabled("late_continue_replenish")
+                else AUTO_CONTINUE_REPLENISH_FRAC)
     return (total_wall_s - elapsed_s) > frac * total_wall_s
 
 
@@ -1291,7 +1380,7 @@ def hard_wrapup_deadline(wall_budget_s, already_fired, plan_mode, read_only) -> 
 
 
 # --- turn-level cumulative think budget -----------------------------------
-# The 086 ceiling above (close-and-continue) watches any ONE generation; it is blind to a
+# The think ceiling above (close-and-continue) watches any ONE generation; it is blind to a
 # turn that burns its budget across MANY separate thinks each under that ceiling —
 # dna-assembly: 123k total generated tokens across 13 big thinks, no single one hit the
 # 6k ceiling. This watches the turn's CUMULATIVE reasoning-token spend instead, and acts
@@ -1308,9 +1397,9 @@ TURN_THINK_BUDGET_FRAC = 0.35  # the budget's TIME cost should stay <= ~35% of t
 TURN_THINK_MIN_WALL_S = 300.0  # below this wall budget the mechanism is inert: a short
                                # auto-continue tail clamps to LO and half-fires on its
                                # first step, churning against hard_wrapup's landing
-                               # (plan 107 F2 — the regex-log relaunch signature)
+                               # (the regex-log relaunch signature)
 TURN_THINK_REARM_TOK = 3000    # past exhaustion, one forced no-think step is owed per
-                               # this many FURTHER think tokens spent (plan 107 F1)
+                               # this many FURTHER think tokens spent
 
 
 def turn_think_budget(wall_budget_s, decode_tps, frac: float = TURN_THINK_BUDGET_FRAC,
@@ -1335,9 +1424,8 @@ def turn_think_budget_check(turn_think_tokens: int, budget: int, half_fired: boo
                             exhausted: bool):
     """Threshold latch for the cumulative per-turn reasoning budget: 'half' fires ONCE as
     a soft steer at budget/2; 'exhausted' fires ONCE as the transition into the throttled
-    state (see turn_think_throttle — the TB2.1 v1.0.0 run showed a blanket rest-of-turn
-    no-think mute degrades Ornith's tool-call syntax and capability over long tails,
-    plan 107). Once exhausted, always returns (None, half_fired, True) — nothing further
+    state (see turn_think_throttle — a blanket rest-of-turn no-think mute was measured
+    to degrade Ornith's tool-call syntax and capability over long tails). Once exhausted, always returns (None, half_fired, True) — nothing further
     to escalate. Returns (decision, half_fired, exhausted). Pure/testable; the caller
     owns the state."""
     if exhausted:
@@ -1357,10 +1445,10 @@ def turn_think_throttle(turn_think_tokens: int, budget: int, nothink_paid: int,
     no-think steps it has already paid (`nothink_paid`). Self-correcting by design —
     a model that keeps burning reasoning is throttled toward always-off (the old
     persistent-mute behavior), while one that stops over-thinking gets its thinking
-    back once the owed steps are paid. The v1.0.0 full run's evidence for restoring
-    rather than muting: break-filter-js spent 26 straight no-think steps after
-    exhaustion and regressed a run1 pass with garbled landing tool calls (plan 107 F1).
-    Pure/testable; never touches an in-flight generation (086 contract)."""
+    back once the owed steps are paid. The evidence for restoring rather than muting:
+    one task spent 26 straight no-think steps after exhaustion and regressed a
+    previously-passing run with garbled landing tool calls.
+    Pure/testable; never touches an in-flight generation."""
     if turn_think_tokens < budget:
         return False
     owed = 1 + (turn_think_tokens - budget) // max(1, rearm)
@@ -1414,7 +1502,7 @@ def loop_should_abort(loop_nudges: int) -> bool:
     return loop_nudges > 2
 
 
-# --- iter-14: duplicate read-only result elision. Small models re-read files and
+# --- Duplicate read-only result elision. Small models re-read files and
 # re-run searches they have already loaded; on a non-trimmable prefix cache every
 # duplicate body is appended prefill paid on every later step. Hosted harnesses solve
 # this with an opt-in changed-since parameter the model must remember to pass; here
@@ -1451,7 +1539,7 @@ def elide_duplicate_result(name, result, messages):
             f"call.]")
 
 
-# The zero-evidence sub-agent tell (iter-14): a confident, non-empty report produced
+# The zero-evidence sub-agent tell: a confident, non-empty report produced
 # with no tool dispatches came from model memory, not the repo. Warn-not-reject: a
 # local re-spawn doubles GPU cost, a false reject breaks the turn, and a false accept
 # merely restores the pre-warning status quo.

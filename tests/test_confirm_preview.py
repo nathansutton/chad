@@ -6,7 +6,7 @@ text edits showed only a path. These assertions lock in that the preview now
 shows the meaningful change, and that it stays bounded (a huge write must not
 flood the prompt).
 
-Run: `uv run python test_confirm_preview.py`
+Run: `uv run python tests/test_confirm_preview.py`
 """
 
 from chad.render import confirm_preview
