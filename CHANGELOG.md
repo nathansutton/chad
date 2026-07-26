@@ -2,6 +2,15 @@
 
 Notable, user-visible changes.
 
+## [Unreleased]
+
+- **`--model` size override.** chad still picks a model RAM-aware by default; the new
+  `--model` flag is the escape hatch — `--model 9b` / `--model 35b` force a size,
+  `--model auto` forces the RAM pick, and any HF repo id / local dir works too. It's the
+  CLI twin of `CHAD_MODEL` and wins over it when both are set. Forcing the 35B where RAM
+  looks too small (or is undetectable) is honored but warns first — the harness advises,
+  you decide. Not a model picker: launch-time only, nothing persisted.
+
 ## [1.0.4] — 2026-07-22
 
 Tool-result economics: three additions, each individually reversible via `CHAD_DISABLE`.

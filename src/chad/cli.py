@@ -205,29 +205,56 @@ def _detect_ram_gb():
         return None
 
 
-def _pick_model():
+def _resolve(local, repo):
+    """Prefer a locally-built models/ dir over the HF repo when it exists."""
+    return local if os.path.isdir(local) else repo
+
+
+def _pick_model(override=None):
     """Resolve the model id and a human label for *why* it was chosen.
 
-    Order: explicit CHAD_MODEL override → RAM-aware default (35B on big boxes, 9B on
-    small) → prefer a locally-built models/ dir over the HF repo when it exists.
+    Precedence: --model override (the `override` arg) → CHAD_MODEL env → RAM-aware
+    default (35B on big boxes, 9B on small). Size aliases '9b'/'35b' force that size;
+    'auto' forces the RAM pick even when CHAD_MODEL is set; anything else is a literal
+    HF repo id / local dir. For every resolved size, prefer a locally-built models/
+    dir over the HF repo.
+
+    An override that forces the 35B where RAM would not (small or undetectable RAM)
+    warns on stderr and proceeds — the harness advises, the caller decides.
     """
-    env = config.env_str("CHAD_MODEL")
-    if env:
-        return env, "CHAD_MODEL override"
+    # --model wins over CHAD_MODEL; default=None on the flag distinguishes "not passed"
+    # from an explicit "auto" (which forces the RAM pick, ignoring the env).
+    choice = override if override is not None else config.env_str("CHAD_MODEL")
+    source = "--model" if override is not None else "CHAD_MODEL"
+    if choice and choice.strip().lower() != "auto":
+        c = choice.strip().lower()
+        if c in ("9b", "35b"):
+            model_id = (_resolve(_LOCAL_9B, _HF_9B) if c == "9b"
+                        else _resolve(_LOCAL_35B, _HF_35B))
+            if c == "35b":
+                ram = _detect_ram_gb()
+                if ram is None or ram < _BIG_RAM_GB:
+                    got = "undetectable" if ram is None else f"{ram:.0f} GB"
+                    sys.stderr.write(
+                        f"chad: --model 35b forced (RAM {got} < ~{_BIG_RAM_GB:.0f} GB "
+                        f"recommended); the 35B needs ~32 GB resident and may OOM or "
+                        f"thrash. Proceeding as asked.\n")
+            return model_id, f"{c.upper()} ({source} override)"
+        return choice, f"{source} override"  # literal repo/dir — unchanged behavior
     ram = _detect_ram_gb()
     if ram is None:
         # RAM unreadable -> the safe (smaller) model: a wrong 9B costs capability, a
         # wrong 35B costs a 12 GB download and possibly an OOM'd first session.
         local, repo = _LOCAL_9B, _HF_9B
         why = "9B (RAM undetectable — choosing the safe smaller model; " \
-              "set CHAD_MODEL to override)"
+              "set CHAD_MODEL or --model to override)"
     elif ram < _BIG_RAM_GB:
         local, repo = _LOCAL_9B, _HF_9B
         why = f"9B (default; {ram:.0f} GB RAM < {_BIG_RAM_GB:.0f} GB, 35B would be tight)"
     else:
         local, repo = _LOCAL_35B, _HF_35B
         why = "35B (default)"
-    return (local if os.path.isdir(local) else repo), why
+    return _resolve(local, repo), why
 
 
 def _model_download_gb(model_id):
@@ -406,6 +433,14 @@ def main():
                          "fresh-context turn to independently verify the deliverables and fix "
                          "any mismatch. Off by default (needs --turn-budget-s to arm); also "
                          "CHAD_REVIEW_PASS=1.")
+    # Model override. chad picks a size RAM-aware by default (the harness knows best);
+    # this is the escape hatch, the CLI twin of CHAD_MODEL with friendly size aliases.
+    ap.add_argument("--model", default=None,
+                    help="override the RAM-aware model pick: 'auto' (default behavior), "
+                         "'9b', '35b', or any HF repo id / local dir. The CLI twin of "
+                         "CHAD_MODEL; --model wins if both are set, and '--model auto' "
+                         "forces the RAM pick even when CHAD_MODEL is set. The harness "
+                         "picks well by default — reach for this only to force a size.")
     # Backend selection. Default 'mlx' is the in-process engine and the whole point of
     # chad; 'llama' drives a llama.cpp server's raw /completion with token-id prompts +
     # real cache telemetry (see completion_engine.py) — the arm used when chad runs inside
@@ -469,7 +504,8 @@ def main():
         from . import prove
         sys.exit(prove.run(args))
     # Ornith; no draft, ever. RAM-aware default, local-dir-preferred, HF fallback.
-    model_id, why = _pick_model()
+    # --model (or CHAD_MODEL) overrides the RAM pick; see _pick_model.
+    model_id, why = _pick_model(args.model)
 
     # Advanced, rarely-touched knobs live in env vars to keep the CLI sane:
     #   CHAD_MAX_CONTEXT       YaRN-extend the window (e.g. 131072 for 128k)

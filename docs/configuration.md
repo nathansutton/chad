@@ -210,6 +210,7 @@ CHAD_CTX_RESERVE_GB=2.5 uv run chad      # scratch RAM held back when auto-sizin
 CHAD_CTX_SLOPE_FACTOR=1.0 uv run chad    # per-token cost multiplier for that auto-sizing (default
                                          # 1.75: measured peak grows ~1.75x the raw KV bytes/token)
 CHAD_MODEL=/path/to/mlx-model uv run chad  # power-user escape hatch: run a different MLX model
+                                         # (also: --model 9b|35b|auto|<repo> — the CLI twin, wins over this)
 CHAD_PREFILL_CHUNK=1024 uv run chad      # force a fixed prefill chunk (default: adaptive — MoE 2048
                                          # / dense 512, decaying to 256 as context+pressure grow)
 CHAD_NO_MEMORY_CLAMP=1  uv run chad      # A/B knob: skip the Metal allocator clamps installed at load
@@ -240,13 +241,24 @@ retries. `CHAD_NO_MEMORY_CLAMP=1` disables the clamps (A/B). The compaction thre
 additionally respects host-physical free memory (pressure from Docker or other apps
 that the Metal budget can't see) and is re-checked between turns.
 
-**Forcing the small model.** `CHAD_MODEL` also names another Ornith on Hugging Face, so
-it doubles as the "use the 9B" recipe. chad's default keys on *physical* RAM, so a 24 GB
-Mac with a lot already resident still gets the 35B (~14 GB peak) and can swap-thrash —
-close other apps, or pin the 9B (~5 GB) for the session:
+**Forcing a size (`--model`).** chad's default keys on *physical* RAM, so a 24 GB Mac
+with a lot already resident still gets the 35B (~14 GB peak) and can swap-thrash — close
+other apps, or force the size for the session. The `--model` flag is the ergonomic way:
 
 ```bash
-CHAD_MODEL=nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX uv run chad
+uv run chad --model 9b     # pin the small model (~5 GB) regardless of RAM
+uv run chad --model 35b    # force the big model; warns first if RAM looks too small
+uv run chad --model auto   # explicit RAM-aware pick (ignores CHAD_MODEL if it's set)
+```
+
+`--model` is the CLI twin of `CHAD_MODEL`: it also accepts any HF repo id / local dir,
+and it **wins over `CHAD_MODEL`** when both are set. Precedence is `--model` → `CHAD_MODEL`
+→ the RAM-aware default. Forcing `35b` under the RAM threshold is honored but prints a
+one-line OOM warning first — the harness advises, you decide. The env spelling still works
+and is handy for pinning across a whole shell session:
+
+```bash
+CHAD_MODEL=nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX uv run chad   # env equivalent of --model 9b
 ```
 
 ### Alternate backend (remote)
