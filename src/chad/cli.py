@@ -248,34 +248,54 @@ def _detect_ram_gb():
         return None
 
 
+def _resolve(local, repo):
+    """Prefer a locally-built models/ dir over the HF repo when it exists."""
+    return local if os.path.isdir(local) else repo
+
+
 def _pick_model(spec=None):
     """Resolve the model id and a human label for *why* it was chosen.
 
     Order: explicit `--model` (`spec`) → CHAD_MODEL → RAM-aware default (35B unless the
     box is small). A resolved shorthand prefers a locally-built models/ dir over the HF
     repo when one exists; an arbitrary spec is passed through untouched.
+
+    Forcing `35b` where the RAM check would not have chosen it (small or undetectable
+    RAM) is honored, but warns on stderr first: chad advises, the caller decides.
     """
+    # Name the winning source in the reason: it is only ever ambiguous when both the
+    # flag and the env var are set, which is exactly when the user needs to be told.
+    source = "--model" if spec is not None else "CHAD_MODEL"
     spec = spec or config.env_str("CHAD_MODEL")
-    if spec and spec != "auto":
-        alias = _MODEL_ALIASES.get(spec.lower())
+    if spec and spec.strip().lower() != "auto":
+        key = spec.strip().lower()
+        alias = _MODEL_ALIASES.get(key)
         if not alias:
-            return spec, "explicitly requested"
+            return spec, f"explicitly requested ({source} override)"
         local, repo = alias
-        return (local if os.path.isdir(local) else repo), f"{spec.lower()} (requested)"
+        if key == "35b":
+            ram = _detect_ram_gb()
+            if ram is None or ram < _BIG_RAM_GB:
+                got = "undetectable" if ram is None else f"{ram:.0f} GB"
+                sys.stderr.write(
+                    f"chad: 35b forced via {source} (RAM {got} < ~{_BIG_RAM_GB:.0f} GB "
+                    f"recommended); the 35B needs ~16 GB resident with its KV cache and "
+                    f"may OOM or thrash here. Proceeding as asked.\n")
+        return _resolve(local, repo), f"{key} (requested via {source})"
     ram = _detect_ram_gb()
     if ram is None:
         # RAM unreadable -> the safe (smaller) model: a wrong 9B costs capability, a
         # wrong 35B costs a 12 GB download and possibly an OOM'd first session.
         local, repo = _LOCAL_9B, _HF_9B
         why = "9B (RAM undetectable — choosing the safe smaller model; " \
-              "pass --model 35b to override)"
+              "set CHAD_MODEL or --model to override)"
     elif ram < _BIG_RAM_GB:
         local, repo = _LOCAL_9B, _HF_9B
         why = f"9B (default; {ram:.0f} GB RAM < {_BIG_RAM_GB:.0f} GB, 35B would be tight)"
     else:
         local, repo = _LOCAL_35B, _HF_35B
         why = "35B (default)"
-    return (local if os.path.isdir(local) else repo), why
+    return _resolve(local, repo), why
 
 
 def _model_download_gb(model_id):

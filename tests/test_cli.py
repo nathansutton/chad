@@ -186,6 +186,103 @@ def test_pick_model_prefers_local_dir(monkeypatch):
     check("local 35B preferred over HF repo", model == cli._LOCAL_35B, model)
 
 
+def test_pick_model_flag_auto_ignores_env(monkeypatch):
+    # '--model auto' forces the RAM pick even when CHAD_MODEL is set: the env must NOT
+    # win. Big box + no local dirs -> the 35B default, not the env value.
+    monkeypatch.setenv("CHAD_MODEL", "/env/repo")
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
+    model, why = cli._pick_model("auto")
+    check("--model auto ignores env, RAM-picks 35B", model == cli._HF_35B, model)
+    check("--model auto reason is a default", "default" in why, why)
+
+
+def test_pick_model_flag_9b_both_ram(monkeypatch, capsys):
+    # Forcing 9B yields 9B on a big box AND a small box, and NEVER warns (9B is always
+    # safe). No local dirs -> HF repo.
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    for ram in (16.0, 64.0):
+        monkeypatch.setattr(cli, "_detect_ram_gb", lambda ram=ram: ram)
+        model, why = cli._pick_model("9b")
+        check(f"--model 9b -> 9B at {ram} GB", model == cli._HF_9B, model)
+        check("--model 9b reason names source", "--model" in why, why)
+    check("forcing 9B never warns", capsys.readouterr().err == "")
+
+
+def test_pick_model_flag_35b_big_no_warn(monkeypatch, capsys):
+    # Forcing 35B on a big box is exactly what the RAM pick would do -> no warning.
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
+    model, why = cli._pick_model("35b")
+    check("--model 35b -> 35B HF repo", model == cli._HF_35B, model)
+    check("35B on big box does not warn", capsys.readouterr().err == "")
+
+
+def test_pick_model_flag_35b_small_warns(monkeypatch, capsys):
+    # Forcing 35B under the RAM threshold still honors the override BUT warns (2A): the
+    # harness advises, the caller decides.
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 16.0)
+    model, _ = cli._pick_model("35b")
+    check("--model 35b honored on small box", model == cli._HF_35B, model)
+    err = capsys.readouterr().err
+    check("small-box 35B warns", "35b forced" in err, err)
+    check("warning names the OOM risk", "OOM" in err, err)
+
+
+def test_pick_model_flag_35b_ram_none_warns(monkeypatch, capsys):
+    # RAM undetectable + forced 35B: warn (we can't vouch for the memory) and proceed.
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: None)
+    model, _ = cli._pick_model("35b")
+    check("--model 35b honored on unknown RAM", model == cli._HF_35B, model)
+    check("unknown-RAM 35B warns 'undetectable'",
+          "undetectable" in capsys.readouterr().err)
+
+
+def test_pick_model_flag_repo_passthrough(monkeypatch):
+    # A non-alias value is a literal repo id / local dir, passed through unchanged (the
+    # CLI twin of CHAD_MODEL). RAM is irrelevant.
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 8.0)
+    model, why = cli._pick_model("/some/local/model")
+    check("--model repo passthrough", model == "/some/local/model", model)
+    check("passthrough reason names source + override",
+          "--model" in why and "override" in why.lower(), why)
+
+
+def test_pick_model_flag_beats_env(monkeypatch):
+    # Both set -> the CLI flag wins over CHAD_MODEL.
+    monkeypatch.setenv("CHAD_MODEL", "/env/repo")
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
+    model, why = cli._pick_model("9b")
+    check("--model beats CHAD_MODEL", model == cli._HF_9B, model)
+    check("winner reason names --model", "--model" in why, why)
+
+
+def test_pick_model_flag_prefers_local_dir(monkeypatch):
+    # A forced size prefers the locally-built dir, same as the RAM path.
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
+    monkeypatch.setattr(os.path, "isdir", lambda p: p == cli._LOCAL_35B)
+    model, _ = cli._pick_model("35b")
+    check("forced 35B prefers local dir", model == cli._LOCAL_35B, model)
+
+
+def test_pick_model_default_equals_auto(monkeypatch):
+    # Regression lock for bench.py's no-arg callers: _pick_model() must behave exactly
+    # like _pick_model("auto") for a fixed environment.
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
+    check("no-arg == auto", cli._pick_model() == cli._pick_model("auto"))
+
+
 def test_ram_aware_ctx_limit():
     GB = 1e9
     # Measured 24 GB M4 Pro numbers: 19.07 GB working set, 12.06 GB resident after

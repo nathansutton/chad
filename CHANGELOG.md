@@ -13,7 +13,9 @@ Notable, user-visible changes.
 - **`--model` replaces reaching for an env var to change model.** Takes `35b`, `9b`,
   `auto`, or any Hugging Face repo id / local model dir; works on `chad` and `chad serve`.
   `CHAD_MODEL` still works and the flag outranks it, so a globally exported var can't pin
-  every run.
+  every run, and `--model auto` forces the RAM-aware pick even when the env var is set.
+  Forcing `35b` on a box whose RAM is too small (or unreadable) is honored but warns
+  first — chad advises, you decide.
 - **`serve`, `prove` and `levers` are real subcommands** with their own `--help`. They
   were dispatched on the literal task string, so `chad --help` never mentioned them while
   still listing `--host`/`--port` as "`chad serve` only" — flags that parsed fine and were

@@ -301,9 +301,9 @@ def run(args):
         cli._preflight("mlx")
     except SystemExit:
         return 2
-    if os.environ.get("CHAD_MODEL"):
-        sys.stderr.write("[prove pins the validated 9B — CHAD_MODEL is ignored "
-                         "for this run]\n")
+    if os.environ.get("CHAD_MODEL") or getattr(args, "model", None):
+        sys.stderr.write("[prove pins the validated 9B — CHAD_MODEL and --model are "
+                         "ignored for this run]\n")
     model_id = cli._HF_9B
     invoking_dir = os.getcwd()
 
