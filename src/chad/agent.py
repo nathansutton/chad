@@ -375,7 +375,8 @@ class Agent:
         self._compact_state: dict = {}
         self._deny_reason: str | None = None  # headless guard-block explanation for the model
         # Live ctx-limit recheck: the startup limit was computed on
-        # an idle box; Docker/harbor spinning up mid-session changes what's safe.
+        # an idle box; containers or other engines spinning up mid-session change
+        # what's safe.
         # Called at the top of each turn; only a >10% move is applied (hysteresis).
         self._ctx_limit_fn = ctx_limit_fn
         # Runaway-turn governor: a per-turn budget on cumulative prefill tokens
@@ -687,7 +688,7 @@ class Agent:
             # Fail-safe: a sub-agent that ends early — step cap, crash, interrupt — or
             # that returns nothing at all must still hand back where it got to. Never
             # surface a bare sentinel: the parent then restarts the localization from
-            # zero (the django-14007/sphinx-9230 failure), and the anti-respawn guard
+            # zero (the demonstrated failure), and the anti-respawn guard
             # above refuses the retry, so the turn dies with the findings still in the
             # dead sub-agent's transcript. progress_note is deterministic and model-free,
             # so it works even from a crashed turn: it re-reads the sub-agent's own tool
@@ -826,8 +827,8 @@ class Agent:
         plan_reviews = 0    # one-shot "re-read the plan you just wrote" (levers.plan_review)
         # Files edited this turn -> mtime at last syntax check. Bash can mutate files
         # too (sed -i, python rewrites) but bypasses the write/edit syntax gate; watch
-        # edited files and re-check them after any bash that touched them (
-        # sphinx-7440's file survived 9 blind `sed -i` "fixes" unparseable, unflagged).
+        # edited files and re-check them after any bash that touched them (a measured
+        # file survived 9 blind `sed -i` "fixes" unparseable and unflagged).
         edited_syntax_watch: dict = {}
         think_cap_hits = 0  # soft think-cap firings this turn (drives escalation)
         repeat_stops = 0  # degenerate-repetition cut-offs this turn (3rd aborts the turn)
@@ -845,7 +846,7 @@ class Agent:
         # log/steer; past it, no-think steps are paid on a duty cycle
         # (guardrails.turn_think_throttle) rather than muting the rest of the turn —
         # the blanket mute regressed passing runs with garbled no-think tails.
-        # landing_no_think is the 103 landing's own unconditional latch: once the hard
+        # landing_no_think is the hard-wrapup landing's own unconditional latch: once
         # wrap-up fires, the landing and everything after it stay no-think regardless.
         turn_think_tokens = 0
         turn_think_half_fired = False
@@ -1145,7 +1146,7 @@ class Agent:
             # set AND this step is actually thinking (a no-think escalation step has no
             # <think> to salvage). None => the engine path is byte-identical to before.
             step_ceiling = self.think_ceiling if (self.think_ceiling and step_thinking) else None
-            # Landing generations (after the 103 deadline abort armed the latch) are
+            # Landing generations (after the deadline abort armed the latch) are
             # token-boxed so the forced landing can't itself run long or spiral: the
             # remaining wall only affords so many tokens, halved to leave room for the
             # landing's own tool dispatch. Default path is byte-identical (self.max_gen_tokens).
@@ -1162,8 +1163,8 @@ class Agent:
             except BackendError as e:
                 # A transient backend fault (5xx / mid-stream error chunk) used to escape
                 # run_turn and kill the process from cli.main — forfeiting the rest of an
-                # unattended task's budget (one benchmark task died at 721s of a
-                # 1770s budget on a single llama.cpp 500). Re-issue the step instead: the
+                # unattended task's budget — a measured run died at 721s of a 1770s
+                # budget on a single llama.cpp 500. Re-issue the step instead: the
                 # prompt is rebuilt from `messages` each iteration and the failed
                 # generation was never appended, so a retry is a clean re-roll — and at
                 # temp>0 a resample usually clears a parser-rejected completion.
@@ -1214,9 +1215,9 @@ class Agent:
                     self._emit("stream", "\n")
             # strip any trailing special tokens the template will re-add — and any
             # LEAKED special-token literal anywhere in the text. A quantized model
-            # can emit a stray marker like <|mask_end|> mid-turn (
-            # django-14404 r3: one leaked at step 12 and the turn read as a clean
-            # final answer, ending the run rc=0 with an unverified edit); scrubbed
+            # can emit a stray marker like <|mask_end|> mid-turn (one leaked at
+            # step 12 of a measured run and the turn read as a clean final answer,
+            # ending rc=0 with an unverified edit); scrubbed
             # here so it can neither pollute the transcript nor masquerade as
             # content.
             text = _SPECIAL_TOKEN_RE.sub("", text).rstrip()
@@ -1501,12 +1502,12 @@ class Agent:
                                        "— progress note banked; say 'continue' to retry]")
                     return ("[stopped: the model kept emitting malformed tool calls "
                             "— say 'continue' to resume]")
-                # Iter-3 did-nothing gate: in auto/headless mode (every benchmark run), a
-                # turn that ends having executed ZERO real tools is never a legitimate
-                # completion — the keyword intent classifier misses tasks like "extract the
-                # secret and save it" (no action verb), so action_task is False and the
-                # gate below wouldn't fire (one benchmark task shipped a 28-token garble
-                # as its answer). read_only/explain asks are exempt. Banks a note so
+                # Did-nothing gate: in auto/headless mode a turn that ends having
+                # executed ZERO real tools is never a legitimate completion — the keyword
+                # intent classifier misses tasks like "extract the secret and save it"
+                # (no action verb), so action_task is False and the gate below wouldn't
+                # fire, which is how a turn once shipped a 28-token garble as its final
+                # answer. read_only/explain asks are exempt. Banks a note so
                 # auto-continue relaunches fresh instead of shipping nothing.
                 did_nothing = self.mode == "auto" and not read_only_intent and not did_work
                 if (action_task and not read_only_intent
@@ -1547,9 +1548,9 @@ class Agent:
                             continue
                     # Iter-2 no-empty-diff gate: an action task may not END on a prose
                     # "final answer" while no change landed (or the change is
-                    # unverified) — the demonstrated failures (django-14007,
-                    # sphinx-9230): 49–97s bails accepted as final answers with an
-                    # empty diff and 97% of the budget unused. Bank a progress note
+                    # unverified) — the demonstrated failures: 49–97s bails accepted
+                    # as final answers with an empty diff and 97% of the budget
+                    # unused. Bank a progress note
                     # and end as a hard stop, so --auto-continue (headless) or the
                     # user's 'continue' (TUI) relaunches a fresh attempt with the
                     # note instead of silently shipping nothing.
@@ -1563,11 +1564,10 @@ class Agent:
                                        "— progress note banked; say 'continue' to retry]")
                     return ("[stopped: the turn ended without applying a verified "
                             "change — say 'continue' to resume]")
-                # Done-audit, final-answer twin (Part B readout): a prose
-                # final answer on an action task is a `done` in all but name, and this
-                # accept path bypassed every done gate — several of Part B's wrong-dones
-                # exited here with the lever ON but never engaged (build-pmars on.2,
-                # log-summary on.1, large-scale-text-editing off.1). Same lever, same
+                # Done-audit, final-answer twin: a prose final answer on an action
+                # task is a `done` in all but name, and this accept path bypassed every
+                # done gate — in the measured set several wrong-dones exited here with
+                # the lever ON but never engaged. Same lever, same
                 # guards, same once-per-turn latch as the done-tool branch below; the
                 # steer's "call done again" converts a prose-ender into a done-caller,
                 # which the latch then accepts.
@@ -1697,8 +1697,8 @@ class Agent:
                     # Same no-empty-diff gate as the prose-final-answer path: `done`
                     # with nothing landed (or landed-unverified after the verify
                     # nudges ran out) becomes a resumable hard stop, not a success
-                    # (matplotlib-25332 r3: done accepted at 84s with edits in tree
-                    # and zero successful post-edit commands).
+                    # (measured: done accepted at 84s with edits in tree and zero
+                    # successful post-edit commands).
                     self.budget_note = guardrails.progress_note(
                         self.messages,
                         rejected_claim=str(terminal.get("summary") or ""))
@@ -1711,10 +1711,10 @@ class Agent:
                             "change — say 'continue' to resume]")
                 # Done-audit: the largest measured fail bucket (20/43)
                 # was dones whose claimed verification was a WEAKER predicate than the
-                # task's own checker — and the generic recheck below was ON for all of
+                # task's own wording — and the generic recheck below was ON for all of
                 # them. On a done every gate above would accept, bounce ONCE with the
                 # task statement's own requirement lines quoted plus stat facts for each
-                # path it names; the NEXT done is accepted unconditionally (the 070
+                # path it names; the NEXT done is accepted unconditionally (the
                 # anti-spiral latch — the model is told so, which keeps the steer
                 # credible). Supersedes done_spec_recheck while enabled: stacking both
                 # would force two bounces per turn. Post-audit edits deliberately do NOT
@@ -1726,8 +1726,8 @@ class Agent:
                 # as possible…" name no action verb); the anchors requirement inside
                 # done_audit (concrete paths / imperative requirement lines) is the
                 # task-text-derived action detector.
-                # Not in sub-agents (Part B: circuit-fibsqrt's bounce fired inside one
-                # with runway=infs — sub-agents carry no wall budget, so the runway
+                # Not in sub-agents (a measured bounce fired inside one at
+                # runway=inf — sub-agents carry no wall budget, so the runway
                 # guard is inert there, and their delegated prompt is not the task
                 # statement the audit should quote). audit_task strips the harness
                 # appendices (progress note / review-pass preamble) a relaunched

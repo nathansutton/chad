@@ -344,8 +344,8 @@ def test_grep_path_not_found():
 
 def test_grep_dirs_do_not_starve_file_cap():
     """The GREP_MAX_FILES budget must count only files we'd actually SEARCH — not the
-    directories (and skipped blobs) the walk passes through. The demonstrated starvation
-    (django-16454): a dir-heavy tree exhausted the cap on directories before the walk
+    directories (and skipped blobs) the walk passes through. The demonstrated
+    starvation: a dir-heavy tree exhausted the cap on directories before the walk
     reached the file holding the target symbol. Here we seed many empty subdirs ahead of
     the one real match and shrink the cap below the dir count: the match must still land,
     and truncation must NOT be reported (no real file was dropped)."""

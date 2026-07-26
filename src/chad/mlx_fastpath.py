@@ -306,7 +306,9 @@ def _compile_layer_step(layer):
     unchanged, which keeps it compatible with the engine's snapshot/rewind (it
     copies cache entries by reference).
 
-    Opt out with CHAD_NO_FUSED_LAYER=1.
+    Off by default; opt in with CHAD_FUSED_LAYER=1. The synthetic-model test proves
+    this is greedy-identical, not that it is faster, and merging compile regions can
+    cut either way — so it stays opt-in until a sweep says it pays on real weights.
     """
     import mlx.core as mx
 

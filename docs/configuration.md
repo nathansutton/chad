@@ -436,6 +436,9 @@ CHAD_NO_SYNTAX_GATE=1       uv run chad  # A/B knob: DISABLE the post-edit synta
 CHAD_NO_PREFIX_CACHE=1      uv run chad  # measurement knob: drop the persistent prefix KV cache
 CHAD_NO_SKILLS=1            uv run chad  # A/B knob: disable all Agent Skill discovery
 CHAD_NO_FASTPATH=1          uv run chad  # A/B knob: disable the fused-projection decode fast path
+CHAD_NO_QSDPA_SGM=1         uv run chad  # A/B knob: disable the split-head qKV attention tier
+CHAD_FUSED_LAYER=1          uv run chad  # opt IN to the fused GDN+MoE compiled layer step
+CHAD_NO_MLX_TUNING=1        uv run chad  # skip chad's tuned MLX runtime defaults
 CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbelt (unsafe)
 ```
 
@@ -467,7 +470,7 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
   — so it is on by default; this knob is the A/B arm.
 - **`CHAD_NO_SYNTAX_GATE`** — **disables** the post-edit syntax gate (`syntaxgate.py`),
   which normally warns when an edit *introduces* a new syntax error (it never flags a
-  pre-existing one). An A/B arm for `run_evals --ab`; leave unset in normal use.
+  pre-existing one). An A/B arm for evaluation runs; leave unset in normal use.
 - **`CHAD_NO_PREFIX_CACHE`** — a fairness/measurement knob that **drops** the persistent
   prefix KV cache (`engine.py`), forcing a full re-prefill every step. It exists to measure
   what the cache is worth and makes chad much slower — never set it in normal use.
@@ -482,6 +485,21 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
 - **`CHAD_NO_FASTPATH`** — disables the fused-projection + compiled decode step installed
   at load for the hybrid MoE checkpoint (`mlx_fastpath.py`). Pure speed, no behavior
   change, so this is an A/B and bisection knob rather than something to run with.
+- **`CHAD_NO_QSDPA_SGM`** — disables the split-head tier of the fused quantized-KV
+  attention kernel (`mlx_qsdpa.py`), falling back to the per-head kernel at every
+  sequence length. The tier only engages on the 35B (it needs 8 query heads per KV head;
+  the 9B's 4 keep the per-head path regardless), and it is bit-exact with the fallback —
+  another speed-only bisection knob. `CHAD_NO_QSDPA=1` is the bigger hammer: it disables
+  the fused kernel entirely.
+- **`CHAD_FUSED_LAYER`** — opts **in** to compiling each hybrid layer's GDN and MoE
+  bodies into a single region instead of two (`mlx_fastpath.py`). Off by default: it is
+  proven greedy-identical but not proven faster, and merging compile regions can cut
+  either way. Set it to measure; leave it unset otherwise.
+- **`CHAD_NO_MLX_TUNING`** — skips `mlx_env.apply_defaults()`, which sets tuned MLX
+  runtime vars before mlx is first imported (`mlx_env.py`). The tuned table currently
+  ships **empty** — nothing is applied until a `chad-bench --sweep` justifies an entry —
+  so today this knob is a no-op kept as the escape hatch for when it isn't. Any var you
+  export yourself always wins over a tuned default, with or without this.
 
 ### Dev & instrumentation
 

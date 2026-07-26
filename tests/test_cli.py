@@ -405,9 +405,9 @@ def test_serve_parser_owns_host_and_port():
 
 
 def test_unattended_governor_knobs_are_env_only():
-    """The governor cluster is set by benchmark harnesses, never by hand, and every knob
+    """The governor cluster is set by unattended runners, never by hand, and every knob
     already had a CHAD_* twin — so the CLI spellings are gone rather than merely hidden.
-    Rejecting them beats accepting-and-ignoring: a harness still passing `--turn-budget-s`
+    Rejecting them beats accepting-and-ignoring: a runner still passing `--turn-budget-s`
     must fail loudly, not silently run without a wall budget."""
     for flag, value in (("--turn-budget-s", "1770"), ("--turn-budget-tokens", "300000"),
                         ("--auto-continue", "3"), ("--think-ceiling", "6000")):

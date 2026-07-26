@@ -134,10 +134,10 @@ _SCOPED_NEGATION_RE = re.compile(
     r"\b(?:files?|database|db|repo|repository|director(?:y|ies)|folders?|tables?|"
     r"scripts?)\b)")
 # A demand to deliver the answer INTO a file ("write the number … to /app/answer.txt",
-# "save the results to a file") — overrides an explanatory opener. Benchmark
-# count-dataset-tokens (2026-07-12): "Tell me how many … write the integer to the file
-# /app/answer.txt" classified read_only, which disarmed every no-progress gate and let
-# a garbled final step end the task with an empty diff. Explicit negations
+# "save the results to a file") — overrides an explanatory opener. The measured miss:
+# "Tell me how many … write the integer to the file /app/answer.txt" classified
+# read_only, which disarmed every no-progress gate and let a garbled final step end the
+# task with an empty diff. Explicit negations
 # (_READ_ONLY_PHRASES) still win: they are OR'd in separately below.
 # Periods are allowed in the gap (abbreviations like `e.g.` and quoted examples sit
 # mid-sentence in real task text); newlines and ?/! still bound the match.
@@ -277,7 +277,7 @@ def _bash_bg_block() -> str:
 
 def _verify_specific_block() -> str:
     """Steer the final verification at the task's OWN stated check instead of a proxy.
-    The measured class: trials that re-verified after a done bounce with a weaker check
+    The measured class: runs that re-verified after a done bounce with a weaker check
     than the task named (file-exists for a content requirement, a hand-rolled probe for
     a stated test command) and shipped a wrong solution with most of the wall unused.
     Static for the session, so it sits above the cache boundary."""

@@ -39,7 +39,7 @@ def apply_defaults() -> dict[str, str]:
 
 
 def describe() -> str:
-    """One line per tuned var, for `chad --levers` / diagnostics."""
+    """One line per tuned var, for `chad levers` / diagnostics."""
     if not DEFAULTS:
         return "MLX runtime defaults: none (stock mlx settings)"
     rows = [f"  {n}={v}  — {why}" for n, (v, why) in DEFAULTS.items()]

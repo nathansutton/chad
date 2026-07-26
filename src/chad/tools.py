@@ -674,7 +674,7 @@ def _reindent(new: str, target_indent: str, span_text: str | None = None,
     line's indent positionally, and any line whose stripped content matches a span
     line takes that line's indent. On the whitespace-flexible recovery path the
     model's relative indents are the least trustworthy part of the edit — the
-    demonstrated failure (sphinx-7440): a semantically correct one-line fix landed
+    demonstrated failure: a semantically correct one-line fix landed
     with the model's broken 10-space indent, shipped an IndentationError, and the
     resulting file was unrepairable through this same path.
 
@@ -934,8 +934,8 @@ def tool_edit(path: str, old: str, new: str) -> str:
             # Reindenting reproduced the file byte-for-byte, yet the model's `new`
             # differs from the span — the edit IS a whitespace change (an
             # indentation fix). Normalizing it away made a broken indent literally
-            # unrepairable through this tool (sphinx-7440: every fix attempt
-            # returned "[no-op edit]" and the model fell back to blind sed). Trust
+            # unrepairable through this tool (measured: every fix attempt returned
+            # "[no-op edit]" and the model fell back to blind sed). Trust
             # the model's whitespace verbatim.
             res = _apply_edit(path, data, data[:s] + raw + data[e:],
                               " (applied verbatim: whitespace-only change)"
@@ -1557,11 +1557,11 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
         return f"[path not found: {path}]"
     else:
         # Count only files we would actually SEARCH against GREP_MAX_FILES — apply the
-        # dir/skip filter BEFORE the cap, not after. The demonstrated starvation
-        # (django-16454): _walk_glob yields directories too, and Django's locale tree is
-        # mostly dirs + skipped blobs, so the 5000-slot budget was exhausted on entries
-        # that can never match before the walk ever reached django/core/, and the target
-        # symbol (position ~3,195 among real files) sat in an unsearched file. Filtering
+        # dir/skip filter BEFORE the cap, not after. The demonstrated starvation:
+        # _walk_glob yields directories too, and a locale tree is mostly dirs + skipped
+        # blobs, so the 5000-slot budget was exhausted on entries that can never match
+        # before the walk ever reached the source root, and the target symbol
+        # (position ~3,195 among real files) sat in an unsearched file. Filtering
         # first roughly doubles the effective reach on a dir-heavy tree.
         fast = _walk_glob(path, glob)
         if fast is None:
@@ -1629,9 +1629,9 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
     if not out:
         # State the searched scope, and NEVER hide truncation on the zero-match path:
         # a capped walk that returns a bare "[no matches]" is a confident lie — the
-        # demonstrated failure (django-14007): the tree exceeded GREP_MAX_FILES, the
-        # issue's own symbol lived in an unsearched file, and the model stalled out
-        # trusting the empty result.
+        # demonstrated failure: the tree exceeded GREP_MAX_FILES, the task's own
+        # symbol lived in an unsearched file, and the model stalled out trusting the
+        # empty result.
         if not levers.enabled("grep_zero_match_notice"):
             return "[no matches]"  # legacy arm: the confident lie, for ablation
         scope = path if path not in (".", "") else "the current directory"

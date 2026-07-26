@@ -161,7 +161,7 @@ def test_update_work_flags():
     check("write_todos leaves edit flags clean", me4 is False and ue4 is False)
 
     # A clean working-tree REVERT un-lands the edit: made_edit AND unverified_edit both
-    # go False so the no-empty-diff gate re-fires (matplotlib-20676 empty-diff hole).
+    # go False so the no-empty-diff gate re-fires (the measured empty-diff hole).
     for cmd in ("git checkout .", "git checkout -- foo/bar.py", "git restore .",
                 "git reset --hard HEAD", "git stash", "git checkout src/mod/x.py"):
         _, me_r, ue_r = update_work_flags(
@@ -590,7 +590,7 @@ def test_degenerate_tail():
     big_unit = ("x" * 300 + " different filler words here ") * 20
     check("over-long short-text unit out of scope", not degenerate_tail(big_unit))
     # Coarse tier: a block whose period is BETWEEN the fine cap (256) and the coarse cap
-    # (3072), repeated to fill the 12KB+ tail, IS caught — the django-14404 reasoning-loop
+    # (3072), repeated to fill the 12KB+ tail, IS caught — the measured reasoning-loop
     # the fine tier was blind to. The block has no short internal period, so only the
     # coarse tier can see it.
     block = " ".join(f"clause {i} of one paragraph with no short internal repeat"
@@ -846,7 +846,7 @@ def test_bash_result_verifies_ignores_trivial_checks():
 
 def test_bash_result_verifies_requires_executing_command():
     """Iter-2: only a command that plausibly RUNS code can clear
-    unverified_edit. The sphinx-7440 false-green: `sed -n '307,308p' std.py | cat -A`
+    unverified_edit. The measured false-green: `sed -n '307,308p' std.py | cat -A`
     exited 0 with output and 'verified' an edit that didn't even parse — disarming
     the verify nudge, the done rejection AND the landing nudge at once."""
     # Display/plumbing commands never verify, however cleanly they exit.

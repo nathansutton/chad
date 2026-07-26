@@ -30,7 +30,7 @@ _XML_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTA
 _INT_PARAMS = {"offset", "limit", "timeout"}
 # Hybrid dialect: a JSON-style `{"name": "bash"` opener followed by XML-style
 # `<parameter=…>…</parameter>` blocks — NOT the `<function=name>` form. Quantized Ornith
-# emits this constantly under temp-1.0 sampling (30 occurrences in one benchmark run), most
+# emits this constantly under temp-1.0 sampling (30 occurrences in a single run), most
 # often as `<tool_call>{"name": "bash" <parameter=command>…</parameter></function>`.
 # Neither the JSON path (the `{…}` never closes, so brace-matching yields nothing) nor the
 # XML path (no `<function=`) matches it, so a fully-specified call — command and all — was
@@ -41,8 +41,8 @@ _HYBRID_NAME_RE = re.compile(r"""\{\s*["']name["']\s*:\s*["']([^"']+)["']""")
 # starts as JSON but doesn't end with `}` — the observed garble is JSON args that
 # never close, followed by XML-dialect closers (`…\n</parameter>\n</function>\n
 # </tool_call>`). _TAG_RE requires a trailing `}` so these never even reach
-# repair_json; count-dataset-tokens (2026-07-12 canary) died exactly here: a complete,
-# runnable bash command dropped, then the turn accepted as a final answer. Closed
+# repair_json; a canary run died exactly here: a complete, runnable bash command
+# dropped, then the turn accepted as a final answer. Closed
 # blocks only — an UNCLOSED block usually means generation truncated mid-content, and
 # running a half-emitted call is worse than the existing malformed-call nudge.
 _TAG_SALVAGE_RE = re.compile(r"<tool_call>\s*(\{.*?)\s*</tool_call>", re.DOTALL)

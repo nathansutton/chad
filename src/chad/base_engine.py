@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterable, Optional, Protocol, runtime_checkabl
 # Close-and-continue salvage: the marker injected to force-close a <think> run
 # that has blown past the ceiling, so decoding continues into the ACTION *in the same step*
 # — vs the soft think-cap, which ends the step and lets the next one re-derive the whole
-# reasoning (the 084 anti-fix: force-close-then-new-step measured 3.8x total think). Both
+# reasoning (the measured anti-fix: force-close-then-new-step cost 3.8x total think). Both
 # engines inject this same string: the MLX path tokenizes it and feeds the ids through the
 # append-only cache; the llama path hands it back as an assistant-prefix continuation.
 THINK_CLOSE = "\n</think>\n\n"

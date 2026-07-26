@@ -33,7 +33,7 @@ import numpy as np
 # But two module-level helpers here — `sweep_orphan_spills` and `peek_context_window` —
 # are MLX-free and ARE needed on the remote `--backend llama` path, which loads no
 # MLX at all. Guard the imports so `import chad.engine` succeeds on a non-Apple host (e.g.
-# inside a Linux benchmark container that runs chad against a remote server). `Engine`
+# inside a Linux container that runs chad against a remote server). `Engine`
 # itself is only ever CONSTRUCTED on the default MLX path, where these are present; if a
 # remote-only host somehow builds one, it fails fast on the first `mx.` use.
 try:
@@ -1214,8 +1214,8 @@ class Engine:
 
         `think_ceiling` is accepted for signature parity but NOT wired here: this path
         is greedy (temp==0) only, whereas the think-spiral close-and-continue targets a
-        temp>0 sampling pathology — the benchmark arm runs the llama backend, and
-        the interactive MLX default falls to the main `generate` decode loop above."""
+        temp>0 sampling pathology — that arm runs the llama backend, and the
+        interactive MLX default falls to the main `generate` decode loop above."""
         common = self._sync_to(prompt_ids)
         suffix = prompt_ids[common:]
         stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)

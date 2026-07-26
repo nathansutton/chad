@@ -117,7 +117,7 @@ def test_opt_out():
 
 def test_symbol_edit():
     # A symbol replacement that produces invalid Python is REJECTED and reverted (plan
-    # 073), and the message says the error is in the model's own code.
+    # the line-addressed class), and the message says the error is in the model's own code.
     p = _tmp("mod.py", "def area(w, h):\n    return w * h\n")
     res = tools.symbols.service().replace_symbol("area", "def area(w, h):\n    return w *", path=p)
     check("symbol bad replace rejected", res.startswith("[edit rejected"), res)

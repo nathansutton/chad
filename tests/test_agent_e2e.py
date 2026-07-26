@@ -403,8 +403,8 @@ def test_step_cap_stops_and_banks_note_without_progress(tmp_path):
 
 def test_no_empty_diff_gate_blocks_prose_end_on_action_task(monkeypatch):
     """An ACTION task whose model stalls into prose 'final answers' (the measured bail
-    signature: django-14007/sphinx-9230 accepted a 'Let me search…' sentence as the
-    final answer with an EMPTY diff and 97% of budget unused) must end as a resumable
+    signature: a 'Let me search…' sentence accepted as the final answer with an EMPTY
+    diff and 97% of budget unused) must end as a resumable
     hard stop with a progress note — never as a silent success. (This test is about
     the GATE; the churn handoff would insert one audit bounce first — its own
     coverage lives in test_done_audit.py.)"""
@@ -425,8 +425,8 @@ def test_no_empty_diff_gate_blocks_prose_end_on_action_task(monkeypatch):
 
 def test_no_empty_diff_gate_blocks_done_with_unverified_edit(tmp_path, monkeypatch):
     """`done` after the verify nudges are exhausted, with an edit in tree and no
-    successful run since (matplotlib-25332 r3: done at 84s, zero post-edit commands
-    succeeded, no guard fired) becomes a resumable hard stop. (Gate-focused: the
+    successful run since (measured: done at 84s, zero post-edit commands succeeded,
+    no guard fired) becomes a resumable hard stop. (Gate-focused: the
     churn handoff — one audit bounce before this stop — is disabled here and
     covered in test_done_audit.py.)"""
     monkeypatch.setenv("CHAD_DISABLE", "audit_churn_handoff")
@@ -463,7 +463,7 @@ def test_prose_answer_still_ends_read_only_turns(tmp_path):
 
 
 def test_bash_mutation_triggers_syntax_recheck(tmp_path, monkeypatch):
-    """Iter-2 (sphinx-7440): bash can rewrite files (sed -i and friends)
+    """Iter-2: bash can rewrite files (sed -i and friends)
     but used to bypass the edit-tool syntax gate — a file survived 9 blind 'fixes'
     unparseable and nothing said so. A bash step that mutates a file edited this
     turn must get a parse warning appended to its result."""
@@ -488,9 +488,9 @@ def test_bash_mutation_triggers_syntax_recheck(tmp_path, monkeypatch):
 
 # --- backend-error resilience -------------------------------------
 # A transient llama.cpp fault used to escape run_turn and kill the process from
-# cli.main, forfeiting the rest of an unattended task's budget: the benchmark's
-# make-mips-interpreter died at 721s of a 1770s budget on a single 500
-# ("The model produced output that does not match the expected Content-only format").
+# cli.main, forfeiting the rest of an unattended task's budget — a measured run died
+# at 721s of a 1770s budget on a single 500 ("The model produced output that does not
+# match the expected Content-only format").
 
 class _FlakyEngine(ScriptedEngine):
     """Raises `BackendError(transient=...)` on the first `n_fail` generate calls, then
@@ -803,7 +803,7 @@ def test_turn_think_budget_restores_thinking_once_debt_paid(monkeypatch):
     # Two big-think stalls exhaust the budget (~29.4k vs 24k -> debt = 1 + 5.4k//3k
     # = 2 no-think steps owed); the model then STOPS thinking (plain tool-call turns
     # accrue zero think delta), so after the two owed steps are paid, thinking must
-    # RESTORE — the plan-107 fix over the v1.0.0 persistent mute, which stayed off for
+    # RESTORE — the fix over the v1.0.0 persistent mute, which stayed off for
     # the rest of the turn (break-filter-js: 26 straight no-think steps, garbled
     # landing calls, regressed a run1 pass).
     stall = "<think>" + "reasoning " * 50 + "</think>"

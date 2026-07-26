@@ -219,7 +219,7 @@ def test_structural_reindent(monkeypatch, tmp_path):
 # === group "iter6" =====================================================
 
 def test_syntax_revert(monkeypatch, tmp_path):
-    """The 073 corruption engine: replacing ONE physical line of a multi-line def
+    """The line-addressed corruption engine: replacing ONE physical line of a multi-line def
     signature with a fragment. ON: rejected, file intact. OFF: warn-and-land."""
     n = bite("syntax_revert")
     p = str(tmp_path / "s.py")
@@ -505,9 +505,9 @@ def test_subagent_budget_note(monkeypatch, tmp_path):
 # === group "iter8" =====================================================
 
 def test_ts_edit_revert(monkeypatch, tmp_path):
-    """The vm.js/ars.R class: a targeted edit breaks a clean non-Python file. ON:
-    rejected, file intact. OFF: warn-and-land — the corruption that compounded through
-    6-20 follow-up edits to reward-zero benchmark tasks."""
+    """A targeted edit breaks a clean non-Python file. ON: rejected, file intact.
+    OFF: warn-and-land — the corruption that compounded through 6-20 follow-up edits
+    into an unrecoverable tree."""
     n = bite("ts_edit_revert")
     before = "int main(){ return 0; }\n"
     on(monkeypatch)

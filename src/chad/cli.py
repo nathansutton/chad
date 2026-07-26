@@ -226,7 +226,7 @@ def _preflight(backend="mlx"):
     """chad's default in-process engine runs only on Apple Silicon — MLX has no CPU/CUDA
     build. Hard-stop with a human message instead of letting `uv sync`/import fail
     cryptically elsewhere. The remote backend (`--backend llama`) loads NO MLX —
-    only a tokenizer plus HTTP — so it runs anywhere (e.g. inside a Linux benchmark
+    only a tokenizer plus HTTP — so it runs anywhere (e.g. inside a Linux
     container reaching a remote server); skip the Apple-Silicon gate for it."""
     if backend == "llama":
         return
@@ -483,12 +483,12 @@ def _agent_parser():
     # The unattended-run governor cluster (think ceiling, turn budgets, auto-continue,
     # review pass) is env-only: CHAD_THINK_CEILING / CHAD_TURN_BUDGET_TOKENS /
     # CHAD_TURN_BUDGET_S / CHAD_AUTO_CONTINUE / CHAD_REVIEW_PASS. The only thing that ever
-    # sets them is a benchmark harness, which already builds a CHAD_* env dict, and five
+    # sets them is an automated runner, which already builds a CHAD_* env dict, and five
     # knobs no interactive user has wanted were most of what made `--help` unreadable.
     # Backend selection. Default 'mlx' is the in-process engine and the whole point of
     # chad; 'llama' drives a llama.cpp server's raw /completion with token-id prompts +
     # real cache telemetry (see completion_engine.py) — the arm used when chad runs inside
-    # a Linux benchmark container against a remote server. The MLX path below is untouched
+    # a Linux container against a remote server. The MLX path below is untouched
     # when --backend is unset.
     ap.add_argument("--backend", choices=("mlx", "llama"), default="mlx",
                     help="inference backend: 'mlx' (default, in-process KV cache) or "

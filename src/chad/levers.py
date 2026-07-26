@@ -28,7 +28,8 @@ can price one bundle without paying for the others.
   REGRESSION_GUARD  the change fixes a demonstrated bug, and OFF restores that bug. A
                  grep that reports "[no matches]" on a tree it never finished walking is
                  a lie, not a configuration. These exist to be *measured*, never shipped
-                 off, and `--levers` says so out loud so nobody wires one into a preset.
+                 off, and `chad levers` says so out loud so nobody wires one into a
+                 preset.
 """
 
 import os
@@ -45,9 +46,10 @@ class Lever:
     kind: str = BEHAVIOR
 
 
-# Keep each description accurate enough that `chad --levers` is a readable inventory of
+# Keep each description accurate enough that `chad levers` is a readable inventory of
 # what the harness does beyond a bare model call. It is the artifact a reviewer reads to
-# judge whether a benchmark number came from the model or the scaffolding.
+# judge how much of the agent's behavior comes from the model and how much from the
+# scaffolding around it.
 LEVERS: dict[str, Lever] = {
     # --- group "iter2": implemented from the overnight forensics; only ever measured
     #     on the 7 tasks it was derived from, never on the other 23. --------------
@@ -80,7 +82,7 @@ LEVERS: dict[str, Lever] = {
     "grep_zero_match_notice": Lever(
         "grep states its searched scope and never hides truncation on the zero-match "
         "path. OFF restores the bare '[no matches]' LIE on a tree grep never finished "
-        "walking — the root trigger of the django-14007 failure.",
+        "walking — the root trigger of the measured zero-match stall.",
         "iter2", REGRESSION_GUARD),
     "syntaxgate_revert": Lever(
         "An edit that introduces an indentation/syntax error is REVERTED, not merely "
@@ -123,8 +125,9 @@ LEVERS: dict[str, Lever] = {
         "model to re-read the task and confirm every required deliverable exists at the "
         "exact path/format the task asked for (check with ls/cat/test), fixing anything "
         "missing or wrong first. Fires once per turn. Targets the 'declared victory with "
-        "budget to spare, wrong output format' losses (one benchmark task wrote directories "
-        "where files were required; bn-fit-modify 8/9). OFF accepts the first done as-is.",
+        "budget to spare, wrong output format' losses — writing directories where files "
+        "were required, or passing 8 of 9 checks on a format mismatch. OFF accepts the "
+        "first done as-is.",
         "iter3"),
 
     # --- uncommitted at the time of writing; likewise unmeasured. ------------------
@@ -156,7 +159,7 @@ LEVERS: dict[str, Lever] = {
         "replace_lines/insert_lines results echo the changed region with its POST-edit "
         "line numbers plus a shift note, so follow-up edits re-anchor on numbers the "
         "model has actually seen instead of reusing the ones from a pre-edit read (the "
-        "073 stale-number failure that conflated two adjacent defs).",
+        "measured stale-number failure that conflated two adjacent defs).",
         "iter6"),
     "stale_file_guard": Lever(
         "replace_lines/insert_lines reject-once, with a fresh numbered view of the "
@@ -178,17 +181,18 @@ LEVERS: dict[str, Lever] = {
         "AttributeError shipped without a word).",
         "iter7"),
 
-    # --- group "iter8": the validate-before-write choke point, from the lydia
-    #     teardown + the two-corpus trace sweep (320 dogfood sessions / 304 benchmark
-    #     trajectories): broken code LANDED 4x more often than it was rejected, 51/55
-    #     benchmark landings came through warn-only write, and non-Python files had no
-    #     revert at all (vm.js / ars.R compounded to reward-zero tasks). ---------------
+    # --- group "iter8": the validate-before-write choke point, from a 624-session
+    #     trace sweep: broken code LANDED 4x more often than it was rejected, 51/55
+    #     landed breaks came through warn-only write, and non-Python files had no
+    #     revert at all (a JS and an R file each compounded into an unrecoverable
+    #     tree). ---------------------------------------------------------------------
     "ts_edit_revert": Lever(
-        "Extends the 073 edit revert beyond Python: a targeted edit that takes a file "
+        "Extends the Python edit revert to every parseable language: a targeted edit "
+        "that takes a file "
         "with zero tree-sitter ERROR/MISSING nodes to one with any is REVERTED. Dirty "
         "baselines stay editable; no-grammar files are never blocked. OFF restores "
-        "warn-and-land on non-Python code — the measured make-mips-interpreter vm.js "
-        "break that six follow-up edits then compounded to a reward-zero task.",
+        "warn-and-land on non-Python code — the measured JS break that six follow-up "
+        "edits then compounded into an unrecoverable tree.",
         "iter8", REGRESSION_GUARD),
     "write_gate": Lever(
         "Whole-file write refuses content that would newly break the parse (existing "
@@ -196,7 +200,7 @@ LEVERS: dict[str, Lever] = {
         "already-broken file stays overwritable as the repair path, and a new "
         "tree-sitter-language file only warns (grammar-quirk risk). OFF restores the "
         "warn-only write that delivered 51 of the 55 landed syntax breaks in the "
-        "benchmark trace sweep.",
+        "trace sweep.",
         "iter8", REGRESSION_GUARD),
     "broken_streak_steer": Lever(
         "After 2+ consecutive landed mutations that leave a Python file unparseable "
@@ -210,14 +214,14 @@ LEVERS: dict[str, Lever] = {
         "idea; targets the lost-track-of-file-state no-op/loop episodes.",
         "iter8"),
 
-    # --- group "iter9" (deadline awareness): the adapter passes the wall budget
-    #     down (CHAD_TURN_BUDGET_S = cap-60), so the governor arms on every run. This
+    # --- group "iter9" (deadline awareness): an unattended runner passes the wall
+    #     budget down (CHAD_TURN_BUDGET_S), so the governor arms on every run. This
     #     lever is the wrap-up NUDGE that rides on top of it. -------------------------
     "wrapup_window": Lever(
         "One-shot wall-clock steering note in the turn's final stretch (remaining <= "
         "max(120s, 15% of the wall budget)): stop exploring and land your best answer "
         "before the force-stop. Distinct from the governor's no-progress hard-stop — this "
-        "fires even on a productive turn so it commits a scored partial instead of being "
+        "fires even on a productive turn so it commits a usable partial instead of being "
         "SIGKILLed mid-edit. Only active when a wall budget is configured; off with the "
         "governor (CHAD_NO_GOVERNOR).",
         "iter9"),
@@ -235,23 +239,23 @@ LEVERS: dict[str, Lever] = {
         "iter9"),
 
     # --- Done-audit: the largest measured fail bucket (20/43)
-    #     was dones claiming SPECIFIC verification the hidden checker rejected — the
-    #     model verifies a WEAKER predicate than the task's own wording, with huge
-    #     unused budget (kv-store-grpc done at 84s of 900), and done_spec_recheck was
-    #     ON for every one of them. -----------------------------------------------
+    #     was dones claiming SPECIFIC verification that did not hold up — the model
+    #     verifies a WEAKER predicate than the task's own wording, with huge unused
+    #     budget (one run declared done at 84s of a 900s wall), and done_spec_recheck
+    #     was ON for every one of them. ---------------------------------------------
     "done_audit": Lever(
         "Bounce a would-otherwise-be-accepted `done` ONCE per turn (turns that did real "
         "work, with wall runway to spare) with the task statement's own requirement "
         "lines quoted verbatim plus stat-level facts about every path the task names, "
-        "then accept the next `done` unconditionally (the 070 anti-spiral latch). "
+        "then accept the next `done` unconditionally (the anti-spiral latch). "
         "Supersedes the generic done_spec_recheck steer while enabled — stacking both "
         "would force two bounces per turn. OFF restores the done_spec_recheck path.",
         "iter10"),
 
-    # --- (turn-level think budget): the 086 ceiling watches any ONE generation
-    #     and is blind to a turn that death-by-a-thousand-cuts its way to a wall-death
-    #     across many separate thinks under that ceiling (dna-assembly: 123k total across
-    #     13 thinks, no single one >= 6k). This watches CUMULATIVE turn think-spend
+    # --- (turn-level think budget): the per-generation think ceiling watches any ONE
+    #     generation and is blind to a turn that death-by-a-thousand-cuts its way to a
+    #     wall-death across many separate thinks under that ceiling (measured: 123k
+    #     total across 13 thinks, no single one >= 6k). This watches CUMULATIVE
     #     instead. Only active when a wall budget is configured (self._turn_budget_s) —
     #     off entirely in interactive/unmetered runs, like wrapup_window. -------------
     "turn_think_budget": Lever(
@@ -261,19 +265,21 @@ LEVERS: dict[str, Lever] = {
         "tokens (guardrails.turn_think_throttle), so thinking restores when the model "
         "stops over-spending; a blanket rest-of-turn mute regressed run1 passes with "
         "garbled no-think tails. Acts only at step boundaries on fresh "
-        "generations, never an in-flight one (086's lesson). Off in plan mode, for "
+        "generations, never an in-flight one (the per-generation ceiling's lesson). "
+        "Off in plan mode, for "
         "read-only-intent turns, and below a 300s wall budget (short relaunch tails "
         "belong to hard_wrapup). Only active with a wall budget configured.",
         "iter11"),
 
-    # --- (103 hard wrap-up): the 085 wrapup_window nudge only lands at a step
-    #     boundary and fired 3/89 (0 rescued) because the model is usually buried in one
-    #     long generation when the window opens. This aborts that generation mid-stream. --
+    # --- (hard wrap-up): the wrapup_window nudge only lands at a step boundary and
+    #     fired in 3 measured runs, rescuing none, because the model is usually buried
+    #     in one long generation when the window opens. This aborts it mid-stream. -----
     "hard_wrapup": Lever(
         "At the wall deadline (within max(90s, 10% of the budget)) ABORT the in-flight "
         "generation mid-stream and force ONE time-boxed, no-think landing turn that writes "
-        "each deliverable to its exact path before the harness SIGKILLs the task — the "
-        "mid-generation backstop the 085 step-boundary nudge (3/89, 0 rescued) can't be. "
+        "each deliverable to its exact path before the runner SIGKILLs the task — the "
+        "mid-generation backstop the step-boundary nudge (3 firings, 0 rescued) can't "
+        "be. "
         "Only active with a wall budget configured; inert in interactive/unmetered runs.",
         "iter12"),
 
@@ -374,11 +380,11 @@ LEVERS: dict[str, Lever] = {
         "One system-prompt block steering the FINAL verification at the task's own "
         "stated acceptance check (run the named command/test end-to-end and read its "
         "output) instead of a proxy like file-existence or grep-counting, with a "
-        "WRONG/CORRECT pair. The measured class: of 42 failed trials that took a "
+        "WRONG/CORRECT pair. The measured class: of 42 failed runs that took a "
         "done-audit bounce, 38 did re-verify afterwards — with a weaker or wrong "
         "check — and still shipped a bad solution, most with over 80% of the wall "
-        "unused; a harness-side predicate cannot judge check quality (plan-112(b) "
-        "closed), so this steers the choice upstream where it is made. Rides the "
+        "unused; a harness-side predicate cannot judge check quality, so this steers "
+        "the choice upstream where it is made. Rides the "
         "cached prefix; OFF removes the block byte-exactly.",
         "iter15"),
     "scoped_destructive_guard": Lever(
@@ -389,7 +395,7 @@ LEVERS: dict[str, Lever] = {
         "refused and how to narrow the delete. In a container every real path is "
         "absolute, so the legacy shape denied ordinary scoped deletes "
         "(`rm -rf /tmp/test-deploy`) as '[denied by user]' — the measured cost: 152 "
-        "denials across 26 trials, one turn re-phrasing the same delete 30 times. "
+        "denials across 26 sessions, one turn re-phrasing the same delete 30 times. "
         "Also screens every rm target in a compound command, not just the first "
         "(a strictly wider net than legacy on multi-target commands). mkfs / "
         "dd-to-device / fork-bomb / curl|sh screens are untouched. OFF restores the "
@@ -495,6 +501,6 @@ def in_group(group: str) -> list[str]:
 
 
 def as_dict() -> dict:
-    """JSON-serializable registry for `chad --levers` / the ablation driver."""
+    """JSON-serializable registry for `chad levers` / the ablation driver."""
     return {n: {"description": lv.description, "group": lv.group, "kind": lv.kind}
             for n, lv in LEVERS.items()}

@@ -4,7 +4,7 @@ WHAT THIS IS
 ------------
 chad's one remote backend: the same agent loop (guardrails, validate/repair, symbolic
 tools, edit cascade) driving a llama.cpp server instead of the in-process MLX engine —
-the arm used when chad runs inside a Linux benchmark container against a GGUF served on a
+the arm used when chad runs inside a Linux container against a GGUF served on a
 GPU box, where MLX can't run. It talks to llama.cpp's native `/completion` endpoint
 rather than a generic `/v1/chat/completions` one, which avoids the two costs a chat
 endpoint would force — DETOKENIZING chad's rendered ids into text the server then
