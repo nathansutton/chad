@@ -464,6 +464,11 @@ class ChadAgent(BaseAgent):
         env = {
             "CHAD_MODEL": model or "",
             "CHAD_NO_SKILLS": "1",          # no personal-skill leakage into benchmark prompts
+            # The diagnostic session log is opt-in (config.traces_enabled: privacy-first OFF
+            # for a local single-user agent). Evals must opt in explicitly, or `session_c`
+            # below downloads a file chad never wrote and every mechanism metric silently
+            # reads zero. Safe here: the container is throwaway and the log is redacted.
+            "CHAD_SESSION_LOG": "1",
             "CHAD_PREFILL_TRACE": trace,
             "CHAD_TRAJECTORY_JSON": traj_c,   # ATIF-v1.7; required for passing trials
             "CHAD_TEMP": self._temp,        # TB2 reference sampling temperature

@@ -98,10 +98,11 @@ Notable, user-visible changes.
   it had none — the one drift the server exists to eliminate. The three now travel as a
   single shared call the CLI and the server both make, so they cannot drift apart again.
 
-## [1.0.5] — 2026-07-24
+## [1.0.5] — 2026-07-25
 
-Completion and reasoning-budget accuracy, plus an opt-in for long-running commands.
-Each behavior change is individually reversible via `CHAD_DISABLE`.
+Completion and reasoning-budget accuracy, long-running commands that survive their
+timeout, and a destructive-command guard that stops crying wolf. Each behavior change
+is individually reversible via `CHAD_DISABLE`.
 
 - **A `done` with nothing landed gets the task's own requirements back, once.**
   Previously, ending a turn with no landed-and-verified change stopped the turn
@@ -123,6 +124,31 @@ Each behavior change is individually reversible via `CHAD_DISABLE`.
   and re-run from zero. Bounded by design — at most two at a time, an absolute
   lifetime each, and all of them terminated when chad exits or is signalled. A user
   interrupt still kills outright. (`bash_auto_background`)
+- **The destructive-command guard screens catastrophes, not cleanups.** The
+  recursive-delete check matched *any* absolute path, and in a headless container run
+  every real path is absolute — so ordinary scoped deletes like
+  `rm -rf /tmp/test-deploy` were refused, over and over, while the result claimed
+  `[denied by user]` when no user was there. The screen now fires on targets whose
+  loss is actually catastrophic — the filesystem root, top-level directories, home
+  trees at any depth, the whole cwd or its parent, a glob that empties a top-level
+  directory — and passes deeper scoped paths. It also screens every target of every
+  `rm` in a compound command, where the old single-target check saw only the first.
+  When it does block with nobody to ask, the result now says the guard (not a person)
+  refused, and how to narrow the delete. mkfs / dd-to-device / fork-bomb / `curl|sh`
+  screens are unchanged. (`scoped_destructive_guard`)
+- **Unattended runs no longer strand a third of their time budget.** Extra fresh
+  attempts after a stalled turn were only granted while more than half the wall
+  budget remained, so a task whose turns kept hitting the step cap ended for good
+  with 25-50% of its time unspent. Extras now keep flowing while more than a quarter
+  remains; the absolute relaunch ceiling and the minimum-remaining-time floor for
+  any relaunch are unchanged. (`late_continue_replenish`)
+- **The system prompt steers final verification at the task's own stated check.** A
+  model that was bounced for unverified work would usually re-verify — with a weaker
+  check than the task named (file-exists for a content requirement, a hand-rolled
+  probe instead of the stated command) — then finish wrong with most of its time
+  unused. One prompt block now says: run the named check end-to-end, read its output,
+  and treat existence as proof of nothing, with a WRONG/CORRECT pair.
+  (`steer_verify_specific`)
 
 Also fixed:
 
