@@ -450,8 +450,6 @@ CHAD_NO_PREFIX_CACHE=1      uv run chad  # measurement knob: drop the persistent
 CHAD_NO_SKILLS=1            uv run chad  # A/B knob: disable all Agent Skill discovery
 CHAD_NO_FASTPATH=1          uv run chad  # A/B knob: disable the fused-projection decode fast path
 CHAD_NO_QSDPA_SGM=1         uv run chad  # A/B knob: disable the split-head qKV attention tier
-CHAD_FUSED_LAYER=1          uv run chad  # opt IN to the fused GDN+MoE compiled layer step
-CHAD_NO_MLX_TUNING=1        uv run chad  # skip chad's tuned MLX runtime defaults
 CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbelt (unsafe)
 ```
 
@@ -504,15 +502,11 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
   the 9B's 4 keep the per-head path regardless), and it is bit-exact with the fallback —
   another speed-only bisection knob. `CHAD_NO_QSDPA=1` is the bigger hammer: it disables
   the fused kernel entirely.
-- **`CHAD_FUSED_LAYER`** — opts **in** to compiling each hybrid layer's GDN and MoE
-  bodies into a single region instead of two (`mlx_fastpath.py`). Off by default: it is
-  proven greedy-identical but not proven faster, and merging compile regions can cut
-  either way. Set it to measure; leave it unset otherwise.
-- **`CHAD_NO_MLX_TUNING`** — skips `mlx_env.apply_defaults()`, which sets tuned MLX
-  runtime vars before mlx is first imported (`mlx_env.py`). The tuned table currently
-  ships **empty** — nothing is applied until a `chad-bench --sweep` justifies an entry —
-  so today this knob is a no-op kept as the escape hatch for when it isn't. Any var you
-  export yourself always wins over a tuned default, with or without this.
+
+chad sets **no** `MLX_*` runtime variables, so there is nothing to opt out of:
+`MLX_METAL_FAST_SYNCH`, `MLX_MAX_OPS_PER_BUFFER` and `MLX_MAX_MB_PER_BUFFER` were each
+measured end-to-end on the 35B and every setting was *slower* than mlx's own defaults.
+Export them yourself if you want to experiment; mlx reads them directly.
 
 ### Dev & instrumentation
 

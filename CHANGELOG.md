@@ -2,7 +2,17 @@
 
 Notable, user-visible changes.
 
-## Unreleased
+## [1.0.5] — 2026-07-26
+
+The release that makes a 24 GB Mac a first-class target: it runs the 35B now, a Linux
+container can drive the real local MLX model through `chad serve` instead of a different
+quantization on a remote box, and the CLI surface is smaller and honest — `serve`, `prove`
+and `levers` are real subcommands, and five harness-only governor flags became `CHAD_*`
+env vars. Plus completion and reasoning-budget accuracy, long-running commands that
+survive their timeout, a destructive-command guard that stops crying wolf, and
+long-context decode throughput that ships to a `uvx` install — measured end-to-end on
+stock PyPI mlx, no custom wheel anywhere. Each behavior change is individually reversible
+via `CHAD_DISABLE`.
 
 - **24 GB Macs now get the 35B.** The 35B's floor was 32 GB because its working set
   SIGKILLed a 24 GB machine mid-turn. The fused attention kernel and the
@@ -97,13 +107,25 @@ Notable, user-visible changes.
   engine and read none of them, so a server started with a sampler config sampled as if
   it had none — the one drift the server exists to eliminate. The three now travel as a
   single shared call the CLI and the server both make, so they cannot drift apart again.
-
-## [1.0.5] — 2026-07-25
-
-Completion and reasoning-budget accuracy, long-running commands that survive their
-timeout, and a destructive-command guard that stops crying wolf. Each behavior change
-is individually reversible via `CHAD_DISABLE`.
-
+- **Long-context decode is faster on both models.** The fused attention kernel's
+  split factor now widens past 16k context instead of staying flat: measured
+  end-to-end (one process, interleaved arms, adopted only where the spread cleared
+  1.000), the 35B decodes **+1.5% at 32k** and +0.6% at 16k, the 9B **+0.5% at
+  32k**, both unchanged at 8k where flat was already optimal. It is the same math
+  on a different grid — the split only regroups the partials pass 2 combines — and
+  the widened tier gets its own kernel-vs-reference test plus a retile-agreement
+  case at that size.
+- **`CHAD_FUSED_LAYER` is removed.** The opt-in fused GDN+MoE compiled region was
+  measured on real weights against the two-call path it replaced and moved decode
+  1.001x-1.002x — indistinguishable from noise — so the code is gone rather than
+  shipped as a dead knob. The measurement lives in the source so the idea isn't
+  re-derived. Setting the var now does nothing.
+- **`CHAD_NO_MLX_TUNING` is removed, along with the tuning it disabled.** The `MLX_*`
+  runtime knobs (`MLX_METAL_FAST_SYNCH`, `MLX_MAX_OPS_PER_BUFFER`,
+  `MLX_MAX_MB_PER_BUFFER`) were swept on the 35B and every arm lost 1-4% at both 8k
+  and 32k, so chad now sets none of them and the module that applied them is gone
+  rather than shipped as an empty table with a flag to switch it off. mlx reads
+  these vars directly if you want to experiment.
 - **A `done` with nothing landed gets the task's own requirements back, once.**
   Previously, ending a turn with no landed-and-verified change stopped the turn
   immediately and banked a progress note — so the done-audit, which quotes the task

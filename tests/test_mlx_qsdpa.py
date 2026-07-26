@@ -114,6 +114,36 @@ def test_eligibility_gates():
     assert not mlx_qsdpa._eligible(q, empty, None)
 
 
+def test_pick_blocks_table():
+    """Below 16k both gqa tiers keep 32 (measured neutral-or-better). At
+    n >= 16384 the split widens to the measured end-to-end winner: 64 at gqa 8
+    (the retile's tier), 128 at gqa 4 (the 9B's per-head kernel). Always a
+    multiple of pass 2's BN=32."""
+    for gqa in (4, 8):
+        for n in (100, 8192, 16000):
+            assert mlx_qsdpa._pick_blocks(n, gqa=gqa) == 32
+    for n in (16384, 32000, 98304):
+        assert mlx_qsdpa._pick_blocks(n, gqa=8) == 64
+        assert mlx_qsdpa._pick_blocks(n, gqa=4) == 128
+    for n in (100, 16384, 99999):
+        for gqa in (4, 8):
+            assert mlx_qsdpa._pick_blocks(n, gqa) % 32 == 0
+
+
+@requires_healthy_kernel
+def test_gqa4_wide_split_matches_reference():
+    """The gqa-4 blocks=128 tier (n >= 16384) is a partials-slab shape no other
+    test reaches; the per-head kernel must still match the fp32 reference there."""
+    n = 16500
+    q, k, v = _make(n, mx.float16, hkv=4)
+    cache = _fill_cache(k, v, mx.float16)
+    assert mlx_qsdpa._pick_blocks(n, 4) == 128  # the tier under test
+    out = mlx_qsdpa.qsdpa(q, cache.keys, cache.values, SCALE, n)
+    ref = _reference(q, cache, n)
+    err = mx.abs(out.astype(mx.float32) - ref).max().item()
+    assert err < 2e-3, err
+
+
 @requires_healthy_kernel
 def test_install_patches_seam_and_matches():
     from mlx_lm.models import base as lm_base
@@ -218,12 +248,13 @@ def test_self_check_result_is_cached(monkeypatch):
 
 
 @requires_healthy_kernel
-@pytest.mark.parametrize("n", [2048, 4095, 5000, 8192, 12345])
+@pytest.mark.parametrize("n", [2048, 4095, 5000, 8192, 12345, 16500])
 def test_sgm_retile_agrees_with_per_head_kernel(n):
     """The simdgroup_matrix retile (n >= _SGM_MIN_N, gqa 8) and the per-head
     kernel are two schedules of identical math, so they must agree far more
     tightly than either agrees with the fp32 reference. Covers ragged tails
-    (n % 8 != 0) and n small enough to leave virtual blocks empty."""
+    (n % 8 != 0), n small enough to leave virtual blocks empty, and one n in
+    the blocks=64 tier (>= 16384) that real long-context decode runs in."""
     q, k, v = _make(n, mx.bfloat16, hkv=2)
     cache = _fill_cache(k, v, mx.bfloat16)
     kq = (cache.keys[0], cache.keys[1], cache.keys[2])

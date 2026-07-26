@@ -531,7 +531,7 @@ def _kernel_sgm():
     return _p1_sgm
 
 
-def _pick_blocks(n: int) -> int:
+def _pick_blocks(n: int, gqa: int = 8) -> int:
     """Split factor for the 2-pass scan. Pass 2 combines `blocks` partials per
     head, so this must stay a multiple of its BN=32.
 
@@ -548,9 +548,24 @@ def _pick_blocks(n: int) -> int:
         32768     0.354 ms   0.369 (256)  -4.1%
         98304     0.990 ms   1.078 (1024) -8.2%
 
-    Fewer than 32 is not available (pass 2's BN), and the curve is monotone up to
-    it, so there is no table left to write.
+    Fewer than 32 is not available (pass 2's BN), and the isolated curve is
+    monotone up to it — but the isolated curve is not the decision criterion
+    (see the module maxim), and end-to-end the answer moved when the retile
+    landed: the flat 32 above was tuned against the PER-HEAD kernel, while at
+    gqa 8, n >= _SGM_MIN_N the kernel is now the simdgroup retile, whose pass-1
+    partials are cheaper per block. Measured end-to-end on the real models (one
+    load, interleaved arms, median-of-4 paired rounds, spread clearing 1.000):
+
+        gqa 8 (35B): 64 is 1.006x+-0.002 @16k, 1.015x+-0.001 @32k; 1.000 @8k;
+                     128 is 0.995 @16k — worse than 64 everywhere it was tried.
+        gqa 4 (9B):  128 is 1.005x+-0.002 @32k; exactly 1.000 @16k; noise @8k.
+
+    Both tiers widen at n >= 16384: the largest measured-neutral point is 16000
+    and the wins start at the next measured context, so the boundary sits just
+    above the neutral evidence.
     """
+    if n >= 16384:
+        return 128 if gqa == 4 else 64
     return 32
 
 
@@ -568,7 +583,7 @@ def qsdpa(q: Any, k_quant: tuple, v_quant: tuple, scale: float, n: int) -> Any:
     B, HQ, S, D = q.shape
     HKV, NP = kw.shape[1], kw.shape[2]
     gqa = HQ // HKV
-    blocks = _pick_blocks(n)
+    blocks = _pick_blocks(n, gqa)
     scale_arr = mx.array([scale], dtype=mx.float32)
     _, p2 = _kernels()
 

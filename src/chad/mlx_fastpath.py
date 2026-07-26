@@ -249,11 +249,6 @@ def _install_layer_fastpath(model) -> None:
         layer._moe_fast = _compile_moe_step(layer)
         if layer.is_linear and hasattr(layer.linear_attn, "_fused_w"):
             layer._gdn_fast = _compile_gdn_step(layer)
-            # Opt-in until `chad-bench --sweep` says it pays on real weights:
-            # the synthetic-model test proves it is greedy-identical, not that it
-            # is faster, and merging compile regions can cut either way.
-            if config.flag("CHAD_FUSED_LAYER"):
-                layer._layer_fast = _compile_layer_step(layer)
 
     stock_layer_call = q35.DecoderLayer.__call__
 
@@ -264,12 +259,8 @@ def _install_layer_fastpath(model) -> None:
                 if (getattr(self, "_gdn_fast", None) is not None
                         and cache[0] is not None and cache[1] is not None
                         and cache.lengths is None):
-                    fused = getattr(self, "_layer_fast", None)
-                    if fused is not None:
-                        out, new_conv, new_rec = fused(x, cache[0], cache[1])
-                    else:
-                        h, new_conv, new_rec = self._gdn_fast(x, cache[0], cache[1])
-                        out = self._moe_fast(h)
+                    h, new_conv, new_rec = self._gdn_fast(x, cache[0], cache[1])
+                    out = self._moe_fast(h)
                     cache[0] = new_conv
                     cache[1] = new_rec
                     cache.advance(1)
@@ -292,39 +283,16 @@ def _compile_gdn_step(layer):
     return mx.compile(_gdn_body(layer))
 
 
-def _compile_layer_step(layer):
-    """GDN and MoE for one layer inside a SINGLE compiled region.
-
-    Installed separately because a GDN layer's decode step otherwise makes two
-    compiled calls, and the compiler cannot see across that boundary: the GDN's
-    closing residual add and the MoE's opening rms_norm read the same tensor back
-    to back and stay separate kernels. Decode on the 35B is dispatch-bound
-    (~9 us of launch/gap per kernel), so boundaries are the thing worth removing.
-
-    Both bodies are already pure state-in/state-out, so composing them is just
-    function application; the compiled region threads (conv, recurrent) through
-    unchanged, which keeps it compatible with the engine's snapshot/rewind (it
-    copies cache entries by reference).
-
-    Off by default; opt in with CHAD_FUSED_LAYER=1. The synthetic-model test proves
-    this is greedy-identical, not that it is faster, and merging compile regions can
-    cut either way — so it stays opt-in until a sweep says it pays on real weights.
-    """
-    import mlx.core as mx
-
-    gdn = _gdn_body(layer)
-    moe = _moe_body(layer)
-
-    def fwd(xin, conv_state, rec_state):
-        h, new_conv, new_rec = gdn(xin, conv_state, rec_state)
-        return moe(h), new_conv, new_rec
-
-    return mx.compile(fwd)
-
-
 def _moe_body(layer):
-    """post_attention_layernorm + full MoE block + residual, UNCOMPILED so it can
-    be composed into a larger compiled region (see _compile_layer_step)."""
+    """post_attention_layernorm + full MoE block + residual, UNCOMPILED so the
+    caller decides the compile region.
+
+    A single fused GDN+MoE region per layer (one mx.compile over both bodies) was
+    built and measured on the real 35B: 1.001x+-0.002 at 8k, 1.002x+-0.003 at 32k,
+    interleaved in one process — indistinguishable from the two-call path, so it
+    was removed rather than shipped as dead opt-in code. The compiler evidently
+    already keeps the boundary cheap; don't re-derive the idea without a new
+    measurement showing otherwise."""
     import mlx.core as mx
     import mlx.nn as nn
 

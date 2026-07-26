@@ -128,30 +128,3 @@ def test_wrong_architecture_is_noop():
     assert mlx_fastpath.install(NotAModel()) is False
 
 
-def test_fused_layer_step_matches_two_call_path(monkeypatch):
-    """The fused GDN+MoE region must be a pure scheduling change.
-
-    Merging two compiled regions lets the fuser combine the GDN's closing
-    residual with the MoE's opening rms_norm, which can shift bf16 rounding, so
-    this pins greedy token choices exactly and logits to rounding noise against
-    the two-call path it replaces.
-    """
-    monkeypatch.delenv("CHAD_FUSED_LAYER", raising=False)
-    two_call = build_tiny()
-    assert mlx_fastpath.install(two_call) is True
-    assert all(getattr(ly, "_layer_fast", None) is None
-               for ly in two_call.language_model.model.layers), \
-        "the fused region must be opt-in"
-    ref_ids, _ref_pre, ref_steps = greedy(two_call, PROMPT)
-
-    monkeypatch.setenv("CHAD_FUSED_LAYER", "1")
-    fused = build_tiny()
-    assert mlx_fastpath.install(fused) is True
-    assert any(getattr(ly, "_layer_fast", None) is not None
-               for ly in fused.language_model.model.layers), \
-        "CHAD_FUSED_LAYER=1 should install the fused region"
-    got_ids, _got_pre, got_steps = greedy(fused, PROMPT)
-
-    assert got_ids == ref_ids, "fused layer step changed greedy token choices"
-    worst = max(float(mx.abs(a - b).max()) for a, b in zip(ref_steps, got_steps))
-    assert worst < 5e-2, f"fused layer step drifted logits {worst}"
