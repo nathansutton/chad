@@ -222,7 +222,6 @@ lsp = [
 ]
 speech = [
     { name = "sounddevice" },
-    { name = "tiktoken" },
 ]
 
 [package.dev-dependencies]
@@ -247,7 +246,6 @@ requires-dist = [
     { name = "rustworkx", specifier = ">=0.15" },
     { name = "serena-agent", marker = "extra == 'lsp'", specifier = ">=1.5" },
     { name = "sounddevice", marker = "extra == 'speech'", specifier = ">=0.5" },
-    { name = "tiktoken", marker = "extra == 'speech'", specifier = ">=0.11" },
     { name = "transformers", specifier = ">=5.0,<5.13" },
     { name = "tree-sitter", specifier = ">=0.26.0" },
     { name = "tree-sitter-language-pack", specifier = ">=1.12.2" },

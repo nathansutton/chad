@@ -82,16 +82,14 @@ highlight = ["pygments>=2.17"]
 # Install with `uv sync --extra lsp`.
 lsp = ["serena-agent>=1.5"]
 # Voice mode (/speech in the TUI): push-to-talk dictation via chad's vendored
-# Whisper-on-MLX (src/chad/whisper — the PyPI mlx-whisper hard-requires torch,
-# ~2 GB of dead weight for MLX-format weights) + spoken replies via macOS `say`.
-# All on-device, nothing leaves the machine. mlx/numpy/huggingface-hub are
-# already core deps, so the extra adds only the mic (sounddevice/PortAudio) and
-# Whisper's tokenizer (tiktoken). Optional and import-guarded in speech.py:
-# absent, /speech prints the install hint and everything else is untouched.
-# Install with `uv sync --extra speech`.
+# Parakeet-on-MLX (src/chad/parakeet — the PyPI parakeet-mlx drags librosa's
+# numba/scipy tree for one mel-filterbank call) + spoken replies via macOS
+# `say`. All on-device, nothing leaves the machine. mlx/numpy/huggingface-hub
+# are already core deps, so the extra adds only the mic (sounddevice/PortAudio).
+# Optional and import-guarded in speech.py: absent, /speech prints the install
+# hint and everything else is untouched. Install with `uv sync --extra speech`.
 speech = [
     "sounddevice>=0.5",
-    "tiktoken>=0.11",
 ]
 
 # The one entrypoint: `uv run chad`. (`chad-bench` reproduces docs/benchmarks.md.)
@@ -122,12 +120,10 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# Vendored whisper's runtime data (mel filterbank + tiktoken vocabs, ~1.6 MB):
-# tokenizer.py/audio.py resolve them relative to __file__, so they must ship
-# inside the wheel or /speech dies on first use of an installed chad.
+# The vendored Parakeet code is Apache-2.0; its license text must travel with
+# the code, wheel included.
 [tool.setuptools.package-data]
-"chad.whisper" = ["assets/*"]
-
+"chad.parakeet" = ["LICENSE"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # No "-q" here: CI/docs/agents all invoke `pytest -q` explicitly, and stacking the two
@@ -149,10 +145,10 @@ select = ["F", "E9", "I"]
 ignore = ["E741"]  # ambiguous var names (l/I) appear in existing math code
 
 [tool.ruff.lint.per-file-ignores]
-# Vendored upstream (see chad/whisper/__init__.py), kept byte-close for future
-# re-syncs: F821 is upstream's quoted "Whisper" forward refs to a class it never
-# imports; F841 is locals orphaned by cutting the word-timestamps path.
-"src/chad/whisper/*" = ["F821", "F841"]
+# Vendored upstream (see chad/parakeet/__init__.py), kept byte-close for
+# future re-syncs — not held to chad's own lint standard. (F401: imports left
+# in place for upstream fidelity after the transcribe(path) cut.)
+"src/chad/parakeet/*" = ["F401", "F821", "F841", "E741"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -170,9 +166,9 @@ disable_error_code = ["var-annotated"]
 # follow-up once this baseline holds.
 
 [[tool.mypy.overrides]]
-# Vendored upstream inference code (see chad/whisper/__init__.py) predates types;
-# it is not held to chad's gate so re-syncs stay a plain re-copy.
-module = "chad.whisper.*"
+# Vendored upstream inference code (see chad/parakeet/__init__.py) is not held
+# to chad's gate so re-syncs stay a plain re-copy.
+module = "chad.parakeet.*"
 ignore_errors = true
 
 [[tool.mypy.overrides]]

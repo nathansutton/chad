@@ -1,12 +1,13 @@
 """All-local speech I/O for the TUI: push-to-talk dictation + spoken replies.
 
-Nothing here leaves the machine. STT is Whisper on MLX — chad's own vendored
-copy (chad.whisper), same stack as the coding model, weights in the shared
-Hugging Face cache; TTS is macOS `say`, which synthesizes on-device. The audio
-deps are optional: the module imports clean without them, and `available()`
-reports what's missing so the TUI can print an install hint instead of crashing.
+Nothing here leaves the machine. STT is Parakeet TDT on MLX — chad's own
+vendored copy (chad.parakeet), same stack as the coding model, weights in the
+shared Hugging Face cache; TTS is macOS `say`, which synthesizes on-device.
+The one audio dep (sounddevice) is optional: the module imports clean without
+it, and `available()` reports what's missing so the TUI can print an install
+hint instead of crashing.
 
-The heavy imports (sounddevice pulls PortAudio, chad.whisper loads MLX) are
+The heavy imports (sounddevice pulls PortAudio, chad.parakeet loads MLX) are
 deferred to first use — `/speech` off must cost nothing, and touching MLX at
 import time would slow the banner for every non-speech session.
 """
@@ -19,18 +20,36 @@ import subprocess
 import threading
 from collections import deque
 
-# whisper-small is the default: ~460 MB once, and the accuracy step over base
-# is the difference between dictation you send and dictation you retype (base
-# mishears function words and loops more readily on imperfect audio). Larger
-# still (whisper-large-v3-turbo) is better again at ~1.6 GB download + wired
-# memory — which matters when a 35B is already resident. Env-overridable, not
-# a flag: it's a per-machine fit, not a per-session choice.
-DEFAULT_STT_MODEL = "mlx-community/whisper-small-mlx"
-SAMPLE_RATE = 16_000  # what Whisper was trained on; record at it, no resample
+# Parakeet TDT v3 (0.6B, multilingual): the engine Hex ships as its default,
+# and for the same reasons — a class faster than Whisper per clip, better
+# dictation accuracy, and a TDT decoder without Whisper's repetition-loop
+# hallucination mode. One-time ~2.5 GB download (the repo stores fp32;
+# from_pretrained casts to bf16, ~1.2 GB resident); the tokenizer vocabulary
+# rides inside the repo's config.json, so no vocab files ship with chad.
+# Env-overridable, not a flag: a per-machine fit, not a per-session choice.
+DEFAULT_STT_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
+SAMPLE_RATE = 16_000  # what the ASR models are trained on; record at it
 
 
 def stt_model() -> str:
-    return os.environ.get("CHAD_WHISPER_MODEL", DEFAULT_STT_MODEL)
+    return os.environ.get("CHAD_STT_MODEL", DEFAULT_STT_MODEL)
+
+
+def stt_quant_bits():
+    """Load-time quantization width for the STT weights; None = keep bf16.
+
+    Default 8: A/B'd against bf16 on a 24-clip multi-voice battery — 21/24
+    transcripts byte-identical, the rest case/spacing-level (twice the 8-bit
+    output was the *more* correct one), 786 MB resident vs 1296, and ~40%
+    faster decode (the decoder is memory-bound). CHAD_STT_QUANT=4 halves
+    memory again (514 MB, equally clean on the battery) but synthetic clean
+    audio can't rule out degradation on noisy mics — opt-in, not default."""
+    raw = os.environ.get("CHAD_STT_QUANT", "8").strip().lower()
+    if raw in ("", "0", "16", "none", "off", "bf16"):
+        return None
+    if raw in ("4", "8"):
+        return int(raw)
+    raise ValueError(f"CHAD_STT_QUANT must be 8 (default), 4, or none — got {raw!r}")
 
 
 def model_cached() -> bool:
@@ -40,8 +59,9 @@ def model_cached() -> bool:
     if os.path.isdir(stt_model()):
         return True
     try:
-        from huggingface_hub import snapshot_download
-        snapshot_download(repo_id=stt_model(), local_files_only=True)
+        from huggingface_hub import hf_hub_download
+        for f in ("config.json", "model.safetensors"):  # what from_pretrained loads
+            hf_hub_download(stt_model(), f, local_files_only=True)
         return True
     except Exception:
         return False
@@ -62,14 +82,9 @@ def available():
             missing.append("sounddevice")
     except (ImportError, ValueError):
         missing.append("sounddevice")
-    try:
-        if find_spec("tiktoken") is None:  # the one dep chad.whisper's tokenizer adds
-            missing.append("tiktoken")
-    except (ImportError, ValueError):
-        missing.append("tiktoken")
     if missing:
         return False, (f"speech needs {' + '.join(missing)} — install with "
-                       f"`uv sync --extra speech` (all local: Whisper-on-MLX STT, "
+                       f"`uv sync --extra speech` (all local: Parakeet-on-MLX STT, "
                        f"macOS `say` TTS)")
     return True, ""
 
@@ -232,7 +247,7 @@ class Speaker:
 
 
 # ---------------------------------------------------------------------------
-# STT: microphone capture (sounddevice) -> mlx-whisper transcription.
+# STT: microphone capture (sounddevice) -> Parakeet-on-MLX transcription.
 # ---------------------------------------------------------------------------
 
 class Recorder:
@@ -344,35 +359,55 @@ class Recorder:
             self._frames = []
 
 
+_stt = {}  # {model_id: loaded chad.parakeet model} — load once per process
+
+
 def transcribe(audio) -> str:
-    """Whisper over a raw 16 kHz array. First call downloads + loads the model
-    (chad.whisper caches it in-process afterwards); runs on the same GPU as the
-    coding model, which is idle between turns — exactly when dictation happens."""
+    """Parakeet over a raw 16 kHz array. First call downloads + loads the model
+    (cached in-process afterwards); runs on the same GPU as the coding model,
+    which is idle between turns — exactly when dictation happens."""
     audio = trim_silence(audio)
     if len(audio) < SAMPLE_RATE // 4:  # <0.25s of actual sound: a tap, not speech
         return ""
+    import mlx.core as mx
     from huggingface_hub.utils import (
         are_progress_bars_disabled,
         disable_progress_bars,
         enable_progress_bars,
     )
 
-    from . import whisper
-    # The first-use snapshot_download draws tqdm bars straight to the tty, over
-    # the prompt_toolkit region — silence them for the duration (the TUI shows
-    # its own download notice); restore so chad's own model download keeps its bar.
+    from . import parakeet
+    # The first-use hf download draws tqdm bars straight to the tty, over the
+    # prompt_toolkit region — silence them for the duration (the TUI shows its
+    # own download notice); restore so chad's own model download keeps its bar.
     bars_off = are_progress_bars_disabled()
     disable_progress_bars()
     try:
-        # condition_on_previous_text=False: standard dictation hygiene — each
-        # window decodes independently, so one mis-heard segment can't prompt-
-        # feed the next into a repetition loop.
-        result = whisper.transcribe(audio, path_or_hf_repo=stt_model(),
-                                    condition_on_previous_text=False)
+        key = (stt_model(), stt_quant_bits())
+        model = _stt.get(key)
+        if model is None:
+            model = parakeet.from_pretrained(stt_model())
+            bits = stt_quant_bits()
+            if bits:
+                # Quantize at load from the fp32 download — no separate quant
+                # repo to host, and the group-64 divisibility predicate leaves
+                # the few odd-shaped layers (and all convs) in bf16.
+                import mlx.nn as mlx_nn
+                mlx_nn.quantize(
+                    model, group_size=64, bits=bits,
+                    class_predicate=lambda p, m: isinstance(
+                        m, (mlx_nn.Linear, mlx_nn.Embedding))
+                    and m.weight.shape[-1] % 64 == 0)
+            _stt[key] = model
+        mel = parakeet.get_logmel(mx.array(audio), model.preprocessor_config)
+        result = model.generate(mel)[0]
     finally:
         if not bars_off:
             enable_progress_bars()
-    text = collapse_repeats((result.get("text") or "").strip())
+    # collapse_repeats stays as cheap insurance: Parakeet's TDT decoder lacks
+    # Whisper's repetition-loop failure mode, but a flooded input box is bad
+    # enough to keep the guard anyway.
+    text = collapse_repeats(result.text.strip())
     try:
         text = apply_remaps(text, load_remaps())
     except (ValueError, OSError):

@@ -217,7 +217,7 @@ SLASH_COMMANDS = [
     ("/clear", "clear the conversation + KV cache"),
     ("/model", "show model + context window"),
     ("/mode", "cycle permission mode"),
-    ("/speech", "toggle voice mode — all-local STT (mlx-whisper) + TTS (say)"),
+    ("/speech", "toggle voice mode — all-local STT (Parakeet-on-MLX) + TTS (say)"),
     ("/accept", "accept a pending plan and implement it"),
     ("/exit", "quit chad"),
     ("/quit", "quit chad"),
@@ -883,12 +883,12 @@ class TUI:
         except (ValueError, OSError) as e:
             self._emit("info", f"  word remaps IGNORED — {speech.remap_path()}: {e}")
         if not speech.model_cached():
-            self._emit("info", "  whisper weights aren't cached yet — the first "
+            self._emit("info", "  STT weights aren't cached yet — the first "
                                "ctrl-t transcription downloads them once (the "
                                "status line shows 'transcribing' meanwhile)")
 
     def _toggle_recording(self):
-        """ctrl-t handler (UI thread). Whisper runs on a helper thread so the
+        """ctrl-t handler (UI thread). STT runs on a helper thread so the
         first-use model download/load can't freeze the input loop; the finished
         transcript is inserted back on the event loop, where buffer edits belong."""
         from . import speech
