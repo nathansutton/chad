@@ -114,7 +114,7 @@ def test_available_reports_missing_deps_as_hint():
 
 
 def test_collapse_repeats_kills_hallucination_loop():
-    # The real failure this guards: Whisper looping on a silent tail.
+    # The real failure this guards: a decoder looping on a silent tail.
     loop = "look at all the failing test cases and the " + "hour and " * 60
     t = collapse_repeats(loop.strip())
     assert t.count("hour") <= 4  # a couple survive, the flood doesn't

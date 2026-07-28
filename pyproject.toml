@@ -50,8 +50,8 @@ dependencies = [
     # absence crashes the first turn. Declare it directly.
     "jinja2>=3.1",
     # <3: the old <2 cap was 1.0.0-era caution, not a known break. numpy 2.4.6
-    # verified end-to-end (full gate + live Whisper-on-MLX inference); staying
-    # open keeps 2.x-floored ASR deps (e.g. parakeet-mlx) adoptable.
+    # verified end-to-end (full gate + live Parakeet-on-MLX transcription +
+    # `chad prove` 4/4); staying open keeps 2.x-floored ASR deps adoptable.
     "numpy>=1.26,<3",
     "huggingface-hub>=1.22.0", # first-run model download (cli.py/engine.py); imported directly, not just transitively
     "jedi>=0.19.2", # in-process symbolic code intelligence (read/search/edit)

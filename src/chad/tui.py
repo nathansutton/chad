@@ -380,6 +380,9 @@ class TUI:
         self._speaker = None
         self._recorder = None
         self._speech_phase = ""
+        # Mirrored off speech.MAX_TAKE_S at enable so the per-frame status
+        # render never imports the speech module.
+        self._speech_max_s = 0
 
         # Multiline input that auto-grows up to 8 rows. Enter submits; alt-enter
         # (or ctrl-j) inserts a newline; pasted text keeps its newlines.
@@ -593,7 +596,13 @@ class TUI:
         # Voice indicator ahead of everything: while the mic is open the user
         # must be able to see it (an open mic you can't see is a bug, not a feature).
         if self._speech_phase == "recording":
-            left = [("class:rec", " ● rec — ctrl-t transcribes · esc discards ")] + left
+            # A capped take is still recording (the mic is honestly open) but no
+            # longer growing — say which, or the user thinks they're being heard.
+            if self._recorder is not None and self._recorder.take_full:
+                left = [("class:rec", f" ● rec — max length ({self._speech_max_s}s) "
+                                      f"reached · ctrl-t transcribes ")] + left
+            else:
+                left = [("class:rec", " ● rec — ctrl-t transcribes · esc discards ")] + left
         elif self._speech_phase == "transcribing":
             frame = _SPINNER[(self._tick // 2) % len(_SPINNER)]
             left = [("class:spinner", f" {frame} transcribing…  ")] + left
@@ -848,13 +857,24 @@ class TUI:
     def _toggle_speech(self):
         from . import speech
         if self.speech_on:
+            was_decoding = self._speech_phase == "transcribing"
             self.speech_on = False
             self._speech_phase = ""
             if self._recorder:
                 self._recorder.close()  # mic fully released, warm ring included
             if self._speaker:
                 self._speaker.stop()
-            self._emit("info", "speech off — mic released.")
+            # Hand the STT weights back too — a session that dictated once
+            # shouldn't carry ~790MB on a machine whose coding model already
+            # owns most of RAM. NOT while a decode is in flight: the worker
+            # thread holds a live reference to the model inside generate().
+            # That take is being discarded anyway (see _job), and the next
+            # /speech reloads from the HF cache.
+            freed = False
+            if not was_decoding:
+                freed = speech.release_model()
+            self._emit("info", "speech off — mic released."
+                               + (" stt weights unloaded." if freed else ""))
             return
         ok, reason = speech.available()
         if not ok:
@@ -871,6 +891,7 @@ class TUI:
             self._emit("error", f"[mic unavailable: {e}]")
             return
         self.speech_on = True
+        self._speech_max_s = int(speech.MAX_TAKE_S)
         self._emit("info", f"speech on — the mic stays open (see status line) with a "
                            f"{speech.Recorder.PRE_ROLL_S:.2g}s pre-roll so your first "
                            f"word isn't clipped. ctrl-t to talk, ctrl-t again to "
@@ -882,6 +903,14 @@ class TUI:
                 self._emit("info", f"  {n} word remap(s) active from {speech.remap_path()}")
         except (ValueError, OSError) as e:
             self._emit("info", f"  word remaps IGNORED — {speech.remap_path()}: {e}")
+        # Everything voice mode depends on that ISN'T the mic gets checked here,
+        # while the fix is still cheap. Both failures are otherwise invisible
+        # until after you've spoken: a bad CHAD_VOICE never raises (say exits
+        # nonzero and Speaker swallows it), and a bad CHAD_STT_QUANT raises
+        # inside transcribe(), i.e. once the take is already recorded.
+        for ok, reason in (speech.tts_status(), speech.stt_status()):
+            if not ok:
+                self._emit("info", f"  {reason}")
         if not speech.model_cached():
             self._emit("info", "  STT weights aren't cached yet — the first "
                                "ctrl-t transcription downloads them once (the "
@@ -890,7 +919,37 @@ class TUI:
     def _toggle_recording(self):
         """ctrl-t handler (UI thread). STT runs on a helper thread so the
         first-use model download/load can't freeze the input loop; the finished
-        transcript is inserted back on the event loop, where buffer edits belong."""
+        transcript is inserted back on the event loop, where buffer edits belong.
+
+        Three threads touch voice mode, and only one of them may touch the
+        prompt_toolkit buffer. Who owns what:
+
+            CoreAudio callback          UI thread (event loop)      chad-stt worker
+            ──────────────────          ──────────────────────      ───────────────
+            Recorder._on_audio          ctrl-t ─► _toggle_recording
+              ring/take append            │
+              (holds Recorder._lock)      ├─ start()  phase ""─►"recording"
+                                          │
+                                          ├─ stop()   phase ─►"transcribing"
+                                          │      └─ spawn ──────────► _job
+                                          │                             │
+                                          │                    speech.transcribe
+                                          │                    (model load, GPU)
+                                          │                             │
+                                          │                     phase ─► ""
+                                          │        app.invalidate() ◄────┤ (safe:
+                                          │                             │  ptk does
+                                          │                             │  the hop)
+                                    buffer.insert_text ◄────────────────┘ via
+                                          │                    loop.call_soon_threadsafe
+                                          ▼
+                                    reviewed text; Enter still sends it
+
+        The worker NEVER touches self.input.buffer directly — every buffer edit
+        crosses back through call_soon_threadsafe. app.invalidate() is the one
+        exception it may call outright, because prompt_toolkit does that hop
+        itself.
+        """
         from . import speech
         if self._speech_phase == "transcribing":
             return  # previous utterance still decoding; one at a time
@@ -918,6 +977,13 @@ class TUI:
                 self.app.invalidate()
             if not text:
                 self._emit("info", "heard nothing.")
+                return
+            # /speech may have been turned off while this decode ran — on first
+            # use that window includes the one-time model download. Text
+            # appearing in the input box from a mode the user already left
+            # reads as a bug, so drop it, and say so rather than swallowing it.
+            if not self.speech_on:
+                self._emit("info", "speech was turned off — transcript discarded.")
                 return
             if loop is not None:
                 loop.call_soon_threadsafe(self.input.buffer.insert_text, text)

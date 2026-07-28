@@ -153,8 +153,10 @@ it chad uses the tree-sitter fallback automatically.
   into the input box for you to review before Enter sends it (esc discards a take);
   replies are read aloud via macOS `say`. A pre-roll buffer means your first syllable
   isn't clipped, and a personal word table (`~/.chad/speech_words.json`) teaches it your
-  identifiers — `{"pie test": "pytest"}`. Nothing leaves the machine. Needs the `speech`
-  extra (`uv sync --extra speech` — just a mic library; no torch, no numba).
+  identifiers — `{"pie test": "pytest"}`. Dictation cost is linear in take length, so a
+  long thought is fine; `/speech` off releases both the mic and the weights. Nothing
+  leaves the machine. Needs the `speech` extra (`uv sync --extra speech` — just a mic
+  library; no torch, no numba).
 
 **Usage.** `uv run chad --help` is the source of truth:
 

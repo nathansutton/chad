@@ -27,6 +27,29 @@ Notable, user-visible changes.
   `parakeet-tdt-0.6b-v3`, multilingual; ~2.5 GB fetched on first use), `CHAD_STT_QUANT`
   (`8` default · `4` halves memory again, clean on the battery but unproven on noisy
   mics · `none` for bf16), `CHAD_VOICE`, `CHAD_SPEECH_RATE`.
+- **Dictation length is linear, not quadratic.** The encoder ships as `rel_pos` with
+  `att_context_size [-1,-1]` — full global attention, so a take's cost grows with the
+  *square* of its own length, on the same GPU the coding model is resident on. chad now
+  switches it to the banded local kernel at load: the score matrix goes from `T×T` to
+  `(T, 2w+1)`, and w=256 encoder frames is ±20.5s of audio at 12.5 frames/s, so a
+  dictation take still sees its whole self. The transcript is **byte-identical** to full
+  attention on a real clip (and 8-bit local is byte-identical to bf16 local). A 359s take
+  now decodes in 3.9s with peak memory flattening (58s→2.0 GB, 175s→3.1, 359s→3.3) where
+  full attention keeps climbing. The switch happens *before* quantization, because
+  `set_attention_model` rebuilds the attention modules and `load_weights` rejects a
+  quantized layer's scales/biases. A take is also capped at 600s as a backstop: recording
+  doesn't stop and the status line says so, the take just stops growing — a mic left open
+  is truncated, never lost.
+- **`/speech` off gives the memory back, and enable tells you what's broken.** Turning
+  voice mode off now unloads the STT weights (747 MB → 0 measured), not just the mic —
+  it won't fire mid-transcription, where the worker still holds the model. Enable-time
+  validation covers the two failures that were previously invisible until after you'd
+  spoken: a misspelled `CHAD_VOICE` (`say` exits nonzero, so nothing ever raised — you
+  just got silence forever; now it names the typo and suggests the nearest real voice)
+  and a bad `CHAD_STT_QUANT` (which only raised from inside the decode). Both warn rather
+  than block — a machine without `say` can still dictate. And a transcript that finishes
+  after you've turned `/speech` off is discarded with a note instead of typing itself
+  into an input box in a mode you already left.
 - **Voice mode capture + correction, borrowed from the best.** Three ideas adapted from
   [Hex](https://github.com/kitlangton/Hex) (MIT), the open-source macOS dictation app:
   while `/speech` is on the mic stays warm feeding a ~1s ring buffer, and each take is
