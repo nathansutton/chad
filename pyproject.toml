@@ -4,7 +4,7 @@
 # import name, and command name are independent. `uvx chad-code` runs the alias
 # script added under [project.scripts].
 name = "chad-code"
-version = "1.0.5"
+version = "1.0.6"
 description = "Local MLX-backed, Claude-Code-style coding agent (Apple Silicon, Ornith 35B/9B)"
 readme = "README.md"
 license = "MIT"
@@ -49,7 +49,10 @@ dependencies = [
     # absent in a clean install (e.g. chad inside a Linux benchmark container), where its
     # absence crashes the first turn. Declare it directly.
     "jinja2>=3.1",
-    "numpy>=1.26,<2",
+    # <3: the old <2 cap was 1.0.0-era caution, not a known break. numpy 2.4.6
+    # verified end-to-end (full gate + live Whisper-on-MLX inference); staying
+    # open keeps 2.x-floored ASR deps (e.g. parakeet-mlx) adoptable.
+    "numpy>=1.26,<3",
     "huggingface-hub>=1.22.0", # first-run model download (cli.py/engine.py); imported directly, not just transitively
     "jedi>=0.19.2", # in-process symbolic code intelligence (read/search/edit)
     "prompt_toolkit>=3.0.43",
@@ -78,6 +81,18 @@ highlight = ["pygments>=2.17"]
 # heavyweight tree; absent, every caller falls back to the tree-sitter backend.
 # Install with `uv sync --extra lsp`.
 lsp = ["serena-agent>=1.5"]
+# Voice mode (/speech in the TUI): push-to-talk dictation via chad's vendored
+# Whisper-on-MLX (src/chad/whisper — the PyPI mlx-whisper hard-requires torch,
+# ~2 GB of dead weight for MLX-format weights) + spoken replies via macOS `say`.
+# All on-device, nothing leaves the machine. mlx/numpy/huggingface-hub are
+# already core deps, so the extra adds only the mic (sounddevice/PortAudio) and
+# Whisper's tokenizer (tiktoken). Optional and import-guarded in speech.py:
+# absent, /speech prints the install hint and everything else is untouched.
+# Install with `uv sync --extra speech`.
+speech = [
+    "sounddevice>=0.5",
+    "tiktoken>=0.11",
+]
 
 # The one entrypoint: `uv run chad`. (`chad-bench` reproduces docs/benchmarks.md.)
 # `chad-code` is an alias so `uvx chad-code` (which runs the console script matching
@@ -107,6 +122,12 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Vendored whisper's runtime data (mel filterbank + tiktoken vocabs, ~1.6 MB):
+# tokenizer.py/audio.py resolve them relative to __file__, so they must ship
+# inside the wheel or /speech dies on first use of an installed chad.
+[tool.setuptools.package-data]
+"chad.whisper" = ["assets/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # No "-q" here: CI/docs/agents all invoke `pytest -q` explicitly, and stacking the two
@@ -127,6 +148,12 @@ src = ["src", "tests"]
 select = ["F", "E9", "I"]
 ignore = ["E741"]  # ambiguous var names (l/I) appear in existing math code
 
+[tool.ruff.lint.per-file-ignores]
+# Vendored upstream (see chad/whisper/__init__.py), kept byte-close for future
+# re-syncs: F821 is upstream's quoted "Whisper" forward refs to a class it never
+# imports; F841 is locals orphaned by cutting the word-timestamps path.
+"src/chad/whisper/*" = ["F821", "F841"]
+
 [tool.mypy]
 python_version = "3.11"
 files = ["src/chad"]
@@ -141,6 +168,12 @@ implicit_optional = true        # `x: T = None` defaults are idiomatic throughou
 disable_error_code = ["var-annotated"]
 # Tighten (disallow_untyped_defs, re-enable var-annotated, add B/UP/SIM in ruff) in a
 # follow-up once this baseline holds.
+
+[[tool.mypy.overrides]]
+# Vendored upstream inference code (see chad/whisper/__init__.py) predates types;
+# it is not held to chad's gate so re-syncs stay a plain re-copy.
+module = "chad.whisper.*"
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 # mlx_fastpath patches mlx_lm classes that only exist on macOS: with mlx installed

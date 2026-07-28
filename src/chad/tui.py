@@ -75,6 +75,7 @@ _STYLE = Style.from_dict({
     "todo.cur": "#d7a86e bold",
     "todo.pending": "#8a8a8a",
     "todo.summary": "#8a8a8a",
+    "rec": "#ff8787 bold",
 })
 
 MODE_STYLE = {"normal": "status.normal", "auto": "status.auto", "yolo": "status.yolo",
@@ -216,6 +217,7 @@ SLASH_COMMANDS = [
     ("/clear", "clear the conversation + KV cache"),
     ("/model", "show model + context window"),
     ("/mode", "cycle permission mode"),
+    ("/speech", "toggle voice mode — all-local STT (mlx-whisper) + TTS (say)"),
     ("/accept", "accept a pending plan and implement it"),
     ("/exit", "quit chad"),
     ("/quit", "quit chad"),
@@ -368,6 +370,16 @@ class TUI:
         # Sessions last shown by a bare `/resume` (so `/resume <n>` maps a number to a
         # session without re-listing / a race with new saves).
         self._resume_list = []
+
+        # Voice mode (/speech): push-to-talk dictation + spoken replies, all
+        # on-device (speech.py). Off by default and lazily constructed — the
+        # audio deps are an optional extra, so a non-speech session never
+        # imports them. `_speech_phase` drives the status-line indicator:
+        # "" | "recording" | "transcribing".
+        self.speech_on = False
+        self._speaker = None
+        self._recorder = None
+        self._speech_phase = ""
 
         # Multiline input that auto-grows up to 8 rows. Enter submits; alt-enter
         # (or ctrl-j) inserts a newline; pasted text keeps its newlines.
@@ -578,11 +590,22 @@ class TUI:
                                    f"↓{_kfmt(self._gen_tokens)} · {cap}ctrl-c ")]
         else:
             left = [("class:idle", f" {_phase_glyph(self._phase)} ready ")]
+        # Voice indicator ahead of everything: while the mic is open the user
+        # must be able to see it (an open mic you can't see is a bug, not a feature).
+        if self._speech_phase == "recording":
+            left = [("class:rec", " ● rec — ctrl-t transcribes · esc discards ")] + left
+        elif self._speech_phase == "transcribing":
+            frame = _SPINNER[(self._tick // 2) % len(_SPINNER)]
+            left = [("class:spinner", f" {frame} transcribing…  ")] + left
         # Model id lives in the startup banner now — no need to repeat it every frame.
         bits = [
             f" {MODE_LABEL[mode]} (shift-tab) ",
             f" ctx {pct}% ",
         ]
+        # The warm-capture contract: while speech mode is on the mic is open
+        # (feeding the pre-roll ring) even when not recording — say so, always.
+        if self.speech_on:
+            bits.append(" mic open (ctrl-t) ")
         if qn:
             bits.append(f" queued:{qn} ")
         sn = len(self._steer_queue)
@@ -672,8 +695,32 @@ class TUI:
             self._confirm_answer = False
             self._confirm_event.set()
 
+        # ctrl-t push-to-talk: first press opens the mic, second press stops and
+        # transcribes into the input box — the transcript is REVIEWED text, not a
+        # submitted message; Enter still sends it. (Overrides emacs transpose-chars,
+        # which nobody will miss.) Active only while /speech is on.
+        speech_on = Condition(lambda: self.speech_on)
+        @kb.add("c-t", filter=speech_on & ~confirming)
+        def _(event):
+            self._toggle_recording()
+            event.app.invalidate()
+
+        # esc during a take discards it without transcribing (Hex parity): a
+        # mistaken recording shouldn't cost a decode + a cleanup of the input
+        # box. ~confirming keeps the confirm-deny esc first; eager so it beats
+        # the non-eager esc=interrupt binding below while the mic is live.
+        rec_active = Condition(lambda: self._speech_phase == "recording")
+        @kb.add("escape", filter=rec_active & ~confirming, eager=True)
+        def _(event):
+            self._recorder.cancel()
+            self._speech_phase = ""
+            self._emit("info", "recording discarded.")
+            event.app.invalidate()
+
         @kb.add("c-c")
         def _(event):
+            if self._speaker:
+                self._speaker.stop()  # ctrl-c also silences a reply mid-sentence
             if self._busy or self._confirm_req:
                 self._interrupt.set()
                 self._confirm_event.set()  # unblock a pending confirm as a denial
@@ -701,6 +748,10 @@ class TUI:
 
     def _shutdown_app(self, event):
         self._shutdown = True
+        if self._speaker:
+            self._speaker.stop()
+        if self._recorder:
+            self._recorder.close()
         self._wake.set()
         self._confirm_event.set()
         event.app.exit()
@@ -792,6 +843,98 @@ class TUI:
         self._resume_list = []
         self._emit("info", f"resumed (forked): {session.describe(pick)}")
 
+    # -- voice mode (/speech) ---------------------------------------------
+
+    def _toggle_speech(self):
+        from . import speech
+        if self.speech_on:
+            self.speech_on = False
+            self._speech_phase = ""
+            if self._recorder:
+                self._recorder.close()  # mic fully released, warm ring included
+            if self._speaker:
+                self._speaker.stop()
+            self._emit("info", "speech off — mic released.")
+            return
+        ok, reason = speech.available()
+        if not ok:
+            self._emit("info", reason)
+            return
+        self._speaker = self._speaker or speech.Speaker()
+        self._recorder = self._recorder or speech.Recorder()
+        # Open the warm stream NOW: the TCC permission prompt fires here, at an
+        # explicit /speech, and a denied mic fails here with the reason —
+        # not silently as an empty take later.
+        try:
+            self._recorder.open_stream()
+        except Exception as e:
+            self._emit("error", f"[mic unavailable: {e}]")
+            return
+        self.speech_on = True
+        self._emit("info", f"speech on — the mic stays open (see status line) with a "
+                           f"{speech.Recorder.PRE_ROLL_S:.2g}s pre-roll so your first "
+                           f"word isn't clipped. ctrl-t to talk, ctrl-t again to "
+                           f"transcribe, esc discards a take; replies are read aloud "
+                           f"(ctrl-c hushes). all local: {speech.stt_model()} + macOS say.")
+        try:
+            n = len(speech.load_remaps())
+            if n:
+                self._emit("info", f"  {n} word remap(s) active from {speech.remap_path()}")
+        except (ValueError, OSError) as e:
+            self._emit("info", f"  word remaps IGNORED — {speech.remap_path()}: {e}")
+        if not speech.model_cached():
+            self._emit("info", "  whisper weights aren't cached yet — the first "
+                               "ctrl-t transcription downloads them once (the "
+                               "status line shows 'transcribing' meanwhile)")
+
+    def _toggle_recording(self):
+        """ctrl-t handler (UI thread). Whisper runs on a helper thread so the
+        first-use model download/load can't freeze the input loop; the finished
+        transcript is inserted back on the event loop, where buffer edits belong."""
+        from . import speech
+        if self._speech_phase == "transcribing":
+            return  # previous utterance still decoding; one at a time
+        if not self._recorder.recording:
+            self._speaker.stop()  # never transcribe our own TTS
+            try:
+                self._recorder.start()
+            except Exception as e:  # stream died since /speech (device unplugged)
+                self._emit("error", f"[mic unavailable: {e}]")
+                return
+            self._speech_phase = "recording"
+            return
+        audio = self._recorder.stop()
+        self._speech_phase = "transcribing"
+        loop = self.app.loop
+
+        def _job():
+            try:
+                text = speech.transcribe(audio)
+            except Exception as e:
+                self._emit("error", f"[transcription failed: {e}]")
+                return
+            finally:
+                self._speech_phase = ""
+                self.app.invalidate()
+            if not text:
+                self._emit("info", "heard nothing.")
+                return
+            if loop is not None:
+                loop.call_soon_threadsafe(self.input.buffer.insert_text, text)
+        threading.Thread(target=_job, daemon=True, name="chad-stt").start()
+
+    def _speak_reply(self):
+        """Read the turn's final prose aloud (worker thread; `say` is a detached
+        subprocess, so this never blocks the next queued turn)."""
+        from . import speech
+        from .toolcall_parse import strip_think
+        for m in reversed(self.agent.messages):
+            if m.get("role") == "assistant":
+                text = speech.spoken_text(strip_think(m.get("content") or ""))
+                if text:
+                    self._speaker.speak(text)
+                return
+
     # -- input handling --------------------------------------------------
 
     def _on_accept(self, buff):
@@ -819,6 +962,9 @@ class TUI:
             return False
         if text == "/mode":
             self.agent.cycle_mode()
+            return False
+        if text == "/speech":
+            self._toggle_speech()
             return False
         if text == "/compact":
             # Manual context reclaim. Refuse mid-turn (mutating messages under the
@@ -872,7 +1018,7 @@ class TUI:
             self._emit("info", "shift-tab: cycle mode (normal/auto-accept edits/yolo/plan) "
                                "· esc/ctrl-c: "
                                "interrupt · /init /skills /mcp /mcp trust /mcp login <server> "
-                               "/resume /reset /clear /compact /model /mode /accept /exit · !cmd shell · @path "
+                               "/resume /reset /clear /compact /model /mode /speech /accept /exit · !cmd shell · @path "
                                "attach · type while busy to steer the running turn "
                                "(applies after the current step) · plan ready: type to "
                                "steer, ctrl-g to accept")
@@ -955,6 +1101,8 @@ class TUI:
                 else:
                     self.agent.run_turn(msg, stream=True)
                     self.agent.save()  # persist conversation for --continue
+                    if self.speech_on and self._speaker:
+                        self._speak_reply()
                     # Governor hard-stop: the turn ran out of budget with no
                     # landed+verified change. Surface the banked progress note and arm the
                     # fresh-continue handoff — the next typed message starts clean, seeded.

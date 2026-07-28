@@ -149,6 +149,12 @@ it chad uses the tree-sitter fallback automatically.
   `/model`, `/mode`, `/help`, `/exit`. Same set in the `--repl` line interface.
 - **`@file` / `@dir` mentions** and **`!command` shell passthrough** — pull a file into
   context inline, or run a shell command without invoking the model.
+- **voice mode, all local** — `/speech`, then ctrl-t to talk: Whisper-on-MLX transcribes
+  into the input box for you to review before Enter sends it (esc discards a take);
+  replies are read aloud via macOS `say`. A pre-roll buffer means your first syllable
+  isn't clipped, and a personal word table (`~/.chad/speech_words.json`) teaches it your
+  identifiers — `{"pie test": "pytest"}`. Nothing leaves the machine. Needs the `speech`
+  extra (`uv sync --extra speech` — just a mic library and a tokenizer; no torch).
 
 **Usage.** `uv run chad --help` is the source of truth:
 

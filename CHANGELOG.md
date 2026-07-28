@@ -4,6 +4,37 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+- **Voice mode, all local.** `/speech` in the TUI turns on push-to-talk: ctrl-t opens the
+  mic (a red `● rec` pin in the status line — an open mic you can't see is a bug), ctrl-t
+  again transcribes into the input box. The transcript is *reviewed* text, not a sent
+  message — you read what Whisper heard and Enter submits, same supervision contract as
+  every edit. Replies are read aloud (code blocks dropped, cut at a sentence boundary;
+  ctrl-c hushes). STT is Whisper on MLX via a copy vendored into `chad.whisper`, TTS is
+  macOS `say` — nothing leaves the machine, and the audio never touches disk. Vendoring
+  is deliberate: the PyPI `mlx-whisper` hard-requires torch (~2 GB) for a checkpoint
+  conversion the MLX-format weights never need, so `uv sync --extra speech` adds only the
+  mic library (sounddevice) and Whisper's tokenizer (tiktoken). Dictation hygiene is
+  built in: trailing/leading silence is trimmed before Whisper sees it (the silent tail
+  of a push-to-talk capture is exactly what it hallucinates on), each window decodes
+  unconditioned, and a repetition-collapse pass stops a decode loop from flooding the
+  input box. Tune with `CHAD_WHISPER_MODEL` (default `whisper-small-mlx`, ~460 MB,
+  fetched on first use), `CHAD_VOICE`, `CHAD_SPEECH_RATE`.
+- **Voice mode capture + correction, borrowed from the best.** Three ideas adapted from
+  [Hex](https://github.com/kitlangton/Hex) (MIT), the open-source macOS dictation app:
+  while `/speech` is on the mic stays warm feeding a ~1s ring buffer, and each take is
+  seeded with 0.45s of *pre-roll* from before the keypress — opening a CoreAudio device
+  takes 100–300ms, so a cold-opened mic clips your first syllable ("ix the failing
+  test"). The status line says `mic open` the whole time, because an open mic you can't
+  see is a bug; `/speech` off releases it. **esc during a take discards it** instead of
+  transcribing — a mistaken recording shouldn't cost a decode plus an input-box cleanup.
+  And a personal **word table** (`~/.chad/speech_words.json`, or `CHAD_SPEECH_WORDS`) of
+  `{"heard": "meant"}` fixes what no ASR model can — your identifiers: `{"pie test":
+  "pytest", "you vee": "uv"}`. Case-insensitive, whole-word, longest match first,
+  loaded fresh each take; `/speech` reports the count (or the parse error) at enable.
+- **numpy 2 allowed.** The `<2` cap dated to 1.0.0 and encoded no known break — it also
+  blocked modern ASR dependencies that floor at numpy 2. Now `>=1.26,<3`, verified on
+  numpy 2.4.6: full unit gate, live Whisper-on-MLX transcription, and `chad prove` 4/4
+  (Ornith 9B smoke model) at normal throughput.
 - **You can see what you're approving.** The confirm prompt used to render into the
   one-row status line with newlines flattened to `⏎` and a 160-character clip, so a
   multi-line bash command was unreadable — approving it was approving blind. Approvals
