@@ -1,7 +1,8 @@
 """Terminal UI for chad — the part that makes it feel like Claude Code.
 
 Features that close the gap with Claude Code's UX:
-  * shift-tab cycles permission modes: normal -> auto-accept edits -> plan mode
+  * shift-tab cycles permission modes:
+      normal -> auto-accept edits -> yolo -> plan mode
   * type-ahead message queue: keep typing while the agent works; messages run in order
   * ctrl-c interrupts the running turn (stops generation) without killing the session
   * inline y/n approval for mutating tools in normal mode
@@ -50,7 +51,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
-from . import config
+from . import config, guardrails
 from .agent import INIT_PROMPT, MODE_LABEL, Agent
 from .base_engine import BaseEngine
 from .ignore import IGNORE_DIRS
@@ -64,15 +65,59 @@ _STYLE = Style.from_dict({
     "user": "#d7a86e bold",
     "status.normal": "reverse",
     "status.auto": "bg:#3a5f3a #ffffff",
+    "status.yolo": "bg:#6f2a2a #ffffff",
     "status.plan": "bg:#3a3a6f #ffffff",
     "confirm": "bg:#6f5a2a #ffffff",
+    "confirm.title": "#d7a86e bold",
+    "confirm.body": "#e8e8e8",
+    "confirm.danger": "#ff8787 bold",
     "todo.done": "#6b8f6b",
     "todo.cur": "#d7a86e bold",
     "todo.pending": "#8a8a8a",
     "todo.summary": "#8a8a8a",
 })
 
-MODE_STYLE = {"normal": "status.normal", "auto": "status.auto", "plan": "status.plan"}
+MODE_STYLE = {"normal": "status.normal", "auto": "status.auto", "yolo": "status.yolo",
+              "plan": "status.plan"}
+
+# The approval panel's body is bounded so a giant heredoc can't swallow the screen,
+# but generously enough that the thing you're approving is actually readable — the
+# whole point is that a one-line clipped preview means approving blind.
+_CONFIRM_MAX_LINES = 10
+_CONFIRM_MAX_CHARS = 600
+
+
+def _confirm_body_lines(name: str, args) -> list:
+    """The approval preview as real lines, bounded in both directions. Unlike the
+    status line (one row, newlines flattened), this keeps a bash command's structure —
+    pipes, &&-chains and heredocs read as written."""
+    lines = confirm_preview(name, args).splitlines() or [""]
+    extra = len(lines) - _CONFIRM_MAX_LINES
+    if extra > 0:
+        lines = lines[:_CONFIRM_MAX_LINES] + [f"… (+{extra} more lines)"]
+    out, budget = [], _CONFIRM_MAX_CHARS
+    for ln in lines:
+        if budget <= 0:
+            out.append("…")
+            break
+        out.append(ln[:budget])
+        budget -= len(ln)
+    return out
+
+
+def _confirm_title(name: str) -> str:
+    """What the model is asking to do, named in plain words — 'bash' alone doesn't
+    tell you a shell command is about to run on your machine."""
+    if name == "bash":
+        return "run a terminal command"
+    if name.startswith("mcp__"):
+        return f"call the MCP tool {name[len('mcp__'):]}"
+    return {"write": "write a file", "edit": "edit a file",
+            "replace_lines": "replace lines in a file",
+            "insert_lines": "insert lines into a file",
+            "replace_symbol": "replace a symbol", "insert_symbol": "insert a symbol",
+            "rename_symbol": "rename a symbol"}.get(name, f"run {name}")
+
 
 # Spinner frames + the gerund shown next to it, keyed off the latest activity.
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -342,11 +387,20 @@ class TUI:
                    dont_extend_height=True),
             filter=Condition(lambda: bool(_todo_panel_rows(self._todos))),
         )
+        # The approval panel: shown ONLY while a confirm is pending, directly above the
+        # status line. It exists because the status line is one row — a multi-line bash
+        # command flattened into it is unreadable, and approving what you can't read is
+        # not approving. wrap_lines so a long command wraps instead of being clipped.
+        self.confirm_panel = ConditionalContainer(
+            Window(content=FormattedTextControl(self._confirm_fragments),
+                   dont_extend_height=True, wrap_lines=True),
+            filter=Condition(lambda: self._confirm_req is not None),
+        )
         # Only the todo panel + status line + input are owned by prompt_toolkit; the
         # transcript is printed above this region into the terminal's normal scrollback.
         # A FloatContainer hosts the `/` + `@` completion menu.
         root = FloatContainer(
-            HSplit([self.todo_panel, self.status, self.input]),
+            HSplit([self.todo_panel, self.confirm_panel, self.status, self.input]),
             floats=[Float(xcursor=True, ycursor=True,
                           content=CompletionsMenu(max_height=8, scroll_offset=1))],
         )
@@ -467,16 +521,30 @@ class TUI:
 
     # -- UI rendering ----------------------------------------------------
 
+    def _confirm_fragments(self):
+        """The body of the pending approval, rendered above the status line: a header
+        naming what will happen, then the full preview on its own lines."""
+        if not self._confirm_req:
+            return []
+        name, args = self._confirm_req
+        frags = [("class:confirm.title", f" ⏵ chad wants to {_confirm_title(name)}:")]
+        for ln in _confirm_body_lines(name, args):
+            frags += [("", "\n"), ("class:confirm.body", "   " + ln)]
+        # Same screen the agent-side seatbelt uses (agent._confirm), surfaced here so the
+        # warning sits next to the command instead of scrolling past in the transcript.
+        if (name == "bash" and isinstance(args, dict)
+                and guardrails.is_destructive_bash(str(args.get("command", "")))):
+            frags += [("", "\n"),
+                      ("class:confirm.danger", " ⚠ looks destructive — review carefully")]
+        return frags
+
     def _status_fragments(self):
         if self._confirm_req:
-            name, args = self._confirm_req
-            # The status window is a single line (height=1), so flatten the
-            # (possibly multi-line) preview into one clipped line.
-            preview = confirm_preview(name, args).replace("\n", " ⏎ ")
-            if len(preview) > 160:
-                preview = preview[:160] + " …"
+            name, _ = self._confirm_req
+            # The command itself lives in the confirm panel above (multi-line, readable);
+            # this row is just the question and the keys.
             return [("class:confirm",
-                     f" allow {name}({preview})?  [y]es  [n]o ")]
+                     f" approve {name}?  [y]es  [n]o  (esc denies) ")]
         mode = self.agent.mode
         pct = int(100 * self._cur_prompt_tokens / self.ctx_limit) if self.ctx_limit else 0
         qn = len(self._queue)
@@ -801,7 +869,8 @@ class TUI:
                 self._emit("info", "  " + ln)
             return False
         if text == "/help":
-            self._emit("info", "shift-tab: cycle mode (normal/auto/plan) · esc/ctrl-c: "
+            self._emit("info", "shift-tab: cycle mode (normal/auto-accept edits/yolo/plan) "
+                               "· esc/ctrl-c: "
                                "interrupt · /init /skills /mcp /mcp trust /mcp login <server> "
                                "/resume /reset /clear /compact /model /mode /accept /exit · !cmd shell · @path "
                                "attach · type while busy to steer the running turn "

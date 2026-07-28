@@ -57,11 +57,12 @@ SUBAGENT_READ_ONLY = {
 
 def subagent_tools_for(parent_mode: str, requested: str) -> str:
     """The toolset a sub-agent may run with. A sub-agent auto-approves its own tool
-    calls (mode='auto', no confirm callback), so it must never hold more autonomy
-    than its parent: only an 'auto' parent (--yolo / headless) may delegate 'all';
-    a 'normal' parent's human-approval promise and plan mode's read-only promise
-    both clamp the sub-agent to read-only."""
-    if parent_mode == "auto" and requested == "all":
+    calls (mode='yolo', no confirm callback), so it must never hold more autonomy
+    than its parent: only a 'yolo' parent (--yolo / headless) may delegate 'all'.
+    A 'normal' parent's human-approval promise, an 'auto' parent's narrower promise
+    (edits yes, shell no — and 'all' includes bash), and plan mode's read-only
+    promise all clamp the sub-agent to read-only."""
+    if parent_mode == "yolo" and requested == "all":
         return "all"
     return "read-only"
 
@@ -209,10 +210,30 @@ def close_unclosed_think(text: str, thinking: bool) -> str:
 
 # Permission modes (Claude Code parity, cycled with shift-tab in the TUI):
 #   normal — confirm each mutating tool (bash/write/edit)
-#   auto   — auto-approve mutating tools (yolo)
+#   auto   — auto-approve FILE EDITS only; bash and MCP tools still ask
+#   yolo   — auto-approve every mutating tool (--yolo starts here)
 #   plan   — read-only: changes are blocked; the model researches and proposes a plan
-MODES = ("normal", "auto", "plan")
-MODE_LABEL = {"normal": "normal", "auto": "auto-accept edits", "plan": "plan mode"}
+MODES = ("normal", "auto", "yolo", "plan")
+MODE_LABEL = {"normal": "normal", "auto": "auto-accept edits", "yolo": "yolo",
+              "plan": "plan mode"}
+
+# What `auto` waves through: edits to files in the workspace, whose blast radius is a
+# diff you can read and revert. `bash` is excluded on purpose — a shell command can
+# touch anything on the machine, is the one tool whose preview is genuinely hard to
+# eyeball, and is exactly what a human is still in the loop for. MCP tools are excluded
+# for the same reason (a server-side tool can send mail or hit an API). The list is
+# explicit rather than `MUTATING - {"bash"}` so it fails CLOSED: a mutating tool added
+# later asks for approval until someone deliberately adds it here.
+AUTO_EDIT_TOOLS = {"write", "edit", "replace_lines", "insert_lines",
+                   "replace_symbol", "insert_symbol", "rename_symbol"}
+
+
+def auto_approves(mode: str, name: str) -> bool:
+    """Does `mode` clear tool `name` without asking a human? Read-only tools never
+    reach here (the caller checks is_mutating first)."""
+    if mode == "yolo":
+        return True
+    return mode == "auto" and name in AUTO_EDIT_TOOLS
 _PLAN_PREFIX = (
     "[PLAN MODE. Research first (read/grep/glob/repo_map/overview) — do NOT edit "
     "project files or run commands. Then write ONE self-contained plan to "
@@ -325,7 +346,7 @@ class Agent:
             skills.reset_session()
             from . import mcp
             mcp.reset_session()
-        self.mode = mode or ("auto" if yolo else "normal")
+        self.mode = mode or ("yolo" if yolo else "normal")
         self.thinking = thinking  # Ornith is a reasoning model; toggles <think> blocks
         # Steps per WINDOW, not a hard kill: a window that landed+verified a change
         # earns an extension (see guardrails.extend_step_cap; absolute ceiling 4x).
@@ -460,7 +481,7 @@ class Agent:
 
     @property
     def yolo(self) -> bool:
-        return self.mode == "auto"
+        return self.mode == "yolo"
 
     @property
     def tok_per_s(self) -> float:
@@ -586,18 +607,18 @@ class Agent:
 
     def _confirm(self, name, args) -> bool:
         # Destructive-bash seatbelt: a catastrophic shell command (rm -rf ~, mkfs,
-        # curl|sh, …) is screened even in --yolo/auto mode, because the model acts on
-        # untrusted repo contents and auto mode has no human in the loop. If a confirm
+        # curl|sh, …) is screened even in --yolo mode, because the model acts on
+        # untrusted repo contents and yolo mode has no human in the loop. If a confirm
         # channel exists (TTY or callback) we force the prompt; headless with no channel
         # we BLOCK rather than execute on injection. CHAD_NO_DESTRUCTIVE_GUARD=1 opts out.
         dangerous = (name == "bash" and isinstance(args, dict)
                      and not config.flag("CHAD_NO_DESTRUCTIVE_GUARD")
                      and guardrails.is_destructive_bash(str(args.get("command", ""))))
-        if self.mode == "auto" or not is_mutating(name):
+        if not is_mutating(name) or auto_approves(self.mode, name):
             if not dangerous:
                 return True
             if self._confirm_cb is None and not sys.stdin.isatty():
-                self._emit("info", f"  [blocked destructive command in auto mode: "
+                self._emit("info", f"  [blocked destructive command — nobody to approve it: "
                                    f"{args.get('command', '')!r}; set CHAD_NO_DESTRUCTIVE_GUARD=1 to allow]")
                 # Tell the MODEL the truth about who blocked it and why: "[denied by
                 # user]" reads as a human refusal and teaches the wrong lesson (the
@@ -642,12 +663,13 @@ class Agent:
         parent. Its grep/read churn never enters the main transcript; only this return
         does. Depth 1 only: a sub-agent can't itself call `task` (its schema omits it)."""
         # Never grant a sub-agent more autonomy than its parent: the sub-agent runs
-        # mode='auto' with no confirm callback, so an 'all' toolset is honored only when
-        # the parent itself is auto-approved (--yolo/headless); 'normal' (human confirms
-        # every mutation) and 'plan' (read-only) parents clamp it to read-only.
+        # mode='yolo' with no confirm callback, so an 'all' toolset is honored only when
+        # the parent itself is fully auto-approved (--yolo/headless); 'normal' (human
+        # confirms every mutation), 'auto' (human still confirms shell) and 'plan'
+        # (read-only) parents clamp it to read-only.
         requested, tools = tools, subagent_tools_for(self.mode, tools)
         if requested == "all" and tools == "read-only":
-            self._emit("muted", "   ⌊ sub-agent clamped to read-only (parent mode is not auto)")
+            self._emit("muted", "   ⌊ sub-agent clamped to read-only (parent mode is not yolo)")
         self._emit("muted", f"   ⌊ delegating to sub-agent: {description}")
         log.info("TASK start | desc=%r | tools=%s | prompt=%r",
                  description, tools, redact(prompt[:300]))
@@ -657,7 +679,7 @@ class Agent:
         try:
             sub = Agent(
                 self.engine,
-                mode="auto",                       # auto-approve within its restricted toolset
+                mode="yolo",                       # auto-approve within its restricted toolset
                 max_steps=SUBAGENT_MAX_STEPS,
                 ctx_limit=min(self.ctx_limit, SUBAGENT_CTX_LIMIT),
                 thinking=self.thinking,
@@ -1509,7 +1531,8 @@ class Agent:
                 # fire, which is how a turn once shipped a 28-token garble as its final
                 # answer. read_only/explain asks are exempt. Banks a note so
                 # auto-continue relaunches fresh instead of shipping nothing.
-                did_nothing = self.mode == "auto" and not read_only_intent and not did_work
+                did_nothing = (self.mode in ("auto", "yolo")
+                               and not read_only_intent and not did_work)
                 if (action_task and not read_only_intent
                         and (not made_edit or unverified_edit)) or did_nothing:
                     # Churn→audit handoff: this hard stop used to fire with the

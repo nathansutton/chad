@@ -323,16 +323,18 @@ def test_subagent_skips_session_reset(monkeypatch):
 
 def test_subagent_tools_policy():
     """A sub-agent auto-approves its own tool calls, so it must never hold more autonomy
-    than its parent: only an 'auto' (--yolo/headless) parent may delegate 'all'. Anything
-    else — including a 'normal' parent whose safety promise is human confirmation of every
-    mutation — clamps to read-only."""
+    than its parent: only a 'yolo' (--yolo/headless) parent may delegate 'all'. Anything
+    else — a 'normal' parent whose safety promise is human confirmation of every mutation,
+    or an 'auto' parent whose promise is narrower than 'all' (edits yes, shell no) —
+    clamps to read-only."""
     from chad.agent import subagent_tools_for
     for parent_mode, requested, expected in [
-        ("auto", "all", "all"),
+        ("yolo", "all", "all"),
+        ("auto", "all", "read-only"),
         ("normal", "all", "read-only"),
         ("plan", "all", "read-only"),
         ("normal", "read-only", "read-only"),
-        ("auto", "read-only", "read-only"),
+        ("yolo", "read-only", "read-only"),
     ]:
         check(f"subagent_tools_for({parent_mode!r}, {requested!r})",
               subagent_tools_for(parent_mode, requested) == expected,

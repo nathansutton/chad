@@ -617,7 +617,7 @@ def test_truncation_recovery_matches_fresh():
     from chad.agent import Agent
 
     eng.prompt_lookup = True
-    agent = Agent(eng, mode="auto", thinking=False)
+    agent = Agent(eng, mode="yolo", thinking=False)
     agent.messages.append({"role": "user", "content": "Print hello world in Python."})
     base_prompt = list(agent._render())
 

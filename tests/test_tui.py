@@ -14,7 +14,16 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from chad.engine import Engine  # noqa: E402
-from chad.tui import TUI, _kfmt, _phase_glyph, _todo_panel_rows  # noqa: E402
+from chad.tui import (  # noqa: E402
+    _CONFIRM_MAX_CHARS,
+    _CONFIRM_MAX_LINES,
+    TUI,
+    _confirm_body_lines,
+    _confirm_title,
+    _kfmt,
+    _phase_glyph,
+    _todo_panel_rows,
+)
 
 
 def test_kfmt():
@@ -480,3 +489,43 @@ def test_leftover_steer_falls_back_to_typeahead():
     assert done.wait(_JOIN), "the leftover steer never ran as a follow-up turn"
     assert fake.calls == ["task", "too late to steer"]
     _stop_worker(tui, th)
+
+
+# -- The approval panel: what you are actually approving must be legible ------
+#
+# The failure this pins: the confirm used to render into the height-1 status window
+# with newlines flattened to " ⏎ " and a 160-char clip, so a multi-line bash command
+# was unreadable — you were approving blind. The panel keeps the command's real lines.
+
+def test_confirm_body_keeps_multiline_structure():
+    body = _confirm_body_lines("bash", {"command": "set -e\ncd /tmp/x\npytest -x -q"})
+    assert body == ["set -e", "cd /tmp/x", "pytest -x -q"]
+
+
+def test_confirm_body_is_bounded_in_lines_and_chars():
+    # A 500-line heredoc must not swallow the terminal, and the overflow is stated
+    # rather than silently dropped.
+    body = _confirm_body_lines("write", {"path": "x.py", "content": "y\n" * 500})
+    assert len(body) <= _CONFIRM_MAX_LINES + 1
+    assert any("more lines" in ln for ln in body)
+    assert sum(len(ln) for ln in body) <= _CONFIRM_MAX_CHARS + len(body[-1])
+
+
+def test_confirm_title_names_the_shell_in_plain_words():
+    # "bash" alone does not tell you a shell command is about to run on your machine.
+    assert _confirm_title("bash") == "run a terminal command"
+    assert _confirm_title("edit") == "edit a file"
+    assert "MCP" in _confirm_title("mcp__srv__send")
+
+
+def test_confirm_panel_shows_full_command_and_flags_destructive():
+    tui = TUI(_fake_engine(), ctx_limit=24000)
+    assert tui._confirm_fragments() == []  # hidden when nothing is pending
+    tui._confirm_req = ("bash", {"command": "rm -rf ~"})
+    text = "".join(t for _, t in tui._confirm_fragments())
+    assert "rm -rf ~" in text                      # the command itself, not a clip
+    assert "terminal command" in text
+    assert "destructive" in text                   # seatbelt warning next to the command
+    # The status row carries only the question + keys; the body lives in the panel.
+    status = "".join(t for _, t in tui._status_fragments())
+    assert "approve bash?" in status and "[y]es" in status and "rm -rf" not in status

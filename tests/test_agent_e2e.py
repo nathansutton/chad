@@ -11,7 +11,7 @@ network by swapping the MLX `Engine` for a `ScriptedEngine`: a structural `BaseE
 whose `generate` returns pre-authored assistant turns (canned `<tool_call>` blocks)
 instead of sampling a model. The tokenizer is a tiny fake — the scripted engine ignores
 the rendered prompt, so the render path only needs to produce a length (see
-`_FakeTok.apply_chat_template`); no chat template, no download. `mode="auto"` auto-approves
+`_FakeTok.apply_chat_template`); no chat template, no download. `mode="yolo"` auto-approves
 the confirm gate — this test is about the LOOP, not the gate (covers the gate).
 
 Mirrors the fake-engine style of test_completion_engine.py; hermetic via `tmp_path`.
@@ -97,7 +97,7 @@ def _tool_call(name, **args):
 def _agent(script, **kw):
     # thinking=False: the scripted turns carry no <think> block, so we skip the
     # template's think handling (and close_unclosed_think) for a clean, literal turn.
-    return Agent(ScriptedEngine(script), mode="auto", thinking=False, **kw)
+    return Agent(ScriptedEngine(script), mode="yolo", thinking=False, **kw)
 
 
 # --- Step 1: the scripted engine structurally satisfies BaseEngine -----------
@@ -110,7 +110,7 @@ def test_scripted_engine_satisfies_base_engine_protocol():
 def test_scripted_agent_constructs_without_weights_or_network():
     # Step 2 verify: an Agent builds on the scripted engine + fake tok — no model load.
     agent = _agent(["hi"])
-    assert agent.mode == "auto"
+    assert agent.mode == "yolo"
     assert agent.engine.model_id == "scripted-test"
 
 
@@ -219,7 +219,7 @@ def test_wrapup_window_injects_one_steer_in_final_stretch(tmp_path, monkeypatch)
         _tool_call("bash", command=f"python3 {m}"),            # step1: verify -> progress
         _tool_call("done", summary="done"),                    # step2: after the wrap-up fires
     ]
-    agent = Agent(ClockEngine(script), mode="auto", thinking=False, turn_budget_s=1000.0)
+    agent = Agent(ClockEngine(script), mode="yolo", thinking=False, turn_budget_s=1000.0)
     agent.run_turn("do the thing")
 
     steers = [msg for msg in agent.messages
@@ -339,7 +339,7 @@ def test_agent_loop_cuts_off_degenerate_repetition():
     NEXT (healthy) answer — the dogfood-trace runaway, replayed without a model."""
     runaway = "The answer starts well " + "`CHAD_NO_TASK`, " * 400   # ~6.4k chars of loop
     script = [runaway, "The flags live in config.py."]
-    agent = Agent(_TokenizingEngine(script), mode="auto", thinking=False, max_steps=10)
+    agent = Agent(_TokenizingEngine(script), mode="yolo", thinking=False, max_steps=10)
 
     result = agent.run_turn("which file centralizes the CHAD_ flags?")
 
@@ -513,7 +513,7 @@ class _FlakyEngine(ScriptedEngine):
 def test_transient_backend_error_is_retried_and_the_turn_completes(monkeypatch):
     monkeypatch.setattr("chad.agent.time.sleep", lambda *_: None)   # no backoff in tests
     eng = _FlakyEngine(["all done"], n_fail=1, transient=True)
-    agent = Agent(eng, mode="auto", thinking=False)
+    agent = Agent(eng, mode="yolo", thinking=False)
     agent.run_turn("do the thing")
     assert eng.calls == 2, "the failed step should have been re-issued exactly once"
     assert agent.messages[-1]["content"] == "all done"
@@ -525,7 +525,7 @@ def test_transient_backend_errors_give_up_after_the_retry_budget(monkeypatch):
 
     from chad.base_engine import BackendError
     eng = _FlakyEngine(["unreachable"], n_fail=99, transient=True)
-    agent = Agent(eng, mode="auto", thinking=False)
+    agent = Agent(eng, mode="yolo", thinking=False)
     with pytest.raises(BackendError):
         agent.run_turn("do the thing")
     # 3 retries + the original attempt: a server that is genuinely down must surface,
@@ -539,7 +539,7 @@ def test_non_transient_backend_error_is_not_retried(monkeypatch):
 
     from chad.base_engine import BackendError
     eng = _FlakyEngine(["unreachable"], n_fail=99, transient=False)
-    agent = Agent(eng, mode="auto", thinking=False)
+    agent = Agent(eng, mode="yolo", thinking=False)
     with pytest.raises(BackendError):
         agent.run_turn("do the thing")
     assert eng.calls == 1, "a 4xx is the prompt's fault; re-rolling it is wasted budget"
@@ -548,7 +548,7 @@ def test_non_transient_backend_error_is_not_retried(monkeypatch):
 def test_backend_retry_budget_resets_per_turn(monkeypatch):
     monkeypatch.setattr("chad.agent.time.sleep", lambda *_: None)
     eng = _FlakyEngine(["first", "second"], n_fail=1, transient=True)
-    agent = Agent(eng, mode="auto", thinking=False)
+    agent = Agent(eng, mode="yolo", thinking=False)
     agent.run_turn("one")
     eng.n_fail, eng.calls = 3, 0      # a fresh transient fault on the next turn
     eng._i = 1                        # replay from "second"
@@ -598,7 +598,7 @@ def test_steering_injects_between_steps_and_run_continues(tmp_path, monkeypatch)
         out, steers[:] = list(steers), []
         return out
 
-    agent = Agent(eng, mode="auto", thinking=False, drain_steering=drain, max_steps=10)
+    agent = Agent(eng, mode="yolo", thinking=False, drain_steering=drain, max_steps=10)
     result = agent.run_turn("create note.txt")
 
     assert result == "finished"
@@ -677,7 +677,7 @@ def test_steering_keeps_the_render_prefix_stable(tmp_path, monkeypatch):
     # _SeqTok yields one id per CHARACTER, so the ~44k-char system prompt alone would
     # cross the default 24k compaction threshold; raise it — this test is about the
     # injection's prefix purity, not compaction (test_compaction.py owns that).
-    agent = Agent(eng, mode="auto", thinking=False, drain_steering=drain,
+    agent = Agent(eng, mode="yolo", thinking=False, drain_steering=drain,
                   max_steps=10, ctx_limit=200_000)
     agent.run_turn("create note.txt")
 
@@ -731,7 +731,7 @@ def _run_escalation(monkeypatch, *, ablated: bool):
     eng.tok = tok
     # thinking=True so there IS a <think> to disable; max_gen_tokens tiny so the forced
     # generated_tokens == max_tokens trips hit_cap.
-    agent = Agent(eng, mode="auto", thinking=True, max_gen_tokens=64)
+    agent = Agent(eng, mode="yolo", thinking=True, max_gen_tokens=64)
     agent.run_turn("change the config value")   # an action task, not read-only
     return tok.flags
 
@@ -780,7 +780,7 @@ def _run_turn_think_budget(monkeypatch, *, ablated: bool, script=None,
     # A configured wall budget is required to arm the mechanism at all (like
     # wrapup_window); huge so the UNRELATED governor/wrapup checks never fire and
     # muddy the transcript this test inspects.
-    agent = Agent(eng, mode="auto", thinking=True, max_gen_tokens=20000,
+    agent = Agent(eng, mode="yolo", thinking=True, max_gen_tokens=20000,
                   turn_budget_s=turn_budget_s)
     agent.run_turn("change the config value")   # an action task, not read-only
     return tok.flags
@@ -843,7 +843,7 @@ def _run_capped_think(monkeypatch, *, ablated: bool):
     eng = _BigThinkEngine([truncated] * 6)
     tok = _ThinkFlagTok()
     eng.tok = tok
-    agent = Agent(eng, mode="auto", thinking=True, max_gen_tokens=15000,
+    agent = Agent(eng, mode="yolo", thinking=True, max_gen_tokens=15000,
                   turn_budget_s=1e9)
     agent.run_turn("change the config value")
     return tok.flags

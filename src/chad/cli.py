@@ -712,7 +712,7 @@ def _main(argv=None):
         sys.stderr.write(f"ready in {load_s:.1f}s | context {eng.effective_ctx} tokens "
                          f"(compact at {ctx_limit})\n")
 
-    start_mode = "plan" if args.plan else ("auto" if args.yolo else "normal")
+    start_mode = "plan" if args.plan else ("yolo" if args.yolo else "normal")
     thinking = not args.no_think
 
     # Live per-turn ctx-limit recheck: the startup number was
@@ -758,9 +758,9 @@ def _main(argv=None):
         # auto-approve mutating tools unless the user asked for read-only --plan.
         run_mode = start_mode
         if run_mode == "normal" and not sys.stdin.isatty():
-            run_mode = "auto"
+            run_mode = "yolo"
             sys.stderr.write("[headless: auto-approving tools (use --plan for read-only)]\n")
-        agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
+        agent = Agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
                       mode=run_mode, thinking=thinking, resume=resume, persist=True,
                       think_budget=args.think_budget,
                       turn_budget_s=turn_budget_s, ctx_limit_fn=ctx_limit_fn)
@@ -777,7 +777,7 @@ def _main(argv=None):
         # ships as an empty diff — the measured bail signature.
         auto_continue = config.env_int("CHAD_AUTO_CONTINUE")
         continues = auto_continue if auto_continue is not None \
-            else (2 if run_mode == "auto" else 0)
+            else (2 if run_mode == "yolo" else 0)
         used_continues = 0
         while agent.budget_note:
             # Base allowance first; past it, keep granting fresh attempts while most
@@ -819,7 +819,7 @@ def _main(argv=None):
             if getattr(eng, "temp", None) is not None:
                 eng.temp = max(eng.temp, 0.6)
             eng.reset()
-            agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
+            agent = Agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
                           mode=run_mode, thinking=thinking, persist=True,
                           think_budget=args.think_budget,
                           turn_budget_s=relaunch_s, ctx_limit_fn=ctx_limit_fn)
@@ -841,7 +841,7 @@ def _main(argv=None):
             sys.stderr.write(f"[review] task finished with {turn_budget_s - elapsed:.0f}s "
                              "of budget left; running one fresh-context verification pass\n")
             eng.reset()
-            agent = Agent(eng, yolo=(run_mode == "auto"), ctx_limit=ctx_limit,
+            agent = Agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
                           mode=run_mode, thinking=thinking, persist=True,
                           think_budget=args.think_budget,
                           turn_budget_s=review_budget, ctx_limit_fn=ctx_limit_fn)

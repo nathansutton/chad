@@ -2,6 +2,28 @@
 
 Notable, user-visible changes.
 
+## [Unreleased]
+
+- **You can see what you're approving.** The confirm prompt used to render into the
+  one-row status line with newlines flattened to `⏎` and a 160-character clip, so a
+  multi-line bash command was unreadable — approving it was approving blind. Approvals
+  now open a panel above the input that shows the command on its own lines (bounded, so a
+  giant heredoc can't swallow the screen), names in plain words what is about to happen
+  ("chad wants to run a terminal command"), and puts the destructive-command warning next
+  to the command instead of in scrollback.
+- **New demo GIF.** The old one predated the banner entirely (no logo, a dead model id,
+  and a fixture that no longer matched the checked-in tape). The new one is a 35B session
+  end to end in 51 seconds: banner, type-ahead while the weights load, the model finding
+  the cent that floor division loses, fixing it, verifying itself, and your own `pytest`
+  confirming it stuck.
+- **`auto-accept edits` now means what it says.** It auto-approved *everything*, bash
+  included. It now auto-approves file edits only — terminal commands and mutating MCP
+  tools still ask, which is the mode most people actually wanted. The old
+  approve-everything behavior is unchanged but now has its own name, `yolo`, still where
+  `--yolo` starts you and now reachable with shift-tab: `normal → auto-accept edits →
+  yolo → plan`. A sub-agent's `tools: "all"` request is honored only under `yolo`, since
+  `all` includes the shell.
+
 ## [1.0.5] — 2026-07-26
 
 The release that makes a 24 GB Mac a first-class target: it runs the 35B now, a Linux

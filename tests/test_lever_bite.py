@@ -425,11 +425,11 @@ def test_backend_retry(monkeypatch, tmp_path):
     script = [_tool_call("read", path="m.py"), _tool_call("done", summary="ok")]
 
     on(monkeypatch)
-    ag = Agent(FlakyEngine(script), mode="auto", thinking=False)
+    ag = Agent(FlakyEngine(script), mode="yolo", thinking=False)
     assert ag.run_turn("do it", stream=False), "a transient 5xx must be re-rolled"
 
     off(monkeypatch, n)
-    ag = Agent(FlakyEngine(script), mode="auto", thinking=False)
+    ag = Agent(FlakyEngine(script), mode="yolo", thinking=False)
     with pytest.raises(BackendError):
         ag.run_turn("do it", stream=False)
 
@@ -450,7 +450,7 @@ def test_subagent_no_respawn(monkeypatch, tmp_path):
             _tool_call("task", description="find it", prompt="where is retry handled?"),
             _tool_call("task", description="find it", prompt="where is retry handled?"),
             _tool_call("done", summary="ok"),
-        ]), mode="auto", thinking=False)
+        ]), mode="yolo", thinking=False)
         ag._run_subagent = lambda d, p, *a, **k: (spawns.append((d, p)), "found nothing")[1]
         ag.run_turn("add retry handling", stream=False)
         return spawns, ag
@@ -490,7 +490,7 @@ def test_subagent_budget_note(monkeypatch, tmp_path):
             _tool_call("task", description="find it", prompt="where is retry handled?"),
             "unused",                       # consumed by the sub-agent's raising turn
             _tool_call("done", summary="ok"),
-        ]), mode="auto", thinking=False)
+        ]), mode="yolo", thinking=False)
         ag.run_turn("add retry handling", stream=False)
         return "\n".join(m.get("content", "") for m in ag.messages if m.get("name") == "task")
 

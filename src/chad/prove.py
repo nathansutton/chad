@@ -214,7 +214,7 @@ def _run_one(engine, task, capture_ttft=False):
         subprocess.run(["git", "init", "-q"], capture_output=True)
         subprocess.run(["git", "add", "-A"], capture_output=True)
         deadline = [None]
-        agent = Agent(engine, mode="auto", thinking=True,
+        agent = Agent(engine, mode="yolo", thinking=True,
                       should_stop=lambda: (deadline[0] is not None
                                            and time.time() > deadline[0]))
         if capture_ttft:

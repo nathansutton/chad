@@ -486,7 +486,7 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
   prefix KV cache (`engine.py`), forcing a full re-prefill every step. It exists to measure
   what the cache is worth and makes chad much slower — never set it in normal use.
 - **`CHAD_NO_DESTRUCTIVE_GUARD`** — **disables** the catastrophic-bash seatbelt
-  (`guardrails.py`) even in `--yolo`/auto mode. With it set, an injected `rm -rf ~`,
+  (`guardrails.py`) even in `--yolo` mode. With it set, an injected `rm -rf ~`,
   `mkfs`, `dd of=/dev/…`, fork bomb, or `curl … | sh` is **not** screened before running.
   It is a seatbelt, not a security boundary (a sandbox is) — recommend leaving it unset.
 - **`CHAD_NO_SKILLS`** — turns off [Agent Skill](#agent-skills-agentskillsio) discovery

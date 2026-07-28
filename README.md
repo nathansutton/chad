@@ -44,10 +44,12 @@ instrument:
 | **Harness**     | open-ended, anything you can imagine            | plan. execute. nothing else.    |
 | **When wrong**  | reasons a way out                               | already shipped                 |
 
-![chad fixing a failing test end to end — reason, read, edit, rerun pytest, all on a local 35B](docs/demo.gif)
+![chad fixing a failing test end to end — reason, read, edit, run pytest, confirm green, all on a local 35B](docs/demo.gif)
 
-> Real session, unedited (cold model load cut): a local 35B reasons through the failure,
-> edits the file, reruns the tests, confirms green.
+> Real session, unedited (the silent prefill is cut): a local 35B finds the cent that
+> floor division loses, fixes it, and verifies itself — then your own `pytest`, in your
+> own shell. Recorded with `--yolo` so nothing pauses for a keypress; the default mode
+> stops and asks before every edit and every command.
 
 ## Frontier scores, laptop cost
 
@@ -134,7 +136,10 @@ it chad uses the tree-sitter fallback automatically.
 `uv run chad` launches a full-screen terminal UI (built on prompt_toolkit):
 
 - **shift-tab cycles permission modes** — `normal` (confirm each bash/write/edit) →
-  `auto-accept edits` → `plan mode` (read-only: investigate + propose a numbered plan) → back.
+  `auto-accept edits` (edits land silently; **terminal commands still ask**) → `yolo`
+  (nothing asks) → `plan mode` (read-only: investigate + propose a numbered plan) → back.
+- **the approval prompt shows what you're approving** — the full command on its own lines
+  above the input, not a clipped single line. Approving blind isn't approving.
 - **type-ahead message queue** — keep typing while the agent works; messages run in order.
 - **ctrl-c interrupts the running turn** without killing the session.
 - **live status line** — model, mode, context %, a state glyph + verb, elapsed seconds, and

@@ -22,12 +22,20 @@ environment approval — publishes `chad-code` to PyPI.
    ```bash
    vhs docs/demo.tape
    ```
-   Watch it once. The wifi-off moment must survive the cut — it's the offline
-   claim, demonstrated. Expect to tune `Sleep`/`Wait` values if the TUI or
-   model timings changed; the tape (`docs/demo.tape`) is the source of truth
-   and ships with the repo so the demo can't silently rot.
-   Wifi comes back on at the end of the tape; check it did
-   (`networksetup -getairportpower en0`).
+   Watch it once, all the way through. Two things must survive the cut: the
+   banner (logo, version, model, context, cwd) and the fix landing with its diff
+   on screen. The tape (`docs/demo.tape`) is the source of truth and ships with
+   the repo so the demo can't silently rot.
+
+   Two things about recording it, both learned the hard way:
+   - **The turn is timed, not matched.** `Wait+Screen` stops seeing the screen
+     once chad's TUI starts a turn, so the tape sleeps through it. Overshooting
+     costs a few dull frames of a finished transcript; undershooting types
+     `/exit` into a running turn. If the model or the prompt changed, re-measure
+     the offsets before recording — the tape header says how.
+   - **Expect to re-roll.** Sampling is not deterministic: a take where the model
+     fumbles (invents a path, re-reads, wanders) is a bad demo, not a bad tape.
+     Watch the frames, and if it wandered, just run it again.
 5. **Version bump** in BOTH `pyproject.toml` and `src/chad/__init__.py`
    (`__version__` drives `--version`; the pyproject version drives the wheel and
    the ATIF trajectory's agent.version). They must match.

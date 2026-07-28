@@ -1772,7 +1772,7 @@ SCHEMAS: list[dict[str, Any]] = [
                     "tools": {"type": "string", "enum": ["read-only", "all"],
                               "description": "Tool access: 'read-only' (default; search/read "
                                              "only) or 'all' (also edit/run — honored only in "
-                                             "--yolo/auto mode; otherwise clamped to read-only)."},
+                                             "--yolo mode; otherwise clamped to read-only)."},
                 },
                 "required": ["description", "prompt"],
             },

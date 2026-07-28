@@ -58,7 +58,7 @@ def test_garble_exhaustion_hard_stops_instead_of_accepting(tmp_path, monkeypatch
     script = _script_prefix(f) + [GARBLE] * (GARBLE_NUDGE_CAP + 1)
     # Big scripted ctx: the governor's cumulative-prefill budget (3x ctx) must not
     # fire before the garble budget does — this test is about the garble exit.
-    agent = Agent(ScriptedEngine(script, effective_ctx=400000), mode="auto",
+    agent = Agent(ScriptedEngine(script, effective_ctx=400000), mode="yolo",
                   thinking=False, max_steps=30, ctx_limit=400000)
 
     result = agent.run_turn(f"write a script at {f} that prints hi")

@@ -10,7 +10,7 @@ can't silently re-open the hole:
    (`plans/../secret.py` escaping) would let plan mode scribble anywhere. We table-test
    `_under_plans` (incl. `..` and sibling-prefix escapes) and the gate's compose logic.
 2. The destructive-bash seatbelt in `_confirm` (agent.py ~390): a catastrophic shell
-   command (`rm -rf ~`, `curl|sh`) is screened even in auto/--yolo mode, and headless
+   command (`rm -rf ~`, `curl|sh`) is screened even in --yolo mode, and headless
    with no confirm channel it BLOCKS rather than runs. The predicate
    (`guardrails.is_destructive_bash`) is tested elsewhere; this pins the run-vs-block
    WIRING — the part a refactor that dropped `not sys.stdin.isatty()` would break.
@@ -104,7 +104,7 @@ def test_is_mutating_covers_every_mutator():
 def test_plan_mode_blocks_mutating_tools():
     """In plan mode: every mutating tool is blocked, EXCEPT write/edit under ./plans/.
     A write outside ./plans/, an escaping `plans/../x`, bash, and symbol edits all block;
-    a legitimate plan write/edit is allowed. (In auto/normal mode the plan-block never
+    a legitimate plan write/edit is allowed. (Outside plan mode the plan-block never
     fires — it is a plan-mode-only clamp.)"""
     # Blocked in plan mode:
     check("plan: bash blocked", _plan_gate("plan", "bash", {"command": "ls"}) == "blocked")
@@ -135,20 +135,20 @@ _SAFE = "ls -la"
 
 
 def test_confirm_auto_safe_bash_runs():
-    """auto mode + a non-dangerous bash → runs without a prompt (returns True)."""
-    agent = _mk_agent(mode="auto")
+    """yolo mode + a non-dangerous bash → runs without a prompt (returns True)."""
+    agent = _mk_agent(mode="yolo")
     check("safe bash auto-approves", agent._confirm("bash", {"command": _SAFE}) is True)
 
 
 def test_confirm_auto_destructive_headless_blocks(monkeypatch):
-    """auto mode + a destructive bash + no confirm channel (no callback, not a TTY) → the
+    """yolo mode + a destructive bash + no confirm channel (no callback, not a TTY) → the
     seatbelt BLOCKS (returns False) rather than executing on a possible injection, and says
     so on the transcript. This is the exact wiring a refactor dropping the
     `not sys.stdin.isatty()` block would silently re-open."""
     monkeypatch.delenv("CHAD_NO_DESTRUCTIVE_GUARD", raising=False)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     seen = []
-    agent = _mk_agent(mode="auto", emit=lambda k, t: seen.append((k, t)))
+    agent = _mk_agent(mode="yolo", emit=lambda k, t: seen.append((k, t)))
     # _confirm_cb defaults to None (no callback), so the headless-block branch is reached.
     check("destructive bash is blocked headless",
           agent._confirm("bash", {"command": _RM_HOME}) is False)
@@ -166,7 +166,7 @@ def test_confirm_destructive_consults_callback(monkeypatch):
         calls.append((name, args))
         return True
 
-    agent = _mk_agent(mode="auto", confirm=cb)
+    agent = _mk_agent(mode="yolo", confirm=cb)
     check("callback answer honored", agent._confirm("bash", {"command": _RM_HOME}) is True)
     check("callback was actually consulted", calls == [("bash", {"command": _RM_HOME})], calls)
 
@@ -179,13 +179,13 @@ def test_confirm_headless_block_sets_truthful_deny_reason(monkeypatch):
     monkeypatch.delenv("CHAD_NO_DESTRUCTIVE_GUARD", raising=False)
     monkeypatch.delenv("CHAD_DISABLE", raising=False)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
-    agent = _mk_agent(mode="auto")
+    agent = _mk_agent(mode="yolo")
     check("block still blocks", agent._confirm("bash", {"command": _RM_HOME}) is False)
     check("deny reason names the guard, not the user",
           agent._deny_reason is not None and "destructive-command guard" in agent._deny_reason,
           agent._deny_reason)
     monkeypatch.setenv("CHAD_DISABLE", "scoped_destructive_guard")
-    agent2 = _mk_agent(mode="auto")
+    agent2 = _mk_agent(mode="yolo")
     check("lever OFF: still blocks", agent2._confirm("bash", {"command": _RM_HOME}) is False)
     check("lever OFF: bare '[denied by user]' preserved (no reason set)",
           agent2._deny_reason is None, agent2._deny_reason)
@@ -193,12 +193,68 @@ def test_confirm_headless_block_sets_truthful_deny_reason(monkeypatch):
 
 def test_confirm_guard_opt_out(monkeypatch):
     """CHAD_NO_DESTRUCTIVE_GUARD=1 disables the seatbelt: the same catastrophic command in
-    auto mode with no channel now runs (returns True) instead of blocking."""
+    yolo mode with no channel now runs (returns True) instead of blocking."""
     monkeypatch.setenv("CHAD_NO_DESTRUCTIVE_GUARD", "1")
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
-    agent = _mk_agent(mode="auto")
+    agent = _mk_agent(mode="yolo")
     check("opt-out lets the destructive command run",
           agent._confirm("bash", {"command": _RM_HOME}) is True)
+
+
+# === 4. The accept-edits gate: 'auto' auto-approves edits but NOT the shell ==============
+
+def test_auto_mode_approves_edits_without_prompting():
+    """'auto' (auto-accept edits) waves through file edits: no confirm callback is
+    consulted and _confirm returns True on its own."""
+    calls = []
+    agent = _mk_agent(mode="auto", confirm=lambda n, a: calls.append(n) or True)
+    for name in ("write", "edit", "replace_lines", "insert_lines",
+                 "replace_symbol", "insert_symbol", "rename_symbol"):
+        check(f"auto approves {name} silently",
+              agent._confirm(name, {"path": "src/x.py"}) is True)
+    check("no confirm channel consulted for edits", calls == [], calls)
+
+
+def test_auto_mode_still_confirms_bash():
+    """The whole point of the mode: a terminal command still reaches the human, and a
+    denial is honored. (A mutating MCP tool takes the same path — see
+    test_auto_mode_fails_closed_on_unknown_mutating_tool for the policy call, which is
+    where it can be pinned without standing up an MCP server.)"""
+    seen = []
+
+    def cb(name, args):
+        seen.append(name)
+        return False
+
+    agent = _mk_agent(mode="auto", confirm=cb)
+    check("bash is confirmed, not auto-approved",
+          agent._confirm("bash", {"command": "ls -la"}) is False)
+    check("the human channel was consulted", seen == ["bash"], seen)
+
+
+def test_auto_mode_fails_closed_on_unknown_mutating_tool():
+    """AUTO_EDIT_TOOLS is an allowlist, not `MUTATING - {bash}`: a mutating tool nobody
+    has classified yet must ask rather than inherit auto-approval."""
+    from chad.agent import AUTO_EDIT_TOOLS, auto_approves
+    check("unknown mutating tool is not auto-approved",
+          auto_approves("auto", "deploy_to_prod") is False)
+    check("a mutating MCP tool is not auto-approved",
+          auto_approves("auto", "mcp__srv__send_email") is False)
+    check("bash is never in the edits allowlist", "bash" not in AUTO_EDIT_TOOLS)
+    check("yolo approves everything", auto_approves("yolo", "deploy_to_prod") is True)
+    check("normal approves nothing mutating", auto_approves("normal", "edit") is False)
+    check("plan approves nothing mutating", auto_approves("plan", "edit") is False)
+
+
+def test_mode_cycle_reaches_every_mode():
+    """shift-tab must reach yolo, and cycling must return home — a mode you can enter but
+    not leave (or can't reach) is a UX trap."""
+    from chad.agent import MODE_LABEL, MODES
+    agent = _mk_agent(mode="normal")
+    seq = [agent.cycle_mode() for _ in range(len(MODES))]
+    check("cycle visits every mode", set(seq) == set(MODES), seq)
+    check("cycle returns to the start", seq[-1] == "normal", seq)
+    check("every mode has a label", all(m in MODE_LABEL for m in MODES), MODE_LABEL)
 
 
 if __name__ == "__main__":
