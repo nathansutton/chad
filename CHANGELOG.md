@@ -2,7 +2,7 @@
 
 Notable, user-visible changes.
 
-## [Unreleased]
+## [1.0.6] — 2026-07-28
 
 - **Voice mode, all local.** `/speech` in the TUI turns on push-to-talk: ctrl-t opens the
   mic (a red `● rec` pin in the status line — an open mic you can't see is a bug), ctrl-t
