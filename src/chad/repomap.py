@@ -12,16 +12,17 @@ This is the aider "repo map" idea, built in-process on tree-sitter:
 * `tree-sitter-language-pack` ships ~300 grammars (downloaded + cached on first use)
   AND the `tags.scm` queries that mark every definition/reference — so symbol
   extraction is **language-agnostic** with no language-server subprocess to install
-  (that precision layer comes later, behind this same surface, via solidlsp).
+  (the precision layer sits behind this same surface, via chad's own LSP client).
 * `repo_map()` ranks definitions with personalized PageRank (rustworkx) over the
   file→symbol reference graph and renders the most central ones as elided signatures
   within a token budget. Whole-repo tag extraction is mtime-cached on disk per repo
   and sharded across subprocess workers on a cold scan (see `_extract_all`).
 * `overview` / `find_symbol` / `view_symbol` / `find_refs` are the per-symbol read
-  tools, now multi-language (they replace the Python-only jedi backend in
-  `symbols.py`; jedi remains the editor for `replace_symbol`/`insert_symbol`).
-
-API mirrors `symbols.SymbolService` so `tools.py` can route to either backend.
+  tools, multi-language. Qualified paths ("Engine/generate") resolve in every
+  language via each Tag's scope chain — span containment plus receiver/impl
+  context (see `Tag`). `symbols.py` (the `replace_symbol`/`insert_symbol` editor)
+  resolves through the same `_find_defs`, so what the model views is what an edit
+  replaces, in any language.
 """
 
 import hashlib
@@ -85,7 +86,7 @@ _MAX_DEFINERS = 16
 #      re-import chad's entry point, which would drag the whole MLX engine into each.
 _PARALLEL_MIN_FILES = 200   # below this, worker startup costs more than it saves
 _CACHE_SAVE_MIN = 32        # don't persist a cache for tiny repos (or tiny test fixtures)
-_CACHE_VERSION = 1          # bump when the entry shape or tags queries change
+_CACHE_VERSION = 2          # bump when the entry shape or tags queries change
 _CACHE_DIR = os.path.expanduser("~/.chad/cache/repomap")
 
 _WORKER_SRC = """\
@@ -105,11 +106,153 @@ def _worker_count() -> int:
         return n
     return max(1, min(8, (os.cpu_count() or 4) - 2))
 
+
+# Chad-owned tags queries for languages where the pack's are missing or broken
+# (measured on tests/fixtures/polyglot, 2026-07-29): typescript/tsx ship NO query
+# (0 chars); php's names `method_call_expression`, which current tree-sitter-php
+# renamed `member_call_expression`, so Query() refuses to compile the whole thing;
+# c has no @reference captures and tags header prototypes as definitions; cpp
+# misses out-of-class (`Engine::process`) and in-class method definitions.
+_TS_TAGS = """\
+(class_declaration name: (type_identifier) @name) @definition.class
+(abstract_class_declaration name: (type_identifier) @name) @definition.class
+(interface_declaration name: (type_identifier) @name) @definition.interface
+(type_alias_declaration name: (type_identifier) @name) @definition.type
+(enum_declaration name: (identifier) @name) @definition.type
+(internal_module name: (identifier) @name) @definition.module
+(function_declaration name: (identifier) @name) @definition.function
+(generator_function_declaration name: (identifier) @name) @definition.function
+((method_definition name: (property_identifier) @name) @definition.method
+ (#not-eq? @name "constructor"))
+(method_signature name: (property_identifier) @name) @definition.method
+(lexical_declaration (variable_declarator
+  name: (identifier) @name
+  value: [(arrow_function) (function_expression)]) @definition.function)
+(variable_declaration (variable_declarator
+  name: (identifier) @name
+  value: [(arrow_function) (function_expression)]) @definition.function)
+((call_expression function: (identifier) @name) @reference.call
+ (#not-match? @name "^(require)$"))
+(call_expression function: (member_expression
+  property: (property_identifier) @name)) @reference.call
+(new_expression constructor: (identifier) @name) @reference.class
+"""
+
+# go and rust attach methods without lexical nesting (receivers / impl blocks), so
+# span containment alone can't derive `Engine/Process` there. Their overrides add
+# @context.receiver (the method's receiver type) and @context.scope (the impl
+# block's span) on top of the pack's own captures.
+_TAGS_OVERRIDE = {
+    "typescript": _TS_TAGS,
+    "tsx": _TS_TAGS,
+    "go": """\
+(function_declaration name: (identifier) @name) @definition.function
+(method_declaration
+  receiver: (parameter_list (parameter_declaration
+    type: [(type_identifier) @context.receiver
+           (pointer_type (type_identifier) @context.receiver)]))
+  name: (field_identifier) @name) @definition.method
+(type_spec name: (type_identifier) @name) @definition.type
+(call_expression function: [
+  (identifier) @name
+  (parenthesized_expression (identifier) @name)
+  (selector_expression field: (field_identifier) @name)
+  (parenthesized_expression (selector_expression field: (field_identifier) @name))
+]) @reference.call
+(type_identifier) @name @reference.type
+""",
+    "rust": """\
+(struct_item name: (type_identifier) @name) @definition.class
+(enum_item name: (type_identifier) @name) @definition.class
+(union_item name: (type_identifier) @name) @definition.class
+(type_item name: (type_identifier) @name) @definition.class
+(declaration_list (function_item name: (identifier) @name) @definition.method)
+(function_item name: (identifier) @name) @definition.function
+(trait_item name: (type_identifier) @name) @definition.interface
+(mod_item name: (identifier) @name) @definition.module
+(macro_definition name: (identifier) @name) @definition.macro
+(call_expression function: (identifier) @name) @reference.call
+(call_expression function: (field_expression
+  field: (field_identifier) @name)) @reference.call
+(macro_invocation macro: (identifier) @name) @reference.call
+(impl_item trait: (type_identifier) @name) @reference.implementation
+(impl_item type: (type_identifier) @name !trait) @reference.implementation
+(impl_item type: (type_identifier) @name) @context.scope
+(impl_item type: (generic_type type: (type_identifier) @name)) @context.scope
+""",
+    "php": """\
+(class_declaration name: (name) @name) @definition.class
+(interface_declaration name: (name) @name) @definition.interface
+(method_declaration name: (name) @name) @definition.method
+(function_definition name: (name) @name) @definition.function
+(class_declaration (base_clause (name) @name)) @reference.implementation
+(class_declaration (class_interface_clause (name) @name)) @reference.implementation
+(interface_declaration (base_clause (name) @name)) @reference.implementation
+(function_call_expression function: (name) @name) @reference.call
+(member_call_expression name: (name) @name) @reference.call
+(scoped_call_expression name: (name) @name) @reference.call
+""",
+    "c": """\
+(function_definition declarator: (function_declarator
+  declarator: (identifier) @name)) @definition.function
+(function_definition declarator: (pointer_declarator
+  declarator: (function_declarator
+    declarator: (identifier) @name))) @definition.function
+(struct_specifier name: (type_identifier) @name body: (_)) @definition.class
+(declaration type: (union_specifier name: (type_identifier) @name)) @definition.class
+(type_definition declarator: (type_identifier) @name) @definition.type
+(enum_specifier name: (type_identifier) @name) @definition.type
+(call_expression function: (identifier) @name) @reference.call
+""",
+    "cpp": """\
+(class_specifier name: (type_identifier) @name) @definition.class
+(struct_specifier name: (type_identifier) @name body: (_)) @definition.class
+(function_definition declarator: (function_declarator
+  declarator: (identifier) @name)) @definition.function
+(function_definition declarator: (function_declarator
+  declarator: (qualified_identifier scope: (_) @context.receiver
+               name: (identifier) @name))) @definition.method
+(function_definition declarator: (function_declarator
+  declarator: (field_identifier) @name)) @definition.method
+(class_specifier (base_class_clause (type_identifier) @name)) @reference.implementation
+(call_expression function: (identifier) @name) @reference.call
+(call_expression function: (field_expression
+  field: (field_identifier) @name)) @reference.call
+""",
+}
+
 # A definition discovered by tree-sitter. `kind` is the tag suffix (function,
 # class, method, constant, ...); `sig` is the collapsed header line(s). `name_row`
 # and `name_col` are the 0-based position of the identifier itself (what an LSP
-# wants for go-to-def / find-references).
-Tag = namedtuple("Tag", "rel path name kind line end_line sig name_row name_col")
+# wants for go-to-def / find-references). `scope` is the enclosing-symbol chain,
+# outermost first (("Engine",) for a method, ("Outer", "Inner") when nested) — how
+# a qualified path like `Engine/generate` resolves in any language: by span
+# containment where methods nest lexically, and by receiver/impl context captures
+# (@context.receiver / @context.scope) where they don't (Go, Rust, C++ Engine::).
+Tag = namedtuple("Tag", "rel path name kind line end_line sig name_row name_col scope")
+
+
+def _scope_chains(spans):
+    """Enclosing-name chains by span containment: spans is [(start, end, name)],
+    returns for each input its chain of strictly-containing names, outermost first.
+    Tree-sitter spans nest or are disjoint (never partially overlap), so a single
+    (start, -end)-ordered pass with a stack is exact and O(n log n)."""
+    order = sorted(range(len(spans)), key=lambda i: (spans[i][0], -spans[i][1]))
+    stack = []  # indices of open (containing) spans
+    chains = [()] * len(spans)
+    for i in order:
+        start, end, _name = spans[i]
+        while stack and spans[stack[-1]][1] < start:
+            stack.pop()
+        chains[i] = tuple(spans[j][2] for j in stack
+                          if (spans[j][0], spans[j][1]) != (start, end))
+        stack.append(i)
+    return chains
+
+
+def _qual_parts(name: str):
+    """A symbol path ("Engine/generate" or "Engine.generate") as its segments."""
+    return [p for p in name.replace(".", "/").split("/") if p]
 
 
 def _estimate_tokens(text: str) -> int:
@@ -157,6 +300,7 @@ class RepoMap:
         self._tooling = {}   # lang -> (Parser, Query) | None
         self._cache = {}     # path -> (mtime, [defs], [(refname, rel, line)])
         self._files = None   # memoized completed _code_files() result; None = uncomputed
+        self._files_at = 0.0  # when that walk completed (staleness retry guard)
         self._disk_checked = False  # the on-disk tags cache is loaded at most once
         self._agg = None     # incremental rank-graph tables; see _aggregates()
         self._refsum_cache = {}  # (path, row, col, mtime) -> disambig note
@@ -296,7 +440,7 @@ class RepoMap:
         if lang not in self._tooling:
             try:
                 language = tlp.get_language(lang)
-                qsrc = tlp.get_tags_query(lang)
+                qsrc = _TAGS_OVERRIDE.get(lang) or tlp.get_tags_query(lang)
                 if not qsrc:
                     self._tooling[lang] = None
                 else:
@@ -343,6 +487,7 @@ class RepoMap:
         result = sorted(out)[:_MAX_FILES]
         if not interrupted:        # never cache a partial scan
             self._files = result
+            self._files_at = time.monotonic()
         return result
 
     @staticmethod
@@ -387,22 +532,47 @@ class RepoMap:
                 matches = []
                 src = b""
             rel = self._rel(path)
+            seen_spans = set()  # rust tags an impl fn as method AND function: one Tag
+            raw = []      # (name, kind, line0, end0, sig, nrow, ncol, receiver)
+            scopes = []   # (line0, end0, name) container spans that aren't symbols
+                          # themselves (rust `impl Engine { … }` blocks)
             for _pat, caps in matches:
                 name_nodes = caps.get("name")
                 name = (src[name_nodes[0].start_byte:name_nodes[0].end_byte]
                         .decode("utf-8", "replace")) if name_nodes else None
                 nrow = name_nodes[0].start_point[0] if name_nodes else 0
                 ncol = name_nodes[0].start_point[1] if name_nodes else 0
+                rnodes = caps.get("context.receiver")
+                receiver = (src[rnodes[0].start_byte:rnodes[0].end_byte]
+                            .decode("utf-8", "replace")) if rnodes else None
                 for cap, nodes in caps.items():
                     if cap.startswith("definition") and name:
                         kind = cap.split(".", 1)[1] if "." in cap else "def"
                         for dn in nodes:
-                            defs.append(Tag(rel, path, name, kind,
-                                            dn.start_point[0] + 1, dn.end_point[0] + 1,
-                                            self._header(src, dn), nrow, ncol))
+                            span = (name, dn.start_point[0], dn.end_point[0])
+                            if span in seen_spans:
+                                continue
+                            seen_spans.add(span)
+                            raw.append((name, kind, dn.start_point[0], dn.end_point[0],
+                                        self._header(src, dn), nrow, ncol, receiver))
                     elif cap.startswith("reference") and name:
                         for rn in nodes:
                             refs.append((name, rel, rn.start_point[0] + 1))
+                    elif cap.startswith("context.scope") and name:
+                        for sn in nodes:
+                            scopes.append((sn.start_point[0], sn.end_point[0], name))
+            # Scope chains: lexical containment over this file's defs + context
+            # spans, then the receiver (Go `func (e Engine)`, C++ `Engine::`)
+            # appended where the language attaches methods without nesting them.
+            spans = [(r[2], r[3], r[0]) for r in raw] + scopes
+            chains = _scope_chains(spans)
+            for i, (name, kind, l0, e0, sig, nrow, ncol, receiver) in enumerate(raw):
+                scope = chains[i]
+                if receiver:
+                    scope = scope + tuple(_qual_parts(
+                        receiver.replace("::", "/").lstrip("*").strip()))
+                defs.append(Tag(rel, path, name, kind, l0 + 1, e0 + 1,
+                                sig, nrow, ncol, scope))
         self._cache[path] = (mtime, defs, refs)
         return defs, refs
 
@@ -522,7 +692,15 @@ class RepoMap:
     # -- per-symbol reads (multi-language) -------------------------------
 
     def _find_defs(self, name, path=None, should_stop=None):
-        target = name.replace(".", "/").split("/")[-1]
+        """Definition Tags matching `name` — a bare identifier or a qualified path
+        ("Engine/generate", "Engine.generate"), any language. Qualified segments
+        must be a suffix of the Tag's scope chain, so `Engine/generate` never
+        silently resolves to a free `generate` (strict, like the jedi backend it
+        replaced); bare names behave exactly as before."""
+        parts = _qual_parts(name)
+        if not parts:
+            return []
+        target, quals = parts[-1], tuple(parts[:-1])
         files = [os.path.join(self.root, path)] if path and not os.path.isabs(path) \
             else ([path] if path else self._code_files(should_stop))
         if not path:
@@ -533,9 +711,27 @@ class RepoMap:
                 break
             defs, _ = self._extract(f)
             for d in defs:
-                if d.name == target:
+                if d.name == target and (
+                        not quals or d.scope[max(0, len(d.scope) - len(quals)):] == quals):
                     hits.append(d)
+        if not hits and path is None and not (should_stop and should_stop()):
+            # The symbol may live in a file created after the memoized walk. Before
+            # reporting not-found, re-walk once — only genuine misses pay this.
+            fresh = self._refresh_files()
+            if fresh:
+                return self._find_defs(name, path, should_stop)
         return hits
+
+    def _refresh_files(self):
+        """Invalidate the memoized file walk if it could be stale; True if a
+        re-walk actually found a different file set (callers then retry their
+        lookup). A walk under a second old is trusted — a burst of misses must
+        not re-walk an 11k-file tree per call."""
+        if self._files is None or time.monotonic() - self._files_at < 1.0:
+            return False
+        before = self._files
+        self._files = None
+        return self._code_files() != before
 
     def _refsum_key(self, h):
         return (h.path, h.name_row, h.name_col, self._cache.get(h.path, (None,))[0])
@@ -636,6 +832,24 @@ class RepoMap:
                          for i in range(a, b + 1) if 0 < i <= len(lines))
         return f"{h.rel}:{a}-{b}\n{body}"
 
+    def hover(self, name: str, path=None, should_stop=None) -> str:
+        """Type signature / resolved type / docs for ONE symbol, via the language
+        server — the model reads a type in ~30 tokens instead of opening the
+        defining file. Name may be qualified ('Engine/process'); degrades to a
+        pointer at view_symbol when no server is available for the language."""
+        hits = self._find_defs(name, path, should_stop)
+        if not hits:
+            return f"[symbol not found: {name}]"
+        if len(hits) > 1 and path is None:
+            return self._disambig(name, hits)
+        h = hits[0]
+        from . import lsp
+        txt = lsp.service().hover(h.rel, h.name_row, h.name_col)
+        if not txt:
+            return ("[no hover info — no language server available for this file "
+                    "type; use view_symbol]")
+        return f"{h.rel}:{h.line}\n{txt[:1200]}"
+
     def find_refs(self, name: str, path=None, should_stop=None) -> str:
         """Every USE of a symbol across the project. Precise when a language server
         is available (follows imports, respects scope, won't confuse same-named
@@ -645,7 +859,7 @@ class RepoMap:
         hits = self._find_defs(name, path, should_stop)
         if hits and not (len(hits) > 1 and path is None):
             h = hits[0]
-            from . import lsp  # lazy: only pay the solidlsp import when refs are requested
+            from . import lsp  # lazy: only start weighing servers when refs are requested
             locs = lsp.service().references(h.rel, h.name_row, h.name_col)
             if locs is not None:
                 if not locs:
@@ -715,7 +929,7 @@ class RepoMap:
                     f"one before renaming:]\n{self._disambig(name, hits)}")
         h = hits[0]
         target = h.name
-        from . import lsp  # lazy: only pay the solidlsp import when a rename is requested
+        from . import lsp  # lazy: only pay the client import when a rename is requested
         locs = lsp.service().references(h.rel, h.name_row, h.name_col)
         if locs is None:
             return ("[rename needs the precise language server (find-all-references), which "

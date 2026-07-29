@@ -21,7 +21,7 @@ import threading
 import time
 from typing import Any
 
-from . import config, levers, repomap, symbols, syntaxgate
+from . import config, levers, lsp, repomap, symbols, syntaxgate
 from .ignore import IGNORE_DIRS, slash_wrapped
 
 # Directories never worth walking: huge, generated, or VCS internals. The canonical set
@@ -874,7 +874,13 @@ def _apply_edit(path: str, before: str, after: str, note: str,
     if warn:
         result += warn
     drift = syntaxgate.drift_warn(path, before, after)
-    return result + drift if drift else result
+    if drift:
+        result += drift
+    if levers.enabled("post_edit_diagnostics"):
+        # The semantic tier above syntaxgate: the language server's typecheck of the
+        # landed edit ("" when no server is warm for this language).
+        result += lsp.diagnostics_note(path)
+    return result
 
 
 def tool_edit(path: str, old: str, new: str) -> str:
@@ -1671,7 +1677,7 @@ DISPATCH = {
                                          a.get("context", 0), should_stop=ss),
     # Symbolic code tools. READS go through the tree-sitter backend (repomap) — it's
     # language-agnostic and the repo_map gives a ranked skeleton for cheap navigation.
-    # EDITS stay on the jedi backend (symbols), the proven Python symbol editor.
+    # EDITS (symbols) resolve through the same tags, so viewed span == edited span.
     "repo_map": lambda a, ss=None: repomap.service().repo_map(
         a.get("budget", 1500), a.get("focus"), should_stop=ss),
     "overview": lambda a, ss=None: repomap.service().overview(a["path"], should_stop=ss),
@@ -1679,6 +1685,8 @@ DISPATCH = {
         a["name"], a.get("path"), should_stop=ss),
     "find_symbol": lambda a, ss=None: repomap.service().find_symbol(a["name"], should_stop=ss),
     "find_refs": lambda a, ss=None: repomap.service().find_refs(
+        a["name"], a.get("path"), should_stop=ss),
+    "hover": lambda a, ss=None: repomap.service().hover(
         a["name"], a.get("path"), should_stop=ss),
     "replace_symbol": lambda a, ss=None: symbols.service().replace_symbol(
         a["name"], a["new"], a.get("path"), should_stop=ss),
@@ -2050,6 +2058,23 @@ SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "hover",
+            "description": "The resolved TYPE SIGNATURE (and docs) of one symbol, from the "
+                           "language server — read a type in one line instead of opening its "
+                           "file. Name may be 'Class/method'; pass path to disambiguate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Symbol or 'Class/method'."},
+                    "path": {"type": "string", "description": "Optional file to disambiguate."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "replace_symbol",
             "description": "Replace the ENTIRE source of one function/class/method with new code "
                            "(found by name, not text matching — robust to whitespace). `new` is "
@@ -2116,7 +2141,7 @@ SCHEMAS: list[dict[str, Any]] = [
 # between arms and the agent's render path calls active_schemas() each turn. SCHEMAS
 # itself stays the full list (name lookups / required-arg validation need every tool).
 _SYMBOLIC = {"repo_map", "overview", "view_symbol", "find_symbol", "find_refs",
-             "replace_symbol", "insert_symbol", "rename_symbol"}
+             "hover", "replace_symbol", "insert_symbol", "rename_symbol"}
 
 
 def _activate_skill_schema(names):

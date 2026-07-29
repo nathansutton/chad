@@ -160,12 +160,15 @@ each phase is good at:
   every definition with a built-in PageRank over the file→symbol reference graph;
   `overview` / `find_symbol` / `view_symbol` / `find_refs` read one symbol at a time. This
   is the cheap, always-available skeleton.
-- **Precision (solidlsp/pyright, `lsp.py`).** Semantic resolution that name-matching
-  *cannot* give: true go-to-definition, and cross-file find-all-references that follow
-  imports, respect scoping, and don't confuse a method with an unrelated function of the
-  same name. We drive Serena's synchronous LSP core directly — **no MCP server, no Serena
-  agent** — spawning pyright on a worker thread (~0.3 s warm), started **lazily** on first
-  use and bound to one project root.
+- **Precision (chad's own LSP client, `lspclient.py` + `lspservers.py` + `lsp.py`).**
+  Semantic resolution that name-matching *cannot* give: true go-to-definition,
+  cross-file find-all-references that follow imports, respect scoping, and don't
+  confuse a method with an unrelated function of the same name, hover types, and
+  post-edit typecheck diagnostics. The client is ~350 lines of chad-owned JSON-RPC
+  with zero language knowledge; which server speaks for which language is *data* in
+  `lspservers.py` (the nvim-lspconfig shape) — pyright via uvx for Python, the
+  TypeScript 7 native LSP via npx, gopls / rust-analyzer / clangd from PATH. Servers
+  start **lazily** on first use, bound to one project root.
 
 Why each of those earns its place specifically on a *small* model:
 
@@ -184,12 +187,14 @@ Why each of those earns its place specifically on a *small* model:
   call sites is a broken build, and a small model doing it by grep+edit *will* miss one.
   `rename_symbol` follows scope and renames every site or none.
 
-**Never a hard dependency.** The precision layer ships as the optional `lsp` extra
-(`serena-agent`, which contains solidlsp): `uv sync --extra lsp`; a default install
-runs entirely on tree-sitter. And even with the extra
-installed, if the language server can't start — no Node, offline, unsupported language —
-every caller falls back to the tree-sitter backend. Python is the proven backend
-(pyright); the other languages light up automatically once their server is available. The
+**Ships by default, never a hard dependency.** The precision layer is in the base
+install — no extra, no vendored language server. `uvx chad-code` itself proves uv is
+installed, so Python precision (pyright via `uvx`) works on the primary install path
+with zero configuration; other languages light up when their server is on PATH or
+fetchable via npx. If a server can't start — no Node, offline, unsupported language,
+or a project missing its honesty gate (a C++ tree without `compile_commands.json`, a
+TS tree without a `tsconfig`) — every caller falls back to the tree-sitter backend,
+which labels its references NAME-MATCH ONLY instead of lying with confidence. The
 LSP is a precision *upgrade*, and the harness runs fine without it.
 
 The honest payoff is **reliability, not raw prefill savings**. On a small repo a capable

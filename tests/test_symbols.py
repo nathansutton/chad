@@ -1,13 +1,12 @@
-"""Characterization tests for symbols.py — the jedi-backed symbol EDITOR that writes
-to source files. Previously ZERO direct coverage. test_edit.py is the text-edit
-analogue; this is the symbol-edit one.
+"""Characterization tests for symbols.py — the symbol EDITOR that writes to source
+files. test_edit.py is the text-edit analogue; this is the symbol-edit one.
 
-A bug in `_span`/`_apply` silently edits the wrong line range (clobbering an adjacent
-symbol); a bug in `_locate_one`/`_matches` targets a free function when a method was
-meant. These pin: replace lands on exactly the named span, qualified `Class/method`
-targeting works, insert keeps the file parseable, and the not-found / empty-content
-guards leave the file untouched. jedi is a hard dependency so these always run — no
-model gate.
+A bug in `_locate_one`/`_apply` silently edits the wrong line range (clobbering an
+adjacent symbol) or targets a free function when a method was meant. These pin:
+replace lands on exactly the named span, qualified `Class/method` targeting works
+(in TWO languages — the backend is one tree-sitter path for all of them, so an
+asymmetry here is a regression), insert keeps the file parseable, and the
+not-found / empty-content guards leave the file untouched. No model gate.
 
 Run: `uv run python tests/test_symbols.py`
 """
@@ -79,6 +78,43 @@ def test_qualified_name_targets_method(tmp_path):
     check("still parses after method replace", _parses(after, fp))
 
 
+def test_qualified_method_vs_free_function(tmp_path):
+    """A method and a free function share a bare name: the qualified path must hit
+    the method, the bare name must disambiguate — in both fixture languages."""
+    svc = _tree(tmp_path, {
+        "shape.py": ("class Shape:\n"
+                     "    def area(self):\n"
+                     "        return 1\n"
+                     "\n\n"
+                     "def area():\n"
+                     "    return 2\n"),
+        "shape.js": ("class Shape {\n"
+                     "  area() {\n"
+                     "    return 1;\n"
+                     "  }\n"
+                     "}\n"
+                     "\n"
+                     "function area() {\n"
+                     "  return 2;\n"
+                     "}\n"),
+    })
+    for fn, comment in (("shape.py", "python"), ("shape.js", "javascript")):
+        fp = os.path.join(str(tmp_path), fn)
+        res = svc.replace_symbol(
+            "Shape/area",
+            "  def area(self):\n        return 11" if fn.endswith(".py")
+            else "  area() {\n    return 11;\n  }",
+            path=fp)
+        check(f"{comment}: qualified replace lands", res.startswith("[replaced"), res)
+        check(f"{comment}: label is Shape.area", "Shape.area" in res, res)
+        after = open(fp).read()
+        check(f"{comment}: free area() untouched", "return 2" in after, after)
+        check(f"{comment}: method rewritten", "11" in after, after)
+        # the bare name stays ambiguous: no silent pick between method and function
+        bare = svc.replace_symbol("area", "x", path=None)
+        check(f"{comment}: bare name disambiguates", "disambiguate" in bare, bare)
+
+
 def test_insert_after_places_and_parses(tmp_path):
     svc, fp = _fixture(tmp_path)
     res = svc.insert_symbol("alpha", "def inserted():\n    return 0",
@@ -101,6 +137,15 @@ def test_not_found_leaves_file_untouched(tmp_path):
     check("file unchanged on not-found", open(fp).read() == SRC)
 
 
+def test_qualified_never_falls_back_to_bare(tmp_path):
+    """A qualified path whose container doesn't exist must be a miss, not a silent
+    resolve to the bare last segment (editing the wrong symbol is corruption)."""
+    svc, fp = _fixture(tmp_path)
+    res = svc.replace_symbol("NoSuchClass/alpha", "def alpha():\n    return 0", path=fp)
+    check("wrong qualifier is a miss", "symbol not found" in res, res)
+    check("file unchanged on qualified miss", open(fp).read() == SRC)
+
+
 def test_empty_content_refused(tmp_path):
     svc, fp = _fixture(tmp_path)
     res = svc.replace_symbol("alpha", "   ", path=fp)
@@ -116,16 +161,6 @@ def _parses(src, fp):
         return False
 
 
-# ---------------------------------------------------------------------------
-# Locate-path guardrails (profiling pass on the 11k-file pytorch clone). The
-# pathologies these anchor, all measured before the fix: the substring prefilter
-# ("main" in text) matched thousands of files ("domain", __main__ guards, comments)
-# and every false candidate cost a full jedi parse — 130s for _find_defs("main");
-# a name defined in hundreds of files was jedi-parsed in each one just to say
-# "ambiguous" (60s for 'forward'); disambiguation listings were unbounded (205
-# lines of 'main' straight into prefill).
-# ---------------------------------------------------------------------------
-
 def _tree(tmp_path, spec):
     """Write {relpath: content} under tmp_path and return a SymbolService on it."""
     for rel, content in spec.items():
@@ -135,28 +170,19 @@ def _tree(tmp_path, spec):
     return SymbolService(str(tmp_path))
 
 
-def test_prefilter_wants_definition_shape(tmp_path):
-    svc = _tree(tmp_path, {
-        "defines.py": "def main():\n    return 1\n",
-        "calls.py": "from defines import main\nmain()\n",
-        "guard.py": "if __name__ == '__main__':\n    pass\n",
-        "substr.py": "domain = 'remains'\n",
-    })
-    cands = [os.path.basename(c) for c in svc._candidate_files("main")]
-    check("only the def site is a candidate", cands == ["defines.py"], cands)
-
-
-def test_mass_definer_bails_by_file(tmp_path):
+def test_mass_definer_disambiguates_capped(tmp_path):
+    """A name defined in dozens of files yields a capped disambiguation listing
+    (unbounded listings measured 205 lines of 'main' straight into prefill), and
+    path= still resolves precisely."""
     from chad import symbols as symmod
-    n = symmod._MAX_DEF_FILES + symmod._DISAMBIG_MAX_LINES + 3
+    n = symmod._DISAMBIG_MAX_LINES + 19
     svc = _tree(tmp_path, {f"m{i:03d}.py": "def forward(x):\n    return x\n"
                            for i in range(n)})
-    hit, err = svc._locate_one("forward", None)
-    check("mass definer returns no hit", hit is None, err)
-    check("by-file disambig names the count", f"defined in {n} files" in err, err)
-    listed = [ln for ln in err.splitlines() if ln.startswith("  m")]
-    check("listing capped", len(listed) == symmod._DISAMBIG_MAX_LINES, err)
-    check("overflow announced", "more)" in err.splitlines()[-1], err)
+    res = svc.replace_symbol("forward", "def forward(x):\n    return x + 1")
+    check("mass definer disambiguates", f"{n} symbols named 'forward'" in res, res)
+    listed = [ln for ln in res.splitlines() if ln.startswith("  m")]
+    check("listing capped", len(listed) == symmod._DISAMBIG_MAX_LINES, res)
+    check("overflow announced", "more)" in res.splitlines()[-1], res)
     res = svc.replace_symbol("forward", "def forward(x):\n    return x + 1",
                              path=os.path.join(str(tmp_path), "m000.py"))
     check("path= still resolves precisely", res.startswith("[replaced"), res)
@@ -167,15 +193,15 @@ def test_new_file_visible_despite_walk_memo(tmp_path):
     check("warm-up locate works", svc._locate_one("alpha", None)[0] is not None)
     with open(os.path.join(str(tmp_path), "fresh.py"), "w") as f:
         f.write("def beta():\n    pass\n")
-    svc._py_files_at -= 2.0  # age the memo past the retry guard, not past the TTL
+    svc._repomap()._files_at -= 2.0  # age the memo past the re-walk guard
     hit, err = svc._locate_one("beta", None)
     check("file created after the cached walk is found", hit is not None, err)
 
 
 # ---------------------------------------------------------------------------
-# Multi-language editing: non-Python files resolve through the tree-sitter repo
-# map's definition spans (the same ones view_symbol shows). Python behavior is
-# pinned above and must be unchanged. Skips cleanly if the grammar can't load.
+# Multi-language editing: every language resolves through the tree-sitter repo
+# map's definition spans (the same ones view_symbol shows). Skips cleanly if the
+# grammar can't load.
 # ---------------------------------------------------------------------------
 
 JS = """function greet(name) {
@@ -189,7 +215,8 @@ function farewell(name) {
 
 
 def _js_available(svc):
-    return bool(svc._ts_locate("greet", None))
+    hit, _err = svc._locate_one("greet", None)
+    return hit is not None
 
 
 def test_replace_symbol_javascript(tmp_path):
@@ -209,13 +236,15 @@ def test_replace_symbol_javascript(tmp_path):
           after2.index("function farewell") < after2.index("function extra"), after2)
 
 
-def test_python_still_wins_name_collisions(tmp_path):
-    """A name defined in both a .py and a non-py file must keep resolving to the
-    Python definition (the pre-generalization behavior)."""
+def test_cross_language_collision_disambiguates(tmp_path):
+    """A name defined in both a .py and a .js file is ambiguous and says so —
+    the old backend silently preferred Python, which is exactly the per-language
+    asymmetry the unified backend removed."""
     svc = _tree(tmp_path, {"m.py": "def greet():\n    return 1\n", "app.js": JS})
     hit, err = svc._locate_one("greet", None)
-    check("collision resolves", hit is not None, err)
-    check("collision resolves to python", hit[2].endswith("m.py"), hit)
+    check("collision returns no silent hit", hit is None, hit)
+    check("collision disambiguates across languages",
+          err and "m.py" in err and "app.js" in err, err)
 
 
 def test_non_python_not_found_is_clean(tmp_path):
@@ -228,17 +257,19 @@ def test_reedit_uses_fresh_parse(tmp_path):
     svc = _tree(tmp_path, {"mod.py": "def f():\n    return 1\n"})
     res = svc.replace_symbol("f", "def f():\n    return 2\ndef g():\n    return 3")
     check("first replace lands", res.startswith("[replaced"), res)
-    # g() only exists post-edit; finding it proves the (path, mtime) cache evicted
+    # g() only exists post-edit; finding it proves the mtime cache evicted
     hit, err = svc._locate_one("g", None)
     check("post-edit parse is fresh", hit is not None, err)
 
 
 if __name__ == "__main__":
     for fn in (test_replace_lands_on_one_symbol, test_qualified_name_targets_method,
+               test_qualified_method_vs_free_function,
                test_insert_after_places_and_parses, test_not_found_leaves_file_untouched,
-               test_empty_content_refused, test_prefilter_wants_definition_shape,
-               test_mass_definer_bails_by_file, test_new_file_visible_despite_walk_memo,
-               test_replace_symbol_javascript, test_python_still_wins_name_collisions,
+               test_qualified_never_falls_back_to_bare, test_empty_content_refused,
+               test_mass_definer_disambiguates_capped,
+               test_new_file_visible_despite_walk_memo,
+               test_replace_symbol_javascript, test_cross_language_collision_disambiguates,
                test_non_python_not_found_is_clean, test_reedit_uses_fresh_parse):
         with tempfile.TemporaryDirectory() as d:
             fn(d)

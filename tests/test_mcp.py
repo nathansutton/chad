@@ -19,7 +19,7 @@ import time
 
 import pytest
 import uvicorn
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
 from chad import mcp, render, tools, validate
@@ -228,6 +228,31 @@ def test_readonly_hint_skips_confirm(project):
     assert tools.is_mutating("mcp__demo__echo") is False        # readOnlyHint: true
     assert tools.is_mutating("mcp__demo__write_note") is True   # default: mutating
     assert tools.is_mutating("bash") is True                    # builtin unaffected
+
+
+# ---------------------------------------------------------------------------
+# mcp 2.x silent-rename pins. Two 1.x -> 2.x attribute renames fail SILENTLY
+# through getattr defaults: code reading the OLD name would not crash, it would
+# just misbehave (every read-only tool demands confirmation; tool-reported errors
+# stop being flagged). Each gets a unit pin that FAILS on the 1.x spelling.
+# ---------------------------------------------------------------------------
+
+def test_is_mutating_reads_snake_case_read_only_hint():
+    """getattr(ann, "readOnlyHint") on a 2.x model returns None -> _is_mutating
+    would classify EVERY read-only tool as mutating. This test fails then."""
+    from mcp.types import Tool
+    t = Tool.model_validate({"name": "x", "inputSchema": {"type": "object"},
+                             "annotations": {"readOnlyHint": True}})  # wire: camelCase
+    assert mcp._is_mutating(t) is False
+
+
+def test_render_result_reads_snake_case_is_error():
+    """getattr(res, "isError", False) on a 2.x model returns False -> tool-reported
+    errors would silently stop being prefixed. This test fails then."""
+    from mcp.types import CallToolResult
+    res = CallToolResult.model_validate(
+        {"content": [{"type": "text", "text": "kaboom"}], "isError": True})
+    assert mcp._render_result(res).startswith("[tool reported an error]")
 
 
 # ---------------------------------------------------------------------------
@@ -489,10 +514,10 @@ def test_midsession_crash_degrades(project):
 # HTTP transport (Streamable HTTP) — a real in-process MCP server on loopback
 # ---------------------------------------------------------------------------
 #
-# The SDK's `streamablehttp_client` drives a true end-to-end HTTP transport against a
-# FastMCP server (built with the SDK's server side) run by uvicorn in a background
-# thread on an ephemeral port. This exercises the same public seam as the stdio tests,
-# proving the transport swap is behavior-preserving across both transports.
+# The SDK's `streamable_http_client` (fed by chad's own `create_mcp_http_client`)
+# drives a true end-to-end HTTP transport against an MCPServer app (the SDK's server
+# side) run by uvicorn in a background thread on an ephemeral port. This exercises the
+# same public seam as the stdio tests, proving the transport is behavior-preserving.
 
 def _free_port():
     s = socket.socket()
@@ -520,9 +545,9 @@ class _CaptureAuth:
 def _build_http_app(holder):
     """A Streamable HTTP MCP app exposing one read-only tool (`ping`, readOnlyHint),
     one mutating tool (`do_write`), and one that always errors (`boom`)."""
-    server = FastMCP("httpdemo")
+    server = MCPServer("httpdemo")
 
-    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @server.tool(annotations=ToolAnnotations(read_only_hint=True))
     def ping(message: str) -> str:
         """Echo back the message (read-only)."""
         return "pong:" + message

@@ -6,7 +6,7 @@ no module's *effective* skip set. repomap keeps its 3 extra dirs; every other mo
 keeps exactly the base 9.
 """
 
-from chad import repomap, skills, symbols, tools
+from chad import repomap, skills, tools
 
 EXPECTED_BARE = (".git", "node_modules", "__pycache__", ".venv", "venv",
                  ".mypy_cache", ".pytest_cache", "dist", "build")
@@ -17,8 +17,8 @@ def test_ignore_sets_unchanged():
     assert tools.IGNORE_DIRS == EXPECTED_BARE
     assert tools._SKIP_DIRS == tuple(f"/{d}/" for d in EXPECTED_BARE)
     assert skills._SKIP_DIRS == set(EXPECTED_BARE)
-    # symbols prunes bare names during its os.walk now (no slash-wrapped post-filter)
-    assert symbols.IGNORE_DIRS == EXPECTED_BARE
+    # symbols no longer walks the tree at all — it resolves through repomap's
+    # file scan, so repomap's skip set is the symbol editor's skip set too
     assert repomap._SKIP_NAMES == EXPECTED_REPOMAP_NAMES
 
 

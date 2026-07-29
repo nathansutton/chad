@@ -33,7 +33,7 @@ import urllib.request
 import anyio
 import pytest
 import uvicorn
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from mcp.types import ToolAnnotations
 
@@ -232,9 +232,9 @@ def _free_port():
 
 
 def _build_app():
-    server = FastMCP("oauthdemo")
+    server = MCPServer("oauthdemo")
 
-    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @server.tool(annotations=ToolAnnotations(read_only_hint=True))
     def ping(message: str) -> str:
         """Echo back the message (read-only)."""
         return "pong:" + message

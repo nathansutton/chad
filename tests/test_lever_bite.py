@@ -809,6 +809,29 @@ def test_late_continue_replenish(monkeypatch):
     assert guardrails.replenish_continue(900, 500, 2) is False
 
 
+# === ctxengine: post-edit language-server diagnostics ======================
+
+def test_post_edit_diagnostics_bite(tmp_path, monkeypatch):
+    """The same landed edit carries the typecheck note with the lever on and is
+    byte-identical to the pre-lever result with it off."""
+    from chad import lsp
+    n = bite("post_edit_diagnostics")
+    monkeypatch.setattr(lsp, "diagnostics_note",
+                        lambda path: "\n[typecheck — 1 error(s) (language server):"
+                                     "\n  line 1: boom]")
+    p = str(tmp_path / "m.py")
+
+    def edit(tag):
+        with open(p, "w") as f:
+            f.write("x = 1\n")
+        return tools._apply_edit(p, "x = 1\n", f"x = {tag}\n", "")
+
+    on(monkeypatch)
+    assert "typecheck" in edit(2)
+    off(monkeypatch, n)
+    assert "typecheck" not in edit(3)
+
+
 # === the coverage contract =================================================
 
 def test_every_registered_lever_has_a_bite_test():

@@ -4,12 +4,46 @@ Notable, user-visible changes.
 
 ## [1.0.7] — 2026-07-29
 
+- **Precision code intelligence now ships in the base install.** `find_refs` /
+  `rename_symbol` precision used to live behind an optional `lsp` extra
+  (`serena-agent`, 33 transitive dependencies) that `uvx chad-code` never installed —
+  so every published install ran name-match only. chad now drives language servers
+  through its own ~350-line LSP client (`lspclient.py`) plus a declarative registry
+  (`lspservers.py`, the nvim-lspconfig shape): pyright via uvx (guaranteed present on
+  the uvx install path), the TypeScript 7 native LSP via npx, gopls / rust-analyzer /
+  clangd / solargraph / intelephense from PATH. Zero new Python dependencies; the
+  `lsp` extra and serena-agent are gone. Servers that would answer confidently-wrong
+  empties without project context (clangd without `compile_commands.json`, TS without
+  a `tsconfig`) are refused, keeping the honestly-labeled name-match fallback.
+- **Qualified symbol paths in every language.** `view_symbol("Engine/process")`,
+  `replace_symbol("Engine.process", …)` etc. now resolve the method — not a same-named
+  free function — in Python, TS/JS, Go, Rust, Java, Ruby, C#, PHP, Kotlin and C++
+  alike, via scope chains derived from tree-sitter spans (plus receiver/impl context
+  for Go/Rust/C++, whose methods don't nest lexically). This was Python-only via
+  jedi before; jedi is deleted and every language takes one code path (verified
+  against jedi on this repo: 230/230 span-identical). A qualified path whose
+  container doesn't match is now a miss instead of silently editing the bare name.
+- **Broken grammars fixed for 4 of 12 fixture languages.** First polyglot measurement
+  found the language pack ships NO tags query for TypeScript/TSX, a PHP query that
+  doesn't compile against the current grammar, C with no reference captures, and C++
+  missing out-of-class method definitions. chad now carries its own tags queries for
+  those (`repomap._TAGS_OVERRIDE`), pinned by a 12-language coverage test.
+- **Post-edit typecheck in the edit result.** When a language server is warm, every
+  edit/symbol-edit result appends the server's type errors (errors only, capped,
+  ~50 tokens) — a type error surfaces immediately instead of one failed test run
+  later. Edits never pay a cold server start (lever: `post_edit_diagnostics`).
+- **New `hover` tool.** The resolved type signature + docs of one symbol via the
+  language server — one line instead of opening the defining file.
+- **mcp 2.x, single code path.** The `mcp<2` cap (below) was serena-agent collateral;
+  with serena gone chad runs natively on mcp 2.0 (protocol 2026-07-28). The two
+  renames that fail silently through getattr defaults (`isError`→`is_error`,
+  `readOnlyHint`→`read_only_hint`) are each pinned by a test that fails on the 1.x
+  spelling.
 - **Fixes a broken install.** `uvx chad-code` (and any other fresh resolve) crashed on
   startup with `ImportError: cannot import name 'streamablehttp_client'`. The `mcp`
   dependency was unbounded, so a clean resolve picked up the SDK's 2.0 major, which
   removed the HTTP transport chad uses, moved to `httpx2`, and split the wire types into
-  a separate distribution. `mcp` is now capped below 2.0; porting to the new API is a
-  deliberate change, not something a resolver should do to you at install time.
+  a separate distribution. (The cap has since become the deliberate 2.x port above.)
 - **A broken MCP SDK can no longer take the agent down.** Every other MCP failure already
   degraded — a server that's missing, misconfigured, or crashing costs you its tools and
   nothing else — but the SDK import itself ran unguarded at `chad.mcp` load, which happens

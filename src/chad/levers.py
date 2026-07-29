@@ -446,6 +446,17 @@ LEVERS: dict[str, Lever] = {
         "a flat file listing, so the model orients without a reflexive step-1 repo_map "
         "call. Degrades to the flat listing when repomap is unavailable (see prompt.py).",
         "ai-codex"),
+
+    # --- group "ctxengine": the uniform-symbols work. -------------------------------
+    "post_edit_diagnostics": Lever(
+        "Append the language server's post-edit typecheck errors (~50 tokens, errors "
+        "only, capped) to edit/symbol-edit results — the semantic tier above "
+        "syntaxgate's parse check. A type error surfaced in the edit result replaces "
+        "the multi-thousand-token failed test run the model would otherwise need to "
+        "discover it. Never spawns a server (an edit must not pay a cold start): "
+        "only a server already warmed by find_refs/hover/disambiguation is "
+        "consulted; absent one, silence.",
+        "ctxengine"),
 }
 
 
