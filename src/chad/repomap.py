@@ -86,7 +86,7 @@ _MAX_DEFINERS = 16
 #      re-import chad's entry point, which would drag the whole MLX engine into each.
 _PARALLEL_MIN_FILES = 200   # below this, worker startup costs more than it saves
 _CACHE_SAVE_MIN = 32        # don't persist a cache for tiny repos (or tiny test fixtures)
-_CACHE_VERSION = 2          # bump when the entry shape or tags queries change
+_CACHE_VERSION = 3          # bump when the entry shape or tags queries change
 _CACHE_DIR = os.path.expanduser("~/.chad/cache/repomap")
 
 _WORKER_SRC = """\
@@ -145,6 +145,18 @@ _TS_TAGS = """\
 _TAGS_OVERRIDE = {
     "typescript": _TS_TAGS,
     "tsx": _TS_TAGS,
+    # The pack ships NO bash tags query, yet shell is everywhere real.  Without
+    # tags, every .sh function is invisible to repo_map/overview/view_symbol and the
+    # symbol editor. Functions (both `f() {}` and `function f {}` parse to the same
+    # node), TOP-LEVEL variable assignments only (anchored to program: config
+    # constants surface, function-local temps don't), and command invocations as
+    # references (builtins like echo/set resolve to no definer, so the rank graph
+    # ignores them; invocations of repo-defined functions are exactly find_refs).
+    "bash": """\
+(function_definition name: (word) @name) @definition.function
+(program (variable_assignment name: (variable_name) @name) @definition.constant)
+(command name: (command_name (word) @name)) @reference.call
+""",
     "go": """\
 (function_declaration name: (identifier) @name) @definition.function
 (method_declaration

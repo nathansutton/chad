@@ -14,8 +14,10 @@ First measurement (2026-07-29) found the pack's tags queries broken or missing f
 4 of 12 languages — typescript/tsx (no query at all), php (query names a node type
 the current grammar renamed), c (no reference captures; header prototypes tagged
 as definitions), cpp (out-of-class `Engine::process` invisible) — fixed by chad's
-`repomap._TAGS_OVERRIDE`. This test pins all 12 so a language-pack bump that
-breaks a grammar's tags surfaces here, not in an agent run.
+`repomap._TAGS_OVERRIDE`, which also adds bash outright (the pack ships no bash
+query; 89 of 91 terminal-bench-2.1 tasks contain shell). This test pins all 13
+languages so a language-pack bump that breaks a grammar's tags surfaces here, not
+in an agent run.
 
 No model, no language server, no network; runs in the fast gate.
 """
@@ -42,6 +44,7 @@ LANGS = {
     "kotlin": ("helper", "process", "run", "Engine", "Lib.kt", "App.kt"),
     "c": ("helper", "process", "run", "engine_process", "lib.c", "app.c"),
     "cpp": ("helper", "process", "run", "Engine", "lib.cpp", "app.cpp"),
+    "bash": ("helper", "process", "run", "engine_process", "lib.sh", "app.sh"),
 }
 
 
@@ -83,7 +86,7 @@ def process_call_present(view, lang):
     """The viewed `run` body must contain the call into Engine's method — the span
     is real code, not a header-only stub."""
     needle = {"go": "e.Process(", "csharp": ".Process(", "c": "engine_process(",
-              "php": "->process("}.get(lang, ".process(")
+              "php": "->process(", "bash": "engine_process "}.get(lang, ".process(")
     return needle in view
 
 

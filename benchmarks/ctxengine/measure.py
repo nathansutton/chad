@@ -41,6 +41,7 @@ LANGS = {
     "kotlin": ("helper", "process", "run", "Engine", "Lib.kt", "App.kt"),
     "c": ("helper", "process", "run", "engine_process", "lib.c", "app.c"),
     "cpp": ("helper", "process", "run", "Engine", "lib.cpp", "app.cpp"),
+    "bash": ("helper", "process", "run", "engine_process", "lib.sh", "app.sh"),
 }
 
 

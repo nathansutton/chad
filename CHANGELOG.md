@@ -23,11 +23,16 @@ Notable, user-visible changes.
   jedi before; jedi is deleted and every language takes one code path (verified
   against jedi on this repo: 230/230 span-identical). A qualified path whose
   container doesn't match is now a miss instead of silently editing the bare name.
-- **Broken grammars fixed for 4 of 12 fixture languages.** First polyglot measurement
-  found the language pack ships NO tags query for TypeScript/TSX, a PHP query that
-  doesn't compile against the current grammar, C with no reference captures, and C++
-  missing out-of-class method definitions. chad now carries its own tags queries for
-  those (`repomap._TAGS_OVERRIDE`), pinned by a 12-language coverage test.
+- **Broken grammars fixed for 4 of 12 fixture languages — and shell added outright.**
+  First polyglot measurement found the language pack ships NO tags query for
+  TypeScript/TSX, a PHP query that doesn't compile against the current grammar, C
+  with no reference captures, and C++ missing out-of-class method definitions. chad
+  now carries its own tags queries for those (`repomap._TAGS_OVERRIDE`), plus a new
+  bash query the pack never had: shell functions and top-level variables now appear
+  in `repo_map`/`overview`, `find_refs` finds invocations across scripts, and
+  `replace_symbol` edits a shell function by name — shell is the one surface nearly
+  every real repo (and 89 of 91 terminal-bench-2.1 tasks) contains. All pinned by a
+  13-language coverage test.
 - **Post-edit typecheck in the edit result.** When a language server is warm, every
   edit/symbol-edit result appends the server's type errors (errors only, capped,
   ~50 tokens) — a type error surfaces immediately instead of one failed test run
