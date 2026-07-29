@@ -309,6 +309,51 @@ def test_disabled_server_skipped(tmp_path, monkeypatch):
     mcp.reset_session()
 
 
+def test_unusable_sdk_degrades_gracefully(tmp_path, monkeypatch):
+    """An `mcp` SDK whose symbols chad can't import costs the operator their MCP tools
+    and a warning — never the agent. The SDK import is guarded (chad.mcp is imported
+    unconditionally when an Agent is built, so an ImportError there is an unskippable
+    traceback on startup); this covers the resulting no-SDK state."""
+    home = tmp_path / "home"; home.mkdir()
+    monkeypatch.setattr(os.path, "expanduser",
+                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
+    (tmp_path / ".mcp.json").write_text(json.dumps(
+        {"mcpServers": {"demo": {"command": "python", "args": ["-c", "pass"]}}}))
+    monkeypatch.chdir(tmp_path)
+    mcp._set_trusted(str(tmp_path))
+    monkeypatch.setattr(mcp, "_SDK_ERROR", "ImportError: cannot import name 'x'")
+    mcp.reset_session()
+    assert mcp.schemas() == []                          # nothing exposed to the model
+    assert mcp.service().clients == []                  # nothing connected
+    assert any("MCP disabled" in w for w in mcp.service().warnings)
+    assert any("MCP disabled" in ln for ln in mcp.summary_lines())
+    mcp.reset_session()
+
+
+def test_unusable_sdk_silent_without_servers(tmp_path, monkeypatch):
+    """No servers configured: nothing to warn about, so the broken SDK is not mentioned
+    — an operator who never used MCP sees no new noise."""
+    home = tmp_path / "home"; home.mkdir()
+    monkeypatch.setattr(os.path, "expanduser",
+                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mcp, "_SDK_ERROR", "ImportError: cannot import name 'x'")
+    mcp.reset_session()
+    assert mcp.service().warnings == []
+    assert "no MCP servers configured" in mcp.summary_lines()[0]
+    mcp.reset_session()
+
+
+def test_oauth_disabled_when_sdk_unusable(monkeypatch):
+    """The OAuth symbols are guarded the same way; an unusable SDK reads as flag-off, so
+    every caller takes its existing "OAuth unavailable" path instead of raising."""
+    from chad import mcp_oauth
+    monkeypatch.setenv("CHAD_MCP_OAUTH", "1")
+    assert mcp_oauth.oauth_enabled() is True
+    monkeypatch.setattr(mcp_oauth, "_SDK_ERROR", "ImportError: cannot import name 'x'")
+    assert mcp_oauth.oauth_enabled() is False
+
+
 def test_bad_command_degrades_gracefully(tmp_path, monkeypatch):
     home = tmp_path / "home"; home.mkdir()
     monkeypatch.setattr(os.path, "expanduser",

@@ -47,17 +47,30 @@ from typing import Any, Optional
 
 import anyio
 from anyio.from_thread import start_blocking_portal
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 
+# The SDK import is GUARDED. Everything else in this module degrades when a server is
+# missing or broken; the one thing that used to take the whole process down was the SDK
+# itself changing shape underneath us — chad.mcp is imported unconditionally by Agent's
+# constructor, so an ImportError here is a traceback on `chad` with no way past it. (It
+# happened: mcp 2.0 removed `streamablehttp_client`.) The dep is capped in pyproject;
+# this is the backstop, so an incompatible SDK costs the operator their MCP tools and a
+# warning line instead of the agent. `_SDK_ERROR` is checked in `_Registry._connect`.
+#
 # `streamablehttp_client(url, headers=..., auth=...)` is the documented HTTP entry
-# point that takes headers (and, in , an `auth=` OAuth provider) directly,
-# building the httpx client via MCP's own factory with the right defaults. mcp 1.28.1
-# marks it deprecated in favour of `streamable_http_client(url, *, http_client=...)`,
-# but that variant has no `headers=`/`auth=` — you'd hand-build an httpx client and
-# risk dropping MCP's required client config — so we keep this one until the new API
-# grows an equivalent. (Confirmed against mcp==1.28.1.)
-from mcp.client.streamable_http import streamablehttp_client
+# point that takes headers (and an `auth=` OAuth provider) directly, building the httpx
+# client via MCP's own factory with the right defaults. 1.28.1 marks it deprecated in
+# favour of `streamable_http_client(url, *, http_client=...)`, but that variant has no
+# `headers=`/`auth=` — you'd hand-build an httpx client and risk dropping MCP's required
+# client config — so we keep this one until the new API grows an equivalent.
+try:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    from mcp.client.streamable_http import streamablehttp_client
+    _SDK_ERROR: Optional[str] = None
+except Exception as _e:  # noqa: BLE001 — any import-time failure, not just ImportError
+    ClientSession = StdioServerParameters = None    # type: ignore[assignment,misc]
+    stdio_client = streamablehttp_client = None     # type: ignore[assignment]
+    _SDK_ERROR = f"{type(_e).__name__}: {_e}"
 
 from . import mcp_oauth
 from .diag import log, warn_footer
@@ -397,6 +410,16 @@ class _Registry:
     def _connect(self):
         servers, warnings = _load_config(self.cwd)
         self.warnings = list(warnings)
+        if _SDK_ERROR:
+            # Unusable SDK: connect nothing, expose no tools, say so once in /mcp and the
+            # warning footer. Configured servers are still read so the message only fires
+            # for operators who actually have some.
+            if servers:
+                self.warnings.append(
+                    f"MCP disabled — the installed `mcp` SDK is not compatible with this "
+                    f"chad ({_SDK_ERROR}). Reinstall chad, or pin `mcp<2`.")
+                log.warning("mcp: SDK unusable, no servers connected: %s", _SDK_ERROR)
+            return
         trusted = _is_trusted(self.cwd)
 
         # Decide which servers we'll actually connect (after disabled/name/trust gates).
@@ -686,7 +709,10 @@ def summary_lines():
     """Human-readable rows for the `/mcp` command: one line per server (transport +
     tool count, or its connection error), each server's tools, then any warnings."""
     reg = service()
-    if not reg.clients and not reg.blocked and not reg.needs_login:
+    # `and not reg.warnings`: a config that produced warnings but no connections (malformed
+    # file, unusable SDK, server with neither url nor command) is NOT "no servers
+    # configured" — that early-out would swallow the one message explaining why.
+    if not reg.clients and not reg.blocked and not reg.needs_login and not reg.warnings:
         return ["no MCP servers configured. Add one to .mcp.json (project) or "
                 "~/.chad/mcp.json (user): "
                 '{"mcpServers": {"name": {"command": "...", "args": [...]}}} '

@@ -27,6 +27,28 @@ jobs:
         # The published `uvx chad-code` one-liner. `|| true` until the first release
         # exists on PyPI — drop it once `chad-code` is published.
         run: uvx chad-code --version || true
+      - name: Released artifact actually imports (PyPI)
+        # `--version`/`--help` exit inside argparse, so they can't see a module that only
+        # loads on the first turn. That is exactly how an upstream mcp major shipped a
+        # broken `uvx chad-code` past a green canary: the entrypoint printed, the first
+        # prompt traced back. Import every submodule, and treat a fired SDK guard as
+        # failure (graceful degradation is for users, not for the canary).
+        run: |
+          uv run --no-project --with chad-code python -c "
+          import importlib, pkgutil, sys, chad
+          bad = []
+          for m in pkgutil.walk_packages(chad.__path__, 'chad.'):
+              try:
+                  importlib.import_module(m.name)
+              except Exception as e:
+                  bad.append(f'{m.name}: {type(e).__name__}: {e}')
+          import chad.mcp, chad.mcp_oauth
+          bad += [f'{m.__name__}: MCP SDK unusable: {m._SDK_ERROR}'
+                  for m in (chad.mcp, chad.mcp_oauth) if m._SDK_ERROR]
+          for b in bad:
+              print('BROKEN', b)
+          sys.exit(1 if bad else 0)
+          "
       - name: Version stamp (for the failure-email breadcrumb)
         if: always()
         run: uvx --from 'git+https://github.com/nathansutton/chad' chad --version || true

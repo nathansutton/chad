@@ -2,6 +2,26 @@
 
 Notable, user-visible changes.
 
+## [1.0.7] — 2026-07-29
+
+- **Fixes a broken install.** `uvx chad-code` (and any other fresh resolve) crashed on
+  startup with `ImportError: cannot import name 'streamablehttp_client'`. The `mcp`
+  dependency was unbounded, so a clean resolve picked up the SDK's 2.0 major, which
+  removed the HTTP transport chad uses, moved to `httpx2`, and split the wire types into
+  a separate distribution. `mcp` is now capped below 2.0; porting to the new API is a
+  deliberate change, not something a resolver should do to you at install time.
+- **A broken MCP SDK can no longer take the agent down.** Every other MCP failure already
+  degraded — a server that's missing, misconfigured, or crashing costs you its tools and
+  nothing else — but the SDK import itself ran unguarded at `chad.mcp` load, which happens
+  on every Agent. It's guarded now: an incompatible SDK means no MCP tools plus one
+  warning line in `/mcp`, and the rest of chad runs. Relatedly, `/mcp` no longer reports
+  "no MCP servers configured" when servers *are* configured but all failed — it shows the
+  warnings that explain why.
+- **CI now catches this class of break.** The fresh-resolve job and the weekly install
+  canary only ran `chad --help`, which exits inside argparse and never imports the modules
+  that load on the first turn. Both now import every `chad` submodule against a clean
+  resolve and fail if the MCP SDK guard fires.
+
 ## [1.0.6] — 2026-07-28
 
 - **Voice mode, all local.** `/speech` in the TUI turns on push-to-talk: ctrl-t opens the

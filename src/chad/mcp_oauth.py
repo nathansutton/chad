@@ -53,12 +53,25 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import anyio
-from mcp.client.auth import OAuthClientProvider
-from mcp.shared.auth import (
-    OAuthClientInformationFull,
-    OAuthClientMetadata,
-    OAuthToken,
-)
+
+# Guarded like the transport import in mcp.py, and for the same reason: this module is
+# imported at `chad.mcp` import time, which happens on every Agent construction, so an
+# SDK that moved these symbols would be a traceback on startup rather than a degraded
+# feature. With the SDK unusable `oauth_enabled()` reports False and no OAuth code path
+# is ever entered — the same shape as the operator leaving the flag off.
+try:
+    from mcp.client.auth import OAuthClientProvider
+    from mcp.shared.auth import (
+        OAuthClientInformationFull,
+        OAuthClientMetadata,
+        OAuthToken,
+    )
+    _SDK_ERROR: "str | None" = None
+except Exception as _e:  # noqa: BLE001 — any import-time failure, not just ImportError
+    OAuthClientProvider = None                                   # type: ignore[assignment,misc]
+    OAuthClientInformationFull = OAuthClientMetadata = None       # type: ignore[assignment,misc]
+    OAuthToken = None                                             # type: ignore[assignment,misc]
+    _SDK_ERROR = f"{type(_e).__name__}: {_e}"
 
 from .diag import log
 
@@ -76,7 +89,12 @@ _POLL = 1.0
 
 def oauth_enabled() -> bool:
     """True only when the operator has opted into OAuth via `CHAD_MCP_OAUTH`. With this
-    off, no OAuth code runs and the stdio/bearer/HTTP paths are unaffected."""
+    off, no OAuth code runs and the stdio/bearer/HTTP paths are unaffected. An SDK whose
+    auth symbols we couldn't import reads as off, so the callers' existing "OAuth
+    unavailable" path handles it — nothing here can raise."""
+    if _SDK_ERROR:
+        log.warning("mcp: OAuth unavailable, SDK auth import failed: %s", _SDK_ERROR)
+        return False
     val = os.environ.get("CHAD_MCP_OAUTH", "")
     return val.strip().lower() not in ("", "0", "false", "no", "off")
 

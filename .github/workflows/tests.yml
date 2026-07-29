@@ -79,6 +79,35 @@ jobs:
           uv venv --python 3.11 /tmp/fresh
           VIRTUAL_ENV=/tmp/fresh uv pip install .
           /tmp/fresh/bin/chad --help
+      - name: Every module imports under the fresh resolve
+        # `chad --help` exits inside argparse, so it only proves the CLI module tree
+        # imports. Modules imported later — mcp/mcp_oauth on the first Agent, speech on
+        # /speech — were unguarded by this job, and a fresh resolve that pulled an
+        # incompatible SDK crashed on the first real run while CI stayed green. Walk and
+        # import EVERY submodule so any import-time break fails here instead of at a
+        # user's first prompt.
+        run: |
+          /tmp/fresh/bin/python -c "
+          import importlib, pkgutil, sys, chad
+          bad = []
+          for m in pkgutil.walk_packages(chad.__path__, 'chad.'):
+              try:
+                  importlib.import_module(m.name)
+              except Exception as e:
+                  bad.append(f'{m.name}: {type(e).__name__}: {e}')
+          for b in bad:
+              print('IMPORT FAILED', b)
+          # chad.mcp/mcp_oauth guard their SDK imports so a bad resolve degrades instead
+          # of killing the agent — which would also hide the break from the walk above.
+          # Assert the guard did NOT fire: in CI an unusable SDK is a failure, not a
+          # graceful degradation.
+          import chad.mcp, chad.mcp_oauth
+          for mod in (chad.mcp, chad.mcp_oauth):
+              if mod._SDK_ERROR:
+                  bad.append(f'{mod.__name__}: MCP SDK unusable: {mod._SDK_ERROR}')
+                  print('SDK GUARD FIRED', bad[-1])
+          sys.exit(1 if bad else 0)
+          "
 
   lock:
     # uv.lock must stay in sync with pyproject.toml. Pure metadata check — no MLX,

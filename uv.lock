@@ -195,7 +195,7 @@ wheels = [
 
 [[package]]
 name = "chad-code"
-version = "1.0.6"
+version = "1.0.7"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
@@ -237,7 +237,7 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=1.22.0" },
     { name = "jedi", specifier = ">=0.19.2" },
     { name = "jinja2", specifier = ">=3.1" },
-    { name = "mcp", specifier = ">=1.27" },
+    { name = "mcp", specifier = ">=1.27,<2" },
     { name = "mlx", marker = "sys_platform == 'darwin'", specifier = ">=0.32.0,<0.33" },
     { name = "mlx-lm", marker = "sys_platform == 'darwin'", specifier = ">=0.31.3,<0.32" },
     { name = "numpy", specifier = ">=1.26,<3" },
