@@ -2,6 +2,20 @@
 
 Notable, user-visible changes.
 
+## [1.0.9] — 2026-07-30
+
+- **Decode is 5–7% faster on the 35B.** The MoE block — the largest remaining
+  inefficiency in the per-token decode step — now runs as two custom Metal kernels
+  (JIT-compiled at load, no wheel rebuild): one dispatch computes gate|up for all 8
+  routed experts plus the shared expert with the SiLU epilogue in-register, the other
+  folds every down-projection, the routing weights, the shared-expert gate, and the
+  residual add into a single pass. Routing itself is bit-identical to stock; measured
+  on the shipped checkpoint: 70.7 → 74.3 tok/s at 8k context, decode-path perplexity
+  a hair *better* (the fused combine accumulates in fp32), prefill unchanged
+  (756 tok/s @7k vs 723 baseline), peak memory unchanged. Engages only on the exact
+  35B geometry, falls back to the stock graph anywhere else; opt out with
+  `CHAD_NO_MOE_FUSED=1`.
+
 ## [1.0.8] — 2026-07-29
 
 - **`/speech` now names an install command that can actually work.** The voice-mode
