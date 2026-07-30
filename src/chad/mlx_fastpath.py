@@ -61,6 +61,10 @@ def install(model: Any) -> bool:
             return False
         _concat_expert_gate_up(model)
         _concat_gdn_in_projs(model)
+        # Fused MoE decode kernels + router|seg / shared gate|up concats;
+        # engages only on the exact 35B geometry, silent no-op elsewhere.
+        from . import mlx_moe_fused
+        mlx_moe_fused.install(model)
         _install_layer_fastpath(model)
         log.info("FASTPATH installed: fused expert/GDN projections + compiled "
                  "S=1 layer step")
@@ -129,6 +133,8 @@ def _patch_switch_glu() -> None:
     import mlx.core as mx
     from mlx_lm.models import switch_layers as sl
 
+    if getattr(sl.SwitchGLU.__call__, "_chad_fastpath", False):
+        return  # already patched; re-wrapping would stack guards
     stock_call = sl.SwitchGLU.__call__
 
     def fused_call(self, x, indices):
@@ -151,6 +157,7 @@ def _patch_switch_glu() -> None:
             y = sl._scatter_unsort(y, inv_order, indices.shape)
         return y.squeeze(-2)
 
+    fused_call._chad_fastpath = True
     sl.SwitchGLU.__call__ = fused_call  # type: ignore[method-assign]
 
 
@@ -187,6 +194,8 @@ def _patch_gdn_call() -> None:
     import mlx.nn as nn
     from mlx_lm.models import qwen3_5 as q35
 
+    if getattr(q35.GatedDeltaNet.__call__, "_chad_fastpath", False):
+        return
     stock_call = q35.GatedDeltaNet.__call__
 
     def call(self, inputs, mask=None, cache=None):
@@ -236,6 +245,7 @@ def _patch_gdn_call() -> None:
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
 
+    call._chad_fastpath = True
     q35.GatedDeltaNet.__call__ = call  # type: ignore[method-assign]
 
 
@@ -246,13 +256,32 @@ def _install_layer_fastpath(model) -> None:
     from mlx_lm.models import qwen3_5 as q35
 
     for layer in model.language_model.model.layers:
-        layer._moe_fast = _compile_moe_step(layer)
+        body = _compile_moe_step(layer)
+        fused = getattr(layer.mlp, "_fused_step", None)
+        if fused is not None:
+            # mlx_moe_fused kernels handle the single-token (1,1,2048) decode
+            # step; anything else (batched decode, foreign width) takes the
+            # compiled stock-graph body. Pinning the exact element count keeps
+            # a future geometry change from reaching kernels that hardcode it.
+            from .mlx_moe_fused import HID as moe_hid
+            layer._moe_body_fast = body
+            layer._moe_fast = (lambda h, f=fused, b=body, n=moe_hid:
+                               f(h) if h.size == n else b(h))
+        else:
+            layer._moe_fast = body
         if layer.is_linear and hasattr(layer.linear_attn, "_fused_w"):
             layer._gdn_fast = _compile_gdn_step(layer)
 
+    if getattr(q35.DecoderLayer.__call__, "_chad_fastpath", False):
+        return
     stock_layer_call = q35.DecoderLayer.__call__
 
     def layer_call(self, x, mask=None, cache=None):
+        # S==1 cannot distinguish decode from a stray 1-token prefill chunk
+        # (mask is None for both); such a chunk takes this path and pays one
+        # token's worth of the same rounding class decode itself injects into
+        # the cache every step — bounded, unlike S>1 compile-fusion drift,
+        # which is why prefill proper stays on the stock graph.
         if mask is None and x.shape[1] == 1 and cache is not None \
                 and getattr(self, "_moe_fast", None) is not None:
             if self.is_linear:
@@ -270,6 +299,7 @@ def _install_layer_fastpath(model) -> None:
                 return self._moe_fast(x + r)
         return stock_layer_call(self, x, mask=mask, cache=cache)
 
+    layer_call._chad_fastpath = True
     q35.DecoderLayer.__call__ = layer_call  # type: ignore[method-assign]
 
 
@@ -300,14 +330,22 @@ def _moe_body(layer):
     sw = mlp.switch_mlp
     ln_w = layer.post_attention_layernorm.weight
     ln_eps = layer.post_attention_layernorm.eps
-    gate = mlp.gate
     fw, fs, fb = sw._fused_w, sw._fused_s, sw._fused_b
     sgs, sbits = sw._fused_gs, sw._fused_bits
     dp = sw.down_proj
     se = mlp.shared_expert
-    seg = mlp.shared_expert_gate
     k = mlp.top_k
     norm_topk = mlp.norm_topk_prob
+    E = mlp.num_experts
+    # mlx_moe_fused may have concatenated router|seg and shared gate|up; this
+    # body must then read the fused copies (originals are placeholders). Both
+    # variants are the same math per row.
+    moek = hasattr(mlp, "_rt_w")
+    if moek:
+        rt = (mlp._rt_w, mlp._rt_s, mlp._rt_b)
+        shg = (mlp._sh_w, mlp._sh_s, mlp._sh_b)
+    else:
+        gate, seg = mlp.gate, mlp.shared_expert_gate
 
     def qmm(x, m):
         return mx.quantized_matmul(x, m.weight, scales=m.scales, biases=m.biases,
@@ -316,7 +354,13 @@ def _moe_body(layer):
 
     def fwd(h):
         x = mx.fast.rms_norm(h, ln_w, ln_eps)
-        gates = mx.softmax(qmm(x, gate), axis=-1, precise=True)
+        if moek:
+            rg = mx.quantized_matmul(x, rt[0], scales=rt[1], biases=rt[2],
+                                     transpose=True, group_size=mlp._rt_gs,
+                                     bits=mlp._rt_bits)
+            gates = mx.softmax(rg[..., :E], axis=-1, precise=True)
+        else:
+            gates = mx.softmax(qmm(x, gate), axis=-1, precise=True)
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if norm_topk:
@@ -329,6 +373,13 @@ def _moe_body(layer):
         y = mx.gather_qmm(hh, dp.weight, dp.scales, dp.biases, rhs_indices=inds,
                           transpose=True, group_size=dp.group_size, bits=dp.bits)
         y = (y.squeeze(-2) * scores[..., None]).sum(axis=-2)
+        if moek:
+            sgu = mx.quantized_matmul(x, shg[0], scales=shg[1], biases=shg[2],
+                                      transpose=True, group_size=mlp._sh_gs,
+                                      bits=mlp._sh_bits)
+            g, u = mx.split(sgu, 2, axis=-1)
+            sh = qmm(nn.silu(g) * u, se.down_proj)
+            return h + y + mx.sigmoid(rg[..., E:E + 1]) * sh
         sh = qmm(nn.silu(qmm(x, se.gate_proj)) * qmm(x, se.up_proj), se.down_proj)
         return h + y + mx.sigmoid(qmm(x, seg)) * sh
 
