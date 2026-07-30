@@ -174,10 +174,10 @@ module = "chad.parakeet.*"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-# mlx_fastpath patches mlx_lm classes that only exist on macOS: with mlx installed
-# (dev Macs, the macos CI jobs) its `type: ignore[method-assign]` comments are load-
+# These modules patch mlx_lm classes that only exist on macOS: with mlx installed
+# (dev Macs, the macos CI jobs) their `type: ignore[method-assign]` comments are load-
 # bearing; on the Linux lint runner mlx_lm is absent, the patched classes type as Any,
 # and warn_unused_ignores flags those same comments — unfixable in the code for both
-# platforms at once, so the unused-ignore warning alone is relaxed for this module.
-module = "chad.mlx_fastpath"
+# platforms at once, so the unused-ignore warning alone is relaxed for them.
+module = ["chad.mlx_fastpath", "chad.mlx_moe_fused"]
 warn_unused_ignores = false
