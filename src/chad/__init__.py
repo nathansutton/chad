@@ -4,7 +4,7 @@ A flat collection of cooperating modules behind one console script (``chad``):
 the inference engine, the tool layer, the agent loop, and the terminal UI.
 """
 
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 # chad sets no MLX_* runtime vars. MLX_METAL_FAST_SYNCH, MLX_MAX_OPS_PER_BUFFER
 # and MLX_MAX_MB_PER_BUFFER were each measured end-to-end on the 35B and every

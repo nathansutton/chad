@@ -2,6 +2,21 @@
 
 Notable, user-visible changes.
 
+## [1.0.8] — 2026-07-29
+
+- **`/speech` now names an install command that can actually work.** The voice-mode
+  install hint was hardcoded to `uv sync --extra speech` — true only in a git clone, so
+  every published install (`uvx chad-code`, `uv tool install chad-code`) was sent to a
+  command with no project to sync. An extra rides on the *install spec*, not on a
+  separate step, and `speech.install_hint()` now derives the right form from how chad was
+  actually installed: `uv tool install --force 'chad-code[speech]'`, `uvx --from
+  'chad-code[speech]' chad`, `uv sync --extra speech` in a clone, or `uv pip install
+  'chad-code[speech]'` in a plain venv.
+- **Extras documented in one place.** The README install section now states the
+  install-spec rule with all three commands side by side, so the PyPI project page
+  carries it too. Also drops a stale line claiming LSP-precise find-refs/rename need an
+  `lsp` extra — that extra is gone and precision ships in the base install as of 1.0.7.
+
 ## [1.0.7] — 2026-07-29
 
 - **Precision code intelligence now ships in the base install.** `find_refs` /
