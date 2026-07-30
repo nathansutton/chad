@@ -85,6 +85,27 @@ def model_cached() -> bool:
         return False
 
 
+def install_hint(extra: str = "speech", path: str | None = None) -> str:
+    """The command that adds an optional extra to THIS install.
+
+    There is no single right answer: an extra attaches to the install SPEC for a
+    `uv tool`/`uvx` install and to `uv sync` only in a clone, so the one-line
+    hint /speech prints has to know which of those it's talking to — a clone-only
+    hint sends the (majority) PyPI user to a command that can't work. Keyed off
+    where this file physically lives, the one thing we can observe.
+    """
+    here = os.path.realpath(path or __file__)
+    if f"{os.sep}uv{os.sep}tools{os.sep}" in here:   # uv tool install
+        return f"uv tool install --force 'chad-code[{extra}]'"
+    # uvx's ephemeral env: hardlinked out of the uv cache (archive-v*/environments-v*).
+    if f"{os.sep}uv{os.sep}archive-" in here or f"{os.sep}uv{os.sep}environments-" in here:
+        return f"uvx --from 'chad-code[{extra}]' chad"
+    root = os.path.dirname(os.path.dirname(os.path.dirname(here)))  # src/chad/x.py -> repo
+    if os.path.exists(os.path.join(root, "pyproject.toml")):
+        return f"uv sync --extra {extra}"
+    return f"uv pip install 'chad-code[{extra}]'"    # a plain venv
+
+
 def available():
     """(ok, reason). ok=False carries the one-line reason speech can't start —
     surfaced verbatim by /speech, so it names the fix, not just the failure."""
@@ -102,7 +123,7 @@ def available():
         missing.append("sounddevice")
     if missing:
         return False, (f"speech needs {' + '.join(missing)} — install with "
-                       f"`uv sync --extra speech` (all local: Parakeet-on-MLX STT, "
+                       f"`{install_hint()}` (all local: Parakeet-on-MLX STT, "
                        f"macOS `say` TTS)")
     return True, ""
 

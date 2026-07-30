@@ -72,11 +72,15 @@ dependencies = [
     "mcp>=2,<3",
 ]
 
+# Extras ride on the INSTALL SPEC, so the command depends on how chad was installed:
+# `uv tool install --force 'chad-code[<extra>]'` (or `uvx --from 'chad-code[<extra>]' chad`)
+# for a PyPI install, `uv sync --extra <extra>` only in a clone. speech.install_hint()
+# derives the right one at runtime — keep it in step with any extra added here.
+# NOTE: the PyPI distribution is `chad-code`; 'pip install chad' installs an unrelated
+# squatted package.
+#
 # Optional syntax highlighting in diffs / confirm previews. Pure-Python,
 # import-guarded in render.py: absent, output is byte-identical to the un-highlighted path.
-# Install with `uv sync --extra highlight`.
-# NOTE: no PyPI release exists; 'pip install chad' installs an unrelated squatted
-# package. Document uv/git installs only.
 [project.optional-dependencies]
 highlight = ["pygments>=2.17"]
 # Voice mode (/speech in the TUI): push-to-talk dictation via chad's vendored
@@ -85,7 +89,7 @@ highlight = ["pygments>=2.17"]
 # `say`. All on-device, nothing leaves the machine. mlx/numpy/huggingface-hub
 # are already core deps, so the extra adds only the mic (sounddevice/PortAudio).
 # Optional and import-guarded in speech.py: absent, /speech prints the install
-# hint and everything else is untouched. Install with `uv sync --extra speech`.
+# hint and everything else is untouched.
 speech = [
     "sounddevice>=0.5",
 ]

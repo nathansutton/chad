@@ -110,7 +110,24 @@ def test_available_reports_missing_deps_as_hint():
     ok, reason = speech.available()
     assert ok in (True, False)
     if not ok:
-        assert "uv sync --extra speech" in reason
+        assert "sounddevice" in reason and "speech" in reason
+
+
+def test_install_hint_matches_how_chad_was_installed():
+    # The hint is the whole fix, so it has to name the command that works for the
+    # reader: extras ride on the install spec for uvx/tool installs, on `uv sync`
+    # only in a clone. Paths are the real shapes uv produces.
+    h = speech.install_hint
+    assert h(path="/Users/x/.local/share/uv/tools/chad-code/lib/python3.13/"
+                  "site-packages/chad/speech.py") == \
+        "uv tool install --force 'chad-code[speech]'"
+    assert h(path="/Users/x/.cache/uv/archive-v0/abc123/lib/python3.13/"
+                  "site-packages/chad/speech.py") == "uvx --from 'chad-code[speech]' chad"
+    assert h(path="/Users/x/.local/share/uv/python/venv/lib/python3.13/"
+                  "site-packages/chad/speech.py") == "uv pip install 'chad-code[speech]'"
+    # This test file IS a clone, so the live module resolves to the clone form.
+    assert speech.install_hint() == "uv sync --extra speech"
+    assert h("highlight") == "uv sync --extra highlight"
 
 
 def test_collapse_repeats_kills_hallucination_loop():

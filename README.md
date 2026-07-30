@@ -103,6 +103,21 @@ uv run chad "add a --json flag to main.py and update the tests"   # one-shot, he
 uv run chad -c               # resume this directory's last conversation
 ```
 
+**Optional extras.** Everything core is in the base install; two features are opt-in
+because they pull deps not every install wants — `speech` (voice mode: a mic library,
+no torch) and `highlight` (syntax colour in diffs/previews). An extra rides on the
+**install spec**, not on a separate command, so how you add it depends on how you
+installed chad:
+
+```bash
+uv tool install --force 'chad-code[speech]'   # add to an existing `uv tool` install
+uvx --from 'chad-code[speech]' chad           # one-off run, nothing installed
+uv sync --extra speech                        # from a clone
+```
+
+`/speech` in the TUI prints whichever of those matches your install, so you never have
+to work it out from here.
+
 **The model.** chad picks one for you by RAM and downloads it once into the shared Hugging
 Face cache (`~/.cache/huggingface`, reused across every project). Override with
 `--model 9b` / `--model 35b`, or `--model <repo or local dir>` for anything else.
@@ -128,8 +143,8 @@ re-downloads the model.
 **Development.** `uv sync` once, then `uv run pytest -q` — the fast unit gate loads **no
 model weights**, runs in seconds, and is what CI runs. Throughput on your own machine:
 `uv run chad-bench` (see [Throughput & performance](docs/benchmarks.md)). LSP-precise
-find-references / rename need the `lsp` extra (`uv tool install 'chad-code[lsp]'`); without
-it chad uses the tree-sitter fallback automatically.
+find-references / rename need no extra — chad fetches pyright via `uvx` on first use and
+falls back to tree-sitter when a language server can't start.
 
 ## Interactive UX
 
@@ -155,8 +170,9 @@ it chad uses the tree-sitter fallback automatically.
   isn't clipped, and a personal word table (`~/.chad/speech_words.json`) teaches it your
   identifiers — `{"pie test": "pytest"}`. Dictation cost is linear in take length, so a
   long thought is fine; `/speech` off releases both the mic and the weights. Nothing
-  leaves the machine. Needs the `speech` extra (`uv sync --extra speech` — just a mic
-  library; no torch, no numba).
+  leaves the machine. Needs the `speech` extra — just a mic library; no torch, no numba
+  (see [Installing & upgrading](#installing--upgrading); on a `uv tool` install that's
+  `uv tool install --force 'chad-code[speech]'`).
 
 **Usage.** `uv run chad --help` is the source of truth:
 
