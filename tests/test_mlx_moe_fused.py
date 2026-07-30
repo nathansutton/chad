@@ -24,8 +24,7 @@ import mlx.nn as nn  # noqa: E402
 from mlx_lm.models.qwen3_5 import Model, ModelArgs  # noqa: E402
 
 from chad import mlx_fastpath  # noqa: E402
-from test_mlx_fastpath import TINY_CFG, greedy  # noqa: E402
-from test_mlx_fastpath import build_tiny  # noqa: E402
+from test_mlx_fastpath import TINY_CFG, build_tiny, greedy  # noqa: E402
 
 REAL_CFG = {
     "model_type": "qwen3_5_moe",

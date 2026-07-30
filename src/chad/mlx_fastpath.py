@@ -157,7 +157,7 @@ def _patch_switch_glu() -> None:
             y = sl._scatter_unsort(y, inv_order, indices.shape)
         return y.squeeze(-2)
 
-    fused_call._chad_fastpath = True
+    fused_call._chad_fastpath = True  # type: ignore[attr-defined]
     sl.SwitchGLU.__call__ = fused_call  # type: ignore[method-assign]
 
 
@@ -245,7 +245,7 @@ def _patch_gdn_call() -> None:
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
 
-    call._chad_fastpath = True
+    call._chad_fastpath = True  # type: ignore[attr-defined]
     q35.GatedDeltaNet.__call__ = call  # type: ignore[method-assign]
 
 
@@ -299,7 +299,7 @@ def _install_layer_fastpath(model) -> None:
                 return self._moe_fast(x + r)
         return stock_layer_call(self, x, mask=mask, cache=cache)
 
-    layer_call._chad_fastpath = True
+    layer_call._chad_fastpath = True  # type: ignore[attr-defined]
     q35.DecoderLayer.__call__ = layer_call  # type: ignore[method-assign]
 
 

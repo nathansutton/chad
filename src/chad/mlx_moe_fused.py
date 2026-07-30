@@ -420,7 +420,7 @@ def _matches(model) -> bool:
     for layer in layers:
         mlp = getattr(layer, "mlp", None)
         sw = getattr(mlp, "switch_mlp", None)
-        if not hasattr(sw, "_fused_w"):
+        if mlp is None or sw is None or not hasattr(sw, "_fused_w"):
             return False
         E = mlp.num_experts
         if (mlp.top_k != TOP_K or not mlp.norm_topk_prob or E <= TOP_K
@@ -560,7 +560,7 @@ def _patch_block() -> None:
         sh = self.shared_expert.down_proj(nn.silu(g) * u)
         return y + mx.sigmoid(rg[..., E:E + 1]) * sh
 
-    call._chad_moe_fused = True
+    call._chad_moe_fused = True  # type: ignore[attr-defined]
     q3n.Qwen3NextSparseMoeBlock.__call__ = call  # type: ignore[method-assign]
 
 
