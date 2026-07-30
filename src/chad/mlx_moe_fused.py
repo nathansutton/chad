@@ -12,10 +12,9 @@ as mlx_qsdpa) two kernels that replace the whole post-router block:
      (6-bit branch) in ONE dispatch. Row pairs (j, j+512) of the concatenated
      gate|up matrices are computed together so silu(g)*u happens in-register;
      output is h (9, 512) with slot 8 = shared expert. The inner loops are
-     mlx's own qmv math verbatim (prescaled x_thread, byte-mask qdot) — three
-     attempts to beat that inner loop lost cleanly (see
-     benchmarks/gemv_spike/FINDINGS.md), so only the SHAPE is changed: one
-     8-expert dispatch instead of 8 tiny ones.
+     mlx's own qmv math verbatim (prescaled x_thread, byte-mask qdot) — that
+     inner loop is at its plateau and every attempt to beat it lost, so only
+     the SHAPE is changed: one 8-expert dispatch instead of 8 tiny ones.
   B: every down-projection (3-bit routed + 6-bit shared) with routing scores,
      sigmoid(seg) and the residual add folded in; each output block loops the
      experts in-register, so the combine costs no traffic and no atomics.
@@ -29,12 +28,11 @@ renormalize ops in the same order), over two bit-exact weight transforms:
 An algebraic swap (softmax over just the top-8 logits) was measured perf-
 neutral and rejected: it perturbed scores for zero win.
 
-Measured (synthetic weights at exact checkpoint shapes/bits, cache-busted +
-clock-pinned + interleaved; M4 Pro 24 GB): MoE block step 108.1 -> 84.4 us
-serialized (1.28x), projected ~0.98 ms/token on the 40-layer 35B. Numerics
-are bf16-accumulation class (~1e-2 rel on block output), expert selection
-bit-identical; end-to-end greedy parity is gated on the real checkpoint
-before release.
+Measured on the shipped checkpoint (M4 Pro 24 GB, in-process A/B against the
+compiled stock body): 1.28x on the MoE block, +5-7% end-to-end decode. Numerics
+are bf16-accumulation class (~1e-2 rel on block output) with expert selection
+bit-identical; decode-path perplexity comes out marginally better than stock,
+since the combine accumulates in fp32 where the stock graph sums in bf16.
 
 Scope: engages only when every layer matches the exact 35B MoE geometry
 (hidden 2048, expert inter 512, top-8, expert gate|up 2-bit / down 3-bit
