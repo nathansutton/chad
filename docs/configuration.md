@@ -449,6 +449,7 @@ CHAD_NO_SYNTAX_GATE=1       uv run chad  # A/B knob: DISABLE the post-edit synta
 CHAD_NO_PREFIX_CACHE=1      uv run chad  # measurement knob: drop the persistent prefix KV cache
 CHAD_NO_SKILLS=1            uv run chad  # A/B knob: disable all Agent Skill discovery
 CHAD_NO_FASTPATH=1          uv run chad  # A/B knob: disable the fused-projection decode fast path
+CHAD_NO_MOE_FUSED=1         uv run chad  # A/B knob: disable the fused MoE decode kernels (35B only)
 CHAD_NO_QSDPA_SGM=1         uv run chad  # A/B knob: disable the split-head qKV attention tier
 CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbelt (unsafe)
 ```
@@ -496,6 +497,13 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
 - **`CHAD_NO_FASTPATH`** — disables the fused-projection + compiled decode step installed
   at load for the hybrid MoE checkpoint (`mlx_fastpath.py`). Pure speed, no behavior
   change, so this is an A/B and bisection knob rather than something to run with.
+- **`CHAD_NO_MOE_FUSED`** — disables the fused MoE decode kernels (`mlx_moe_fused.py`),
+  which run the 35B's per-token MoE block — routed experts, shared expert, routing
+  weights, and the residual add — as two Metal dispatches instead of many, worth 5–7%
+  decode throughput (70.7 → 74.3 tok/s at 8k context). Expert routing is bit-identical
+  to stock and the kernels engage only on the exact 35B geometry (the 9B and any
+  foreign model keep the stock graph), so this is another speed-only bisection knob.
+  They install through the fast path, so `CHAD_NO_FASTPATH=1` disables them too.
 - **`CHAD_NO_QSDPA_SGM`** — disables the split-head tier of the fused quantized-KV
   attention kernel (`mlx_qsdpa.py`), falling back to the per-head kernel at every
   sequence length. The tier only engages on the 35B (it needs 8 query heads per KV head;

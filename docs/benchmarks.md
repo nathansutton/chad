@@ -73,6 +73,11 @@ consequences:
 - Work that removes *kernels* pays; work that removes *bytes* often doesn't. chad's decode
   fast-path ([`mlx_fastpath.py`](../src/chad/mlx_fastpath.py)) fuses expert and GDN
   projections and compiles the whole S=1 layer step, removing ~150 dispatches per token.
+  On top of that, the 35B's per-token MoE block now runs as two custom Metal kernels
+  ([`mlx_moe_fused.py`](../src/chad/mlx_moe_fused.py)) — one for all routed + shared
+  gate|up projections, one folding the down-projections, routing weights, and residual
+  add — worth another 5–7% decode (70.7 → 74.3 tok/s at 8k context), with routing
+  bit-identical to stock. Opt out with `CHAD_NO_MOE_FUSED=1`.
 - Attention is the exception, and it's a reuse problem rather than a fetch problem. Ablating
   the math out of the fused quantized-KV kernel leaves it streaming at ~331 GB/s — already at
   this machine's measured roofline — with ~68% of its runtime spent on the 8 GQA q-heads
