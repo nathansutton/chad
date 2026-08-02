@@ -625,6 +625,7 @@ class Agent:
                 # measured trace: a model re-phrasing the same delete 30 times). The
                 # guard names itself and the fix — narrow the target.
                 if levers.enabled("scoped_destructive_guard"):
+                    levers.fired("scoped_destructive_guard", deny_text=True)
                     self._deny_reason = (
                         "[blocked by the destructive-command guard, not by a person: "
                         "the command matches a catastrophic pattern (recursive delete "
@@ -722,6 +723,7 @@ class Agent:
                 note = sub.budget_note or guardrails.progress_note(sub.messages)
                 if not note:
                     return res
+                levers.fired("subagent_budget_note")
                 return (res.rstrip() + "\n[sub-agent progress before it "
                         f"stopped: {note}]").strip()
             if sub.interrupted:
@@ -1196,6 +1198,7 @@ class Agent:
                         or self._backend_retries >= _MAX_BACKEND_RETRIES):
                     raise
                 self._backend_retries += 1
+                levers.fired("backend_retry", attempt=self._backend_retries)
                 log.warning("backend error (retry %d/%d): %s",
                             self._backend_retries, _MAX_BACKEND_RETRIES, e)
                 self._emit("status", f"Backend error; retrying "
@@ -1285,6 +1288,8 @@ class Agent:
                 # the first branch already credits; an unclosed generation that
                 # stopped SHORT of the cap is a truncation of some other kind, not
                 # the reasoning overspend this counts.
+                levers.fired("capped_think_credit", step=step,
+                             tokens=stats.generated_tokens)
                 _think_delta = stats.generated_tokens
             else:
                 _think_delta = 0
@@ -1312,6 +1317,7 @@ class Agent:
                 if _tt_decision == "half":
                     log.info("THINK-BUDGET half at step %d: %d/%d cumulative think tok "
                              "this turn", step, turn_think_tokens, _tt_budget)
+                    levers.fired("turn_think_budget", step=step, decision="half")
                     self.messages.append({"role": "tool", "name": "steer",
                                           "content": guardrails.TURN_THINK_BUDGET_STEER})
                 elif _tt_decision == "exhausted":
@@ -1319,6 +1325,7 @@ class Agent:
                              "tok this turn — throttling <think> (one action step per "
                              "%d further think tok)", step, turn_think_tokens,
                              _tt_budget, guardrails.TURN_THINK_REARM_TOK)
+                    levers.fired("turn_think_budget", step=step, decision="exhausted")
                     self._emit("info", "  [reasoning budget exhausted for this turn — "
                                        "throttling further <think>]")
 
@@ -1388,6 +1395,8 @@ class Agent:
                 hard_wrapup_fired = True
                 landing_no_think = True
                 _remaining = self._turn_budget_s - (time.monotonic() - turn_start)
+                levers.fired("hard_wrapup", step=step,
+                             remaining_s=int(_remaining))
                 log.info("HARD-WRAPUP abort at step %d: %.0fs left, gen was %d tok",
                          step, _remaining, stats.generated_tokens)
                 self._emit("info", "  [wall deadline reached — landing the best answer now]")
@@ -1452,6 +1461,7 @@ class Agent:
                     capped_stall_streak += 1
                     if (self.think_ceiling and self.thinking and capped_stall_streak >= 2
                             and levers.enabled("no_think_escalation")):
+                        levers.fired("no_think_escalation", step=step)
                         no_think_next = True
                 else:
                     capped_stall_streak = 0
@@ -1481,6 +1491,7 @@ class Agent:
                     # last). Costs one prefix-cache invalidation on this rare path.
                     if (levers.enabled("garble_never_final")
                             and consecutive_garbles >= 2 and last_garble_idx is not None):
+                        levers.fired("garble_never_final", step=step, action="scrub")
                         self.messages[last_garble_idx]["content"] = \
                             guardrails.GARBLE_SCRUBBED
                         log.info("GARBLE scrub at step %d: previous garbled message "
@@ -1516,6 +1527,7 @@ class Agent:
                 # the audit latch, and the last one ships as the answer with most of the
                 # wall budget still unspent).
                 if garbled and levers.enabled("garble_never_final"):
+                    levers.fired("garble_never_final", step=step, action="hard-stop")
                     self.budget_note = guardrails.progress_note(self.messages)
                     log.info("END step %d: GARBLE hard-stop (%d garble nudges spent) — "
                              "a garbled tool call is never a final answer",
@@ -1558,6 +1570,8 @@ class Agent:
                         if audit:
                             done_audit_fired = True
                             done_audit_bounces += 1
+                            levers.fired("done_audit", step=step, entry="churn-handoff")
+                            levers.fired("audit_churn_handoff", step=step)
                             audit_absent_list = guardrails.audit_absent_paths(audit_task)
                             _runway = ((self._turn_budget_s
                                         - (time.monotonic() - turn_start))
@@ -1607,6 +1621,7 @@ class Agent:
                     if audit:
                         done_audit_fired = True
                         done_audit_bounces += 1
+                        levers.fired("done_audit", step=step, entry="final-answer")
                         audit_absent_list = guardrails.audit_absent_paths(audit_task)
                         _runway = ((self._turn_budget_s
                                     - (time.monotonic() - turn_start))
@@ -1706,6 +1721,9 @@ class Agent:
                         if audit:
                             done_audit_fired = True
                             done_audit_bounces += 1
+                            levers.fired("done_audit", step=step,
+                                         entry="churn-handoff-done")
+                            levers.fired("audit_churn_handoff", step=step)
                             audit_absent_list = guardrails.audit_absent_paths(audit_task)
                             _runway = ((self._turn_budget_s
                                         - (time.monotonic() - turn_start))
@@ -1768,6 +1786,7 @@ class Agent:
                         if audit:
                             done_audit_fired = True
                             done_audit_bounces += 1
+                            levers.fired("done_audit", step=step, entry="done")
                             audit_absent_list = guardrails.audit_absent_paths(audit_task)
                             _runway = ((self._turn_budget_s
                                         - (time.monotonic() - turn_start))
@@ -1802,6 +1821,7 @@ class Agent:
                         and guardrails.done_spec_recheck(
                             did_work, unverified_edit, done_recheck_done, read_only_intent):
                     done_recheck_done = True
+                    levers.fired("done_spec_recheck", step=step)
                     log.info("DONE deferred for deliverable recheck (step %d)", step)
                     self.messages.append({"role": "tool", "name": "done",
                                           "content": guardrails.DONE_SPEC_RECHECK})
@@ -1897,6 +1917,7 @@ class Agent:
                     _sub_sig = (str(args.get("description", "")).strip(),
                                 str(args.get("prompt", "")).strip())
                     if _sub_sig in subagent_sigs and levers.enabled("subagent_no_respawn"):
+                        levers.fired("subagent_no_respawn", step=step)
                         result = ("[you already ran this exact sub-agent this turn — do NOT "
                                   "re-run it. Use what it returned, or do the work yourself "
                                   "now with grep/read to locate the code and edit to change "
@@ -1977,6 +1998,7 @@ class Agent:
                 if (plan_write and result.startswith("[wrote") and not plan_reviews
                         and levers.enabled("plan_review")):
                     plan_reviews += 1
+                    levers.fired("plan_review", step=step)
                     log.info("PLAN REVIEW nudge for %s", self.last_plan_path)
                     self.messages.append({"role": "tool", "name": "read", "content": (
                         f"[plan written to {self.last_plan_path}. Before you call `done`, "
@@ -2087,6 +2109,9 @@ class Agent:
                         n == "bash"
                         and not guardrails.is_readonly_bash(str(a.get("command", "")))
                         for n, a in calls):
+                    if readonly_streak:  # the exemption actually reset a live streak
+                        levers.fired("gate_ops_exempt", step=step,
+                                     streak=readonly_streak)
                     readonly_streak = 0
                 else:
                     readonly_streak += 1

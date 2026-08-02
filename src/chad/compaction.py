@@ -208,6 +208,8 @@ def compact_if_needed(messages, render, emit, ctx_limit, prompt_ids, state=None)
         for i in reversed(victims):  # delete high→low so earlier indices stay valid
             del messages[i]
         guard += 1
+    if trailing_window and guard:
+        levers.fired("subagent_compact_window", batches=guard)
     # pass 4: last resort — recent outputs alone still exceed target. Truncate what
     # is left oldest-first, escalating only as far as the budget demands, and NEVER
     # touching the newest tool result: compaction runs at the top of a step, before
@@ -239,6 +241,7 @@ def compact_if_needed(messages, render, emit, ctx_limit, prompt_ids, state=None)
     path, capped = ("", False)
     if dropped and levers.enabled("compact_offload"):
         path, capped = _spill(dropped)
+        levers.fired("compact_offload", dropped=len(dropped), capped=capped)
     noticed = False
     if dropped and levers.enabled("compact_notice"):
         where = ""
@@ -257,6 +260,7 @@ def compact_if_needed(messages, render, emit, ctx_limit, prompt_ids, state=None)
             f"If you need earlier file contents or command output, re-read the file or "
             f"re-run the command — do not recall it from memory. Then continue the task.")})
         noticed = True
+        levers.fired("compact_notice", dropped=len(dropped))
         # The notice costs tokens, and it is appended after the passes above have already
         # reclaimed down to the ceiling. On the pathological path — one fresh read bigger
         # than the whole target — that can push the render back over ctx_limit, and an

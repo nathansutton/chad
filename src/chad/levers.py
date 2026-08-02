@@ -33,10 +33,24 @@ can price one bundle without paying for the others.
 """
 
 import os
+import json
+import logging
+from collections import Counter
 from dataclasses import dataclass
 
 BEHAVIOR = "behavior"
 REGRESSION_GUARD = "regression-guard"
+
+# How a lever's use is observable in a trace (plan 123: exists / exercised / improved).
+#   EVENT    the lever has a discrete action site that calls `fired()` when its
+#            behavior actually runs — a steer injected, an edit reverted, a gate
+#            biting. "Configured" and "exercised" are different claims, and only a
+#            firing event ties an outcome delta to a lever that actually did
+#            something on that task.
+#   PASSIVE  the lever's whole effect is static prompt content; "fired" would mean
+#            "the system prompt was built", which the config record already says.
+EVENT = "event"
+PASSIVE = "passive"
 
 
 @dataclass(frozen=True)
@@ -44,6 +58,7 @@ class Lever:
     description: str
     group: str
     kind: str = BEHAVIOR
+    fires: str = EVENT
 
 
 # Keep each description accurate enough that `chad levers` is a readable inventory of
@@ -386,7 +401,7 @@ LEVERS: dict[str, Lever] = {
         "unused; a harness-side predicate cannot judge check quality, so this steers "
         "the choice upstream where it is made. Rides the "
         "cached prefix; OFF removes the block byte-exactly.",
-        "iter15"),
+        "iter15", fires=PASSIVE),
     "scoped_destructive_guard": Lever(
         "Scope the destructive-bash seatbelt's recursive-rm screen to targets whose "
         "loss is actually catastrophic — filesystem root, top-level directories, "
@@ -437,7 +452,7 @@ LEVERS: dict[str, Lever] = {
     "profile_prompt": Lever(
         "Append the active model profile's prompt block to the system prompt "
         "(model-specific accommodations; see profiles.py).",
-        "playbook"),
+        "playbook", fires=PASSIVE),
 
     # --- from the ai-codex teardown: an index the model already has beats one it must
     #     fetch. chad had the ranked map but only as a tool; this puts a digest in-prompt.
@@ -445,7 +460,7 @@ LEVERS: dict[str, Lever] = {
         "Inject a ranked repo_map digest into the system-prompt dynamic tail instead of "
         "a flat file listing, so the model orients without a reflexive step-1 repo_map "
         "call. Degrades to the flat listing when repomap is unavailable (see prompt.py).",
-        "ai-codex"),
+        "ai-codex", fires=PASSIVE),
 
     # --- group "ctxengine": the uniform-symbols work. -------------------------------
     "post_edit_diagnostics": Lever(
@@ -482,6 +497,42 @@ def enabled(name: str) -> bool:
     if name not in LEVERS:
         raise UnknownLever(f"unregistered lever {name!r}; add it to levers.LEVERS")
     return name not in _disabled()
+
+
+_fire_counts: Counter = Counter()
+
+
+def fired(name: str, step: int | None = None, **detail) -> None:
+    """Record that a lever's behavior actually ran — not that it was configured.
+
+    Call this at the ACTION site, inside the `enabled()` branch, at the moment the
+    lever's distinctive effect is produced (a nudge returned, an edit reverted, a
+    gate refusing, a result modified) — never at the bare `enabled()` check, and for
+    predicate-style levers only when the lever CHANGED the outcome vs the legacy path.
+    An arm's per-lever firing counts are what let an outcome delta be split into
+    "exercised and useless" vs "never fired on these tasks" (plan 123).
+
+    Emits one line to the session log: `LEVER {"lever": ..., "step": ..., ...}` —
+    machine-parseable, one JSON object per event. A fire while the lever is disabled
+    is a call-site bug (the guard leaked); it is recorded with `"disabled": true`
+    rather than crashing a live task, and the test suite treats it as a failure.
+    """
+    if name not in LEVERS:
+        raise UnknownLever(f"unregistered lever {name!r}; add it to levers.LEVERS")
+    _fire_counts[name] += 1
+    evt: dict = {"lever": name}
+    if step is not None:
+        evt["step"] = step
+    if name in _disabled():
+        evt["disabled"] = True
+    if detail:
+        evt.update(detail)
+    logging.getLogger("chad").info("LEVER %s", json.dumps(evt, sort_keys=True, default=str))
+
+
+def fire_counts() -> dict[str, int]:
+    """Per-lever firing counts for this process, for tests and end-of-run summaries."""
+    return dict(_fire_counts)
 
 
 def validate_env() -> None:
