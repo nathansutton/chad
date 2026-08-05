@@ -8,35 +8,58 @@ needs exactly one thing from the harness: a way to switch a single behavior off 
 touching the tree.
 
 So every behavioral lever gets a name here and a `levers.enabled("name")` guard at its
-site. `CHAD_DISABLE=a,b` turns off a and b; the private ablation harness enumerates this
-registry and runs the slice once per lever to produce a per-lever delta.
+site. `CHAD_ENABLE=a,b` turns on a and b (`CHAD_ENABLE=all` turns on everything);
+`CHAD_DISABLE=a,b` subtracts from whatever is enabled, so the leave-one-out ablation
+idiom is `CHAD_ENABLE=all CHAD_DISABLE=x`.
 
-Unknown names in `CHAD_DISABLE` are a hard error, not a warning. A typo'd lever in an
+Unknown names in either variable are a hard error, not a warning. A typo'd lever in an
 ablation script would otherwise run the *unmodified* harness and report a delta of zero,
 which reads as "this lever does nothing" — the single most expensive way for this
 machinery to lie to you. `validate_env()` runs it at startup, not at first use.
 
-Levers default ON: the registry describes what can be switched off, not what is off.
+Levers default OFF (since 1.10.0). Every lever here was born from a plausible failure
+narrative, but the measured record says the bare model + tool loop matches or beats the
+full stack on the benchmark that motivated them (the 2026-08 clean-slate arms: BARE-0
+within noise of FULL, at substantially less token spend). Default-on made the scaffold
+the null hypothesis; it is now the alternative, and a lever ships ON only with a
+pre-registered, positive, measured contrast behind it. The registry and the firing
+telemetry stay so that any lever remains one env var away from a fair re-trial.
 
 Two fields carry the judgment a bare on/off switch can't:
 
 `group` — the harness iteration that introduced the change, so `ablate.py --group iter3`
 can price one bundle without paying for the others.
 
-`kind` — whether the OFF state is a state you could ever ship.
+`kind` — what the ON state buys.
   BEHAVIOR       the change adds a behavior; without it the agent is merely less helped.
-  REGRESSION_GUARD  the change fixes a demonstrated bug, and OFF restores that bug. A
-                 grep that reports "[no matches]" on a tree it never finished walking is
-                 a lie, not a configuration. These exist to be *measured*, never shipped
-                 off, and `chad levers` says so out loud so nobody wires one into a
-                 preset.
+  REGRESSION_GUARD  the change fixes a once-demonstrated bug, and OFF restores that
+                 bug's possibility. A grep that reports "[no matches]" on a tree it
+                 never finished walking is a lie, not a configuration — but the
+                 clean-slate arms measured no aggregate score cost to running without
+                 these, so they follow the same default-OFF, evidence-to-ship rule.
+                 The classification survives so `chad levers` can say exactly what
+                 enabling one buys back.
 """
 
+import json
+import logging
 import os
+from collections import Counter
 from dataclasses import dataclass
 
 BEHAVIOR = "behavior"
 REGRESSION_GUARD = "regression-guard"
+
+# How a lever's use is observable in a trace (plan 123: exists / exercised / improved).
+#   EVENT    the lever has a discrete action site that calls `fired()` when its
+#            behavior actually runs — a steer injected, an edit reverted, a gate
+#            biting. "Configured" and "exercised" are different claims, and only a
+#            firing event ties an outcome delta to a lever that actually did
+#            something on that task.
+#   PASSIVE  the lever's whole effect is static prompt content; "fired" would mean
+#            "the system prompt was built", which the config record already says.
+EVENT = "event"
+PASSIVE = "passive"
 
 
 @dataclass(frozen=True)
@@ -44,6 +67,7 @@ class Lever:
     description: str
     group: str
     kind: str = BEHAVIOR
+    fires: str = EVENT
 
 
 # Keep each description accurate enough that `chad levers` is a readable inventory of
@@ -386,7 +410,7 @@ LEVERS: dict[str, Lever] = {
         "unused; a harness-side predicate cannot judge check quality, so this steers "
         "the choice upstream where it is made. Rides the "
         "cached prefix; OFF removes the block byte-exactly.",
-        "iter15"),
+        "iter15", fires=PASSIVE),
     "scoped_destructive_guard": Lever(
         "Scope the destructive-bash seatbelt's recursive-rm screen to targets whose "
         "loss is actually catastrophic — filesystem root, top-level directories, "
@@ -437,7 +461,7 @@ LEVERS: dict[str, Lever] = {
     "profile_prompt": Lever(
         "Append the active model profile's prompt block to the system prompt "
         "(model-specific accommodations; see profiles.py).",
-        "playbook"),
+        "playbook", fires=PASSIVE),
 
     # --- from the ai-codex teardown: an index the model already has beats one it must
     #     fetch. chad had the ranked map but only as a tool; this puts a digest in-prompt.
@@ -445,7 +469,7 @@ LEVERS: dict[str, Lever] = {
         "Inject a ranked repo_map digest into the system-prompt dynamic tail instead of "
         "a flat file listing, so the model orients without a reflexive step-1 repo_map "
         "call. Degrades to the flat listing when repomap is unavailable (see prompt.py).",
-        "ai-codex"),
+        "ai-codex", fires=PASSIVE),
 
     # --- group "ctxengine": the uniform-symbols work. -------------------------------
     "post_edit_diagnostics": Lever(
@@ -461,41 +485,90 @@ LEVERS: dict[str, Lever] = {
 
 
 class UnknownLever(ValueError):
-    """A CHAD_DISABLE entry that names no registered lever."""
+    """A CHAD_ENABLE/CHAD_DISABLE entry that names no registered lever."""
 
 
-def _disabled() -> frozenset[str]:
-    raw = os.environ.get("CHAD_DISABLE", "")
+def _parse(var: str) -> frozenset[str]:
+    raw = os.environ.get(var, "")
     names = frozenset(n.strip() for n in raw.split(",") if n.strip())
-    unknown = names - LEVERS.keys()
+    unknown = names - LEVERS.keys() - {"all"}
     if unknown:
         raise UnknownLever(
-            f"CHAD_DISABLE names unregistered lever(s): {sorted(unknown)}. "
-            f"Known levers: {sorted(LEVERS)}")
+            f"{var} names unregistered lever(s): {sorted(unknown)}. "
+            f"Known levers: {sorted(LEVERS)} (or 'all')")
     return names
 
 
+def _enabled_set() -> frozenset[str]:
+    """Levers ON right now: CHAD_ENABLE (default none, 'all' = everything) minus
+    CHAD_DISABLE. Read live, never cached — the eval harness flips these between
+    tasks in-process."""
+    on = _parse("CHAD_ENABLE")
+    if "all" in on:
+        on = frozenset(LEVERS)
+    off = _parse("CHAD_DISABLE")
+    if "all" in off:
+        off = frozenset(LEVERS)
+    return on - off
+
+
 def enabled(name: str) -> bool:
-    """True unless `name` appears in CHAD_DISABLE. Raises if `name` is not registered —
-    a guard on an unregistered lever is invisible to the ablation driver, so it must not
-    silently pass."""
+    """True only if `name` is switched on via CHAD_ENABLE (and not subtracted by
+    CHAD_DISABLE). Raises if `name` is not registered — a guard on an unregistered
+    lever is invisible to the ablation driver, so it must not silently pass."""
     if name not in LEVERS:
         raise UnknownLever(f"unregistered lever {name!r}; add it to levers.LEVERS")
-    return name not in _disabled()
+    return name in _enabled_set()
+
+
+_fire_counts: Counter = Counter()
+
+
+def fired(name: str, step: int | None = None, **detail) -> None:
+    """Record that a lever's behavior actually ran — not that it was configured.
+
+    Call this at the ACTION site, inside the `enabled()` branch, at the moment the
+    lever's distinctive effect is produced (a nudge returned, an edit reverted, a
+    gate refusing, a result modified) — never at the bare `enabled()` check, and for
+    predicate-style levers only when the lever CHANGED the outcome vs the legacy path.
+    An arm's per-lever firing counts are what let an outcome delta be split into
+    "exercised and useless" vs "never fired on these tasks" (plan 123).
+
+    Emits one line to the session log: `LEVER {"lever": ..., "step": ..., ...}` —
+    machine-parseable, one JSON object per event. A fire while the lever is disabled
+    is a call-site bug (the guard leaked); it is recorded with `"disabled": true`
+    rather than crashing a live task, and the test suite treats it as a failure.
+    """
+    if name not in LEVERS:
+        raise UnknownLever(f"unregistered lever {name!r}; add it to levers.LEVERS")
+    _fire_counts[name] += 1
+    evt: dict = {"lever": name}
+    if step is not None:
+        evt["step"] = step
+    if name not in _enabled_set():
+        evt["disabled"] = True
+    if detail:
+        evt.update(detail)
+    logging.getLogger("chad").info("LEVER %s", json.dumps(evt, sort_keys=True, default=str))
+
+
+def fire_counts() -> dict[str, int]:
+    """Per-lever firing counts for this process, for tests and end-of-run summaries."""
+    return dict(_fire_counts)
 
 
 def validate_env() -> None:
-    """Raise on a typo'd CHAD_DISABLE now, at startup, rather than at the first compaction
-    — which on a long sweep is forty minutes of wall-clock into a run that is already
-    measuring the wrong thing. Called from the CLI and the eval runner."""
-    _disabled()
+    """Raise on a typo'd CHAD_ENABLE/CHAD_DISABLE now, at startup, rather than at the
+    first compaction — which on a long sweep is forty minutes of wall-clock into a run
+    that is already measuring the wrong thing. Called from the CLI and the eval runner."""
+    _enabled_set()
 
 
 def active() -> list[str]:
     """Registered levers currently enabled, sorted. Recorded in eval rows so a banked
-    result carries the harness configuration that produced it."""
-    off = _disabled()
-    return sorted(n for n in LEVERS if n not in off)
+    result carries the harness configuration that produced it. Empty on a default
+    (bare) run."""
+    return sorted(_enabled_set())
 
 
 def groups() -> list[str]:

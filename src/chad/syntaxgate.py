@@ -158,6 +158,7 @@ def check_syntax(path: str, before: str | None) -> str | None:
             line = lines[e.lineno - 1] if e.lineno and e.lineno <= len(lines) else ""
             more = ""
             if streak >= 2 and levers.enabled("broken_streak_steer"):
+                levers.fired("broken_streak_steer", streak=streak)
                 more = (f" You have now landed {streak} consecutive changes while this "
                         f"file does not parse — STOP patching it line by line. Rewrite "
                         f"the ENTIRE file with write (send the complete corrected "
@@ -288,6 +289,7 @@ def edit_reject(path: str, before: str, after: str,
         # precondition for the whitespace-surgery death loop this fix exists to stop.
         if not levers.enabled("syntaxgate_revert"):
             return None
+        levers.fired("syntaxgate_revert", line=e.lineno)
         lines = after.splitlines()
         line = lines[e.lineno - 1] if e.lineno and e.lineno <= len(lines) else ""
         # B: name the enclosing function so the model can take the STABLE path — rewrite
@@ -307,6 +309,7 @@ def edit_reject(path: str, before: str, after: str,
         # engine of that dogfood run (severed signature landed, then compounded).
         if not levers.enabled("syntax_revert"):
             return None
+        levers.fired("syntax_revert", line=e.lineno)
         lines = after.splitlines()
         line = lines[e.lineno - 1] if e.lineno and e.lineno <= len(lines) else ""
         before_lines = before.count("\n") + 1
@@ -347,6 +350,7 @@ def _ts_reject(path: str, lang: str, before: str, after: str,
     after_errs = _ts_errors(lang, after)
     if after_errs is None or after_errs[0] == 0:
         return None
+    levers.fired("ts_edit_revert", lang=lang)
     parts = [f"[edit rejected: it would leave {os.path.basename(path)} unparseable — "
              f"syntax error near {_ts_error_loc(after, after_errs[1] or 1)}. The file "
              f"was left unchanged. Re-send the change as a COMPLETE statement/block "
@@ -397,6 +401,7 @@ def write_reject(path: str, before: str | None, content: str) -> str | None:
             lines = content.splitlines()
             frag = lines[e.lineno - 1].strip() if e.lineno and e.lineno <= len(lines) else ""
             fate = "was not created" if before is None else "was left unchanged"
+            levers.fired("write_gate", lang="python", line=e.lineno)
             return (f"[write rejected: the content you sent does not parse — {e.msg} at "
                     f"line {e.lineno}: {frag!r}. The file {fate}. The error is inside "
                     f"YOUR content: fix it and re-send the complete file. {bash_hint}]")
@@ -408,6 +413,7 @@ def write_reject(path: str, before: str | None, content: str) -> str | None:
     after_errs = _ts_errors(lang, content)
     if after_errs is None or after_errs[0] == 0:
         return None
+    levers.fired("write_gate", lang=lang)
     return (f"[write rejected: the new content no longer parses — syntax error near "
             f"{_ts_error_loc(content, after_errs[1] or 1)}. The file was left "
             f"unchanged. Fix the syntax and re-send the complete file. {bash_hint}]")
@@ -617,6 +623,7 @@ def drift_warn(path: str, before: str | None, after: str) -> str | None:
                                f"{attr_uses[name]})")
     if not dropped:
         return None
+    levers.fired("edit_drift_warn", dropped=len(dropped))
     listed = "; ".join(dropped[:3])
     return (f"\n[warning: this edit DROPPED {listed} — likely an accidentally deleted "
             f"line in the rewrite. Restore the dropped definition, or update the "

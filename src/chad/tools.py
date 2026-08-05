@@ -296,6 +296,7 @@ def _bash_auto_background(command: str, timeout: int, should_stop) -> str:
         if time.time() > deadline:
             note = _bash_backgrounded(d, timeout)
             if note is not None:
+                levers.fired("bash_auto_background", timeout_s=timeout)
                 return note
             _kill_group(p); d.thread.join(2)
             return _bash_killed(
@@ -601,6 +602,7 @@ def _write_delta(before: str | None, content: str) -> str:
             adds += 1
         elif d.startswith("-") and not d.startswith("---"):
             dels += 1
+    levers.fired("write_diff_note", adds=adds, dels=dels)
     return f" (+{adds} -{dels} lines vs previous)"
 
 
@@ -846,6 +848,7 @@ def _stale_check(path: str, data: str, around: tuple[int, int]) -> str | None:
     if seen is None or seen == _seen_hash(data):
         return None
     _mark_seen(path, data)
+    levers.fired("stale_file_guard")
     total = data.count("\n") + 1
     a, b = max(1, around[0] - 3), min(total, around[1] + 3)
     return (f"[edit rejected: {_rel(path)} changed on disk since you last read it — "
@@ -879,7 +882,10 @@ def _apply_edit(path: str, before: str, after: str, note: str,
     if levers.enabled("post_edit_diagnostics"):
         # The semantic tier above syntaxgate: the language server's typecheck of the
         # landed edit ("" when no server is warm for this language).
-        result += lsp.diagnostics_note(path)
+        note = lsp.diagnostics_note(path)
+        if note:
+            levers.fired("post_edit_diagnostics")
+        result += note
     return result
 
 
@@ -929,6 +935,8 @@ def tool_edit(path: str, old: str, new: str) -> str:
     if not spans and levers.enabled("edit_typo_match"):
         spans = _ws_flexible_spans(data, probe, typo=True)
         how = "typographic quotes/dashes and whitespace"
+        if spans:
+            levers.fired("edit_typo_match", matches=len(spans))
     if len(spans) == 1:
         s, e = spans[0]
         head = data[s:e].split("\n")[0]
@@ -1158,6 +1166,7 @@ def _splice(path: str, data: str, prefix: str, suffix: str, new: str,
             and repomap.service().lang_for(path) == "python"):
         cand = prefix + shape(_reindent_python(new, target_indent, unit)) + suffix
         if not syntaxgate.edit_reject(path, data, cand, edit_range):
+            levers.fired("structural_reindent")
             return _apply_edit(path, data, cand, f" ({label}; reindented to structure)",
                                edit_range)
     cand = prefix + shape(_snap_indent(new, target_indent)) + suffix
@@ -1185,6 +1194,7 @@ def _region_echo(path: str, first: int, last: int, delta: int) -> str:
         a, b = b, a
     shift = (f" — lines after {b} shifted by {delta:+d}, so line numbers from earlier "
              f"reads are stale below that" if delta else "")
+    levers.fired("edit_result_echo", shifted=bool(delta))
     return (f"\n[the region now reads (use THESE numbers for follow-up edits{shift}):\n"
             f"{syntaxgate._numbered(data, a, b)}\n]")
 
@@ -1581,6 +1591,10 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
                 files_truncated = True
                 break
             files.append(fp)
+        if filter_first and files_truncated:
+            # The reordering was load-bearing: the cap engaged after filtering, so
+            # the legacy order would have spent budget on skipped/dir entries.
+            levers.fired("grep_filter_before_cap")
         if not filter_first:  # legacy arm: dirs/skipped blobs consumed the budget
             files = [fp for fp in files if not _skip(fp) and os.path.isfile(fp)]
     for fp in files:
@@ -1640,6 +1654,7 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
         # empty result.
         if not levers.enabled("grep_zero_match_notice"):
             return "[no matches]"  # legacy arm: the confident lie, for ablation
+        levers.fired("grep_zero_match_notice", truncated=files_truncated)
         scope = path if path not in (".", "") else "the current directory"
         msg = f"[no matches for {pattern!r} in {scope}]"
         if files_truncated:

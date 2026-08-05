@@ -121,7 +121,10 @@ class SymbolService:
         if levers.enabled("post_edit_diagnostics"):
             # The semantic tier above syntaxgate: the language server's typecheck of
             # the landed edit ("" when no server is warm for this language).
-            result += lsp.diagnostics_note(fp)
+            note = lsp.diagnostics_note(fp)
+            if note:
+                levers.fired("post_edit_diagnostics")
+            result += note
         return result
 
     def replace_symbol(self, name: str, new: str, path=None, should_stop=None) -> str:

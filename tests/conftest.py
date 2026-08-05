@@ -15,6 +15,16 @@ if _SRC not in sys.path:
 
 
 @pytest.fixture(autouse=True)
+def _levers_all_on(monkeypatch):
+    """Levers default OFF (1.10.0), but the suite runs with everything ON so each
+    lever's behavior tests keep exercising their code paths without 40 per-file env
+    preambles. The shipped bare default is asserted explicitly in test_levers.py,
+    which removes this env var. Per-test CHAD_DISABLE monkeypatches still subtract
+    from this, so leave-one-out style tests are unaffected."""
+    monkeypatch.setenv("CHAD_ENABLE", "all")
+
+
+@pytest.fixture(autouse=True)
 def _spill_tmpdir(tmp_path, monkeypatch):
     """Point bash-output spills (tools._spill_bash) at a per-test tmp dir —
     any test that runs an oversized bash command would otherwise leave files in the

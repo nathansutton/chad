@@ -121,7 +121,10 @@ def is_destructive_bash(command: str) -> bool:
     if any(p.search(command) for p in _DESTRUCTIVE_BASH):
         return True
     if levers.enabled("scoped_destructive_guard"):
-        return _rm_hits_protected(command)
+        hit = _rm_hits_protected(command)
+        if hit:
+            levers.fired("scoped_destructive_guard", block=True)
+        return hit
     return bool(_RM_LEGACY.search(command))
 
 
@@ -181,8 +184,10 @@ def bash_result_verifies(result: str, command: str = "") -> bool:
     if not levers.enabled("verify_requires_execution"):
         return True
     if _is_trivial_check(command):
+        levers.fired("verify_requires_execution", rejected="trivial")
         return False
     if not _is_executing_command(command):
+        levers.fired("verify_requires_execution", rejected="non-executing")
         return False
     return True
 
@@ -302,6 +307,7 @@ def audit_rebounce(absent_paths, runway_s):
     still = [p for p in absent_paths if not os.path.exists(p)]
     if not still:
         return None
+    levers.fired("audit_absent_rebounce", paths=len(still))
     return ("[final audit — the task statement names path(s) that still do not "
             "exist:\n" + "\n".join(f"  - {p}" for p in still) +
             "\nIf the task requires them, create them at exactly these paths now "
@@ -341,6 +347,7 @@ def update_work_flags(name, args, result, did_work, made_edit, unverified_edit):
             ("[exit", "[timed out", "[interrupted", "[failed to launch"))
         if (levers.enabled("revert_rearm_gate")
                 and reverts_working_tree(cmd) and not errored):
+            levers.fired("revert_rearm_gate")
             made_edit = False
             unverified_edit = False
         elif bash_result_verifies(result, cmd):
@@ -684,6 +691,8 @@ def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_inte
                          "and \"arguments\", no XML tags inside.]")
             if kind == "garble" and consecutive_garbles >= 2:
                 nudge = nudge[:-1] + TOOLCALL_EXEMPLAR + "]"
+            if kind == "garble":
+                levers.fired("garble_never_final")
             return kind, nudge
     if hit_cap and truncation_nudges < 2:
         # Cap hit but the call (if any) was balanced — a plain mid-thought truncation.
@@ -705,6 +714,7 @@ def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_inte
     if levers.enabled("bail_nudge") \
             and (not read_only_intent) and not made_edit and answer_nudges < 2 \
             and ((not stripped) or _announces_unfulfilled_action(stripped)):
+        levers.fired("bail_nudge")
         nudge = ("[you stopped after thinking without taking any action — no tool call "
                  "and no answer. Do not stop here. Emit your next concrete step now as a "
                  "real <tool_call>: grep/read to locate the code, then edit/write to "
@@ -764,6 +774,7 @@ def investigation_gate(readonly_streak, made_edit, gate_nudges, threshold=6):
         return None
     if made_edit or gate_nudges >= 2 or readonly_streak < threshold:
         return None
+    levers.fired("investigation_gate", streak=readonly_streak)
     return (f"[you've spent {readonly_streak} steps investigating and applied no edit — "
             "you have enough context now. STOP searching. Make your single highest-value "
             "edit with edit/write/replace_symbol, then run the project's real test to "
@@ -864,6 +875,9 @@ def edit_loop_break(noop_edit_streak, break_nudges, kind=None):
     # paste verbatim — precisely what it just did.
     if not levers.enabled("edit_fail_kind"):
         kind = None
+    elif kind is not None:
+        levers.fired("edit_fail_kind", kind=kind)
+    levers.fired("edit_loop_break", kind=kind or "nomatch")
     if kind == "noop":
         return _NOOP_BREAK
     if kind == "indent":
@@ -997,7 +1011,10 @@ def degenerate_tail(text: str, tail: int = REPEAT_TAIL_CHARS,
         return True
     if not levers.enabled("repeat_coarse_tier"):
         return False
-    return _is_periodic_tail(text, REPEAT_COARSE_TAIL_CHARS, REPEAT_COARSE_MAX_PERIOD)
+    if _is_periodic_tail(text, REPEAT_COARSE_TAIL_CHARS, REPEAT_COARSE_MAX_PERIOD):
+        levers.fired("repeat_coarse_tier")
+        return True
+    return False
 
 
 REPEAT_STOP_NUDGE = (
@@ -1201,6 +1218,8 @@ def progress_note(messages, max_lines: int = 24, rejected_claim: str | None = No
     # the diagnosis, the failing signature, what was already looked at — is what the
     # lever adds, and therefore what its delta measures.
     rich = levers.enabled("progress_note_rich")
+    if rich and (hypothesis or last_error or examined):
+        levers.fired("progress_note_rich")
     lines = [PROGRESS_NOTE_HEADER]
     if rejected_claim:
         lines.append(
@@ -1262,6 +1281,7 @@ def wrapup_window_nudge(wall_s, wall_budget_s, wrapup_fired) -> str | None:
     threshold = max(WRAPUP_MIN_S, WRAPUP_FRAC * wall_budget_s)
     if remaining > threshold:
         return None
+    levers.fired("wrapup_window", remaining_s=int(remaining))
     return _wrapup_text(max(0, int(remaining)))
 
 
@@ -1363,7 +1383,13 @@ def replenish_continue(total_wall_s, elapsed_s, used_continues,
         frac = (AUTO_CONTINUE_REPLENISH_FRAC_LATE
                 if levers.enabled("late_continue_replenish")
                 else AUTO_CONTINUE_REPLENISH_FRAC)
-    return (total_wall_s - elapsed_s) > frac * total_wall_s
+    remaining = total_wall_s - elapsed_s
+    granted = remaining > frac * total_wall_s
+    # The lever's effect is exactly the grants the legacy 0.5 line would have refused.
+    if (granted and levers.enabled("late_continue_replenish")
+            and remaining <= AUTO_CONTINUE_REPLENISH_FRAC * total_wall_s):
+        levers.fired("late_continue_replenish", used=used_continues)
+    return granted
 
 
 def hard_wrapup_deadline(wall_budget_s, already_fired, plan_mode, read_only) -> float | None:
@@ -1376,6 +1402,8 @@ def hard_wrapup_deadline(wall_budget_s, already_fired, plan_mode, read_only) -> 
         return None
     if already_fired or not wall_budget_s or plan_mode or read_only:
         return None
+    # fired() is NOT called here: this arms on every eligible step; the firing event
+    # lands at the abort trigger in agent.py, where the caller sets the latch.
     return land_margin(wall_budget_s)
 
 
@@ -1533,6 +1561,7 @@ def elide_duplicate_result(name, result, messages):
     if not any(m.get("role") == "tool" and m.get("name") == name
                and m.get("content") == result for m in messages):
         return None
+    levers.fired("dup_result_elide", tool=name, chars=len(result))
     return (f"[identical output elided: this {name} returned exactly the same result "
             f"as your earlier {name} above — nothing has changed. That content is "
             f"still in your context; use it from there instead of re-running the "
@@ -1560,4 +1589,5 @@ def subagent_evidence_warning(result, tool_dispatches):
         return None
     if not result or not result.strip() or result.startswith(("[task", "[stopped:")):
         return None
+    levers.fired("subagent_evidence_warn")
     return result.rstrip() + SUBAGENT_EVIDENCE_WARNING

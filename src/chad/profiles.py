@@ -23,7 +23,7 @@ model is unknown (chad ships Ornith; an unlabelled local run is an Ornith run).
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from . import levers
 
@@ -45,10 +45,6 @@ class Profile:
     # Appended to the system prompt above the volatile cache boundary, so it stays inside
     # the reusable KV prefix (it is constant for a given model, like the base prompt).
     prompt_block: str = ""
-    # Levers this profile turns off by default. A profile may not turn a lever ON that
-    # CHAD_DISABLE turned off: the env is the ablation driver's channel and must win, or
-    # leave-one-out silently tests nothing.
-    disables: frozenset[str] = field(default_factory=frozenset)
 
 
 ORNITH = Profile(name="ornith", prompt_block=_ORNITH_BLOCK)

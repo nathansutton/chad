@@ -2,6 +2,25 @@
 
 Notable, user-visible changes.
 
+## [1.10.0] — 2026-08-05
+
+- **Every harness lever now defaults OFF: a default run is the bare model + tool
+  loop.** Over a year of iteration, 48 named behaviors accumulated around the agent
+  loop — steers, gates, reverts, nudges — each justified by a real failure in some
+  trace. Clean-slate measurement (bare arms vs the full stack, same tasks, same
+  serving) showed the bare loop matches the full stack's benchmark score within
+  noise at substantially lower token spend, so the burden of proof has flipped: a
+  lever ships ON only behind a measured, positive, pre-registered contrast. Nothing
+  is deleted — `CHAD_ENABLE=<a,b>` turns individual levers on, `CHAD_ENABLE=all`
+  restores the full pre-1.10 stack, and `CHAD_ENABLE=all CHAD_DISABLE=<x>` is the
+  leave-one-out ablation idiom. `chad levers` still prints the registry and what's
+  active; unknown names in either variable are still a startup error.
+- **The TB2 benchmark agent gained `chad_enable=`** (forwarded as `CHAD_ENABLE`
+  in-container) so lever A/B arms stay one flag; its default arm is now the bare
+  harness.
+- The never-populated `Profile.disables` field is gone; profiles are purely additive
+  prompt blocks, themselves behind the (now default-off) `profile_prompt` lever.
+
 ## [1.0.9] — 2026-07-30
 
 - **Decode is 5–7% faster on the 35B.** The MoE block — the largest remaining
