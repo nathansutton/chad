@@ -24,30 +24,56 @@ def _clear(monkeypatch, *names):
         monkeypatch.delenv(n, raising=False)
 
 
-def test_all_levers_default_on(monkeypatch):
+def test_all_levers_default_off(monkeypatch):
+    """The 1.10.0 contract: a default run is the bare model + tool loop. The measured
+    record (2026-08 clean-slate arms) is what earned this polarity; a lever ships ON
+    only behind a positive pre-registered contrast."""
+    _clear(monkeypatch, "CHAD_ENABLE", "CHAD_DISABLE")
+    assert levers.active() == []
+    for name in levers.LEVERS:
+        assert not levers.enabled(name), f"{name} should default OFF"
+
+
+def test_enable_all_turns_everything_on(monkeypatch):
     _clear(monkeypatch, "CHAD_DISABLE")
+    monkeypatch.setenv("CHAD_ENABLE", "all")
     assert levers.active() == sorted(levers.LEVERS)
     for name in levers.LEVERS:
-        assert levers.enabled(name), f"{name} should default ON"
+        assert levers.enabled(name)
 
 
-def test_disable_switches_off_only_the_named_lever(monkeypatch):
+def test_enable_switches_on_only_the_named_lever(monkeypatch):
+    _clear(monkeypatch, "CHAD_DISABLE")
+    monkeypatch.setenv("CHAD_ENABLE", "compact_notice")
+    assert levers.enabled("compact_notice")
+    assert not levers.enabled("compact_offload"), "enabling one lever must not touch another"
+    assert levers.active() == ["compact_notice"]
+
+
+def test_leave_one_out_idiom(monkeypatch):
+    """The ablation driver's OFF arm: everything on minus exactly one lever."""
+    monkeypatch.setenv("CHAD_ENABLE", "all")
     monkeypatch.setenv("CHAD_DISABLE", "compact_notice")
     assert not levers.enabled("compact_notice")
     assert levers.enabled("compact_offload"), "disabling one lever must not touch another"
     assert "compact_notice" not in levers.active()
 
 
-def test_disable_accepts_several_and_tolerates_whitespace(monkeypatch):
-    monkeypatch.setenv("CHAD_DISABLE", " compact_notice , plan_review ")
-    assert not levers.enabled("compact_notice")
-    assert not levers.enabled("plan_review")
-    assert levers.enabled("profile_prompt")
+def test_enable_accepts_several_and_tolerates_whitespace(monkeypatch):
+    _clear(monkeypatch, "CHAD_DISABLE")
+    monkeypatch.setenv("CHAD_ENABLE", " compact_notice , plan_review ")
+    assert levers.enabled("compact_notice")
+    assert levers.enabled("plan_review")
+    assert not levers.enabled("profile_prompt")
 
 
-def test_typo_in_disable_is_a_hard_error(monkeypatch):
-    """The whole point. A silent typo makes an ablation measure the unmodified harness."""
-    monkeypatch.setenv("CHAD_DISABLE", "compact_notic")  # missing the 'e'
+def test_typo_in_enable_or_disable_is_a_hard_error(monkeypatch):
+    """The whole point. A silent typo makes an ablation measure the bare harness."""
+    monkeypatch.setenv("CHAD_ENABLE", "compact_notic")  # missing the 'e'
+    with pytest.raises(levers.UnknownLever):
+        levers.enabled("compact_notice")
+    monkeypatch.setenv("CHAD_ENABLE", "all")
+    monkeypatch.setenv("CHAD_DISABLE", "compact_notic")
     with pytest.raises(levers.UnknownLever):
         levers.enabled("compact_notice")
 

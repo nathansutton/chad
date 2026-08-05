@@ -574,8 +574,9 @@ def _levers_parser():
     return argparse.ArgumentParser(
         prog="chad levers",
         description="Print the harness lever registry as JSON and exit. The ablation "
-                    "driver enumerates this instead of hardcoding lever names; "
-                    "CHAD_DISABLE=a,b turns individual levers off.",
+                    "driver enumerates this instead of hardcoding lever names. All "
+                    "levers default OFF; CHAD_ENABLE=a,b (or 'all') turns levers on, "
+                    "CHAD_DISABLE=a,b subtracts from that.",
     )
 
 
@@ -615,8 +616,8 @@ def _main(argv=None):
     if args.levers:  # deprecated spelling of `chad levers`
         sys.exit(_run_levers())
 
-    # Fail fast on a typo'd CHAD_DISABLE, not mid-run: an unrecognized lever means the
-    # harness would run unmodified while an ablation reports the delta as "no effect".
+    # Fail fast on a typo'd CHAD_ENABLE/CHAD_DISABLE, not mid-run: an unrecognized lever
+    # means the harness would run bare while an ablation reports the delta as "no effect".
     try:
         levers.validate_env()
     except levers.UnknownLever as e:

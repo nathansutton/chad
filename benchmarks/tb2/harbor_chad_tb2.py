@@ -73,9 +73,13 @@ Agent kwargs (--ak key=value):
                              context verification pass. DEFAULT OFF — the 085 gate showed it
                              fires mostly on already-correct tasks (+140-584s wall, 0 flips
                              on the fast arm); arm explicitly for A/Bs only.
-    chad_disable=<a,b>       comma list of harness levers to switch off in-container
-                             (CHAD_DISABLE; see src/chad/levers.py) — the one-flag OFF
-                             arm for lever A/Bs. Unknown names fail loudly at startup.
+    chad_enable=<a,b>        comma list of harness levers to switch ON in-container
+                             (CHAD_ENABLE; see src/chad/levers.py; 'all' = every lever).
+                             Levers default OFF as of 1.10.0, so no flags = the bare
+                             harness and this is the one-flag ON arm for lever A/Bs.
+    chad_disable=<a,b>       comma list subtracted from chad_enable (CHAD_DISABLE) —
+                             with chad_enable=all this is the leave-one-out OFF arm.
+                             Unknown names fail loudly at startup.
     chad_project=<path>      chad checkout to upload (default: the repo this file lives in)
     chad_workdir=<dir>       container dir to run chad in (default: auto via `pwd`, else /app)
 """
@@ -112,6 +116,7 @@ class ChadAgent(BaseAgent):
         chad_timeout_sec: str | int = 1500,
         chad_deadline_margin_s: str | int = 60,
         chad_review_pass: str | bool = False,
+        chad_enable: str | None = None,
         chad_disable: str | None = None,
         chad_project: str | None = None,
         chad_workdir: str | None = None,
@@ -136,9 +141,11 @@ class ChadAgent(BaseAgent):
         # headroom left for chad to wrap up; 0 disables the whole deadline path.
         self._deadline_margin_s = int(chad_deadline_margin_s)
         self._review_pass = str(chad_review_pass).lower() not in ("false", "0", "no", "off")
-        # Lever ablation arm (levers.py): comma list forwarded as CHAD_DISABLE inside the
-        # container, so an A/B's OFF arm is one --ak instead of a code edit. Unknown lever
-        # names are a hard error at chad startup (by design), so typos fail loudly.
+        # Lever arms (levers.py): comma lists forwarded as CHAD_ENABLE / CHAD_DISABLE
+        # inside the container, so an A/B arm is one --ak instead of a code edit. Levers
+        # default OFF, so no flags = the bare harness. Unknown lever names are a hard
+        # error at chad startup (by design), so typos fail loudly.
+        self._enable = (chad_enable or "").strip()
         self._disable = (chad_disable or "").strip()
         self._project = chad_project or _REPO_ROOT
         self._workdir = chad_workdir
@@ -484,6 +491,8 @@ class ChadAgent(BaseAgent):
             "PYTHONUNBUFFERED": "1",
             "HOME": home,
         }
+        if self._enable:
+            env["CHAD_ENABLE"] = self._enable
         if self._disable:
             env["CHAD_DISABLE"] = self._disable
         # Only force OFFLINE tokenizer load when setup() confirmed the cache is warm —
