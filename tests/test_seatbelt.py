@@ -10,7 +10,6 @@ on any platform (and inside CI/test sandboxes, where Seatbelt cannot nest).
 """
 import os
 import subprocess
-import sys
 
 import pytest
 
