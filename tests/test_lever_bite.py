@@ -928,6 +928,30 @@ def test_edit_checkpoint_bite(monkeypatch, tmp_path):
     assert checkpoint.snapshots(str(ws)) == [], "OFF: no snapshot may be taken"
 
 
+def test_seatbelt_protect_git_bite(monkeypatch, tmp_path):
+    """ON, the workspace's .git is carved back OUT of the writable allowlist in the
+    generated profile (a trailing deny, which wins in Seatbelt); OFF, no such deny."""
+    from chad import seatbelt
+    n = bite("seatbelt_protect_git")
+    dotgit = f'(subpath "{tmp_path.resolve() / ".git"}")'
+    on(monkeypatch)
+    assert dotgit in seatbelt.profile_text(str(tmp_path))
+    off(monkeypatch, n)
+    assert dotgit not in seatbelt.profile_text(str(tmp_path))
+
+
+def test_bash_env_guard_bite(monkeypatch):
+    """ON, credential-shaped names are dropped from the env copy handed to the
+    spawned shell; OFF, the child inherits the parent environment untouched."""
+    n = bite("bash_env_guard")
+    monkeypatch.setenv("SOME_API_KEY", "k")
+    on(monkeypatch)
+    env = tools._bash_env()
+    assert env is not None and "SOME_API_KEY" not in env
+    off(monkeypatch, n)
+    assert tools._bash_env() is None
+
+
 def test_every_registered_lever_has_a_bite_test():
     """A lever with no minimal on/off pair is a lever that might not bite. Ablating it
     would report 'no measured effect' and the fix would be deleted on that evidence."""

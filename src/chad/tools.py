@@ -276,6 +276,30 @@ def _bash_backgrounded(d: "_BgDrainer", timeout: int) -> str | None:
     return head + "\n" + _bash_headtail(partial) if partial else head
 
 
+# Environment variable names shaped like credentials, dropped from spawned shell
+# children when the bash_env_guard lever is on. Name-pattern only: values are never
+# inspected (a value test would itself be a secret-handling liability), and the
+# pattern is anchored at the end so AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, and
+# DB_PASSWORD match while PATH, TOKENIZERS_PARALLELISM, and friends pass through.
+_ENV_SECRET_RE = re.compile(
+    r"(?i)(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|API_?KEY|"
+    r"ACCESS_KEY(_ID)?|SECRET_KEY|PRIVATE_KEY)$")
+
+
+def _bash_env() -> dict | None:
+    """The environment for a spawned bash child: None (inherit the parent env
+    untouched — the default contract) unless the guard lever is on, in which case a
+    copy with credential-shaped names removed. A command that legitimately needs a
+    credential sees a clear absence, not a corrupted value."""
+    if not levers.enabled("bash_env_guard"):
+        return None
+    env = {k: v for k, v in os.environ.items() if not _ENV_SECRET_RE.search(k)}
+    dropped = len(os.environ) - len(env)
+    if dropped:
+        levers.fired("bash_env_guard", dropped=dropped)
+    return env
+
+
 def _bash_auto_background(command: str, timeout: int, should_stop) -> str:
     """tool_bash's timeout path when auto-background is armed. Mirrors the foreground
     loop exactly, except that a timeout hands the command off instead of killing it."""
@@ -284,7 +308,7 @@ def _bash_auto_background(command: str, timeout: int, should_stop) -> str:
         p = subprocess.Popen(argv if argv is not None else command,
                              shell=argv is None, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, errors="replace",
-                             start_new_session=True)
+                             start_new_session=True, env=_bash_env())
     except OSError as e:
         return f"[failed to launch: {e}]"
     d = _BgDrainer(p)
@@ -326,7 +350,7 @@ def tool_bash(command: str, timeout: int = 120, should_stop=None) -> str:
         p = subprocess.Popen(argv if argv is not None else command,
                              shell=argv is None, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, errors="replace",
-                             start_new_session=True)
+                             start_new_session=True, env=_bash_env())
     except OSError as e:
         return f"[failed to launch: {e}]"
     # Drain output on a helper thread (so large output can't deadlock the pipe)

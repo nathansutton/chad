@@ -520,7 +520,11 @@ LEVERS: dict[str, Lever] = {
         "In yolo mode on macOS, each bash command's shell child runs under a "
         "Seatbelt profile (sandbox-exec) that denies file writes outside the "
         "workspace, temp dirs, tool caches, and ~/.chad — reads, network, and exec "
-        "stay open. The model process is never sandboxed, only the spawned shell. "
+        "stay open, and ~/.chad/checkpoints (the undo history) is carved back out "
+        "so a sandboxed command cannot delete it. The model process is never "
+        "sandboxed, only the spawned shell. The startup probe proves the profile "
+        "ENFORCES (an allowed write must land, a denied write must not) before any "
+        "confinement is claimed; either failure runs unconfined with a loud log. "
         "Fires when a denial is detected in command output: each fire is a write "
         "the command-pattern denylist did not catch.",
         "safety"),
@@ -529,6 +533,30 @@ LEVERS: dict[str, Lever] = {
         "shadow git repo under ~/.chad/checkpoints (the project's own .git is "
         "never touched or required); /undo and /restore in the TUI revert from "
         "it. Fires once per snapshot taken and once per restore performed.",
+        "safety"),
+    "seatbelt_protect_git": Lever(
+        "Opt-in tier on top of yolo_seatbelt: the workspace's git metadata "
+        "(.git, and a worktree's external gitdir + common dir) is write-DENIED "
+        "inside the otherwise-writable workspace, so an unreviewed command "
+        "cannot destroy project history (`rm -rf .git`) — and with "
+        "edit_checkpoint on, the undo snapshots stay tamper-proof from inside "
+        "the sandbox too. The cost is real: every .git-writing git command "
+        "(commit, add, checkout) EPERMs — sized at <=2.65% of 91,910 real "
+        "session commands, concentrated in 14% of sessions — which is why this "
+        "is its own lever, not part of the base profile. Inert unless "
+        "yolo_seatbelt is also enabled; a denial it causes surfaces through "
+        "yolo_seatbelt's own firing (the profile cannot say which rule bit).",
+        "safety", fires=PASSIVE),
+    "bash_env_guard": Lever(
+        "Spawned bash children get a FILTERED copy of the environment: variable "
+        "names shaped like credentials (…_TOKEN, …_SECRET, …_PASSWORD, "
+        "…_API_KEY, …_ACCESS_KEY(_ID), …_PRIVATE_KEY, …_CREDENTIALS) are "
+        "dropped, closing the gap where a filesystem sandbox still hands every "
+        "command the operator's cloud keys. Name-pattern only — values are "
+        "never read or logged. OFF (the default) inherits the parent env "
+        "untouched, today's behavior; commands that legitimately need a "
+        "credential need the lever off. Fires per spawn that actually dropped "
+        "something, with the count.",
         "safety"),
 }
 

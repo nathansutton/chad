@@ -89,22 +89,168 @@ def test_profile_escapes_scheme_metachars(tmp_path):
     assert 'we"ird")' not in text
 
 
-def test_profile_worktree_gitdir_carveout(tmp_path):
+def _split_at_deny_tail(text: str):
+    """(allow-and-before, trailing deny block) — the deny block that carves paths
+    back OUT of the writable allowlist sits last, because the last matching
+    Seatbelt rule wins."""
+    i = text.rindex("(deny file-write*")
+    return text[:i], text[i:]
+
+
+def _worktree_fixture(tmp_path):
     ws = tmp_path / "wt"
     ws.mkdir()
     gitdir = tmp_path / "main" / ".git" / "worktrees" / "wt"
     gitdir.mkdir(parents=True)
     (gitdir / "commondir").write_text("../..\n")
     (ws / ".git").write_text(f"gitdir: {gitdir}\n")
-    text = seatbelt.profile_text(str(ws))
-    assert str(gitdir.resolve()) in text
-    common = (gitdir / "../..").resolve()
-    assert str(common) in text
+    return ws, gitdir.resolve(), (gitdir / "../..").resolve()
+
+
+def test_profile_worktree_gitdir_carveout(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHAD_DISABLE", "seatbelt_protect_git")
+    ws, gitdir, common = _worktree_fixture(tmp_path)
+    head, tail = _split_at_deny_tail(seatbelt.profile_text(str(ws)))
+    assert str(gitdir) in head and str(common) in head
+    assert str(gitdir) not in tail and str(common) not in tail
+
+
+def test_profile_protect_git_flips_worktree_gitdirs_to_deny(tmp_path):
+    # the suite runs CHAD_ENABLE=all, so the protection tier is on here
+    ws, gitdir, common = _worktree_fixture(tmp_path)
+    head, tail = _split_at_deny_tail(seatbelt.profile_text(str(ws)))
+    assert str(gitdir) in tail and str(common) in tail
+    assert str(gitdir) not in head and str(common) not in head
+
+
+def test_profile_protect_git_denies_workspace_dotgit(tmp_path):
+    _head, tail = _split_at_deny_tail(seatbelt.profile_text(str(tmp_path)))
+    ws = tmp_path.resolve()
+    assert f'(subpath "{ws / ".git"}")' in tail
+
+
+def test_profile_checkpoints_denied_even_without_git_tier(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHAD_DISABLE", "seatbelt_protect_git")
+    text = seatbelt.profile_text(str(tmp_path))
+    head, tail = _split_at_deny_tail(text)
+    ckpt = os.path.join(os.path.expanduser("~"), ".chad", "checkpoints")
+    assert f'(subpath "{ckpt}")' in tail
+    assert "/.git" not in tail
+    # ~/.chad itself stays on the allowlist; only the undo history is carved out
+    assert os.path.join(os.path.expanduser("~"), ".chad") in head
+
+
+def test_profile_cache_distinguishes_git_tier(monkeypatch, tmp_path):
+    _force_capable(monkeypatch)
+    seatbelt.set_context(True, str(tmp_path))
+    with_tier = seatbelt.wrap_argv("true")[2]
+    monkeypatch.setenv("CHAD_DISABLE", "seatbelt_protect_git")
+    without_tier = seatbelt.wrap_argv("true")[2]
+    assert with_tier != without_tier
+    with open(with_tier, encoding="utf-8") as fh:
+        assert str(tmp_path.resolve() / ".git") in fh.read()
+    with open(without_tier, encoding="utf-8") as fh:
+        assert str(tmp_path.resolve() / ".git") not in fh.read()
 
 
 def test_profile_plain_repo_no_carveout(tmp_path):
     (tmp_path / ".git").mkdir()  # normal repo: .git is a dir, no pointer to chase
     assert seatbelt._worktree_gitdirs(str(tmp_path)) == []
+
+
+# -- enforcement probe --------------------------------------------------------
+# probe() must prove the profile DENIES, not merely that sandbox-exec runs: a
+# profile that fails open would otherwise report confinement it does not have.
+
+_real_run = subprocess.run
+
+
+def _probe_with(monkeypatch, fake_run):
+    monkeypatch.setattr(seatbelt, "available", lambda: True)
+    monkeypatch.setattr(seatbelt.subprocess, "run", fake_run)
+    return seatbelt.probe()
+
+
+def test_probe_rejects_non_enforcing_sandbox(monkeypatch, caplog):
+    """sandbox-exec runs the command fine but enforces nothing (both writes land):
+    the probe must come back False, loudly — this is the fail-open case."""
+    def fake(argv, **kw):
+        return _real_run(argv[-3:], capture_output=True, check=False)
+    with caplog.at_level("ERROR", logger="chad"):
+        assert _probe_with(monkeypatch, fake) is False
+    assert any("FAILED to enforce" in r.getMessage() for r in caplog.records)
+
+
+def test_probe_rejects_sandbox_that_cannot_run(monkeypatch):
+    """Nothing executes at all (nested sandbox): neither write lands -> False."""
+    def fake(argv, **kw):
+        return subprocess.CompletedProcess(argv, 1)
+    assert _probe_with(monkeypatch, fake) is False
+
+
+def test_probe_accepts_enforcing_sandbox(monkeypatch):
+    """The allowed write lands and the denied one does not -> True. The fake
+    simulates enforcement by executing only the allowed half of the command."""
+    def fake(argv, **kw):
+        return _real_run(["/bin/sh", "-c", argv[-1].split(";")[0]],
+                         capture_output=True, check=False)
+    assert _probe_with(monkeypatch, fake) is True
+
+
+def test_probe_result_is_cached(monkeypatch):
+    calls = []
+    def fake(argv, **kw):
+        calls.append(argv)
+        return _real_run(["/bin/sh", "-c", argv[-1].split(";")[0]],
+                         capture_output=True, check=False)
+    assert _probe_with(monkeypatch, fake) is True
+    assert seatbelt.probe() is True
+    assert len(calls) == 1
+
+
+# -- the spawned shell's environment (bash_env_guard) -------------------------
+
+def test_bash_env_strips_credential_shaped_names(monkeypatch):
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "k")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "k")
+    monkeypatch.setenv("GITHUB_TOKEN", "k")
+    monkeypatch.setenv("MY_DB_PASSWORD", "k")
+    monkeypatch.setenv("SOME_CLIENT_SECRET", "k")
+    monkeypatch.setenv("TOKEN_COUNT", "5")            # TOKEN not at the end: keep
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "1")  # likewise
+    env = tools._bash_env()
+    assert env is not None
+    for gone in ("AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "GITHUB_TOKEN",
+                 "MY_DB_PASSWORD", "SOME_CLIENT_SECRET"):
+        assert gone not in env
+    for kept in ("PATH", "TOKEN_COUNT", "TOKENIZERS_PARALLELISM"):
+        assert kept in env
+
+
+def test_bash_env_off_means_inherit(monkeypatch):
+    monkeypatch.setenv("CHAD_DISABLE", "bash_env_guard")
+    assert tools._bash_env() is None
+
+
+def test_bash_env_guard_fires_only_when_something_dropped(monkeypatch):
+    for k in list(os.environ):
+        if tools._ENV_SECRET_RE.search(k):
+            monkeypatch.delenv(k)
+    before = levers.fire_counts().get("bash_env_guard", 0)
+    assert tools._bash_env() is not None
+    assert levers.fire_counts().get("bash_env_guard", 0) == before
+    monkeypatch.setenv("SOME_API_KEY", "k")
+    tools._bash_env()
+    assert levers.fire_counts().get("bash_env_guard", 0) == before + 1
+
+
+def test_bash_env_guard_end_to_end(monkeypatch):
+    seatbelt.set_context(False, None)
+    monkeypatch.setenv("SOME_API_KEY", "sekrit-value")
+    monkeypatch.setenv("HARMLESS_SETTING", "visible-value")
+    out = tools.tool_bash("printenv SOME_API_KEY; printenv HARMLESS_SETTING")
+    assert "sekrit-value" not in out
+    assert "visible-value" in out
 
 
 # -- the tool_bash seam -------------------------------------------------------
@@ -147,10 +293,11 @@ def test_unwrapped_denial_output_gets_no_note(monkeypatch):
 
 # -- real sandbox e2e (darwin only, skipped wherever Seatbelt can't apply) -----
 
-_can_sandbox = (sys.platform == "darwin" and os.path.exists(seatbelt.SANDBOX_EXEC)
-                and subprocess.run([seatbelt.SANDBOX_EXEC, "-p",
-                                    "(version 1)(allow default)", "/usr/bin/true"],
-                                   capture_output=True, check=False).returncode == 0)
+# Gate on the real enforcement probe, not a permissive-profile smoke test: inside a
+# CI/harness sandbox a permissive profile can still apply while a deny profile fails
+# open — exactly the environment where these tests must skip, not fail.
+_can_sandbox = seatbelt.probe()
+seatbelt._probe_result = None  # leave module state pristine for the tests above
 
 
 @pytest.mark.skipif(not _can_sandbox, reason="Seatbelt cannot apply here")
@@ -169,3 +316,22 @@ def test_e2e_denies_outside_write_allows_inside(tmp_path, monkeypatch):
     finally:
         if os.path.exists(probe):  # belt failed: don't leave droppings
             os.unlink(probe)
+
+
+@pytest.mark.skipif(not _can_sandbox, reason="Seatbelt cannot apply here")
+def test_e2e_enforcement_probe_green():
+    assert seatbelt.probe() is True
+
+
+@pytest.mark.skipif(not _can_sandbox, reason="Seatbelt cannot apply here")
+def test_e2e_protect_git_denies_gitdir_write(tmp_path):
+    (tmp_path / ".git").mkdir()
+    seatbelt.set_context(True, str(tmp_path))
+    argv = seatbelt.wrap_argv(f"touch {tmp_path}/.git/droppings")
+    r = subprocess.run(argv, capture_output=True, text=True, check=False)
+    assert r.returncode != 0
+    assert not (tmp_path / ".git" / "droppings").exists()
+    # the workspace around it stays writable
+    argv = seatbelt.wrap_argv(f"echo ok > {tmp_path}/normal.txt")
+    r = subprocess.run(argv, capture_output=True, text=True, check=False)
+    assert r.returncode == 0 and (tmp_path / "normal.txt").read_text().strip() == "ok"
