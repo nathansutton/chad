@@ -21,7 +21,7 @@ import threading
 import time
 from typing import Any
 
-from . import config, levers, lsp, repomap, symbols, syntaxgate
+from . import config, levers, lsp, repomap, seatbelt, symbols, syntaxgate
 from .ignore import IGNORE_DIRS, slash_wrapped
 
 # Directories never worth walking: huge, generated, or VCS internals. The canonical set
@@ -279,8 +279,10 @@ def _bash_backgrounded(d: "_BgDrainer", timeout: int) -> str | None:
 def _bash_auto_background(command: str, timeout: int, should_stop) -> str:
     """tool_bash's timeout path when auto-background is armed. Mirrors the foreground
     loop exactly, except that a timeout hands the command off instead of killing it."""
+    argv = seatbelt.wrap_argv(command)
     try:
-        p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
+        p = subprocess.Popen(argv if argv is not None else command,
+                             shell=argv is None, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, errors="replace",
                              start_new_session=True)
     except OSError as e:
@@ -308,18 +310,21 @@ def _bash_auto_background(command: str, timeout: int, should_stop) -> str:
         p.poll()
     if p.returncode not in (0, None):
         out = f"[exit {p.returncode}]\n{out}"
+    out = _seatbelt_note(argv, out)
     return _bash_headtail(out) if out else "[no output]"
 
 
 def tool_bash(command: str, timeout: int = 120, should_stop=None) -> str:
     if levers.enabled("bash_auto_background"):
         return _bash_auto_background(command, timeout, should_stop)
+    argv = seatbelt.wrap_argv(command)
     try:
         # errors="replace": text mode decodes strictly by default, so binary bytes in the
         # output (hexdump, `cat` on an archive) killed the reader thread mid-communicate —
         # the command's whole output AND its exit code vanished into a "[no output]" that
         # read as a quiet success (and could spoof the verify gate).
-        p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
+        p = subprocess.Popen(argv if argv is not None else command,
+                             shell=argv is None, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, errors="replace",
                              start_new_session=True)
     except OSError as e:
@@ -344,7 +349,19 @@ def tool_bash(command: str, timeout: int = 120, should_stop=None) -> str:
         p.poll()  # reconcile: a reader-thread death skips communicate()'s internal wait
     if p.returncode not in (0, None):
         out = f"[exit {p.returncode}]\n{out}"
+    out = _seatbelt_note(argv, out)
     return _bash_headtail(out) if out else "[no output]"
+
+
+def _seatbelt_note(argv, out: str) -> str:
+    """When a sandboxed command's output shows a write denial, say what happened
+    and what to do — a bare 'Operation not permitted' reads as a broken tool, and
+    a model that can't see the boundary will retry into it. Each detected denial
+    is exactly the event the lever exists to produce, so it fires here."""
+    if argv is None or seatbelt.DENIAL_MARKER not in out:
+        return out
+    levers.fired("yolo_seatbelt", denial=True)
+    return out + seatbelt.DENIAL_NOTE
 
 
 def _bash_killed(reason: str, partial: str | None) -> str:

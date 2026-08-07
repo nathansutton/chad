@@ -2,6 +2,29 @@
 
 Notable, user-visible changes.
 
+## [Unreleased]
+
+- **Two new "safety" levers (default OFF, like everything since 1.10.0) —
+  blast-radius containment for unattended mutation:**
+  - `yolo_seatbelt` — in yolo mode on macOS, each bash command's shell child
+    runs under a Seatbelt profile (`sandbox-exec`) that denies file writes
+    outside the workspace, temp dirs, tool caches, and `~/.chad`. Reads,
+    network, and exec stay open, and the model process itself is never
+    sandboxed — only the spawned shell. A detected denial gets a one-line
+    explanation appended to the tool result so the model routes around the
+    boundary instead of retrying into it. Environments where Seatbelt can't
+    apply (CI, nested sandboxes) are probed once and run unconfined.
+    Sized against 91,910 real session commands: 94.3% write only inside the
+    allowlist; the denials are the system-admin writes the sandbox exists for.
+  - `edit_checkpoint` — before a file-mutating tool lands, the workspace is
+    committed to a shadow git repo under `~/.chad/checkpoints` (the project's
+    own `.git` is never touched, written, or required to exist). New TUI
+    commands: `/undo` reverts files to the last checkpoint, `/restore` lists
+    checkpoints and reverts to a chosen one. Restores put snapshotted content
+    back but never delete files created since — deleting is exactly the blast
+    radius this lever contains. Snapshot cost measured at ~56ms per edit on a
+    167-file repo (~84ms at 3,000 files).
+
 ## [1.11.0] — 2026-08-06
 
 - **New tool: `definition(name)`** — jump from a *use* of a symbol to the one

@@ -25,6 +25,15 @@ def _levers_all_on(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _checkpoint_tmpdir(tmp_path, monkeypatch):
+    """Point edit-checkpoint shadow repos (checkpoint._history_root) at a per-test
+    tmp dir. The suite runs CHAD_ENABLE=all, so any test that drives run_turn
+    through a file-mutating tool takes a real snapshot — of the pytest CWD, into
+    the developer's ~/.chad, at ~300ms per shot — unless redirected here."""
+    monkeypatch.setenv("CHAD_CHECKPOINT_DIR", str(tmp_path / "checkpoints"))
+
+
+@pytest.fixture(autouse=True)
 def _spill_tmpdir(tmp_path, monkeypatch):
     """Point bash-output spills (tools._spill_bash) at a per-test tmp dir —
     any test that runs an oversized bash command would otherwise leave files in the

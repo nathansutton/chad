@@ -514,6 +514,22 @@ LEVERS: dict[str, Lever] = {
         "only a server already warmed by find_refs/hover/disambiguation is "
         "consulted; absent one, silence.",
         "ctxengine"),
+
+    # --- group "safety": blast-radius containment for unattended mutation. ---------
+    "yolo_seatbelt": Lever(
+        "In yolo mode on macOS, each bash command's shell child runs under a "
+        "Seatbelt profile (sandbox-exec) that denies file writes outside the "
+        "workspace, temp dirs, tool caches, and ~/.chad — reads, network, and exec "
+        "stay open. The model process is never sandboxed, only the spawned shell. "
+        "Fires when a denial is detected in command output: each fire is a write "
+        "the command-pattern denylist did not catch.",
+        "safety"),
+    "edit_checkpoint": Lever(
+        "Before a file-mutating tool lands, commit a workspace snapshot to a "
+        "shadow git repo under ~/.chad/checkpoints (the project's own .git is "
+        "never touched or required); /undo and /restore in the TUI revert from "
+        "it. Fires once per snapshot taken and once per restore performed.",
+        "safety"),
 }
 
 

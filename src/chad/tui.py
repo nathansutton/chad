@@ -212,6 +212,8 @@ SLASH_COMMANDS = [
     ("/mcp trust", "trust this project's .mcp.json servers"),
     ("/mcp login", "authenticate an MCP server (OAuth)"),
     ("/compact", "reclaim context now"),
+    ("/undo", "revert files to the last edit checkpoint"),
+    ("/restore", "list edit checkpoints; /restore <hash> reverts to one"),
     ("/resume", "list recent sessions; /resume <n> forks one"),
     ("/reset", "clear the conversation + KV cache"),
     ("/clear", "clear the conversation + KV cache"),
@@ -1042,6 +1044,33 @@ class TUI:
                 self._emit("info", f"compacted context: {b:,}→{a:,} tokens"
                                    + (" (already lean)" if a >= b else ""))
             return False
+        if text == "/undo" or text == "/restore" or text.startswith("/restore "):
+            # Checkout mutates workspace files: refuse mid-turn for the same reason
+            # /compact does — the running turn is operating on those files.
+            if self._busy:
+                self._emit("info", "busy — try again once the current turn finishes.")
+                return False
+            from . import checkpoint, levers
+            ws = os.getcwd()
+            arg = text[len("/restore"):].strip() if text.startswith("/restore") else ""
+            if text == "/restore" and not arg:
+                rows = checkpoint.snapshots(ws)
+                if not rows:
+                    self._emit("info", "no checkpoints for this workspace yet — "
+                                       "snapshots are taken before file edits when the "
+                                       "edit_checkpoint lever is on (CHAD_ENABLE=edit_checkpoint)")
+                else:
+                    for h, when, label in rows:
+                        self._emit("info", f"  {h}  {when}  {label}")
+                    self._emit("info", "restore one with /restore <hash>")
+                return False
+            msg = checkpoint.restore(ws, arg or "HEAD")
+            # Restoring from an older session's snapshots is legal with the lever
+            # off, so only count the fire when this session's guard is actually on.
+            if msg.startswith("restored") and levers.enabled("edit_checkpoint"):
+                levers.fired("edit_checkpoint", restore=True)
+            self._emit("info", msg)
+            return False
         if text == "/resume" or text.startswith("/resume "):
             self._handle_resume(text[len("/resume"):].strip())
             return False
@@ -1084,7 +1113,7 @@ class TUI:
             self._emit("info", "shift-tab: cycle mode (normal/auto-accept edits/yolo/plan) "
                                "· esc/ctrl-c: "
                                "interrupt · /init /skills /mcp /mcp trust /mcp login <server> "
-                               "/resume /reset /clear /compact /model /mode /speech /accept /exit · !cmd shell · @path "
+                               "/resume /reset /clear /compact /undo /restore /model /mode /speech /accept /exit · !cmd shell · @path "
                                "attach · type while busy to steer the running turn "
                                "(applies after the current step) · plan ready: type to "
                                "steer, ctrl-g to accept")
