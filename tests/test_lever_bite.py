@@ -881,6 +881,77 @@ def test_bash_read_skeleton_bite(tmp_path, monkeypatch):
 
 # === the coverage contract =================================================
 
+# === group "safety" ===============================================================
+
+def test_yolo_seatbelt_bite(monkeypatch, tmp_path):
+    """ON, a yolo-context bash command gets a sandbox-exec argv; OFF, wrap_argv
+    declines and the spawn is the plain shell=True path. Platform capability is
+    forced so the pair is about the LEVER, not the host."""
+    from chad import seatbelt
+    n = bite("yolo_seatbelt")
+    monkeypatch.setattr(seatbelt, "probe", lambda: True)
+    monkeypatch.setattr(seatbelt, "_profiles", {})
+    seatbelt.set_context(True, str(tmp_path))
+    try:
+        on(monkeypatch)
+        argv = seatbelt.wrap_argv("true")
+        assert argv is not None and argv[0] == seatbelt.SANDBOX_EXEC
+        off(monkeypatch, n)
+        assert seatbelt.wrap_argv("true") is None
+    finally:
+        seatbelt.set_context(False, None)
+
+
+def test_edit_checkpoint_bite(monkeypatch, tmp_path):
+    """ON, a write dispatched through the real run_turn leaves a shadow snapshot;
+    OFF, the same turn leaves none. Driven end to end because the guard lives at
+    the agent's dispatch site, not inside the tool."""
+    from chad import checkpoint
+    from test_agent_e2e import _agent, _tool_call
+    n = bite("edit_checkpoint")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "existing.txt").write_text("pre-existing state worth protecting\n")
+    monkeypatch.chdir(ws)
+    quiet = "done_spec_recheck,done_audit"  # keep the scripted turn to write→done
+
+    monkeypatch.setenv("CHAD_CHECKPOINT_DIR", str(tmp_path / "on"))
+    monkeypatch.setenv("CHAD_DISABLE", quiet)
+    script = [_tool_call("write", path=str(ws / "f.txt"), content="x\n"),
+              _tool_call("done", summary="wrote")]
+    _agent(list(script), max_steps=6).run_turn("write f.txt")
+    assert checkpoint.snapshots(str(ws)), "ON: the write should have snapshotted"
+
+    monkeypatch.setenv("CHAD_CHECKPOINT_DIR", str(tmp_path / "off"))
+    monkeypatch.setenv("CHAD_DISABLE", quiet + "," + n)
+    _agent(list(script), max_steps=6).run_turn("write f.txt")
+    assert checkpoint.snapshots(str(ws)) == [], "OFF: no snapshot may be taken"
+
+
+def test_seatbelt_protect_git_bite(monkeypatch, tmp_path):
+    """ON, the workspace's .git is carved back OUT of the writable allowlist in the
+    generated profile (a trailing deny, which wins in Seatbelt); OFF, no such deny."""
+    from chad import seatbelt
+    n = bite("seatbelt_protect_git")
+    dotgit = f'(subpath "{tmp_path.resolve() / ".git"}")'
+    on(monkeypatch)
+    assert dotgit in seatbelt.profile_text(str(tmp_path))
+    off(monkeypatch, n)
+    assert dotgit not in seatbelt.profile_text(str(tmp_path))
+
+
+def test_bash_env_guard_bite(monkeypatch):
+    """ON, credential-shaped names are dropped from the env copy handed to the
+    spawned shell; OFF, the child inherits the parent environment untouched."""
+    n = bite("bash_env_guard")
+    monkeypatch.setenv("SOME_API_KEY", "k")
+    on(monkeypatch)
+    env = tools._bash_env()
+    assert env is not None and "SOME_API_KEY" not in env
+    off(monkeypatch, n)
+    assert tools._bash_env() is None
+
+
 def test_every_registered_lever_has_a_bite_test():
     """A lever with no minimal on/off pair is a lever that might not bite. Ablating it
     would report 'no measured effect' and the fix would be deleted on that evidence."""

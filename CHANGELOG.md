@@ -2,6 +2,63 @@
 
 Notable, user-visible changes.
 
+## [1.12.0] — 2026-08-07
+
+- **Sandbox hardening — the confinement must prove itself before it may be
+  claimed:**
+  - `yolo_seatbelt`'s startup probe now checks **enforcement in both
+    directions** against a throwaway directory pair: the allowed write must
+    land AND the denied write must not. The old probe only proved
+    `sandbox-exec` could run a permissive profile — a profile failing open
+    (OS drift, a malformed rule) would have reported confinement it did not
+    have, the worst failure a safety lever can have. A denied write that
+    lands now refuses the sandbox with a loud log; either failure runs
+    unconfined and says so. (The probe promptly caught a real member of this
+    class: an allow rule written against the `$TMPDIR` symlink spelling that
+    Seatbelt, matching the kernel's real path, silently denied.)
+  - The undo history (`~/.chad/checkpoints`, the `edit_checkpoint` shadow
+    repo) is now **write-denied inside the sandbox**, closing the gap where
+    it was reachable through the allowed `~/.chad` subpath — a sandboxed
+    command could previously delete the very snapshots `/undo` restores
+    from. Costs real commands nothing: only chad's own never-sandboxed
+    process writes there.
+- **Two new "safety" levers (default OFF):**
+  - `seatbelt_protect_git` — opt-in tier on top of `yolo_seatbelt`: the
+    workspace's git metadata (`.git`, and a worktree's external gitdir +
+    common dir) becomes write-denied inside the otherwise-writable
+    workspace, so an unreviewed command cannot `rm -rf .git` the project's
+    history. The cost is real — every `.git`-writing git command (commit,
+    add, checkout) EPERMs, sized statically at ≤2.65% of 91,910 real session
+    commands, concentrated in 14% of sessions — which is why it is its own
+    lever rather than part of the base profile.
+  - `bash_env_guard` — spawned bash children get a filtered copy of the
+    environment: variable names shaped like credentials (`…_TOKEN`,
+    `…_SECRET`, `…_PASSWORD`, `…_API_KEY`, `…_ACCESS_KEY`, `…_PRIVATE_KEY`)
+    are dropped, name-pattern only, values never read. A filesystem sandbox
+    that still hands every command the operator's cloud keys is a half-closed
+    boundary; commands that legitimately need a credential need the lever
+    off (it defaults off, preserving inherit-all).
+- **Two new "safety" levers (default OFF, like everything since 1.10.0) —
+  blast-radius containment for unattended mutation:**
+  - `yolo_seatbelt` — in yolo mode on macOS, each bash command's shell child
+    runs under a Seatbelt profile (`sandbox-exec`) that denies file writes
+    outside the workspace, temp dirs, tool caches, and `~/.chad`. Reads,
+    network, and exec stay open, and the model process itself is never
+    sandboxed — only the spawned shell. A detected denial gets a one-line
+    explanation appended to the tool result so the model routes around the
+    boundary instead of retrying into it. Environments where Seatbelt can't
+    apply (CI, nested sandboxes) are probed once and run unconfined.
+    Sized against 91,910 real session commands: 94.3% write only inside the
+    allowlist; the denials are the system-admin writes the sandbox exists for.
+  - `edit_checkpoint` — before a file-mutating tool lands, the workspace is
+    committed to a shadow git repo under `~/.chad/checkpoints` (the project's
+    own `.git` is never touched, written, or required to exist). New TUI
+    commands: `/undo` reverts files to the last checkpoint, `/restore` lists
+    checkpoints and reverts to a chosen one. Restores put snapshotted content
+    back but never delete files created since — deleting is exactly the blast
+    radius this lever contains. Snapshot cost measured at ~56ms per edit on a
+    167-file repo (~84ms at 3,000 files).
+
 ## [1.11.0] — 2026-08-06
 
 - **New tool: `definition(name)`** — jump from a *use* of a symbol to the one

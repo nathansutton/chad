@@ -14,7 +14,18 @@ import re
 import sys
 import time
 
-from . import ambient, atif, compaction, config, guardrails, levers, session, syntaxgate
+from . import (
+    ambient,
+    atif,
+    checkpoint,
+    compaction,
+    config,
+    guardrails,
+    levers,
+    seatbelt,
+    session,
+    syntaxgate,
+)
 from .base_engine import BackendError, BaseEngine
 from .diag import args_preview, log, redact, result_preview
 from .prompt import build_subagent_prompt, build_system_prompt, classify_intent
@@ -1971,12 +1982,27 @@ class Agent:
                 else:
                     _t0 = time.perf_counter()
                     self.tool_dispatches += 1
+                    # A snapshot happens AFTER approval, immediately before the tool
+                    # runs — a denied edit must not leave a checkpoint claiming it ran.
+                    if (name in AUTO_EDIT_TOOLS
+                            and levers.enabled("edit_checkpoint")):
+                        _ref = checkpoint.snapshot(
+                            os.getcwd(), f"before {name} {args.get('path', '')}".strip())
+                        if _ref:
+                            levers.fired("edit_checkpoint", step=step, ref=_ref)
+                    # Seatbelt context is scoped to exactly this dispatch: `active`
+                    # reflects the mode of the agent actually executing, so a
+                    # sub-agent's yolo loop is confined inside a normal-mode parent
+                    # turn, and the context can't leak to the `!cmd` passthrough.
+                    seatbelt.set_context(self.mode == "yolo", os.getcwd())
                     try:
                         result = fn(args, self._should_stop)
                         if plan_write and result.startswith("[wrote"):
                             self.last_plan_path = os.path.abspath(args["path"])
                     except Exception as e:  # noqa: BLE001 - surface tool errors to model
                         result = f"[tool error: {type(e).__name__}: {e}]"
+                    finally:
+                        seatbelt.set_context(False, None)
                     _tool_s = time.perf_counter() - _t0
                     # Backstop: bound the prefill from any tool, AND from the step as a
                     # whole — several calls in one step stack into one prefill, so later
