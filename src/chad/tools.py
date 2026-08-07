@@ -1699,6 +1699,8 @@ DISPATCH = {
     "view_symbol": lambda a, ss=None: repomap.service().view_symbol(
         a["name"], a.get("path"), should_stop=ss),
     "find_symbol": lambda a, ss=None: repomap.service().find_symbol(a["name"], should_stop=ss),
+    "definition": lambda a, ss=None: repomap.service().definition(
+        a["name"], a.get("path"), should_stop=ss),
     "find_refs": lambda a, ss=None: repomap.service().find_refs(
         a["name"], a.get("path"), should_stop=ss),
     "hover": lambda a, ss=None: repomap.service().hover(
@@ -2054,6 +2056,27 @@ SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "definition",
+            "description": "Jump from a USE of a symbol to where it is really DEFINED — "
+                           "precise (the language server follows imports and aliases, so "
+                           "when several things share a name you get THE one this code "
+                           "means, not a candidate list). Use find_symbol instead when you "
+                           "only want to list everything with that name. Name may be "
+                           "'Class/method'; pass path to resolve from a use in that file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Symbol or 'Class/method'."},
+                    "path": {"type": "string",
+                             "description": "Optional file to resolve the use site from."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "find_refs",
             "description": "Find every place a symbol is USED across the project — precise "
                            "(a real language server follows imports and scope, so it won't "
@@ -2155,8 +2178,8 @@ SCHEMAS: list[dict[str, Any]] = [
 # both arms of `run_evals.py --ab` in-process: the harness flips CHAD_NO_SYMBOLS
 # between arms and the agent's render path calls active_schemas() each turn. SCHEMAS
 # itself stays the full list (name lookups / required-arg validation need every tool).
-_SYMBOLIC = {"repo_map", "overview", "view_symbol", "find_symbol", "find_refs",
-             "hover", "replace_symbol", "insert_symbol", "rename_symbol"}
+_SYMBOLIC = {"repo_map", "overview", "view_symbol", "find_symbol", "definition",
+             "find_refs", "hover", "replace_symbol", "insert_symbol", "rename_symbol"}
 
 
 def _activate_skill_schema(names):

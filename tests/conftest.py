@@ -33,6 +33,20 @@ def _spill_tmpdir(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_ambient(monkeypatch):
+    """Isolate ambient session state between tests, and stub the
+    env-manifest builder: with the suite's CHAD_ENABLE=all, every Agent/prompt
+    construction would otherwise spawn a dozen real `--version` subprocesses per
+    test. test_ambient.py un-stubs it explicitly to test the real builder."""
+    from chad import ambient
+    ambient.reset()
+    monkeypatch.setattr(ambient, "_build_manifest",
+                        lambda: "- present: python3 3.11 · git 2.43")
+    yield
+    ambient.reset()
+
+
+@pytest.fixture(autouse=True)
 def _fresh_file_seen():
     """Isolate the per-session freshness bookkeeping (tools._FILE_SEEN)
     between tests — a leftover seen-hash from one test must not make another test's

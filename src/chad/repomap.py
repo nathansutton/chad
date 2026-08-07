@@ -29,6 +29,7 @@ import hashlib
 import logging
 import os
 import pickle
+import re
 import subprocess
 import sys
 import threading
@@ -825,6 +826,105 @@ class RepoMap:
             return f"[no definition found for '{name}']"
         out = [f"{h.rel}:{h.line}  {h.kind}  {h.sig}" for h in hits]
         return "\n".join(out[:100])
+
+    def _use_site(self, name: str, path=None, should_stop=None):
+        """A (rel, row0, col0) position where `name` is USED, or None.
+
+        `definition` needs a use site, not a definition site: asking the language
+        server go-to-definition at the definition itself answers with the
+        definition (or, for some servers, nothing). Cached reference Tags carry
+        (name, rel, line) but no column — tree-sitter's reference captures are
+        recorded per line — so the column is recovered by finding the identifier
+        as a whole word in that line's text. Prefers a use in `path` when given,
+        and never returns a line inside the symbol's own definition span (a
+        recursive call resolves to the def either way, but a same-file use
+        elsewhere is a better question to ask)."""
+        target = _qual_parts(name)[-1] if _qual_parts(name) else name
+        word = re.compile(rf"\b{re.escape(target)}\b")
+        files = ([os.path.join(self.root, path)] if path and not os.path.isabs(path)
+                 else ([path] if path else self._code_files(should_stop)))
+        if not path:
+            self._extract_all(files, should_stop)
+        spans = [(d.rel, d.line, d.end_line)
+                 for d in self._find_defs(name, path, should_stop)]
+        best = None
+        for f in files:
+            if should_stop and should_stop():
+                break
+            _defs, refs = self._extract(f)
+            lines = None
+            for rname, rel, ln in refs:
+                if rname != target:
+                    continue
+                inside = any(r == rel and a <= ln <= b for r, a, b in spans)
+                if inside and best is not None:
+                    continue
+                if lines is None:
+                    try:
+                        with open(f, errors="replace") as fh:
+                            lines = fh.read().splitlines()
+                    except OSError:
+                        break
+                if not 0 < ln <= len(lines):
+                    continue
+                m = word.search(lines[ln - 1])
+                if not m:
+                    continue
+                site = (rel, ln - 1, m.start())
+                if not inside:
+                    return site
+                best = best or site
+        return best
+
+    def definition(self, name: str, path=None, should_stop=None) -> str:
+        """Where a symbol is really DEFINED, resolved from one of its use sites.
+
+        The difference from `find_symbol`, and the only reason this exists: the
+        language server follows imports, aliases and scope, so when several
+        symbols share a name it answers with THE one this code actually means,
+        not the candidate list. Degrades to the tree-sitter name match — labelled
+        as such, never silently — when no server is available for the language."""
+        site = self._use_site(name, path, should_stop)
+        if site is not None:
+            rel, row, col = site
+            from . import lsp  # lazy: don't weigh servers until precision is asked for
+            try:
+                locs = lsp.service().definition(rel, row, col)
+            except Exception:  # noqa: BLE001 - a dead server falls back, never raises
+                locs = None
+            if locs:
+                out = []
+                for drel, dline in locs[:20]:
+                    out.append(f"{drel}:{dline}  {self._def_sig(drel, dline)}".rstrip())
+                head = (f"[{len(out)} definition{'s' if len(out) != 1 else ''}, precise "
+                        f"(language server, resolved from the use at {rel}:{row + 1})]\n")
+                return head + "\n".join(out)
+        # fallback: tree-sitter name match — same data find_symbol shows, but the
+        # degraded precision is stated (no server, or no use site to ask from).
+        hits = self._find_defs(name, path, should_stop)
+        if not hits:
+            return f"[no definition found for '{name}']"
+        rows = [f"{h.rel}:{h.line}  {h.kind}  {h.sig}" for h in hits[:100]]
+        head = (f"[{len(hits)} candidate definition{'s' if len(hits) != 1 else ''} — "
+                f"NAME-MATCH ONLY (no language server for this file type); may include "
+                f"unrelated same-named symbols, verify before editing]\n")
+        return head + "\n".join(rows)
+
+    def _def_sig(self, rel, line):
+        """`kind sig` for the definition at rel:line, or "" — decoration for a
+        precise hit, matched by span so a server pointing at the body's first line
+        still names the enclosing symbol."""
+        try:
+            defs, _ = self._extract(os.path.join(self.root, rel))
+        except Exception:  # noqa: BLE001
+            return ""
+        for d in defs:
+            if d.line == line:
+                return f"{d.kind}  {d.sig}"
+        for d in defs:
+            if d.line <= line <= d.end_line:
+                return f"in {d.kind} {d.sig}"
+        return ""
 
     def view_symbol(self, name: str, path=None, should_stop=None) -> str:
         hits = self._find_defs(name, path, should_stop)

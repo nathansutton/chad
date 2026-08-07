@@ -14,7 +14,7 @@ import re
 import sys
 import time
 
-from . import atif, compaction, config, guardrails, levers, session, syntaxgate
+from . import ambient, atif, compaction, config, guardrails, levers, session, syntaxgate
 from .base_engine import BackendError, BaseEngine
 from .diag import args_preview, log, redact, result_preview
 from .prompt import build_subagent_prompt, build_system_prompt, classify_intent
@@ -47,7 +47,7 @@ SUBAGENT_MAX_STEPS = 24
 SUBAGENT_CTX_LIMIT = 32000
 SUBAGENT_READ_ONLY = {
     "read", "grep", "glob", "repo_map", "overview", "view_symbol",
-    "find_symbol", "find_refs", "done", "finish", "stop",
+    "find_symbol", "definition", "find_refs", "done", "finish", "stop",
 }
 # `write_todos` is deliberately absent: a sub-agent that plans its own work would mutate
 # the process-global `_TODOS` and clobber the parent's pinned todo panel (and `_sub_emit`
@@ -346,6 +346,8 @@ class Agent:
             skills.reset_session()
             from . import mcp
             mcp.reset_session()
+            ambient.reset()  # fresh session-state ledger; sub-agents share the
+                             # parent's and never feed it (see run_turn)
         self.mode = mode or ("yolo" if yolo else "normal")
         self.thinking = thinking  # Ornith is a reasoning model; toggles <think> blocks
         # Steps per WINDOW, not a hard kill: a window that landed+verified a change
@@ -1696,10 +1698,15 @@ class Agent:
                     log.info("DONE rejected: edits not verified -> nudge #%d", verify_nudges)
                     self.messages.append({
                         "role": "tool", "name": "done",
+                        # The session-ledger facts (what changed, what last ran) ride
+                        # the bounce when the lever is on — the model's stale state
+                        # model IS the wrong-verify bug.
                         "content": "[not done yet: you changed files but have not run anything "
                                    "to verify them. Run the project's tests (or the code) with "
                                    "bash, check the output is correct, then call done. If a test "
-                                   "fails, fix the code first.]",
+                                   "fails, fix the code first.]"
+                                   + ("" if self._subagent else
+                                      ambient.ledger_suffix(step=step, force=True)),
                     })
                     continue
                 if action_task and not read_only_intent and self.mode != "plan" \
@@ -1793,8 +1800,11 @@ class Agent:
                                        if self._turn_budget_s else float("inf"))
                             log.info("DONE-AUDIT bounce: paths=%s runway=%.0fs",
                                      guardrails.audit_extract_paths(audit_task), _runway)
-                            self.messages.append({"role": "tool", "name": "done",
-                                                  "content": audit})
+                            self.messages.append({
+                                "role": "tool", "name": "done",
+                                # Session-ledger facts ride the audit bounce
+                                "content": audit
+                                + ambient.ledger_suffix(step=step, force=True)})
                             continue
                     # Absent-path re-bounce (see the final-answer twin above): a
                     # still-absent task-named path at accept time gets ONE more bounce,
@@ -1981,6 +1991,16 @@ class Agent:
                         log.info("TOOL %s duplicate result elided (%d chars)",
                                  name, len(result))
                         result = _elided
+                    # Ambient state: fold this result into the session
+                    # ledger and append whatever fact lines the enabled levers owe it
+                    # (session_ledger on landed mutations, bash_read_skeleton on file
+                    # content surfacing through bash/read). After the clip cap on
+                    # purpose — a clipped result must still carry its facts; the
+                    # appended text is bounded in ambient.py. Main agent only: a
+                    # sub-agent's transcript folds away and must not pollute the
+                    # parent's ledger.
+                    if not self._subagent:
+                        result = ambient.annotate(name, args, result, step=step)
                     step_tool_chars += len(result)
                     if _PREFILL_TRACE:
                         self._trace_tools_pending.append([name, round(_tool_s, 4)])

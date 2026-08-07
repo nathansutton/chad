@@ -68,6 +68,7 @@ structure and pull only what you need:
 - `overview(path)` — one file's functions/classes (signatures + line numbers) WITHOUT bodies. Do this before reading a file; only `view_symbol`/`read` the parts you need.
 - `view_symbol(name)` — read ONE function/class/method's source (name may be 'Class/method'). Use instead of `read` to inspect code.
 - `find_symbol(name)` — locate where something is DEFINED across the project (use instead of grep for definitions).
+- `definition(name)` — jump from a USE of a symbol to the ONE place it is really defined (follows imports and aliases; use when several things share a name and grep gives you a pile).
 - `find_refs(name)` — find every USE of a symbol across the project (use instead of grep for usages, e.g. before renaming/changing a function).
 - `replace_symbol(name, new)` — replace a whole function/class/method by name with new source (robust to whitespace; preferred over `edit` for rewriting a function). `insert_symbol(name, code, where)` adds code next to a symbol.
 - `rename_symbol(name, new_name)` — rename a symbol AND every reference to it across files in one step (precise: follows imports/scope, won't touch an unrelated same-named symbol). Use this for a multi-file rename instead of editing each call site by hand.
@@ -223,6 +224,12 @@ def _dynamic_context() -> list:
                 "\n# Workspace files (a real project — use grep/read to inspect before answering)\n"
                 + snapshot
             )
+    manifest = _env_manifest()
+    if manifest:
+        dynamic.append(
+            "\n# Environment manifest (detected at session start; later installs are "
+            "NOT reflected here)\n" + manifest
+        )
     test_cmd = _detect_test_command()
     if test_cmd:
         dynamic.append(
@@ -372,6 +379,19 @@ def _detect_test_command() -> str:
         except OSError:
             pass
     return ""
+
+
+def _env_manifest() -> str:
+    """The lever-gated (`env_manifest`) session-start toolchain inventory — the
+    environment analogue of the workspace map, answering the which/--version/pip-list
+    probe class before it is asked (probes measured fail-enriched 3.33 vs
+    2.46/trial). Built once per session in ambient.py, so the sub-agent prompt reuses
+    it without re-probing; "" (no block) when off or nothing detected."""
+    from . import ambient
+    try:
+        return ambient.env_manifest()
+    except Exception:  # noqa: BLE001 - orientation is best-effort; never block startup
+        return ""
 
 
 def _workspace_map(budget: int = 600) -> str:
