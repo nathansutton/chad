@@ -101,6 +101,37 @@ def test_cross_file_refs(lang):
 
 
 @pytest.mark.parametrize("lang", sorted(LANGS))
+def test_definition_resolves_to_the_defining_file(lang):
+    """`definition(helper)` must land on lib, where helper is defined — resolved
+    from its use in app. No language server is installed in the fast gate, so this
+    exercises the tree-sitter fallback; either way the answer must name lib and
+    must state which precision it is (confidence honesty)."""
+    helper, _process, _run, _container, lib, _app = LANGS[lang]
+    rm = _map_for(lang)
+    out = rm.definition(helper)
+    assert lib in out, out
+    assert ("precise (language server" in out) or ("NAME-MATCH ONLY" in out), out
+
+
+@pytest.mark.parametrize("lang", sorted(LANGS))
+def test_definition_use_site_is_a_use_not_the_definition(lang):
+    """The site `definition` asks the language server about must be a USE of the
+    symbol. Asking at the definition is the bug this guards: go-to-definition
+    there answers with itself (or nothing), which would silently strand every
+    lookup on the name-match fallback."""
+    helper, _process, _run, _container, lib, app = LANGS[lang]
+    rm = _map_for(lang)
+    site = rm._use_site(helper)
+    assert site is not None, "no use site found for %s" % helper
+    rel, row, col = site
+    assert rel == app, site  # helper is *called* in app, *defined* in lib
+    with open(os.path.join(FIXTURES, lang, rel), errors="replace") as fh:
+        line = fh.read().splitlines()[row]
+    assert line[col:col + len(helper)] == helper, (line, col)
+    assert lib != rel
+
+
+@pytest.mark.parametrize("lang", sorted(LANGS))
 def test_same_name_two_files_disambiguates(lang):
     """The colliding name is defined in two files; a bare view_symbol must return
     the disambiguation listing naming both, not silently pick one."""

@@ -350,6 +350,91 @@ def test_disambig_budget_and_cache(tmp_path=None):
         lsp_mod._SERVICE = real_svc
 
 
+def test_definition_precise_and_fallback(tmp_path=None):
+    """`definition` resolves a use site to THE definition via the
+    language server, and says which precision it is.
+
+    The case that makes it worth a tool of its own: two files define `target`, so
+    `find_symbol` can only hand back both. The server knows which one `app.py`
+    actually imported. When there is no server, the answer degrades to the
+    name-match list — labelled, never silently."""
+    import os as _os
+    import pathlib
+    import tempfile
+
+    import chad.lsp as lsp_mod
+
+    if tmp_path is None:
+        tmp_path = pathlib.Path(tempfile.mkdtemp(prefix="repomap_definition_"))
+    (tmp_path / "right.py").write_text("def target():\n    return 1\n")
+    (tmp_path / "wrong.py").write_text("def target():\n    return 2\n")
+    (tmp_path / "app.py").write_text(
+        "from right import target\n\n\ndef run():\n    return target()\n")
+
+    rm = RepoMap(str(tmp_path))
+    rm._disk_checked = True
+
+    # -- no language server: name-match fallback, honestly labelled -------
+    class _NoServer:
+        def __init__(self):
+            self.root = _os.path.abspath(_os.getcwd())
+
+        def definition(self, rel, row, col):
+            return None
+
+    real_svc = lsp_mod._SERVICE
+    lsp_mod._SERVICE = _NoServer()
+    try:
+        out = rm.definition("target")
+        check("no server -> both candidates listed",
+              "right.py" in out and "wrong.py" in out, out)
+        check("no server -> degraded precision is stated",
+              "NAME-MATCH ONLY" in out, out)
+        check("no server -> not claimed precise", "precise" not in out, out)
+    finally:
+        lsp_mod._SERVICE = real_svc
+
+    # -- with a server: one answer, and it is the imported one ------------
+    class _Server:
+        def __init__(self):
+            self.root = _os.path.abspath(_os.getcwd())
+            self.asked = []
+
+        def definition(self, rel, row, col):
+            self.asked.append((rel, row, col))
+            return [("right.py", 1)]
+
+    svc = _Server()
+    lsp_mod._SERVICE = svc
+    try:
+        out = rm.definition("target")
+        check("server -> the one real definition", "right.py:1" in out, out)
+        check("server -> the wrong same-named symbol is not offered",
+              "wrong.py" not in out, out)
+        check("server -> precision is claimed explicitly", "precise" in out, out)
+        check("server -> the definition is decorated with its signature",
+              "def target" in out, out)
+        check("server was asked at a USE site, not at a definition",
+              svc.asked and svc.asked[0][0] == "app.py", svc.asked)
+    finally:
+        lsp_mod._SERVICE = real_svc
+
+    check("an unknown name is a clean miss, not a crash",
+          "no definition found" in rm.definition("nope_not_here"))
+
+
+def test_definition_is_wired_into_the_toolset():
+    """Implemented-and-unreachable was the bug: the service method
+    existed with no tool schema. Pin every wiring point so it cannot regress."""
+    from chad import tools
+    check("dispatchable", "definition" in tools.DISPATCH)
+    names = {s["function"]["name"] for s in tools.SCHEMAS}
+    check("has a tool schema", "definition" in names)
+    check("joins the CHAD_NO_SYMBOLS A/B arm", "definition" in tools._SYMBOLIC)
+    exposed = {s["function"]["name"] for s in tools.active_schemas()}
+    check("exposed to the model by default", "definition" in exposed)
+
+
 if __name__ == "__main__":
     test_repomap()
     test_repo_map_edge_aggregation()
@@ -358,6 +443,8 @@ if __name__ == "__main__":
     test_parallel_extract()
     test_aggregate_memoization()
     test_disambig_budget_and_cache()
+    test_definition_precise_and_fallback()
+    test_definition_is_wired_into_the_toolset()
     print(f"\n{passed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)
 

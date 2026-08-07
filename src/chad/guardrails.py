@@ -196,7 +196,8 @@ def bash_result_verifies(result: str, command: str = "") -> bool:
 # tools, but NOT planning/done. Kept as a named constant so the set is testable.
 SUBSTANTIVE_TOOLS = ("grep", "glob", "read", "write", "edit", "bash",
                      "repo_map", "overview", "view_symbol", "find_symbol",
-                     "find_refs", "replace_symbol", "insert_symbol", "rename_symbol")
+                     "definition", "find_refs", "replace_symbol", "insert_symbol",
+                     "rename_symbol")
 
 
 # Working-tree DISCARD commands: after one of these runs cleanly, the edits the model
@@ -1124,8 +1125,8 @@ _EDIT_TOOLS = ("write", "edit", "replace_symbol", "insert_symbol", "rename_symbo
 # Read/search tools whose target the note records as "already examined" so a relaunch
 # doesn't re-walk the tree it already mapped (the demonstrated leak: repeated attempts
 # burned their whole budget re-exploring because the note carried only edited files).
-_READ_TOOLS = ("read", "grep", "glob", "view_symbol", "find_symbol", "find_refs",
-               "repo_map", "overview")
+_READ_TOOLS = ("read", "grep", "glob", "view_symbol", "find_symbol", "definition",
+               "find_refs", "repo_map", "overview")
 _ERROR_PREFIXES = ("[exit", "[timed out", "[failed to launch", "[tool error", "[denied")
 # Lines in a tool result worth carrying as the failing-test signature — the concrete
 # assertion/exception the next attempt must make pass, not just "[exit 1]".
@@ -1547,7 +1548,7 @@ DUP_ELIDE_MIN_CHARS = 400  # below this the pointer saves nothing over the body
 # have their own guard); MCP tools are excluded (openWorld results may legitimately
 # repeat, e.g. polling).
 DUP_ELIDABLE = {"read", "grep", "glob", "repo_map", "overview", "view_symbol",
-                "find_symbol", "find_refs"}
+                "find_symbol", "definition", "find_refs"}
 
 
 def elide_duplicate_result(name, result, messages):

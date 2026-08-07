@@ -299,6 +299,8 @@ def render_tool_start(emit, name: str, args: dict):
         emit("tool", f"View {args.get('name', '')}")
     elif name == "find_symbol":
         emit("tool", f"Find {args.get('name', '')}")
+    elif name == "definition":
+        emit("tool", f"Def {args.get('name', '')}")
     elif name == "find_refs":
         emit("tool", f"Refs {args.get('name', '')}")
     elif name in ("replace_symbol", "insert_symbol"):
@@ -348,7 +350,7 @@ def render_tool_result(emit, name: str, args: dict, result: str):
     elif name == "overview":
         n = _nlines(result)
         emit("muted", f"  ⎿ {n} symbol{'s' * (n != 1)}")
-    elif name == "find_symbol":
+    elif name in ("find_symbol", "definition"):
         n = _nlines(result)
         emit("muted", f"  ⎿ {n} definition{'s' * (n != 1)}")
     elif name == "find_refs":

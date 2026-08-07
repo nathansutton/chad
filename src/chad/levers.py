@@ -471,6 +471,39 @@ LEVERS: dict[str, Lever] = {
         "call. Degrades to the flat listing when repomap is unavailable (see prompt.py).",
         "ai-codex", fires=PASSIVE),
 
+    # --- group "ambient": facts in the result channel. Trace measurement showed the
+    #     model routes ~83% of searching through bash and ignores the symbolic tools
+    #     under maximal prompt steering; these levers stop asking it to change routes
+    #     and put the harness's state knowledge in the results it already reads.
+    #     Facts only, never admonitions — the clean-slate arms priced the admonition
+    #     class at ~0.
+    "env_manifest": Lever(
+        "Append a session-start environment manifest (toolchains present with "
+        "versions, notable absences, package managers) to the system-prompt tail, "
+        "answering the which/--version/pip-list probe class up front. Measured "
+        "fail-enriched: 3.33 probes/trial in fails vs 2.46 in passes, 37% of probes "
+        "failing outright. Stamped once at session start and never updated in place "
+        "(prefix-resident by design); post-install state is session_ledger's job.",
+        "ambient", fires=PASSIVE),
+    "session_ledger": Lever(
+        "Append one cumulative fact line to landed-mutation results and done bounces "
+        "— files edited (with symbols where known), files written, and when "
+        "something was last actually run (`last verifying run: N calls ago "
+        "(pytest → exit 1)`). State facts only, past tense, with provenance — never "
+        "an instruction, so it cannot be quoted as verification the model didn't "
+        "perform. Targets the wrong-verify done class (the #1 measured fail bucket) "
+        "as a state-visibility gap, and blind re-reads (21.8% of reads; fail 1.20 "
+        "vs pass 0.86/trial). Elided when state is unchanged since last emission.",
+        "ambient"),
+    "bash_read_skeleton": Lever(
+        "The first time a source file's content comes back through bash "
+        "cat/sed/head or `read`, append a one-line symbol map from the tags cache "
+        "(`[file] x.py: parse() 30-71 · _tune() 73-88`); when a bash grep for a "
+        "known symbol returns nothing, append its real definition site. Symbol "
+        "intelligence delivered on the route the model actually uses — it never "
+        "has to learn a tool name. Once per file per session.",
+        "ambient"),
+
     # --- group "ctxengine": the uniform-symbols work. -------------------------------
     "post_edit_diagnostics": Lever(
         "Append the language server's post-edit typecheck errors (~50 tokens, errors "

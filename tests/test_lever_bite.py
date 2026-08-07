@@ -832,6 +832,53 @@ def test_post_edit_diagnostics_bite(tmp_path, monkeypatch):
     assert "typecheck" not in edit(3)
 
 
+# === group "ambient": facts in the result channel ==========================
+
+def test_env_manifest_bite(monkeypatch):
+    """The manifest block exists with the lever on and is absent — not empty-ish,
+    absent — with it off. (The builder is stubbed suite-wide in conftest.)"""
+    from chad import ambient
+    n = bite("env_manifest")
+    on(monkeypatch)
+    ambient.reset()
+    assert "present:" in ambient.env_manifest()
+    off(monkeypatch, n)
+    ambient.reset()
+    assert ambient.env_manifest() == ""
+
+
+def test_session_ledger_bite(monkeypatch):
+    """The same landed edit carries the [session] fact line with the lever on and
+    is byte-identical to the bare result with it off."""
+    from chad import ambient
+    n = bite("session_ledger")
+    on(monkeypatch)
+    ambient.reset()
+    assert "[session] edited: a.py" in ambient.annotate(
+        "edit", {"path": "a.py"}, "[edited a.py]")
+    off(monkeypatch, n)
+    ambient.reset()
+    assert ambient.annotate("edit", {"path": "a.py"}, "[edited a.py]") == "[edited a.py]"
+
+
+def test_bash_read_skeleton_bite(tmp_path, monkeypatch):
+    """The same `cat` result carries the [file] structure line with the lever on
+    and is byte-identical with it off."""
+    from chad import ambient
+    n = bite("bash_read_skeleton")
+    (tmp_path / "m.py").write_text(
+        "def a():\n    pass\n\n\ndef b():\n    pass\n\n\ndef c():\n    pass\n")
+    monkeypatch.chdir(tmp_path)
+    on(monkeypatch)
+    ambient.reset()
+    assert "[file] m.py:" in ambient.annotate(
+        "bash", {"command": "cat m.py"}, "def a(): ...")
+    off(monkeypatch, n)
+    ambient.reset()
+    assert ambient.annotate(
+        "bash", {"command": "cat m.py"}, "def a(): ...") == "def a(): ..."
+
+
 # === the coverage contract =================================================
 
 def test_every_registered_lever_has_a_bite_test():

@@ -2,6 +2,42 @@
 
 Notable, user-visible changes.
 
+## [1.11.0] — 2026-08-06
+
+- **New tool: `definition(name)`** — jump from a *use* of a symbol to the one
+  place it is really defined, following imports and aliases through the language
+  server (pyright/TS/gopls/rust-analyzer/clangd/…), with the honestly-labeled
+  tree-sitter name-match as fallback. The capability had existed since 1.0.7;
+  no tool schema exposed it — the model could never call it. Asked at a use
+  site, not the definition (asking at the definition answers with itself), so
+  two files defining `target` resolve to the one your file actually imports.
+  Verified across 13 fixture languages.
+- **Three new "ambient state" levers (default OFF, like everything since
+  1.10.0): the harness states facts in the results the model already reads,
+  instead of steering it toward tools it demonstrably won't call.** Trace
+  measurement over ~140k tool calls showed the model routes ~83% of its
+  searching through `bash` and calls the symbolic tools ~never, under a prompt
+  that already says not to — so these meet it on the route it chose:
+  - `env_manifest` — a session-start toolchain inventory in the system prompt
+    (compilers/interpreters with versions, notable absences, package managers;
+    ~75 tokens, built once in <1s, prefix-resident). Answers the
+    `which`/`--version`/`pip list` probe chains up front — measured at 3.3
+    probes per failing trial, 37% of them failing.
+  - `session_ledger` — one cumulative fact line on landed edits and done
+    bounces: `[session] edited: x.py·parse() · wrote: answer.txt · last
+    verifying run: 2 calls ago (pytest → exit 1)`. Facts with provenance,
+    never instructions; revert-aware; elided when unchanged. Aimed at the
+    largest measured failure class — confident `done`s built on a stale
+    mental model of what changed and what was actually re-run.
+  - `bash_read_skeleton` — the first time a source file's content comes back
+    through `cat`/`sed`/`read`, the result carries a one-line symbol map
+    (`[file] mod.py: alpha() 1-2 · Gamma 9-11`); a zero-hit `grep` for a
+    symbol the tags cache knows gets its real definition site. Symbol
+    intelligence with no new tool name to learn.
+
+  Enable with `CHAD_ENABLE=env_manifest,session_ledger,bash_read_skeleton` (or
+  `all`); each is instrumented (`fired()` telemetry) and A/B-able on its own.
+
 ## [1.10.0] — 2026-08-05
 
 - **Every harness lever now defaults OFF: a default run is the bare model + tool
