@@ -337,7 +337,7 @@ class Agent:
                  ctx_limit: int = 24000, mode: str = None, emit=None,
                  confirm=None, should_stop=None, drain_steering=None,
                  thinking: bool = True,
-                 max_gen_tokens: int = 8192, resume: list = None, persist: bool = False,
+                 max_gen_tokens: int = None, resume: list = None, persist: bool = False,
                  think_budget: int = None, think_ceiling: int = None,
                  turn_budget_tokens: int = None,
                  turn_budget_s: float = None, subagent: bool = False,
@@ -377,8 +377,21 @@ class Agent:
         # Per-step generation cap. The old 2048 default truncated legitimate work —
         # a reasoning turn that thinks, then emits a `write` of a whole test file can
         # exceed 2048 tokens, and the cut-off was being misread as a final answer
-        # (the "answers on paper then stops" bug). 8192 leaves room for think + a
-        # full-file write; truncation past it is now detected and nudged, not accepted.
+        # (the "answers on paper then stops" bug). 8192 fixed that but had its own
+        # loss class: on hard problems a long chain of thought can pin the cap while
+        # still inside <think>, so the step ends as discarded reasoning with no
+        # action and the next step re-derives from scratch — trace measurement shows
+        # these mid-think pins cluster on exactly the tasks that fail, and that an
+        # uncapped run of the same model almost never exceeds 8192 on its own
+        # (p99 ~4.7k) yet the rare 15-20k thought that does run long completes real
+        # work when allowed to finish. So the cap buys little in the common case and
+        # converts the long-thought tail into zero-progress dead steps. 32768 keeps
+        # a backstop against non-repetitive runaway garble (literal decode loops are
+        # the repeat guard's job, default ON) while fitting the longest observed
+        # legitimate thought with room for the action. Env knob for A/B without a
+        # code change (CHAD_* family).
+        if max_gen_tokens is None:
+            max_gen_tokens = config.env_int("CHAD_MAX_GEN_TOKENS", 32768)
         self.max_gen_tokens = max_gen_tokens
         # Soft think-cap base. None => the mechanism is OFF and generation is
         # byte-identical to before. Falls back to the CHAD_THINK_BUDGET env knob so the
@@ -849,6 +862,10 @@ class Agent:
         break_nudges = 0      # times we escalated a stuck edit this turn
         readonly_streak = 0   # consecutive steps with substantive tools but no landed edit
         gate_nudges = 0       # times the investigation->edit gate fired this turn
+        explore_streak = 0    # consecutive bash steps since the last landed edit (counts
+                              # AFTER an edit too — investigation_gate can't; see
+                              # guardrails.verification_matrix)
+        explore_gate_fires = 0  # times the verification-matrix gate fired this turn
         subagent_sigs = set() # (description, prompt) of sub-agents already spawned this turn
         truncation_nudges = 0  # times we pushed past a token-cap truncation this turn
         garble_nudges = 0  # malformed-tool-call re-nudges (own counter, so a step-0
@@ -1105,7 +1122,7 @@ class Agent:
                     return n >= _cap and "</think>" not in text_so_far
 
             # Degenerate-repetition stop (default ON): greedy decode can lock into
-            # repeating one short string until the 8192-token cap — ~4 minutes of dead
+            # repeating one short string until the max_gen_tokens cap — minutes of dead
             # generation per occurrence at 9B decode speed. Checked every 16 tokens on
             # the generation's tail; a hit stops the step (rep_fired tells this stopper
             # apart from the think-cap, which shares stats.stop_condition_fired) and the
@@ -1368,7 +1385,7 @@ class Agent:
                     # inside <think> — a distinct sub-bucket from a THINK-CAP/ceiling stop
                     # (those are agent-side stop_conditions; this is max_gen_tokens itself),
                     # so future autopsies can size it directly instead of inferring from
-                    # max_gen==8192. A salvaged step already injected the closing tag, so
+                    # the max_gen value. A salvaged step already injected the closing tag, so
                     # this is naturally False for it.
                     "reasoning_length_stop": hit_cap and "</think>" not in text,
                     "deadline_abort": deadline_fired[0],  # 103: wall-clock hard wrap-up cut
@@ -2169,6 +2186,29 @@ class Agent:
                     log.info("INVESTIGATION-GATE at step %d (streak, no edit) -> nudge #%d",
                              step, gate_nudges)
                     self.messages.append({"role": "tool", "name": "edit", "content": gate})
+
+            # Convergence gate (verification-matrix design): count exploratory-
+            # bash steps since the last landed edit — unlike readonly_streak/
+            # investigation_gate this keeps counting AFTER an edit lands, which is where
+            # the demonstrated thrash lives (write early, then probe 60 more times
+            # without calling done). A NEW edit this step resets it; a bash-only step
+            # advances it. When it bites, the model gets the task's real requirements as
+            # a matrix to close by evidence-or-unverified, not an open-ended "keep going".
+            if made_edit and not _gov_prev_made:
+                explore_streak = 0
+            elif any(n == "bash" for n, _ in calls):
+                explore_streak += 1
+            if not read_only_intent:
+                matrix = guardrails.verification_matrix(
+                    guardrails.audit_task_text(user_text),
+                    explore_streak, made_edit, explore_gate_fires)
+                if matrix:
+                    explore_gate_fires += 1
+                    explore_streak = 0
+                    log.info("VERIFICATION-MATRIX gate at step %d (bash-streak, no "
+                             "change) -> nudge #%d", step, explore_gate_fires)
+                    self.messages.append(
+                        {"role": "tool", "name": "bash", "content": matrix})
 
             # Break a flailing-probe run (e.g. guessing the test runner, repeated
             # `python -c import` checks) that the exact-call loop guard can't see because

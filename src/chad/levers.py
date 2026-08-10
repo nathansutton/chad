@@ -91,6 +91,14 @@ LEVERS: dict[str, Lever] = {
         "After ~6 read-only steps with no landed edit, steer the model to act before the "
         "step cap kills the turn with an empty patch.",
         "iter2"),
+    "verification_matrix": Lever(
+        "After ~8 exploratory-bash steps since the last change (even AFTER an edit has "
+        "landed — the case investigation_gate can't see), pull the turn into a bounded "
+        "verification phase: for each task requirement, close it with a real causal run "
+        "OR an explicit 'unverified', then `done`. Reuses done_audit's requirement "
+        "extractor; targets the 69%-of-fails non-convergence (ran-out) bucket while the "
+        "honest-unverified escape keeps it from thrashing on the genuinely-unverifiable.",
+        "iter16"),
     "edit_loop_break": Lever(
         "After 2 consecutive edits that failed to land, stop the model re-trying "
         "variations and tell it to read the real lines / replace the whole symbol.",

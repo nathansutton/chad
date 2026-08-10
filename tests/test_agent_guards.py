@@ -885,6 +885,36 @@ def test_investigation_gate():
     check("gate bounded by gate_nudges", investigation_gate(20, made_edit=False, gate_nudges=2) is None)
 
 
+def test_verification_matrix():
+    from chad.guardrails import verification_matrix
+    task = (
+        "Write /app/out.html so it still triggers alert() after /app/filter.py runs.\n"
+        "The output must be valid HTML and must not require user interaction.\n")
+    # Below threshold: silent.
+    check("no matrix below threshold",
+          verification_matrix(task, 4, made_edit=False, gate_fires=0) is None)
+    # At/over threshold: fires with the evidence-or-unverified matrix.
+    g = verification_matrix(task, 8, made_edit=False, gate_fires=0)
+    check("matrix fires at threshold", g is not None)
+    check("matrix offers the evidence path", g is not None and "EVIDENCE" in g)
+    check("matrix offers the honest-unverified escape",
+          g is not None and "UNVERIFIED" in g)
+    check("matrix ends at done", g is not None and "`done`" in g)
+    # Reuses the requirement extractor: the task's own predicate lines appear as rows.
+    check("matrix quotes a real requirement line",
+          g is not None and "out.html" in g)
+    # The whole point vs investigation_gate: it STILL fires after an edit landed
+    # (the break-filter thrash shape — write early, probe forever).
+    check("matrix fires even after an edit landed",
+          verification_matrix(task, 12, made_edit=True, gate_fires=0) is not None)
+    # A task with no extractable requirement lines still fires (generic close-out).
+    check("matrix fires with no extractable requirements",
+          verification_matrix("do the thing", 8, made_edit=False, gate_fires=0) is not None)
+    # Re-armable but bounded by the firing cap.
+    check("matrix bounded by cap",
+          verification_matrix(task, 30, made_edit=True, gate_fires=6) is None)
+
+
 def test_edit_failed_to_land():
     check("no-op edit failed to land", edit_failed_to_land("[no-op edit: old and new are identical]"))
     check("not-found failed to land", edit_failed_to_land("[old string not found; no change made.]"))
@@ -1200,6 +1230,7 @@ if __name__ == "__main__":
     test_bash_result_verifies_ignores_trivial_checks()
     test_bash_result_verifies_requires_executing_command()
     test_investigation_gate()
+    test_verification_matrix()
     test_edit_failed_to_land()
     test_edit_loop_break()
     test_done_rejection()

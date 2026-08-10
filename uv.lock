@@ -133,7 +133,7 @@ wheels = [
 
 [[package]]
 name = "chad-code"
-version = "1.12.0"
+version = "1.13.0"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },

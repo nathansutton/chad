@@ -2,6 +2,38 @@
 
 Notable, user-visible changes.
 
+## [1.13.0] — 2026-08-10
+
+- **Per-step generation cap raised 8192 → 32768** (`CHAD_MAX_GEN_TOKENS`
+  overrides it): 8192 fixed the old truncated-write bug but introduced its
+  own loss class — on hard problems a long chain of thought can pin the cap
+  while still inside `<think>`, so the step ends as discarded reasoning with
+  no action and the next step re-derives from scratch. Trace measurement:
+  2% of steps pinned the cap, 82% of those mid-think, and a failing trial
+  was 2.75× more likely to contain one; an uncapped run of the same model
+  almost never exceeds 8192 on its own (p99 ~4.7k), yet the rare long
+  thought that does run completes real work when allowed to finish. The cap
+  stays as a backstop against non-repetitive runaway garble — literal decode
+  loops remain the repeat guard's job.
+- **New lever: `verification_matrix` (default OFF).** After ~8 exploratory
+  bash steps since the last landed change — *including after an edit has
+  landed*, the case `investigation_gate` cannot see, since it freezes the
+  moment any edit lands — the turn is pulled into a bounded verification
+  phase. It receives the task's own requirement lines (reusing the same
+  extractor `done_audit` runs, so the rows are the real predicates, not a
+  paraphrase) and must close each by exactly one of: (a) causal evidence
+  from a real run through the public path — a snapshot, a self-authored
+  "PASS", "no error", or a check built from the same assumption as the code
+  do not count — or (b) an explicit "unverified" note. That single rule both
+  bounds the loop (a finite checklist has a terminal state) and blocks
+  false-done; the honest-unverified escape is load-bearing, letting a turn
+  finish a genuinely unverifiable requirement instead of thrashing on it.
+  Re-arms up to 6 times per turn and never says a bare "call `done`", so
+  `done_audit` still guards the actual completion. Targets the measured #1
+  loss class: 69% of failing trials never called `done`, running a long tail
+  of exploratory bash (median 39 commands vs 12 on passes) around the same
+  edits a passing trial makes, until the step cap killed them.
+
 ## [1.12.0] — 2026-08-07
 
 - **Sandbox hardening — the confinement must prove itself before it may be

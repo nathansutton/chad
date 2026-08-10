@@ -782,6 +782,67 @@ def investigation_gate(readonly_streak, made_edit, gate_nudges, threshold=6):
             "verify it. If you already know the fix, apply it this step.]")
 
 
+def verification_matrix(task_text, explore_streak, made_edit, gate_fires,
+                        threshold=8, cap=6):
+    """Pull a thrashing turn into a bounded verification phase.
+
+    The demonstrated failure (measured on the bare full-89 run against a reference
+    harness on the same model/box): chad's #1 loss class is not wrong answers, it is
+    non-convergence. 69% of failing trials never called `done` — they ran a long tail
+    of successful, exploratory bash (median 39 commands vs 12 on passes) with the SAME
+    two edits a passing trial makes, and the step cap killed them mid-poke. On
+    break-filter the failing trial ran 72 bash probes / 2 writes across 75 steps while
+    chad's OWN passing trial found the identical exploit in 13; the model knows the
+    answer and researches past the budget. A reference harness on the same weights
+    sits at chad's PASSING step count.
+
+    The design ported here reframes completion as a VERIFICATION MATRIX: every
+    requirement the task states must be closed by ONE of (a) causal evidence from a
+    real run through the public path, or (b) an explicit "unverified" note. That
+    single rule both BOUNDS the loop (a finite checklist has a terminal state, so the
+    turn knows when to stop) and blocks false-done (a row is not filled by a
+    self-authored PASS label, a snapshot, "no error", or an oracle built from the same
+    assumption as the code). The honest-unverified escape is load-bearing: it lets a
+    turn finish a genuinely-unverifiable requirement instead of thrashing on it
+    forever.
+
+    Reuses chad's own requirement extractor (`audit_requirement_lines`, the same engine
+    `done_audit` runs) so the matrix rows are the task's real predicates, not a
+    paraphrase. Fires from the THRASH entry point — the exploratory-bash streak — which
+    `done_audit` cannot reach (a ran-out turn never calls `done`) and `investigation_
+    gate` cannot reach (it freezes the moment any edit lands; this thrash is all
+    post-edit). Re-arms up to `cap`, never bare-"call done" (so it will not inflate the
+    done-but-wrong bucket that `done_audit` still guards at the actual `done`). Returns
+    nudge text or None; caller resets the streak after a firing."""
+    if not levers.enabled("verification_matrix"):
+        return None
+    if explore_streak < threshold or gate_fires >= cap:
+        return None
+    req_lines = audit_requirement_lines(task_text, audit_extract_paths(task_text))
+    levers.fired("verification_matrix", streak=explore_streak,
+                 reqs=len(req_lines), made_edit=made_edit, fires=gate_fires)
+    parts = [
+        f"[you've run ~{explore_streak} commands since your last change without "
+        "finishing. Stop exploring and close this out as a verification matrix. The "
+        "hidden grader checks the task's OWN requirements — for EACH one below, you "
+        "need exactly ONE of two things:",
+        "  (a) EVIDENCE: a real run through the actual public path that shows the "
+        "required outcome. A snapshot, your own \"PASS\"/\"OK\" text, \"no error\", or "
+        "a check you built from the same assumption as the code do NOT count.",
+        "  (b) UNVERIFIED: a plain note that you could not verify it. An honest "
+        "\"unverified\" is allowed and lets you finish; a false \"it works\" is not.",
+    ]
+    if req_lines:
+        parts.append("Requirements from the task statement:")
+        parts += [f"  > {ln}" for ln in req_lines]
+    else:
+        parts.append("Re-read the task statement and list exactly what it requires, "
+                     "then close each item as (a) or (b).")
+    parts.append("When every requirement is (a) or (b), apply any fix still needed, "
+                 "then call `done`. Do not run more exploratory probes.]")
+    return "\n".join(parts)
+
+
 def edit_failed_to_land(result: str) -> bool:
     """True when an edit/symbolic-edit tool result means the change did NOT apply — a
     no-op (old==new / replacement leaves file unchanged), an unmatched `old` string, or
