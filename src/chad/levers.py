@@ -91,12 +91,13 @@ LEVERS: dict[str, Lever] = {
         "After ~6 read-only steps with no landed edit, steer the model to act before the "
         "step cap kills the turn with an empty patch.",
         "iter2"),
-    "explore_commit_gate": Lever(
+    "verification_matrix": Lever(
         "After ~8 exploratory-bash steps since the last change (even AFTER an edit has "
-        "landed — the case investigation_gate can't see), steer the turn to assess and "
-        "then verify-and-`done` or make the one remaining change. Ported from Terminus-2, "
-        "whose per-turn 'what's done / what remains' reflection keeps it at chad's passing "
-        "step count; targets the 69%-of-fails non-convergence (ran-out) bucket.",
+        "landed — the case investigation_gate can't see), pull the turn into a bounded "
+        "verification phase: for each task requirement, close it with a real causal run "
+        "OR an explicit 'unverified', then `done`. Reuses done_audit's requirement "
+        "extractor; targets the 69%-of-fails non-convergence (ran-out) bucket while the "
+        "honest-unverified escape keeps it from thrashing on the genuinely-unverifiable.",
         "iter16"),
     "edit_loop_break": Lever(
         "After 2 consecutive edits that failed to land, stop the model re-trying "
