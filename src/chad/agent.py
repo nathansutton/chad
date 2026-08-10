@@ -862,6 +862,10 @@ class Agent:
         break_nudges = 0      # times we escalated a stuck edit this turn
         readonly_streak = 0   # consecutive steps with substantive tools but no landed edit
         gate_nudges = 0       # times the investigation->edit gate fired this turn
+        explore_streak = 0    # consecutive bash steps since the last landed edit (counts
+                              # AFTER an edit too — investigation_gate can't; see
+                              # guardrails.explore_commit_gate)
+        explore_gate_fires = 0  # times the explore->commit gate fired this turn
         subagent_sigs = set() # (description, prompt) of sub-agents already spawned this turn
         truncation_nudges = 0  # times we pushed past a token-cap truncation this turn
         garble_nudges = 0  # malformed-tool-call re-nudges (own counter, so a step-0
@@ -2182,6 +2186,26 @@ class Agent:
                     log.info("INVESTIGATION-GATE at step %d (streak, no edit) -> nudge #%d",
                              step, gate_nudges)
                     self.messages.append({"role": "tool", "name": "edit", "content": gate})
+
+            # Convergence gate (Terminus-2 port): count exploratory-bash steps since the
+            # last landed edit — unlike readonly_streak/investigation_gate this keeps
+            # counting AFTER an edit lands, which is where the demonstrated thrash lives
+            # (write early, then probe 60 more times without calling done). A NEW edit
+            # this step resets it; a bash-only step advances it.
+            if made_edit and not _gov_prev_made:
+                explore_streak = 0
+            elif any(n == "bash" for n, _ in calls):
+                explore_streak += 1
+            if not read_only_intent:
+                commit = guardrails.explore_commit_gate(
+                    explore_streak, made_edit, explore_gate_fires)
+                if commit:
+                    explore_gate_fires += 1
+                    explore_streak = 0
+                    log.info("EXPLORE-COMMIT gate at step %d (bash-streak, no change) "
+                             "-> nudge #%d", step, explore_gate_fires)
+                    self.messages.append(
+                        {"role": "tool", "name": "bash", "content": commit})
 
             # Break a flailing-probe run (e.g. guessing the test runner, repeated
             # `python -c import` checks) that the exact-call loop guard can't see because

@@ -169,6 +169,14 @@ def test_investigation_gate(monkeypatch):
     assert guardrails.investigation_gate(8, made_edit=False, gate_nudges=0) is None
 
 
+def test_explore_commit_gate(monkeypatch):
+    n = bite("explore_commit_gate")
+    on(monkeypatch)
+    assert guardrails.explore_commit_gate(8, made_edit=True, gate_fires=0)
+    off(monkeypatch, n)
+    assert guardrails.explore_commit_gate(8, made_edit=True, gate_fires=0) is None
+
+
 def test_edit_loop_break(monkeypatch):
     n = bite("edit_loop_break")
     on(monkeypatch)

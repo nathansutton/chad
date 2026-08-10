@@ -885,6 +885,28 @@ def test_investigation_gate():
     check("gate bounded by gate_nudges", investigation_gate(20, made_edit=False, gate_nudges=2) is None)
 
 
+def test_explore_commit_gate():
+    from chad.guardrails import explore_commit_gate
+    # Below threshold: silent.
+    check("no commit-gate below threshold",
+          explore_commit_gate(4, made_edit=False, gate_fires=0) is None)
+    # At/over threshold: fires and offers the verify-then-done exit.
+    g = explore_commit_gate(8, made_edit=False, gate_fires=0)
+    check("commit-gate fires at threshold", g is not None)
+    check("commit-gate steers to done", g is not None and "`done`" in g)
+    check("commit-gate demands verification first",
+          g is not None and "verification" in g)
+    # The whole point vs investigation_gate: it STILL fires after an edit landed
+    # (the break-filter thrash shape — write early, probe forever).
+    ge = explore_commit_gate(12, made_edit=True, gate_fires=0)
+    check("commit-gate fires even after an edit landed", ge is not None)
+    check("commit-gate acknowledges existing work",
+          ge is not None and "already be in place" in ge)
+    # Re-armable but bounded by the firing cap.
+    check("commit-gate bounded by cap",
+          explore_commit_gate(30, made_edit=True, gate_fires=6) is None)
+
+
 def test_edit_failed_to_land():
     check("no-op edit failed to land", edit_failed_to_land("[no-op edit: old and new are identical]"))
     check("not-found failed to land", edit_failed_to_land("[old string not found; no change made.]"))
@@ -1200,6 +1222,7 @@ if __name__ == "__main__":
     test_bash_result_verifies_ignores_trivial_checks()
     test_bash_result_verifies_requires_executing_command()
     test_investigation_gate()
+    test_explore_commit_gate()
     test_edit_failed_to_land()
     test_edit_loop_break()
     test_done_rejection()

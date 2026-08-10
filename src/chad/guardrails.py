@@ -782,6 +782,46 @@ def investigation_gate(readonly_streak, made_edit, gate_nudges, threshold=6):
             "verify it. If you already know the fix, apply it this step.]")
 
 
+def explore_commit_gate(explore_streak, made_edit, gate_fires,
+                        threshold=8, cap=6):
+    """Push a thrashing turn to converge — assess, then commit or finish.
+
+    The demonstrated failure (BARE89 vs Terminus-2, same model/box): chad's #1 loss
+    class is not wrong answers, it is non-convergence. 69% of failing trials never
+    called `done` — they ran a long tail of successful, exploratory bash (median 39
+    commands vs 12 on passes) with the SAME two edits a passing trial makes, and the
+    step cap killed them mid-poke. On break-filter the failing trial ran 72 bash
+    probes / 2 writes across 75 steps while chad's OWN passing trial found the
+    identical exploit in 13; the model knows the answer and researches past the
+    budget. Terminus, on the same weights, sits at chad's PASSING step count because
+    every turn it must state "what's been accomplished / what still needs doing" and
+    `task_complete` is a standing, one-bounce-guarded option — so it commits.
+
+    `investigation_gate` above cannot cover this: it freezes the moment ANY edit
+    lands (its `not made_edit` guard), and break-filter's thrash is entirely AFTER
+    the first write. This gate counts exploratory-bash steps regardless of a prior
+    edit and re-arms (cap firings, not a hard 2), mirroring terminus's per-turn
+    reflection. It steers to VERIFY-then-`done` (never a bare "call done") so it
+    attacks the ran-out bucket without inflating done-but-wrong. Returns nudge text
+    or None; caller resets the streak so the next firing is `threshold` steps later."""
+    if not levers.enabled("explore_commit_gate"):
+        return None
+    if explore_streak < threshold or gate_fires >= cap:
+        return None
+    levers.fired("explore_commit_gate", streak=explore_streak,
+                 made_edit=made_edit, fires=gate_fires)
+    have = ("Your solution may already be in place. " if made_edit
+            else "You have enough context to act now. ")
+    return (f"[you've run ~{explore_streak} commands since your last change without "
+            f"finishing the task. Stop and take stock: (1) what does the task "
+            f"actually require, and (2) what have you already done toward it? "
+            f"{have}If it's in place, STOP exploring — run the task's real "
+            f"verification (its test/check command) ONE time, and if it passes call "
+            f"`done`. If something is still missing, name the single remaining change "
+            f"in one sentence and make it now with edit/write. Do not run more "
+            f"exploratory probes.]")
+
+
 def edit_failed_to_land(result: str) -> bool:
     """True when an edit/symbolic-edit tool result means the change did NOT apply — a
     no-op (old==new / replacement leaves file unchanged), an unmatched `old` string, or
