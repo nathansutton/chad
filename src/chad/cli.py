@@ -457,7 +457,7 @@ def _pick_session(items):
 # would either shadow it or force `chad -- "some task"`; matching argv[1] exactly keeps
 # `chad "serve the API from cache"` a task and `chad serve` a subcommand, which is the
 # same rule the old literal-positional dispatch used.
-_SUBCOMMANDS = ("serve", "prove", "levers")
+_SUBCOMMANDS = ("serve", "prove", "levers", "worktree", "sessions")
 
 # Set by `_main` once the remote backend's URL is resolved, so the top-level BackendError
 # handler can name the host that stopped answering. Only the remote backend can raise
@@ -494,6 +494,14 @@ def _agent_parser():
                     help="start in read-only plan mode (investigate and propose, no edits)")
     ap.add_argument("--yolo", action="store_true",
                     help="auto-approve bash/write/edit (skip confirmation prompts)")
+    ap.add_argument("--worktree", action="store_true",
+                    help="run this session in a disposable git worktree even when "
+                         "headless or the repo is dirty; changes apply back to your "
+                         "checkout at the end (kept on any failure)")
+    ap.add_argument("--no-worktree", dest="no_worktree", action="store_true",
+                    help="edit the current checkout directly (an interactive session "
+                         "in a clean git repo otherwise gets its own worktree). "
+                         "Also CHAD_WORKTREE=0.")
     ap.add_argument("--no-think", action="store_true",
                     help="skip the model's <think> reasoning blocks (faster)")
     ap.add_argument("--think-budget", type=int, default=None, dest="think_budget",
@@ -588,6 +596,251 @@ def _run_levers():
     return 0
 
 
+def _sessions_parser():
+    ap = argparse.ArgumentParser(
+        prog="chad sessions",
+        description="List recent sessions across ALL projects, newest first — the "
+                    "cross-project view the per-directory picker can't give. Resume "
+                    "one with `chad -c` (or --resume) from its project directory.",
+    )
+    ap.add_argument("-n", "--limit", type=int, default=20,
+                    help="max rows (default 20)")
+    return ap
+
+
+def _run_sessions(args):
+    """No _preflight and no model, same rationale as `chad levers`: reading session
+    indexes should work on any box."""
+    from . import session
+    items = session.sessions_all(limit=args.limit)
+    if not items:
+        sys.stderr.write("no saved sessions yet\n")
+        return 0
+    width = max((len(os.path.basename((it.get("cwd") or "").rstrip("/")) or "?")
+                 for it in items), default=1)
+    for it in items:
+        proj = os.path.basename((it.get("cwd") or "").rstrip("/")) or "?"
+        print(f"{proj:<{width}}  {session.describe(it)}")
+    return 0
+
+
+def _worktree_parser():
+    ap = argparse.ArgumentParser(
+        prog="chad worktree",
+        description="List, apply, or delete this repository's chad worktrees (run from "
+                    "the origin checkout). Sessions offer apply/keep/discard on exit; "
+                    "this is the lifecycle path for kept ones.",
+    )
+    ap.add_argument("action", choices=("list", "apply", "rm"), nargs="?", default="list",
+                    help="list worktrees; apply <id> back to the checkout (then remove "
+                         "it); rm <id> to discard one")
+    ap.add_argument("id", nargs="?",
+                    help="worktree id from `chad worktree list` (any unique prefix)")
+    return ap
+
+
+def _run_worktree(args):
+    """No _preflight and no model, same rationale as `chad levers`: managing worktrees
+    is pure git and should work on any box the repo is checked out on."""
+    from . import worktree
+    if args.action == "list":
+        metas = worktree.list_for(os.getcwd())
+        if not metas:
+            sys.stderr.write("no chad worktrees for this repository (they are created "
+                             "per interactive session and cleaned up on exit)\n")
+            return 0
+        for m in metas:
+            print(worktree.describe(m))
+        return 0
+    if not args.id:
+        sys.stderr.write(f"chad worktree {args.action} needs an id — see "
+                         "`chad worktree list`\n")
+        return 1
+    meta = worktree.find(os.getcwd(), args.id)
+    if not meta:
+        sys.stderr.write(f"no unique worktree matching {args.id!r} for this repository\n")
+        return 1
+    if args.action == "apply":
+        ok, msg = worktree.apply(meta)
+        sys.stderr.write("worktree: " + msg + "\n")
+        if ok:
+            sys.stderr.write("worktree: " + worktree.remove(meta) + "\n")
+        return 0 if ok else 1
+    n, stat = worktree.diff_stat(meta)  # rm: show what dies before it dies
+    if n and sys.stdin.isatty():
+        sys.stderr.write(f"{meta['id']} has {n} changed file(s):\n{stat}\n")
+        try:
+            ans = input("really discard these changes? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans not in ("y", "yes"):
+            sys.stderr.write("kept.\n")
+            return 1
+    sys.stderr.write("worktree: " + worktree.remove(meta) + "\n")
+    return 0
+
+
+def _worktree_wanted(args, task, start_mode):
+    """Whether THIS invocation should get a fresh worktree, before eligibility is
+    consulted. Returns 'force' (create even if the repo is dirty — the caller asked by
+    name), True (default-on), or False.
+
+    Interactive sessions default ON: the point of the feature is that a local model's
+    edits land in a disposable checkout, reviewed on the way back. Headless one-shots
+    default OFF — scripts and eval harnesses depend on edits landing in the cwd they
+    prepared, so isolation there is opt-in (--worktree / CHAD_WORKTREE=1)."""
+    if args.no_worktree or config.env_str("CHAD_WORKTREE") == "0":
+        return False
+    if args.worktree or config.env_str("CHAD_WORKTREE") == "1":
+        return "force"
+    if task and start_mode == "plan":
+        return False  # read-only one-shot: nothing to isolate
+    return sys.stdin.isatty()
+
+
+def _worktree_setup(args, task, start_mode, resume_ref):
+    """Decide, create/re-enter, and announce the session worktree. Runs after resume
+    loading (a resumed session names its worktree) and before Agent/TUI construction
+    (everything downstream follows the process cwd). Any failure degrades to running
+    in place with a printed reason — isolation is an upgrade, not a prerequisite."""
+    from . import worktree
+    if worktree.current():
+        return  # launched inside a kept worktree and adopted it — nothing to set up
+    if resume_ref and not (args.no_worktree or config.env_str("CHAD_WORKTREE") == "0"):
+        # A resumed session re-enters ITS worktree regardless of the fresh-session
+        # default (a headless `chad -c "…"` must land where the conversation's file
+        # state actually lives), gated only by the explicit off switches.
+        meta = worktree.find(os.getcwd(), resume_ref.get("id", ""))
+        if meta and worktree.enter(meta):
+            sys.stderr.write(f"worktree: re-entering {meta['branch']} "
+                             f"({meta['path']})\n")
+            return
+        sys.stderr.write("worktree: this session's worktree is gone — the resumed "
+                         "conversation continues against the current checkout\n")
+    want = _worktree_wanted(args, task, start_mode)
+    if not want:
+        return
+    ok, reason = worktree.eligibility(os.getcwd())
+    if not ok and not (want == "force" and "uncommitted" in reason):
+        # Only a dirty tree is overridable by asking by name; a non-repo isn't.
+        note = f"worktree: running in place ({reason})"
+        if want == "force":
+            note = f"chad: --worktree unavailable: {reason}; running in place"
+        sys.stderr.write(note + "\n")
+        return
+    if not ok:
+        sys.stderr.write("chad: --worktree on a dirty repo — your uncommitted changes "
+                         "stay behind in the checkout; the session starts from HEAD\n")
+    meta, err = worktree.create(os.getcwd())
+    if not meta:
+        sys.stderr.write(f"worktree: running in place (create failed: {err})\n")
+        return
+    if not worktree.enter(meta):
+        sys.stderr.write("worktree: running in place (could not enter the new "
+                         "worktree)\n")
+        worktree.remove(meta)
+        return
+    sys.stderr.write(f"worktree: {meta['branch']} (from HEAD {meta['base'][:12]}) — "
+                     "your checkout stays untouched; changes apply back on exit\n")
+
+
+# True once the exit gate ran, so the atexit note (below) stays silent on the normal
+# path and only speaks for exits that never reached the gate (^C, a crash, sys.exit
+# from deep inside a turn) — a kept worktree must never be silent.
+_WT_HANDLED = False
+
+
+def _worktree_atexit_note():
+    from . import worktree
+    meta = worktree.current()
+    if not _WT_HANDLED and meta:
+        sys.stderr.write(f"\nworktree: kept at {meta['path']} — `chad -c` from "
+                         f"{meta['origin_top']} re-enters it; `chad worktree list` "
+                         "to manage\n")
+
+
+def _worktree_finish(interactive):
+    """The end-of-session gate: apply / keep / discard. Headless auto-applies (it
+    opted in via --worktree, and stranding changes in ~/.chad is worse than applying
+    them); a failed apply ALWAYS keeps the worktree — work is never lost to cleanup."""
+    global _WT_HANDLED
+    _WT_HANDLED = True
+    from . import session as _session
+    from . import worktree
+    meta = worktree.current()
+    if not meta:
+        return
+    anchor = worktree.session_anchor()  # capture BEFORE remove() deactivates it
+
+    def _stamp(status):
+        # Lifecycle status onto the thread's latest save — what `chad sessions` and
+        # the picker report. The just-exited session is by construction the newest.
+        items = _session.list_sessions(anchor, limit=1)
+        if items:
+            _session.set_status(anchor, items[0]["session_id"], status)
+
+    def _cleanup():
+        msg = worktree.remove(meta)
+        # The process cwd may be inside the checkout that was just deleted; land in
+        # the origin so anything later (atexit, error paths) has a real cwd.
+        try:
+            os.chdir(meta["origin_top"])
+        except OSError:
+            pass
+        return msg
+
+    n, stat = worktree.diff_stat(meta)
+    origin = os.path.join(meta["origin_top"], meta.get("origin_rel", ""))
+    if n == 0:
+        sys.stderr.write("worktree: no changes — " + _cleanup() + "\n")
+        return
+    if not interactive:
+        ok, msg = worktree.apply(meta)
+        if ok:
+            _stamp("applied")
+            sys.stderr.write(f"worktree: {msg}\n" + "worktree: " + _cleanup() + "\n")
+        else:
+            _stamp("kept")
+            sys.stderr.write(
+                f"worktree: apply failed ({msg}) — keeping {meta['path']}\n"
+                f"  recover with `chad worktree apply {meta['id']}` from "
+                f"{meta['origin_top']}\n")
+        return
+    sys.stderr.write(f"\nworktree {meta['branch']} changed {n} file(s):\n{stat}\n")
+    try:
+        ans = input(f"apply to {origin}? [Y=apply & clean up / k=keep for later / "
+                    "d=discard] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "k"  # an interrupt at the exit prompt must not destroy or apply anything
+    if ans in ("", "y", "yes", "a", "apply"):
+        ok, msg = worktree.apply(meta)
+        if ok:
+            _stamp("applied")
+            sys.stderr.write(f"worktree: {msg} — review with `git diff`, commit with "
+                             "your own git\n")
+            sys.stderr.write("worktree: " + _cleanup() + "\n")
+        else:
+            _stamp("kept")
+            sys.stderr.write(f"worktree: apply failed ({msg}) — keeping {meta['path']};"
+                             f" recover with `chad worktree apply {meta['id']}`\n")
+    elif ans in ("d", "discard"):
+        try:
+            sure = input(f"really discard {n} changed file(s)? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            sure = ""
+        if sure in ("y", "yes"):
+            _stamp("discarded")
+            sys.stderr.write("worktree: " + _cleanup() + "\n")
+        else:
+            _stamp("kept")
+            sys.stderr.write(f"worktree: kept at {meta['path']} — `chad -c` re-enters "
+                             "it\n")
+    else:
+        _stamp("kept")
+        sys.stderr.write(f"worktree: kept at {meta['path']} — `chad -c` from {origin} "
+                         "re-enters it\n")
+
+
 def main(argv=None):
     """Console entrypoint. Wraps `_main` only to turn a backend fault that escaped the
     agent's retry loop into guidance — it can surface from the one-shot, --repl, or TUI
@@ -611,6 +864,10 @@ def _main(argv=None):
     if sub == "prove":
         from . import prove
         sys.exit(prove.run(_prove_parser().parse_args(argv[1:])))
+    if sub == "worktree":
+        sys.exit(_run_worktree(_worktree_parser().parse_args(argv[1:])))
+    if sub == "sessions":
+        sys.exit(_run_sessions(_sessions_parser().parse_args(argv[1:])))
 
     args = _agent_parser().parse_args(argv)
     if args.levers:  # deprecated spelling of `chad levers`
@@ -716,6 +973,18 @@ def _main(argv=None):
     start_mode = "plan" if args.plan else ("yolo" if args.yolo else "normal")
     thinking = not args.no_think
 
+    # Worktree-per-session isolation. If chad was launched INSIDE a kept worktree
+    # (the user cd'ed into one), adopt it first, so the session lookups below key to
+    # the ORIGIN project and the exit gate still offers apply/keep/discard. The
+    # anchor is that origin dir — identical to os.getcwd() when no worktree is
+    # involved, so non-worktree behavior is byte-identical.
+    from . import worktree
+    adopted = worktree.adopt(os.getcwd())
+    if adopted:
+        sys.stderr.write(f"worktree: inside {adopted['branch']} (origin "
+                         f"{adopted['origin_top']})\n")
+    anchor = worktree.session_anchor()
+
     # Live per-turn ctx-limit recheck: the startup number was
     # computed on whatever the box looked like at load; Docker/harbor/browsers
     # changing the physical free band mid-session changes what is safe. MLX
@@ -728,9 +997,11 @@ def _main(argv=None):
     #   --resume : list recent sessions and pick by number (needs a TTY).
     #   -c       : the most recent session (unchanged simple case).
     resume = None
+    resume_meta = {}   # the resumed session's saved meta (thread, ambient, todos, wt)
+    resume_thread = None
     if args.resume:
         from . import session
-        items = session.list_sessions(os.getcwd(), limit=10)
+        items = session.list_sessions(anchor, limit=10)
         if not items:
             sys.stderr.write("no saved sessions for this directory; starting fresh\n")
         elif not sys.stdin.isatty():
@@ -740,18 +1011,113 @@ def _main(argv=None):
         else:
             pick = _pick_session(items)
             if pick:
-                data = session.load_session(os.getcwd(), pick["session_id"])
+                data = session.load_session(anchor, pick["session_id"])
                 if data:
                     resume = data["messages"]
+                    resume_meta = data.get("meta") or {}
+                    resume_thread = resume_meta.get("thread_id") or data.get("session_id")
                     sys.stderr.write(f"resuming (forked): {session.describe(pick)}\n")
     elif args.cont:
         from . import session
-        data = session.load_session(os.getcwd())
+        data = session.load_session(anchor)
         if data:
             resume = data["messages"]
-            sys.stderr.write(f"resuming session ({session.session_summary(os.getcwd())})\n")
+            resume_meta = data.get("meta") or {}
+            resume_thread = resume_meta.get("thread_id") or data.get("session_id")
+            sys.stderr.write(f"resuming session ({session.session_summary(anchor)})\n")
         else:
             sys.stderr.write("no saved session for this directory; starting fresh\n")
+    # Pre-v2 sessions carry no thread_id; the resumed session's own id becomes the
+    # thread so the chain coheres from here on.
+    if resume_thread and "thread_id" not in resume_meta:
+        resume_meta = {**resume_meta, "thread_id": resume_thread}
+
+    _worktree_setup(args, task, start_mode, resume_meta.get("worktree"))
+    if worktree.current():
+        import atexit
+        atexit.register(_worktree_atexit_note)
+
+    # Instant resume: when a KV snapshot of the resumed thread exists on disk, reuse
+    # the SAVED system prompt (resume_system) so the re-rendered transcript stays a
+    # byte-identical prefix of the snapshot, and load the snapshot once the model is
+    # in. Either half missing degrades to today's cold re-prefill; CHAD_SESSION_KV=0
+    # turns the whole mechanism off.
+    kv_on = config.env_str("CHAD_SESSION_KV") != "0"
+    snap = bool(kv_on and resume is not None and resume_thread
+                and hasattr(eng, "has_session_snapshot")
+                and eng.has_session_snapshot(resume_thread))
+
+    def _restore_snapshot(quiet=False):
+        """Run after eng.load(); inline for the sync paths, inside `finalize` for
+        the TUI's background load (quiet there — a stderr line would smear the
+        already-running UI; the restored cache announces itself as a fast first
+        turn instead)."""
+        if snap:
+            n = eng.restore_session_snapshot(resume_thread)
+            if n and not quiet:
+                sys.stderr.write(f"session cache restored: {n:,} tokens resume "
+                                 "without re-prefill\n")
+
+    def _save_snapshot(a):
+        """Persist the final agent's thread KV at session end — seconds on a big
+        cache, and the difference between a zero-prefill and a minutes-long next
+        `chad -c`."""
+        if a is not None and kv_on and hasattr(eng, "save_session_snapshot"):
+            n = eng.save_session_snapshot(a.thread_id)
+            if n:
+                sys.stderr.write(f"session cache saved: {n:,} tokens (instant resume "
+                                 "with `chad -c`)\n")
+
+    def _finish_session(last):
+        """Interactive (TUI/REPL) session end: ONE question decides everything.
+
+        Wrap up (default): the job is done — the worktree gate runs (apply / keep /
+        discard) and the thread's KV snapshot is dropped, since a finished session
+        has no resume to accelerate. Keep for later: no further questions — the
+        snapshot is saved, the worktree stays untouched, and `chad -c` re-enters
+        the whole thing. An interrupt at the prompt keeps (never tears down).
+        A session with no user turns skips the question entirely."""
+        global _WT_HANDLED
+        from . import session as _session
+        from . import worktree
+        if last is None or not any(m.get("role") == "user" for m in last.messages):
+            _worktree_finish(True)  # removes an untouched worktree silently
+            return
+        goal = f" ({last.goal})" if last.goal else ""
+        try:
+            ans = input(f"\ndone with this session{goal}? "
+                        "[Y=wrap up / n=keep for later] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans in ("n", "no", "k", "keep"):
+            _WT_HANDLED = True
+            _save_snapshot(last)
+            anchor = worktree.session_anchor()
+            items = _session.list_sessions(anchor, limit=1)
+            if items:
+                _session.set_status(anchor, items[0]["session_id"], "kept")
+            wt = worktree.current()
+            sys.stderr.write("session kept — `chad -c`"
+                             + (f" from {anchor}" if wt else "")
+                             + " re-enters it"
+                             + (" (worktree + context cache intact)" if wt
+                                else " (context cache intact)") + "\n")
+            return
+        had_wt = worktree.current() is not None
+        _worktree_finish(True)
+        if not had_wt:
+            anchor = os.getcwd()
+            items = _session.list_sessions(anchor, limit=1)
+            if items:
+                _session.set_status(anchor, items[0]["session_id"], "finished")
+        # Drop the snapshot only if the worktree really wrapped (the inner gate can
+        # still choose keep — contradicting the outer answer is allowed, and then
+        # the resume must stay fast).
+        if worktree.current() is None and kv_on \
+                and hasattr(eng, "delete_session_snapshot"):
+            eng.delete_session_snapshot(last.thread_id)
+    if not background:
+        _restore_snapshot()
 
     if task:
         # A one-shot run is inherently unattended: the interactive confirm prompt
@@ -764,7 +1130,12 @@ def _main(argv=None):
         agent = Agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
                       mode=run_mode, thinking=thinking, resume=resume, persist=True,
                       think_budget=args.think_budget,
-                      turn_budget_s=turn_budget_s, ctx_limit_fn=ctx_limit_fn)
+                      turn_budget_s=turn_budget_s, ctx_limit_fn=ctx_limit_fn,
+                      resume_state=resume_meta if resume else None,
+                      resume_system=snap)
+        # A one-shot's task string IS its goal (a resumed session keeps its own).
+        task_goal = agent.goal or " ".join(task.split())[:200]
+        agent.goal = task_goal
         # Wall time across ALL of this task's turns (initial + any auto-continue
         # relaunches), measured against the wall budget to decide the early-finish review.
         task_start = time.monotonic()
@@ -824,6 +1195,7 @@ def _main(argv=None):
                           mode=run_mode, thinking=thinking, persist=True,
                           think_budget=args.think_budget,
                           turn_budget_s=relaunch_s, ctx_limit_fn=ctx_limit_fn)
+            agent.goal = task_goal
             agent.run_turn(f"{task}\n\n[{note}]")
         # Early-finish self-review: if the task settled CLEANLY (no
         # banked budget note) with more than 30% of the wall budget still unspent, relaunch
@@ -846,11 +1218,18 @@ def _main(argv=None):
                           mode=run_mode, thinking=thinking, persist=True,
                           think_budget=args.think_budget,
                           turn_budget_s=review_budget, ctx_limit_fn=ctx_limit_fn)
+            agent.goal = task_goal
             agent.run_turn(task + guardrails.REVIEW_PASS_PROMPT)
         agent.save()  # persist so a follow-up `chad -c "..."` picks up the thread
+        # One-shots skip the wrap-up question (they chain: `chad -c "next step"`) —
+        # snapshot saved, worktree gate as before.
+        _save_snapshot(agent)
+        _worktree_finish(sys.stdin.isatty())
     elif args.repl:
-        repl(eng, yolo=args.yolo, ctx_limit=ctx_limit, resume=resume, thinking=thinking,
-             ctx_limit_fn=ctx_limit_fn)
+        last = repl(eng, yolo=args.yolo, ctx_limit=ctx_limit, resume=resume,
+                    thinking=thinking, ctx_limit_fn=ctx_limit_fn,
+                    resume_state=resume_meta if resume else None, resume_system=snap)
+        _finish_session(last)
     else:
         from .engine import peek_context_window
         from .tui import run_tui
@@ -864,10 +1243,15 @@ def _main(argv=None):
 
         def finalize():
             load_s = eng.load()
+            _restore_snapshot(quiet=True)
             return load_s, _compute_ctx_limit(eng)
 
-        run_tui(eng, provisional, mode=start_mode, thinking=thinking, resume=resume,
-                ctx_window=window, finalize=finalize, ctx_limit_fn=ctx_limit_fn)
+        last = run_tui(eng, provisional, mode=start_mode, thinking=thinking,
+                       resume=resume, ctx_window=window, finalize=finalize,
+                       ctx_limit_fn=ctx_limit_fn,
+                       resume_state=resume_meta if resume else None,
+                       resume_system=snap)
+        _finish_session(last)
 
 
 if __name__ == "__main__":

@@ -124,16 +124,41 @@ def _load_index(cwd: str) -> dict:
 
 
 def _write_index(cwd: str, sessions: dict) -> None:
-    _atomic_write_json(_index_path(cwd), {"sessions": sessions})
+    # The index carries the real cwd path alongside the rows: the directory NAME is
+    # an opaque hash, and the global `sessions_all` view needs to say which project
+    # each index belongs to without opening any session file.
+    _atomic_write_json(_index_path(cwd),
+                       {"cwd": os.path.abspath(cwd), "sessions": sessions})
 
 
-def _update_index(cwd: str, session_id: str, messages: list, updated: float) -> None:
-    idx = _load_index(cwd)
-    idx["sessions"][session_id] = {
-        "title": _first_user_title(messages),
+def _index_row(messages: list, updated: float, meta: dict = None) -> dict:
+    """One index row. Thread/status/worktree ride the index so the picker,
+    `chad sessions`, and the prune exemption never have to parse session files."""
+    meta = meta or {}
+    # The explicit goal ("what are you working on?") names the session when given;
+    # the first user message stays the fallback so pre-goal sessions look unchanged.
+    title = meta.get("goal") or _first_user_title(messages)
+    if len(title) > _TITLE_LEN:
+        title = title[:_TITLE_LEN] + "…"
+    row = {
+        "title": title,
         "updated": updated,
         "turns": _turns(messages),
     }
+    if meta.get("thread_id"):
+        row["thread_id"] = meta["thread_id"]
+    if meta.get("status"):
+        row["status"] = meta["status"]
+    wt = meta.get("worktree")
+    if isinstance(wt, dict) and wt.get("path"):
+        row["worktree_path"] = wt["path"]
+    return row
+
+
+def _update_index(cwd: str, session_id: str, messages: list, updated: float,
+                  meta: dict = None) -> None:
+    idx = _load_index(cwd)
+    idx["sessions"][session_id] = _index_row(messages, updated, meta)
     _write_index(cwd, idx["sessions"])
 
 
@@ -188,11 +213,8 @@ def list_sessions(cwd: str, limit: int = None) -> list:
         if sid not in sessions:  # file present but unindexed (corrupt index / crash)
             data = _load_path(_session_path(cwd, sid))
             if data:
-                sessions[sid] = {
-                    "title": _first_user_title(data["messages"]),
-                    "updated": data.get("updated", 0),
-                    "turns": _turns(data["messages"]),
-                }
+                sessions[sid] = _index_row(data["messages"], data.get("updated", 0),
+                                           data.get("meta"))
                 changed = True
     for sid in list(sessions):  # drop rows whose file was pruned/removed
         if sid not in on_disk:
@@ -206,11 +228,20 @@ def list_sessions(cwd: str, limit: int = None) -> list:
 
 
 def _prune(cwd: str, keep: int = RETAIN) -> None:
-    """Retention: keep the newest `keep` sessions, remove older files + index rows."""
+    """Retention: keep the newest `keep` sessions, remove older files + index rows.
+
+    Sessions whose worktree checkout still exists are EXEMPT (and don't consume a
+    keep slot): the session file is the only thing that knows a kept worktree's
+    conversation — pruning it would orphan the worktree, silently breaking the
+    `chad -c` re-entry the keep option promised. The exemption ends when the
+    worktree is applied or discarded (its path stops existing)."""
     sessions = _load_index(cwd)["sessions"]
-    if len(sessions) <= keep:
+    prunable = {sid: row for sid, row in sessions.items()
+                if not (row.get("worktree_path")
+                        and os.path.isdir(row["worktree_path"]))}
+    if len(prunable) <= keep:
         return
-    ordered = sorted(sessions.items(), key=lambda kv: kv[1].get("updated", 0), reverse=True)
+    ordered = sorted(prunable.items(), key=lambda kv: kv[1].get("updated", 0), reverse=True)
     for sid, _meta in ordered[keep:]:
         try:
             os.remove(_session_path(cwd, sid))
@@ -235,11 +266,59 @@ def save_session(cwd: str, messages: list, meta: dict = None,
                                        "messages": messages})
         if not ok:
             return ""
-        _update_index(cwd, session_id, messages, updated)
+        _update_index(cwd, session_id, messages, updated, meta)
         _prune(cwd)
         return path
     except OSError:
         return ""
+
+
+def set_status(cwd: str, session_id: str, status: str) -> bool:
+    """Stamp a lifecycle status ('idle', 'needs-attention', 'applied', 'kept',
+    'discarded') onto a saved session — file meta + index row. The cli's worktree
+    exit gate is the main writer; readers are the picker and `chad sessions`.
+    Best-effort like everything here: False on any failure, never raises."""
+    data = _load_path(_session_path(cwd, session_id))
+    if not data:
+        return False
+    data.setdefault("meta", {})["status"] = status
+    if not _atomic_write_json(_session_path(cwd, session_id), data):
+        return False
+    _update_index(cwd, session_id, data["messages"], data.get("updated", time.time()),
+                  data["meta"])
+    return True
+
+
+def sessions_all(limit: int = 20) -> list:
+    """Sessions across EVERY project, newest first — the cross-project "what was I
+    doing" view (`chad sessions`) that per-cwd keying otherwise makes impossible.
+    Rows are index rows plus the owning cwd; reads only index files, so it stays
+    cheap no matter how many projects have history."""
+    items = []
+    try:
+        buckets = os.listdir(SESS_DIR)
+    except OSError:
+        return []
+    for name in buckets:
+        idx_path = os.path.join(SESS_DIR, name, "index.json")
+        try:
+            with open(idx_path) as f:
+                idx = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(idx, dict) or not isinstance(idx.get("sessions"), dict):
+            continue
+        cwd = idx.get("cwd") or ""
+        if not cwd:  # pre-v2 index: recover the project path from any session file
+            for sid in idx["sessions"]:
+                data = _load_path(os.path.join(SESS_DIR, name, sid + ".json"))
+                if data and data.get("cwd"):
+                    cwd = data["cwd"]
+                    break
+        for sid, row in idx["sessions"].items():
+            items.append({"session_id": sid, "cwd": cwd, **row})
+    items.sort(key=lambda it: it.get("updated", 0), reverse=True)
+    return items[:limit] if limit else items
 
 
 def load_session(cwd: str, session_id: str = None):
@@ -263,12 +342,19 @@ def _ago(age_s: int) -> str:
 
 
 def describe(item: dict) -> str:
-    """One-line label for a `list_sessions` entry (the picker / resume notice):
-    `2h ago · 14 turns · "fix the flaky retry test…"`."""
+    """One-line label for a `list_sessions`/`sessions_all` entry (the picker /
+    `chad sessions`): `2h ago · 14 turns · "fix the flaky retry test…" · kept [wt]`.
+    Status and a live-worktree marker only appear when present, so pre-v2 rows
+    render exactly as before."""
     when = _ago(max(0, int(time.time() - item.get("updated", 0))))
     turns = item.get("turns", 0)
     title = item.get("title") or "(no title)"
-    return f'{when} · {turns} turn{"s" * (turns != 1)} · "{title}"'
+    line = f'{when} · {turns} turn{"s" * (turns != 1)} · "{title}"'
+    if item.get("status"):
+        line += f' · {item["status"]}'
+    if item.get("worktree_path") and os.path.isdir(item["worktree_path"]):
+        line += " [wt]"
+    return line
 
 
 def session_summary(cwd: str) -> str:

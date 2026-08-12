@@ -22,6 +22,7 @@ engine. PLD gets speculative decoding's accept/rollback benefit from the context
 """
 
 import hashlib
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -66,9 +67,10 @@ from .base_engine import THINK_CLOSE, GenStats, think_ceiling_hit
 from .diag import log
 
 # checkpoint filename kinds (prefix on the basename) — lets cleanup target the
-# ephemeral push-spills without touching durable warm-prefix files.
+# ephemeral push-spills without touching durable warm-prefix or session files.
 _CKPT_WARM = "warm"
 _CKPT_PUSH = "push"
+_CKPT_SESS = "sess"   # per-session-thread full-transcript snapshot (instant resume)
 
 
 def _log_mlx_provenance() -> None:
@@ -651,6 +653,84 @@ class Engine:
 
     def _n_model_layers(self) -> int:
         return len(self.model.layers)
+
+    # -- per-session snapshots (instant resume) ---------------------------
+    # Same save/load_prompt_cache machinery as warm_prefix, different key and scope:
+    # the FULL live cache at session exit, keyed by the session THREAD id (stable
+    # across the fork-on-resume chain, so a thread occupies one snapshot slot instead
+    # of accumulating one per resume). The resident token ids ride in the safetensors
+    # metadata — the resume path needs them to seed _cached_ids, after which the
+    # normal _sync_to prefix reconciliation takes over: a byte-identical re-render
+    # resumes with zero body prefill, any divergence falls back to exactly today's
+    # cold re-prefill. Files participate in the shared LRU byte budget.
+
+    def _sess_ckpt_path(self, key: str) -> str:
+        h = hashlib.sha1()
+        h.update(self.model_id.encode("utf-8", "ignore"))
+        h.update(b"\x00")
+        h.update(f"kv{self.kv_bits or 0}".encode())  # same identity rule as _ckpt_path
+        h.update(b"\x00")
+        h.update(key.encode("utf-8", "ignore"))
+        return os.path.join(self.cache_dir,  # type: ignore[arg-type]
+                            f"{_CKPT_SESS}-{h.hexdigest()}.safetensors")
+
+    def has_session_snapshot(self, key: str) -> bool:
+        """Whether a snapshot exists for this thread. Callable BEFORE load() — the
+        path is pure model-id/kv-mode/key hashing — which is what lets the caller
+        decide to reuse the saved system prompt before the weights are in."""
+        return bool(self.cache_dir and key) and os.path.isfile(self._sess_ckpt_path(key))
+
+    def save_session_snapshot(self, key: str) -> int:
+        """Persist the live cache + resident ids under thread `key`. Returns the
+        token count persisted, 0 on skip/failure (best-effort — a session exit must
+        never fail on a full disk)."""
+        if not (self.cache_dir and key and self._cached_ids and self._cache):
+            return 0
+        try:
+            path = self._sess_ckpt_path(key)
+            os.makedirs(self.cache_dir, exist_ok=True)
+            cache_utils.save_prompt_cache(
+                path, self._cache, {"ids": json.dumps(self._cached_ids)})
+            self._enforce_kv_budget(path)
+            return len(self._cached_ids)
+        except Exception:
+            return 0
+
+    def delete_session_snapshot(self, key: str) -> bool:
+        """Drop thread `key`'s snapshot — the wrap-up path: a finished session has no
+        resume to accelerate, and each snapshot holds real gigabytes of LRU budget
+        better spent on live threads."""
+        if not (self.cache_dir and key):
+            return False
+        try:
+            os.remove(self._sess_ckpt_path(key))
+            return True
+        except OSError:
+            return False
+
+    def restore_session_snapshot(self, key: str) -> int:
+        """Load thread `key`'s snapshot into the live cache (replacing whatever is
+        resident). Returns the token count restored, 0 on miss/corruption — in which
+        case the cache is left clean and the next turn simply cold-prefills. Must run
+        after load() (layer-count validation reads the model)."""
+        if not (self.cache_dir and key):
+            return 0
+        path = self._sess_ckpt_path(key)
+        if not os.path.isfile(path):
+            return 0
+        try:
+            self._reset_cache()  # free the resident cache before loading GBs beside it
+            loaded, meta = cache_utils.load_prompt_cache(path, return_metadata=True)
+            ids = json.loads((meta or {}).get("ids", "[]"))
+            if not ids or len(loaded) != self._n_model_layers():
+                return 0
+            self._cache = loaded
+            self._cached_ids = [int(t) for t in ids]
+            self._set_cache_flags()
+            return len(self._cached_ids)
+        except Exception:
+            self._reset_cache()            # corrupt/incompatible -> clean cold start
+            return 0
 
     # -- hybrid (qwen3_5) speculative rollback primitives ------------------
     # The recurrent (Gated-DeltaNet) layers can't be trimmed, but they reassign

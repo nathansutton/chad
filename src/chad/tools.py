@@ -1501,6 +1501,18 @@ def tool_write_todos(todos) -> str:
     return "Plan updated:\n" + "\n".join(lines)
 
 
+def current_todos() -> list:
+    """The live todo list — persisted into the session file so a resumed session's
+    plan panel (and the model's own sense of remaining work) survives the restart."""
+    return list(_TODOS)
+
+
+def set_todos(todos) -> None:
+    """Seed the todo list from a restored session (inverse of current_todos)."""
+    global _TODOS
+    _TODOS = list(todos) if isinstance(todos, list) else []
+
+
 def _walk_glob(path: str, pattern: str):
     """Pruned-walk equivalent of `glob(os.path.join(path, pattern), recursive=True)`
     for basename-only patterns — "**/*" or "**/<name-glob>" — which is what the model

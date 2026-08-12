@@ -51,7 +51,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
-from . import config, guardrails
+from . import config, guardrails, worktree
 from .agent import INIT_PROMPT, MODE_LABEL, Agent
 from .base_engine import BaseEngine
 from .ignore import IGNORE_DIRS
@@ -220,6 +220,7 @@ SLASH_COMMANDS = [
     ("/model", "show model + context window"),
     ("/mode", "cycle permission mode"),
     ("/speech", "toggle voice mode — all-local STT (Parakeet-on-MLX) + TTS (say)"),
+    ("/worktree", "session worktree status (apply/keep/discard happens on exit)"),
     ("/accept", "accept a pending plan and implement it"),
     ("/exit", "quit chad"),
     ("/quit", "quit chad"),
@@ -308,7 +309,8 @@ def _make_history():
 class TUI:
     def __init__(self, engine: BaseEngine, ctx_limit: int, mode: str = "normal",
                  thinking: bool = True, max_chars: int = 400_000, resume: list = None,
-                 ctx_window: int = None, finalize=None, ctx_limit_fn=None):
+                 ctx_window: int = None, finalize=None, ctx_limit_fn=None,
+                 resume_state: dict = None, resume_system: bool = False):
         self.engine = engine
         self.ctx_limit = ctx_limit
         self._ctx_limit_fn = ctx_limit_fn  # live per-turn recheck
@@ -357,7 +359,17 @@ class TUI:
             emit=self._emit, confirm=self._confirm, should_stop=self._interrupt.is_set,
             drain_steering=self._drain_steering,
             resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn,
+            resume_state=resume_state, resume_system=resume_system,
         )
+        # A resumed session's plan panel comes back with it (the Agent just seeded
+        # the tools-side todo list from the saved state).
+        if resume_state:
+            from . import tools as _tools
+            self._todos = _tools.current_todos()
+        # Session-entry naming (the Xirp session form, one line of it): a FRESH
+        # interactive session asks "what are you working on?" and swallows the first
+        # input as the goal. Resumes never ask — they announce the goal instead.
+        self._await_goal = resume is None
 
         # Plan-mode handoff state. After a plan-mode turn writes a plan file,
         # `_pending_plan` holds its path and the user can steer (type) or accept
@@ -613,6 +625,10 @@ class TUI:
             f" {MODE_LABEL[mode]} (shift-tab) ",
             f" ctx {pct}% ",
         ]
+        # A session editing a disposable worktree looks identical to one editing the
+        # real checkout — surface which one this is, always (that is the safety story).
+        if worktree.current():
+            bits.append(f" wt:{worktree.current()['id'][-4:]} ")
         # The warm-capture contract: while speech mode is on the mic is open
         # (feeding the pre-roll ring) even when not recording — say so, always.
         if self.speech_on:
@@ -851,7 +867,33 @@ class TUI:
         # Seed the fresh Agent (which already minted a new session_id) with the restored
         # transcript; next save() writes a NEW file, leaving the picked one untouched.
         self.agent.messages += [m for m in data["messages"] if m.get("role") != "system"]
+        # Continue the picked session's THREAD and state, not just its text: thread id
+        # (pre-v2 files fall back to the picked session's own id), ambient ledger, and
+        # the todo panel all come along.
+        meta = data.get("meta") or {}
+        self.agent.thread_id = (meta.get("thread_id") or data.get("session_id")
+                                or self.agent.thread_id)
+        from . import ambient, tools as _tools
+        if meta.get("ambient"):
+            ambient.restore(meta["ambient"])
+        _tools.set_todos(meta.get("todos") or [])
+        self._todos = _tools.current_todos()
+        # Instant resume: with a KV snapshot on disk for this thread, swap in the
+        # SAVED system prompt (so the re-render matches the snapshot byte-for-byte)
+        # and load it — _fresh_agent already reset the engine cache.
+        if (config.env_str("CHAD_SESSION_KV") != "0"
+                and hasattr(self.engine, "has_session_snapshot")
+                and self.engine.has_session_snapshot(self.agent.thread_id)):
+            sysm = next((m for m in data["messages"]
+                         if m.get("role") == "system" and m.get("content")), None)
+            if sysm:
+                self.agent.messages[0] = {"role": "system", "content": sysm["content"]}
+            n = self.engine.restore_session_snapshot(self.agent.thread_id)
+            if n:
+                self._emit("info", f"session cache restored: {n:,} tokens resume "
+                                   "without re-prefill")
         self._resume_list = []
+        self._await_goal = False  # a resumed session is already named
         self._emit("info", f"resumed (forked): {session.describe(pick)}")
 
     # -- voice mode (/speech) ---------------------------------------------
@@ -1005,10 +1047,29 @@ class TUI:
 
     # -- input handling --------------------------------------------------
 
+    def _goal_prompt(self):
+        self._emit("info", "new session — what are you working on? one line names it "
+                           "for resume & `chad sessions` (enter to skip)")
+
     def _on_accept(self, buff):
         text = buff.text.strip()
         if not text:
+            if self._await_goal:
+                # Enter on empty = explicit skip; the first message titles it instead.
+                self._await_goal = False
+                self._emit("info", "unnamed — the first message will title this session")
             return False
+        if self._await_goal:
+            self._await_goal = False
+            # Commands and shell passthrough at the goal prompt behave normally —
+            # only a plain line is treated as the answer.
+            if not text.startswith(("/", "!")):
+                self.agent.goal = " ".join(text.split())[:200]
+                wt = worktree.current()
+                self._emit("info", f"session started: {self.agent.goal}"
+                           + (f"  ·  wt:{wt['id'][-4:]}" if wt else "")
+                           + "  —  now give chad a scoped first task")
+                return False
         if text in ("/exit", "/quit"):
             self._shutdown = True
             self._wake.set()
@@ -1024,6 +1085,8 @@ class TUI:
         if text in ("/reset", "/clear"):
             if self._fresh_agent(self.agent.mode):
                 self._emit("info", "session reset.")
+                self._await_goal = True  # a reset starts a NEW session — name it
+                self._goal_prompt()
             return False
         if text == "/accept":
             self._accept_plan()
@@ -1033,6 +1096,21 @@ class TUI:
             return False
         if text == "/speech":
             self._toggle_speech()
+            return False
+        if text == "/worktree":
+            meta = worktree.current()
+            if not meta:
+                self._emit("info", "running in place (no session worktree) — launch "
+                                   "chad from a clean git checkout to get one")
+                return False
+            n, stat = worktree.diff_stat(meta)
+            self._emit("info", f"worktree {meta['branch']} (from {meta['base'][:12]})")
+            self._emit("info", f"  path:   {meta['path']}")
+            self._emit("info", f"  origin: {meta['origin_top']}")
+            for ln in (stat.splitlines() if n else ["no changes yet"]):
+                self._emit("info", "  " + ln)
+            self._emit("info", "  changes apply back to the origin on exit "
+                               "(or keep / discard)")
             return False
         if text == "/compact":
             # Manual context reclaim. Refuse mid-turn (mutating messages under the
@@ -1113,7 +1191,7 @@ class TUI:
             self._emit("info", "shift-tab: cycle mode (normal/auto-accept edits/yolo/plan) "
                                "· esc/ctrl-c: "
                                "interrupt · /init /skills /mcp /mcp trust /mcp login <server> "
-                               "/resume /reset /clear /compact /undo /restore /model /mode /speech /accept /exit · !cmd shell · @path "
+                               "/resume /reset /clear /compact /undo /restore /model /mode /speech /worktree /accept /exit · !cmd shell · @path "
                                "attach · type while busy to steer the running turn "
                                "(applies after the current step) · plan ready: type to "
                                "steer, ctrl-g to accept")
@@ -1276,6 +1354,10 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
             self._pending.append("\n" + art + "\n")
         self._emit("info", "shift-tab for modes · /help")
         self._emit_first_task_hint()
+        if self._await_goal:
+            self._goal_prompt()
+        elif self.agent.goal:
+            self._emit("info", f"resuming: {self.agent.goal}")
         if self._finalize is not None:
             self._emit("info", f"loading {self.engine.model_id.split('/')[-1]}… "
                                "(type ahead — your first message runs when it's ready)")
@@ -1292,6 +1374,13 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
 
 
 def run_tui(engine: BaseEngine, ctx_limit: int, mode: str = "normal", thinking: bool = True,
-            resume: list = None, ctx_window: int = None, finalize=None, ctx_limit_fn=None):
-    asyncio.run(TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume,
-                    ctx_window=ctx_window, finalize=finalize, ctx_limit_fn=ctx_limit_fn).run())
+            resume: list = None, ctx_window: int = None, finalize=None, ctx_limit_fn=None,
+            resume_state: dict = None, resume_system: bool = False):
+    t = TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume,
+            ctx_window=ctx_window, finalize=finalize, ctx_limit_fn=ctx_limit_fn,
+            resume_state=resume_state, resume_system=resume_system)
+    asyncio.run(t.run())
+    # The final agent goes back to the caller so the cli can snapshot its thread's
+    # KV state after the UI tears down (the save takes seconds on a big cache —
+    # better on a plain stderr line than behind a frozen UI).
+    return t.agent

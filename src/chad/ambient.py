@@ -86,6 +86,38 @@ def reset() -> None:
     _manifest_cache = None
 
 
+def snapshot() -> dict:
+    """JSON-safe copy of the ledger state, persisted in the session file so a resumed
+    session keeps its what-changed/what-ran memory instead of restarting blind — the
+    ledger targets the confident-wrong-done class, and a resume is exactly where stale
+    certainty comes from. The manifest cache and skeleton dedup set stay out: the
+    manifest is a live-environment probe (recompute), and re-showing a skeleton once
+    after a resume costs a line, not a failure."""
+    return {
+        "calls": _calls,
+        "edited": {k: sorted(v) for k, v in _edited.items()},
+        "wrote": list(_wrote),
+        "last_run": dict(_last_run) if _last_run else None,
+    }
+
+
+def restore(state: dict) -> None:
+    """Inverse of snapshot(), replacing reset() for a resumed session. Tolerates any
+    malformed/legacy state by falling back to a plain reset — a bad ledger must never
+    break a resume."""
+    global _calls, _last_run
+    reset()
+    try:
+        _calls = int(state.get("calls", 0))
+        for k, v in (state.get("edited") or {}).items():
+            _edited[str(k)] = set(v)
+        _wrote.extend(str(p) for p in (state.get("wrote") or []))
+        lr = state.get("last_run")
+        _last_run = dict(lr) if isinstance(lr, dict) else None
+    except (TypeError, ValueError, AttributeError):
+        reset()
+
+
 # ---------------------------------------------------------------------------
 # bookkeeping (always on — see module docstring)
 # ---------------------------------------------------------------------------

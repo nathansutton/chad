@@ -161,7 +161,8 @@ falls back to tree-sitter when a language server can't start.
   **↑prefilled / ↓generated** token counts (with an advancing **%** on an unavoidable full
   re-prefill, so it's never silent).
 - **slash commands** — `/init`, `/skills`, `/mcp`, `/accept`, `/resume`, `/compact`,
-  `/model`, `/mode`, `/help`, `/exit`. Same set in the `--repl` line interface.
+  `/model`, `/mode`, `/worktree`, `/help`, `/exit`. Same set in the `--repl` line
+  interface.
 - **`@file` / `@dir` mentions** and **`!command` shell passthrough** — pull a file into
   context inline, or run a shell command without invoking the model.
 - **voice mode, all local** — `/speech`, then ctrl-t to talk: Parakeet-on-MLX transcribes
@@ -184,15 +185,19 @@ falls back to tree-sitter when a language server can't start.
 | `--yolo` | auto-approve bash/write/edit (skip confirm prompts) |
 | `--no-think` | skip Ornith's `<think>` blocks — faster on well-scoped work |
 | `--model` | `35b`, `9b`, `auto`, or any HF repo id / local model dir |
+| `--worktree` | force worktree isolation on (even headless / dirty repo) |
+| `--no-worktree` | edit the current checkout directly (also `CHAD_WORKTREE=0`) |
 | `--repl` | plain line REPL instead of the TUI |
 
-Plus three subcommands, each with its own `--help`:
+Plus four subcommands, each with its own `--help`:
 
 | Command | What it does |
 |---|---|
 | `chad serve` | serve this Mac's model to a container or the LAN ([Configuration](docs/configuration.md#serving-the-local-model-to-a-container-chad-serve)) |
 | `chad prove` | 2-minute offline smoke test: 4 tiny fix-it tasks, verified, timed |
 | `chad levers` | print the harness lever registry as JSON (ablation driver) |
+| `chad worktree` | `list` / `apply <id>` / `rm <id>` — manage kept session worktrees |
+| `chad sessions` | recent sessions across **all** projects (age, status, title, worktree) |
 
 A headless task (positional, or piped with no TTY) auto-approves mutating tools; the model
 runs greedy (temp 0). Every conversation is persisted under `~/.chad/sessions/`, and every
@@ -200,6 +205,51 @@ resume forks a new branch rather than overwriting — details in
 [Configuration](docs/configuration.md#sessions). The rarely-touched tuning knobs
 (`CHAD_MAX_CONTEXT`, `CHAD_KV_BITS`, turn-budget/think-cap, safety opt-outs) all live in
 environment variables, fully documented there.
+
+**Sessions have a beginning and an end.** A fresh `chad` asks one question — *what are
+you working on?* — and the one-line answer names the session everywhere (the picker,
+`chad sessions`, resume banners; enter skips, and the first message names it instead).
+On `/exit` one question closes the loop: **wrap up** (default) runs the worktree
+apply gate and drops the session's context-cache snapshot, or **keep for later**
+saves everything — worktree, KV cache, ledger, todos — and `chad -c` re-enters the
+whole session. One-shots skip both questions so `chad -c "next step"` chains stay
+scriptable.
+
+**Sessions are stateful, and resume is instant.** A session is more than its transcript:
+resuming restores the todo plan, the what-changed/what-ran ledger, the session's worktree,
+and — when the KV snapshot saved at exit is still on disk — the model's **entire context
+cache**, so `chad -c` picks up in seconds instead of re-prefilling minutes of conversation
+into the 35B. Resume chains share one *thread* identity (every resume still forks its own
+file, so nothing is ever overwritten), each session carries a lifecycle status
+(`idle` / `needs-attention` / `applied` / `kept` / `discarded`), and `chad sessions` shows
+the last 20 across every project. Snapshots live in the same LRU-bounded cache dir as the
+warm-prefix files (`CHAD_KV_CACHE_MAX_GB`); set `CHAD_SESSION_KV=0` to disable them.
+
+## Worktrees: chad edits a copy, you approve the merge
+
+A local 35B is a blunter instrument than a frontier model, so chad's edits shouldn't
+land in your checkout as they happen. Launched interactively inside a **clean git
+repo**, chad creates a disposable [git worktree](https://git-scm.com/docs/git-worktree)
+(own branch `chad/<id>`, own checkout under `~/.chad/worktrees/`, shared object store)
+and does all of its work there — your files don't change while the session runs, and
+`--yolo` gets a blast radius one directory wide. On exit you see the diff stat and
+choose:
+
+- **apply** (default) — the session's full diff lands in your checkout as ordinary
+  *unstaged* changes: review with `git diff`, commit with your own git. The worktree
+  is then removed. chad never commits, merges, or switches branches for you.
+- **keep** — the worktree stays put, and because each session records its worktree,
+  `chad -c` from the project re-enters it, half-finished state and all. This is the
+  stateful-session pairing: conversation and checkout persist together.
+- **discard** — the worktree and branch are deleted (after a second confirmation).
+
+Sessions fall back to editing in place — with a printed reason — when the repo is
+dirty (a worktree cut from HEAD couldn't see your uncommitted work), when the
+directory isn't a git repo, or when running headless (scripts and eval harnesses
+expect edits in the cwd they prepared; opt in with `--worktree`, where a clean finish
+auto-applies and *any* failure keeps the worktree — work is never lost to cleanup).
+`chad worktree list` shows what's kept; `/worktree` in the TUI shows the live session's
+status.
 
 ## Extending chad
 

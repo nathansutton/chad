@@ -25,6 +25,7 @@ from . import (
     seatbelt,
     session,
     syntaxgate,
+    worktree,
 )
 from .base_engine import BackendError, BaseEngine
 from .diag import args_preview, log, redact, result_preview
@@ -342,8 +343,13 @@ class Agent:
                  turn_budget_tokens: int = None,
                  turn_budget_s: float = None, subagent: bool = False,
                  subagent_tools: str = "read-only", session_id: str = None,
-                 ctx_limit_fn=None):
+                 ctx_limit_fn=None, resume_state: dict = None,
+                 resume_system: bool = False):
         self.engine = engine
+        # Saved meta from the session being resumed (thread id, ambient ledger, todos)
+        # — restored below so a resume continues the session's state, not just its
+        # transcript. None for a fresh session.
+        self._resume_state = resume_state if isinstance(resume_state, dict) else {}
         # A spawned sub-agent SHARES the parent's session — the same engine,
         # the same live skills/MCP connections — so it must NOT tear those down. Only a
         # top-level Agent resets them (a fresh session clears stale activation state and
@@ -357,8 +363,16 @@ class Agent:
             skills.reset_session()
             from . import mcp
             mcp.reset_session()
-            ambient.reset()  # fresh session-state ledger; sub-agents share the
-                             # parent's and never feed it (see run_turn)
+            # Session-state ledger + todo plan: a resume restores them (the ledger
+            # exists to prevent exactly the stale-certainty a resume reintroduces);
+            # a fresh session clears both. Sub-agents share the parent's and never
+            # feed either (see run_turn).
+            if self._resume_state.get("ambient"):
+                ambient.restore(self._resume_state["ambient"])
+            else:
+                ambient.reset()
+            from . import tools as _tools
+            _tools.set_todos(self._resume_state.get("todos") or [])
         self.mode = mode or ("yolo" if yolo else "normal")
         self.thinking = thinking  # Ornith is a reasoning model; toggles <think> blocks
         # Steps per WINDOW, not a hard kill: a window that landed+verified a change
@@ -374,6 +388,16 @@ class Agent:
         # saves to a NEW file — the original session file is never rewritten. `save()`
         # writes only to this id's file.
         self.session_id = session_id or session.new_session_id()
+        # Thread identity: the continuous "one job" spine that fork-on-resume files
+        # hang off. Inherited across resumes (so the picker can group a resume chain
+        # as one thread, and the per-session KV snapshot has a stable key); a fresh
+        # session starts a new thread named after itself. Pre-v2 sessions have no
+        # thread_id in meta — the caller passes the resumed session's own id instead.
+        self.thread_id = self._resume_state.get("thread_id") or self.session_id
+        # The session's one-line goal ("what are you working on?" — the TUI asks on
+        # a fresh session; a one-shot's task string becomes it). Inherited across
+        # resumes; picker/`chad sessions` titles prefer it over the first message.
+        self.goal = self._resume_state.get("goal") or None
         # Per-step generation cap. The old 2048 default truncated legitimate work —
         # a reasoning turn that thinks, then emits a `write` of a whole test file can
         # exceed 2048 tokens, and the cut-off was being misread as a final answer
@@ -437,9 +461,18 @@ class Agent:
         # against a non-Ornith endpoint drops the Ornith accommodations automatically
         # instead of silently carrying them into a cross-model comparison.
         _mid = getattr(engine, "model_id", None)
+        # A fresh system prompt is normally rebuilt on resume (cwd/workspace may have
+        # changed). `resume_system` inverts that: when a KV snapshot of this session
+        # exists, the SAVED system prompt is reused verbatim so the re-rendered
+        # transcript is a byte-identical prefix of the snapshot — the difference
+        # between a zero-prefill resume and re-prefilling the whole conversation.
+        # The caller only sets it when a snapshot is actually on disk.
+        saved_sys = (resume[0]["content"] if resume_system and resume
+                     and resume[0].get("role") == "system"
+                     and resume[0].get("content") else None)
         self.messages = [{"role": "system",
-                          "content": build_subagent_prompt(_mid) if subagent
-                          else build_system_prompt(_mid)}]
+                          "content": saved_sys or (build_subagent_prompt(_mid) if subagent
+                                                   else build_system_prompt(_mid))}]
         if resume:
             self.messages += [m for m in resume if m.get("role") != "system"]
         self._emit = emit or _default_emit
@@ -520,10 +553,24 @@ class Agent:
             state=self._compact_state)
 
     def save(self):
-        """Persist the conversation for the current dir (no-op unless `persist`)."""
+        """Persist the conversation (no-op unless `persist`). Keyed by the ORIGIN
+        project dir, not the cwd: inside a worktree the two differ, and keying by the
+        worktree would strand the conversation under a directory that apply/discard
+        deletes. The worktree ref in meta is what lets `chad -c` re-enter it."""
         if self.persist:
-            session.save_session(os.getcwd(), self.messages,
-                                 {"mode": self.mode, "thinking": self.thinking},
+            from . import tools as _tools
+            meta = {"mode": self.mode, "thinking": self.thinking,
+                    "thread_id": self.thread_id,
+                    "goal": self.goal,
+                    # Turn-granularity status; the cli's worktree exit gate overwrites
+                    # with the terminal states (applied/kept/discarded) afterwards.
+                    "status": "needs-attention" if self.budget_note else "idle",
+                    "ambient": ambient.snapshot(),
+                    "todos": _tools.current_todos()}
+            ref = worktree.current_ref()
+            if ref:
+                meta["worktree"] = ref
+            session.save_session(worktree.session_anchor(), self.messages, meta,
                                  session_id=self.session_id)
 
     def compact_now(self):
@@ -2199,9 +2246,11 @@ class Agent:
 
 
 def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = None,
-         thinking: bool = True, ctx_limit_fn=None):
+         thinking: bool = True, ctx_limit_fn=None, resume_state: dict = None,
+         resume_system: bool = False):
     agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking,
-                  resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn)
+                  resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn,
+                  resume_state=resume_state, resume_system=resume_system)
     print(banner(engine.model_id.split("/")[-1], ctx_limit, mode=agent.mode))
     print(f"{C_DIM}type a task, or /reset, /exit.{C_RST}")
     while True:
@@ -2271,3 +2320,4 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             continue
         agent.run_turn(line)
         agent.save()
+    return agent

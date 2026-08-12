@@ -2,6 +2,58 @@
 
 Notable, user-visible changes.
 
+## [Unreleased]
+
+- **Session start/end UX:** a fresh interactive session asks *"what are you
+  working on?"* — the one-line answer becomes the session's goal (its title in
+  the picker, `chad sessions`, and resume banners; enter skips, slash commands
+  pass through, `/reset` re-asks). Exiting the TUI/REPL asks ONE closing
+  question: **wrap up** (default) runs the worktree apply gate and deletes the
+  thread's KV snapshot (a finished session has no resume to accelerate);
+  **keep for later** saves the snapshot, leaves the worktree untouched with no
+  further prompts, and stamps the session `kept`. A session with no user turns
+  exits silently. One-shots keep their prompt-free flow (task string = goal,
+  snapshot always saved for `chad -c` chaining).
+- **Stateful sessions + instant resume:** a session now persists (and a resume
+  restores) far more than its transcript —
+  - **KV snapshot on exit:** the full context cache is saved to disk (same
+    machinery as the warm-prefix checkpoints, same `CHAD_KV_CACHE_MAX_GB` LRU
+    budget) keyed by the session *thread*, and `chad -c` reloads it with the
+    **saved** system prompt so the re-rendered transcript is a byte-identical
+    prefix — resume in seconds with zero body re-prefill, on the non-trimmable
+    hybrid cache. Any divergence (or a missing/corrupt snapshot) degrades to
+    the old cold re-prefill; `CHAD_SESSION_KV=0` turns the mechanism off.
+  - **Thread identity:** resumes inherit a `thread_id` (fork-on-resume file
+    semantics unchanged), so a resume chain reads as one job and occupies one
+    snapshot slot instead of one per resume.
+  - **Session state:** the ambient what-changed/what-ran ledger and the todo
+    plan are saved in session meta and restored on resume — a resumed session
+    no longer restarts with stale certainty and an empty plan panel.
+  - **Lifecycle status** (`idle` / `needs-attention` / `applied` / `kept` /
+    `discarded`) stamped by the agent and the worktree exit gate; shown by the
+    picker and the new **`chad sessions`** subcommand, a cross-project list of
+    recent sessions.
+  - **Retention fix:** pruning now exempts sessions whose worktree still
+    exists — keeping a worktree can no longer orphan the conversation that
+    knows how to re-enter it.
+- **Worktree-per-session isolation (default ON for interactive sessions in a
+  clean git repo):** chad now edits a disposable `git worktree` (branch
+  `chad/<id>` under `~/.chad/worktrees/`) instead of your checkout. On exit,
+  an apply/keep/discard gate: **apply** lands the session's full diff as
+  ordinary unstaged changes (plain `git apply`; a `--3way` fallback only when
+  the checkout drifted — that path stages what it merges and says so),
+  **keep** preserves the worktree and `chad -c` re-enters it (sessions record
+  their worktree and stay keyed to the origin project dir), **discard**
+  deletes it after a second confirmation. A failed apply always keeps the
+  worktree; an exit that never reaches the gate (crash, ^C) prints where the
+  worktree is. Dirty repos, non-repos, and headless runs keep the old
+  edit-in-place behavior (headless opts in with `--worktree` and
+  auto-applies); `--no-worktree` / `CHAD_WORKTREE=0` force it off,
+  `CHAD_WORKTREE=1` forces it on. New: `chad worktree list|apply|rm`
+  subcommand, `/worktree` TUI command, and a `wt:<id>` status-bar chip so a
+  worktree session is always distinguishable from one editing the real
+  checkout.
+
 ## [1.12.0] — 2026-08-07
 
 - **Sandbox hardening — the confinement must prove itself before it may be

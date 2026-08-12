@@ -253,6 +253,7 @@ def _worker_tui():
     fake = _FakeAgent(tui.agent._should_stop)  # capture the real wiring before swapping
     tui.agent = fake
     tui.app.invalidate = lambda: None
+    tui._await_goal = False  # these tests model a session already past the goal prompt
     return tui, fake
 
 
