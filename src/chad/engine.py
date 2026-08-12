@@ -337,6 +337,10 @@ class Engine:
     # instead of the full-transcript re-prefill divergence used to cost.
     _rewind_snap: Optional[dict] = field(init=False, default=None)
 
+    # Why the last save_session_snapshot() returned 0, or None on success/never-run.
+    # Read by the session-exit gate, which must not promise a warm resume it didn't get.
+    snapshot_error: Optional[str] = field(init=False, default=None)
+
     def _read_config(self, repo):
         import json
         import os
@@ -683,18 +687,45 @@ class Engine:
     def save_session_snapshot(self, key: str) -> int:
         """Persist the live cache + resident ids under thread `key`. Returns the
         token count persisted, 0 on skip/failure (best-effort — a session exit must
-        never fail on a full disk)."""
-        if not (self.cache_dir and key and self._cached_ids and self._cache):
+        never fail on a full disk).
+
+        A 0 is never silent: the reason lands in `snapshot_error` for the caller to
+        say out loud, because the failure mode this replaces was a session that
+        announced "context cache intact" and then cold-prefilled the next resume.
+        One retry after `mx.clear_cache()`: a multi-hundred-MB write beside resident
+        weights is the shape that trips the Metal budget, and the scratch it frees is
+        often the whole difference."""
+        self.snapshot_error = None
+        if not (self.cache_dir and key):
+            self.snapshot_error = "no KV cache directory"
             return 0
-        try:
-            path = self._sess_ckpt_path(key)
-            os.makedirs(self.cache_dir, exist_ok=True)
-            cache_utils.save_prompt_cache(
-                path, self._cache, {"ids": json.dumps(self._cached_ids)})
-            self._enforce_kv_budget(path)
-            return len(self._cached_ids)
-        except Exception:
+        if not (self._cached_ids and self._cache):
+            self.snapshot_error = "nothing resident to save (cold cache)"
             return 0
+        path = self._sess_ckpt_path(key)
+        for attempt in (1, 2):
+            try:
+                os.makedirs(self.cache_dir, exist_ok=True)
+                cache_utils.save_prompt_cache(
+                    path, self._cache, {"ids": json.dumps(self._cached_ids)})
+                self._enforce_kv_budget(path)
+                return len(self._cached_ids)
+            except Exception as e:  # noqa: BLE001 — a session exit must not raise
+                log.warning("SESS snapshot save failed (attempt %d/2): %s", attempt, e)
+                # A half-written file would pass has_session_snapshot() and then fail
+                # the restore, turning one bad exit into every later resume being slow.
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                if attempt == 1:
+                    try:
+                        mx.clear_cache()
+                    except Exception:  # noqa: BLE001 — probe only, never fatal
+                        pass
+                    continue
+                self.snapshot_error = str(e) or e.__class__.__name__
+        return 0
 
     def delete_session_snapshot(self, key: str) -> bool:
         """Drop thread `key`'s snapshot — the wrap-up path: a finished session has no

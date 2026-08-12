@@ -226,6 +226,37 @@ def test_tui_goal_skip_and_commands():
     assert not t3._await_goal     # resumed sessions never ask
 
 
+def _text(fragments):
+    return "".join(f[1] for f in fragments)
+
+
+def test_tui_goal_state_is_visible_and_uncontradicted():
+    """The goal prompt is one scrollback line; what makes the state legible is the
+    input gutter and the pinned status line agreeing with it."""
+    from types import SimpleNamespace
+    from chad.tui import TUI
+    t = TUI(ScriptedEngine(["never called"]), ctx_limit=24000)
+    t._model_ready.clear()        # model still loading, as on a real cold start
+    assert "name your goal »" in _text(t._input_prompt())
+    # ...and the loading line must not promise the next line RUNS while it names.
+    assert "type ahead" not in _text(t._status_fragments())
+    t._on_accept(SimpleNamespace(text="auth refactor"))
+    assert _text(t._input_prompt()).strip() == "»"
+    assert "type ahead" in _text(t._status_fragments())
+
+
+def test_tui_scoped_ask_tip_waits_for_the_name():
+    """The tip's example is a task. Above the goal prompt it invites the one line the
+    prompt would swallow as a name, so it lands after the name instead."""
+    from types import SimpleNamespace
+    from chad.tui import TUI
+    for answer in ("auth refactor", "", "/help"):
+        t = TUI(ScriptedEngine(["never called"]), ctx_limit=24000)
+        assert not any("scoped asks" in f for f in t._pending)
+        t._on_accept(SimpleNamespace(text=answer))
+        assert any("scoped asks" in f for f in t._pending), answer
+
+
 # -- engine snapshot plumbing (pre-load path logic only) ----------------------
 
 def test_engine_session_snapshot_paths(tmp_path):
@@ -242,6 +273,47 @@ def test_engine_session_snapshot_paths(tmp_path):
     assert eng.restore_session_snapshot("thread-1") == 0   # no file -> clean miss
     no_dir = Engine(model_id="test/model")
     assert not no_dir.has_session_snapshot("thread-1")     # cache_dir None -> off
+
+
+def test_engine_snapshot_failure_is_reported(tmp_path, monkeypatch):
+    """A 0 from save_session_snapshot must say why: the bug this replaces was an exit
+    that announced "context cache intact" and then cold-prefilled the next resume."""
+    from chad import engine as eng_mod
+    from chad.engine import Engine
+    eng = Engine(model_id="test/model", cache_dir=str(tmp_path))
+    assert eng.save_session_snapshot("t") == 0
+    assert "cold cache" in eng.snapshot_error          # nothing resident
+    assert Engine(model_id="test/model").save_session_snapshot("t") == 0
+    eng._cached_ids, eng._cache = [1, 2, 3], ["layer"]
+    calls = []
+
+    class _Boom:
+        @staticmethod
+        def save_prompt_cache(path, cache, meta):
+            calls.append(path)
+            with open(path, "wb") as f:
+                f.write(b"half-written")   # the corrupt-file case
+            raise RuntimeError("metal OOM")
+
+    monkeypatch.setattr(eng_mod, "cache_utils", _Boom)
+    assert eng.save_session_snapshot("t") == 0
+    assert "metal OOM" in eng.snapshot_error
+    assert len(calls) == 2                              # one retry after clear_cache
+    # A half-written file would pass has_session_snapshot() and fail every later
+    # restore, so a failed save must leave nothing behind.
+    assert not eng.has_session_snapshot("t")
+
+
+def test_resume_matches_sessions_by_goal():
+    from chad.cli import _match_sessions
+    items = [{"title": "auth refactor"}, {"title": "auth"}, {"title": "flaky retry test"}]
+    assert _match_sessions(items, "flaky")[0]["title"] == "flaky retry test"
+    assert _match_sessions(items, "  AUTH Refactor ")[0]["title"] == "auth refactor"
+    assert _match_sessions(items, "auth")[0]["title"] == "auth"   # exact beats substring
+    assert len(_match_sessions(items, "ret")) == 2                # ambiguous -> both back
+    assert _match_sessions(items, "nope") == []
+    assert _match_sessions(items, "  ") == []
+    assert _match_sessions([{"title": None}], "x") == []          # untitled never matches
 
 
 def test_engine_delete_session_snapshot(tmp_path):

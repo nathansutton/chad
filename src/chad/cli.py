@@ -18,6 +18,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -427,6 +428,22 @@ def _maybe_home_dir_note():
             "(cd into one and rerun).\n")
 
 
+def _match_sessions(items, query):
+    """Sessions from `items` whose title (the session's goal, when it has one) matches
+    `query` — the handle behind `chad --resume "auth refactor"`.
+
+    An exact title match wins outright: a session named "auth" is not ambiguous just
+    because "auth refactor" exists too. Otherwise every substring hit comes back, so
+    the caller can show them and let the user narrow rather than guess which was meant.
+    Whitespace and case are normalized — the goal was typed once, by hand, weeks ago."""
+    q = " ".join(query.split()).lower()
+    if not q:
+        return []
+    exact = [it for it in items
+             if " ".join((it.get("title") or "").split()).lower() == q]
+    return exact or [it for it in items if q in (it.get("title") or "").lower()]
+
+
 def _pick_session(items):
     """Prompt the user to pick one of `items` (from session.list_sessions) by number.
     Returns the chosen item, or None to start fresh. Requires a TTY — the caller
@@ -487,9 +504,11 @@ def _agent_parser():
                     help="one-shot task to run headless and exit; omit for the interactive TUI")
     ap.add_argument("-c", "--continue", dest="cont", action="store_true",
                     help="resume the most recent saved conversation for this directory")
-    ap.add_argument("--resume", action="store_true",
-                    help="list this directory's recent sessions and pick one by number "
-                         "(resuming forks: the picked session is never overwritten)")
+    ap.add_argument("--resume", nargs="?", const="", metavar="GOAL",
+                    help="resume a saved session for this directory: bare lists them and "
+                         "picks by number, or pass part of a session's goal to resume it "
+                         "by name (no TTY needed). Resuming forks: the picked session is "
+                         "never overwritten")
     ap.add_argument("--plan", action="store_true",
                     help="start in read-only plan mode (investigate and propose, no edits)")
     ap.add_argument("--yolo", action="store_true",
@@ -621,6 +640,10 @@ def _run_sessions(args):
     for it in items:
         proj = os.path.basename((it.get("cwd") or "").rstrip("/")) or "?"
         print(f"{proj:<{width}}  {session.describe(it)}")
+    # The listing shows goals; say how to turn one back into a session, or the quoted
+    # names read as decoration and `-c` stays the only resume anyone remembers.
+    sys.stderr.write('\nresume from a project directory: `chad -c` (most recent) or '
+                     '`chad --resume "<goal>"`\n')
     return 0
 
 
@@ -999,24 +1022,42 @@ def _main(argv=None):
     resume = None
     resume_meta = {}   # the resumed session's saved meta (thread, ambient, todos, wt)
     resume_thread = None
-    if args.resume:
+    if args.resume is not None:
         from . import session
-        items = session.list_sessions(anchor, limit=10)
+        # By name: search every session for this directory, not just the last 10 — the
+        # goal you remember may be older than the ten most recent windows.
+        items = session.list_sessions(anchor, limit=None if args.resume else 10)
+        pick = None
         if not items:
             sys.stderr.write("no saved sessions for this directory; starting fresh\n")
+        elif args.resume:
+            hits = _match_sessions(items, args.resume)
+            if not hits:
+                sys.stderr.write(f"no session here matches {args.resume!r} — "
+                                 "`chad sessions` lists them by goal\n")
+                sys.exit(1)
+            if len(hits) > 1:
+                sys.stderr.write(f"{args.resume!r} matches {len(hits)} sessions:\n")
+                for it in hits[:10]:
+                    sys.stderr.write("  " + session.describe(it) + "\n")
+                sys.stderr.write("give more of the goal, or `chad --resume` to pick from "
+                                 "the list\n")
+                sys.exit(1)
+            pick = hits[0]
         elif not sys.stdin.isatty():
             sys.stderr.write("chad --resume needs an interactive terminal to pick a "
-                             "session; use -c to resume the most recent one.\n")
+                             "session; pass part of the goal (`chad --resume \"auth "
+                             "refactor\"`) or -c for the most recent one.\n")
             sys.exit(1)
         else:
             pick = _pick_session(items)
-            if pick:
-                data = session.load_session(anchor, pick["session_id"])
-                if data:
-                    resume = data["messages"]
-                    resume_meta = data.get("meta") or {}
-                    resume_thread = resume_meta.get("thread_id") or data.get("session_id")
-                    sys.stderr.write(f"resuming (forked): {session.describe(pick)}\n")
+        if pick:
+            data = session.load_session(anchor, pick["session_id"])
+            if data:
+                resume = data["messages"]
+                resume_meta = data.get("meta") or {}
+                resume_thread = resume_meta.get("thread_id") or data.get("session_id")
+                sys.stderr.write(f"resuming (forked): {session.describe(pick)}\n")
     elif args.cont:
         from . import session
         data = session.load_session(anchor)
@@ -1025,6 +1066,15 @@ def _main(argv=None):
             resume_meta = data.get("meta") or {}
             resume_thread = resume_meta.get("thread_id") or data.get("session_id")
             sys.stderr.write(f"resuming session ({session.session_summary(anchor)})\n")
+            # `chad -c <goal>` reads as "resume that session" but means "resume the
+            # newest one AND run <goal> as a prompt" — the chaining form scripts rely
+            # on. Say so when the task happens to name a real session, which is the
+            # only case where the two readings differ.
+            if task and _match_sessions(session.list_sessions(anchor), task):
+                sys.stderr.write(
+                    f"note: running {task!r} as this session's next task. To re-enter "
+                    f"the session named {task!r} instead: "
+                    f"`chad --resume {shlex.quote(task)}`\n")
         else:
             sys.stderr.write("no saved session for this directory; starting fresh\n")
     # Pre-v2 sessions carry no thread_id; the resumed session's own id becomes the
@@ -1061,12 +1111,20 @@ def _main(argv=None):
     def _save_snapshot(a):
         """Persist the final agent's thread KV at session end — seconds on a big
         cache, and the difference between a zero-prefill and a minutes-long next
-        `chad -c`."""
-        if a is not None and kv_on and hasattr(eng, "save_session_snapshot"):
-            n = eng.save_session_snapshot(a.thread_id)
-            if n:
-                sys.stderr.write(f"session cache saved: {n:,} tokens (instant resume "
-                                 "with `chad -c`)\n")
+        `chad -c`. Returns the tokens saved (0 = the next resume re-prefills), so
+        the caller can tell the truth about what it kept."""
+        if a is None or not kv_on or not hasattr(eng, "save_session_snapshot"):
+            return 0
+        n = eng.save_session_snapshot(a.thread_id)
+        if n:
+            sys.stderr.write(f"session cache saved: {n:,} tokens (instant resume "
+                             "with `chad -c`)\n")
+        else:
+            why = getattr(eng, "snapshot_error", None)
+            sys.stderr.write("session cache NOT saved"
+                             + (f" ({why})" if why else "")
+                             + " — the next resume re-prefills this transcript\n")
+        return n
 
     def _finish_session(last):
         """Interactive (TUI/REPL) session end: ONE question decides everything.
@@ -1091,17 +1149,22 @@ def _main(argv=None):
             ans = "n"
         if ans in ("n", "no", "k", "keep"):
             _WT_HANDLED = True
-            _save_snapshot(last)
+            saved = _save_snapshot(last)
             anchor = worktree.session_anchor()
             items = _session.list_sessions(anchor, limit=1)
             if items:
                 _session.set_status(anchor, items[0]["session_id"], "kept")
             wt = worktree.current()
-            sys.stderr.write("session kept — `chad -c`"
-                             + (f" from {anchor}" if wt else "")
-                             + " re-enters it"
-                             + (" (worktree + context cache intact)" if wt
-                                else " (context cache intact)") + "\n")
+            # Name only what actually survived. The cache is the one part that can fail
+            # on its own (a big write beside resident weights), and a false "intact"
+            # turns a slow resume into a mystery instead of an expectation.
+            kept = (["worktree"] if wt else []) + (["context cache"] if saved else [])
+            how = f"`chad -c` from {anchor}" if wt else "`chad -c`"
+            if last.goal:  # the goal is the handle: name it, resume it by name
+                how += f" (or `chad --resume {shlex.quote(last.goal)}`)"
+            sys.stderr.write(f"session kept — {how} re-enters it"
+                             + (f" ({' + '.join(kept)} intact)" if kept else "")
+                             + "\n")
             return
         had_wt = worktree.current() is not None
         _worktree_finish(True)

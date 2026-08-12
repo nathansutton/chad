@@ -180,7 +180,7 @@ falls back to tree-sitter when a language server can't start.
 | Flag | What it does |
 |---|---|
 | `-c, --continue` | resume this directory's **most recent** session (non-destructive) |
-| `--resume` | list recent sessions, pick one by number (interactive TTY only) |
+| `--resume [GOAL]` | resume by goal — `chad --resume "auth refactor"` (no TTY needed); bare `--resume` lists recent sessions and picks by number |
 | `--plan` | start in read-only plan mode (investigate + propose, edits blocked) |
 | `--yolo` | auto-approve bash/write/edit (skip confirm prompts) |
 | `--no-think` | skip Ornith's `<think>` blocks — faster on well-scoped work |
@@ -214,6 +214,13 @@ apply gate and drops the session's context-cache snapshot, or **keep for later**
 saves everything — worktree, KV cache, ledger, todos — and `chad -c` re-enters the
 whole session. One-shots skip both questions so `chad -c "next step"` chains stay
 scriptable.
+
+**The goal is the handle.** Once a session is named, `chad --resume "auth refactor"`
+re-enters it by name from anywhere in the project — no picker, no TTY, no session ids.
+The exit message prints the exact command. It also names only what it actually kept: if
+the context cache could not be saved, it says so and says the next resume re-prefills,
+rather than promising a warm start it can't deliver. (Note that `chad -c "auth refactor"`
+is the *chaining* form — it resumes the newest session and runs that string as a task.)
 
 **Sessions are stateful, and resume is instant.** A session is more than its transcript:
 resuming restores the todo plan, the what-changed/what-ran ledger, the session's worktree,

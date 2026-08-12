@@ -76,6 +76,10 @@ _STYLE = Style.from_dict({
     "todo.pending": "#8a8a8a",
     "todo.summary": "#8a8a8a",
     "rec": "#ff8787 bold",
+    # The input prompt while the session is being named — a different word and a
+    # different color, because the same `»` for "name it" and "task it" is what makes
+    # the naming state invisible.
+    "goal": "#8fce8f bold",
 })
 
 MODE_STYLE = {"normal": "status.normal", "auto": "status.auto", "yolo": "status.yolo",
@@ -402,7 +406,7 @@ class TUI:
         # (or ctrl-j) inserts a newline; pasted text keeps its newlines.
         self.input = TextArea(
             height=Dimension(min=1, max=8), multiline=True, wrap_lines=True,
-            prompt="» ", style="class:user", history=_make_history(),
+            prompt=self._input_prompt, style="class:user", history=_make_history(),
             accept_handler=self._on_accept,
             completer=_ChadCompleter(), complete_while_typing=True,
         )
@@ -567,6 +571,15 @@ class TUI:
                       ("class:confirm.danger", " ⚠ looks destructive — review carefully")]
         return frags
 
+    def _input_prompt(self):
+        """The `»` gutter, re-evaluated every render. While the session is being named
+        it reads `name »`: the goal prompt is one scrollback line among the startup
+        lines, so without a live indicator on the input itself there is nothing on
+        screen saying that the next Enter titles the session instead of running it."""
+        if self._await_goal:
+            return [("class:goal", "name your goal » ")]
+        return [("class:user", "» ")]
+
     def _status_fragments(self):
         if self._confirm_req:
             name, _ = self._confirm_req
@@ -587,7 +600,14 @@ class TUI:
             # so the pinned line reads as "working", not hung, while you type ahead.
             frame = _SPINNER[(self._tick // 2) % len(_SPINNER)]
             label = self.engine.model_id.split("/")[-1]
-            hint = "type ahead — runs when ready" if not qn else f"queued:{qn} — runs when ready"
+            # "type ahead" promises the next line RUNS — false while the goal prompt is
+            # up, where the next line names the session instead.
+            if self._await_goal:
+                hint = "name your goal first"
+            elif qn:
+                hint = f"queued:{qn} — runs when ready"
+            else:
+                hint = "type ahead — runs when ready"
             left = [("class:spinner", f" {frame} loading {label}…  "),
                     ("class:idle", f"{hint} ")]
             return left
@@ -1058,17 +1078,22 @@ class TUI:
                 # Enter on empty = explicit skip; the first message titles it instead.
                 self._await_goal = False
                 self._emit("info", "unnamed — the first message will title this session")
+                self._emit_first_task_hint()
             return False
         if self._await_goal:
             self._await_goal = False
             # Commands and shell passthrough at the goal prompt behave normally —
             # only a plain line is treated as the answer.
-            if not text.startswith(("/", "!")):
+            named = not text.startswith(("/", "!"))
+            if named:
                 self.agent.goal = " ".join(text.split())[:200]
                 wt = worktree.current()
                 self._emit("info", f"session started: {self.agent.goal}"
                            + (f"  ·  wt:{wt['id'][-4:]}" if wt else "")
                            + "  —  now give chad a scoped first task")
+            # Deferred from run(): the example task now reads as the next thing to type.
+            self._emit_first_task_hint()
+            if named:
                 return False
         if text in ("/exit", "/quit"):
             self._shutdown = True
@@ -1353,15 +1378,24 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
         with self._lock:
             self._pending.append("\n" + art + "\n")
         self._emit("info", "shift-tab for modes · /help")
-        self._emit_first_task_hint()
-        if self._await_goal:
-            self._goal_prompt()
-        elif self.agent.goal:
+        # The scoped-ask tip is an example TASK; shown above the goal prompt it invites
+        # exactly the line the goal prompt would swallow as a name. On a session being
+        # named it waits and lands once the name is in (see _on_accept).
+        if not self._await_goal:
+            self._emit_first_task_hint()
+        if not self._await_goal and self.agent.goal:
             self._emit("info", f"resuming: {self.agent.goal}")
         if self._finalize is not None:
-            self._emit("info", f"loading {self.engine.model_id.split('/')[-1]}… "
-                               "(type ahead — your first message runs when it's ready)")
+            # Same contradiction as the status line: while naming, the first line does
+            # not run, so don't promise it will.
+            tail = ("(name your goal below — the model loads while you type)" if self._await_goal
+                    else "(type ahead — your first message runs when it's ready)")
+            self._emit("info", f"loading {self.engine.model_id.split('/')[-1]}… {tail}")
             threading.Thread(target=self._load_model, daemon=True).start()
+        # Last, so the question sits directly above the input it is asking you to fill
+        # rather than four lines up in the startup chrome.
+        if self._await_goal:
+            self._goal_prompt()
         try:
             # raw=True passes our ANSI through untouched; patch_stdout keeps the
             # input/status region pinned below while output scrolls above it.

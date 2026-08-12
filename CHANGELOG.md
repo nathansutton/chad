@@ -4,6 +4,26 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+- **Resume by goal:** `chad --resume "auth refactor"` re-enters a session by name
+  from anywhere in the project — exact goal match wins, an ambiguous fragment
+  lists the candidates, and no TTY is required (bare `--resume` still opens the
+  numbered picker). The exit message prints the command, `chad sessions` points
+  at it, and `chad -c <goal>` now says out loud that it is running the string as
+  a task rather than resuming a session by that name.
+- **The kept-session message no longer overstates what it kept.** A failed KV
+  snapshot save used to return 0 silently while the session still announced
+  "context cache intact", so the next `chad -c` re-prefilled the whole
+  transcript with no explanation. The save now reports its reason
+  (`snapshot_error`), retries once after `mx.clear_cache()` — a
+  hundreds-of-MB write beside resident weights is the shape that trips the
+  Metal budget — removes any half-written file (which would otherwise pass the
+  snapshot-exists check and fail every later restore), and the exit line names
+  only what actually survived.
+- **Session naming is visible while it's happening:** the input gutter reads
+  `name your goal »` until the session is named, and the loading/status lines
+  stop promising that the first line runs while it is being used as the name.
+  The scoped-ask tip now lands after naming instead of inviting a task the
+  prompt would swallow.
 - **Session start/end UX:** a fresh interactive session asks *"what are you
   working on?"* — the one-line answer becomes the session's goal (its title in
   the picker, `chad sessions`, and resume banners; enter skips, slash commands
