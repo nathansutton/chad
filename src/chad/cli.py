@@ -42,10 +42,16 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
 # equivalence.
 _HF_35B = "nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX"   # default: 35B MoE, ~13.4 GB resident
 _HF_9B = "nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX"     # low-RAM fallback, ~5 GB resident
+# Qwen3.8-27B (dense qwen3_5 hybrid, text-only 4-bit conversion). Opt-in via
+# `--model 27b` while the wall-clock A/B against the 35B is pending; it is NOT
+# in the RAM-aware default pick. ~16 GB resident is tighter than the 35B on a
+# 24 GB box — the live safe_ctx wall is what makes it survivable there.
+_HF_27B = "mlx-community/Qwen3.8-27B-4bit"
 # A dev clone that already built the weights locally should use them rather than
 # re-download — prefer these dirs when present.
 _LOCAL_35B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-35B-dyn2-q2_down3")
 _LOCAL_9B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-9B-4bit-awq")
+_LOCAL_27B = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-4bit")
 # The 35B (2-bit experts, 3-bit expert down-projections, 6-bit backbone) is ~13.4 GB
 # resident + KV + runtime, and the KV grows across a long agentic turn. That used to
 # SIGKILL mid-turn on a 24 GB Mac, where the Metal wired limit (~2/3 RAM ≈ 16 GB) minus
@@ -57,7 +63,8 @@ _LOCAL_9B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-9B-4bit-awq")
 # below still fall back to the 9B.
 _BIG_RAM_GB = 23.5
 # `--model` shorthands. Anything else is passed through as an HF repo id or local dir.
-_MODEL_ALIASES = {"35b": (_LOCAL_35B, _HF_35B), "9b": (_LOCAL_9B, _HF_9B)}
+_MODEL_ALIASES = {"35b": (_LOCAL_35B, _HF_35B), "9b": (_LOCAL_9B, _HF_9B),
+                  "27b": (_LOCAL_27B, _HF_27B)}
 
 
 # These are the STRICT siblings of config.env_int/env_float: a non-numeric value raises
@@ -301,6 +308,8 @@ def _pick_model(spec=None):
 def _model_download_gb(model_id):
     """Approximate download size in GiB for the shipped models (for the disk preflight
     and the confirm prompt — display honesty, not accounting)."""
+    if "27B" in model_id:
+        return 17.0
     return 12.0 if "35B" in model_id else 5.0
 
 

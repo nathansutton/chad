@@ -49,8 +49,12 @@ class Profile:
 
 ORNITH = Profile(name="ornith", prompt_block=_ORNITH_BLOCK)
 GENERIC = Profile(name="generic")
+# Empty on purpose: a named hook so Qwen3.8 accommodations (if any get earned the
+# way the Ornith block was — by watching a real pathology) land here instead of
+# leaking into core. Behaves exactly like GENERIC until then.
+QWEN38 = Profile(name="qwen38")
 
-PROFILES: dict[str, Profile] = {p.name: p for p in (ORNITH, GENERIC)}
+PROFILES: dict[str, Profile] = {p.name: p for p in (ORNITH, GENERIC, QWEN38)}
 
 
 def resolve(model_id: str | None = None) -> Profile:
@@ -64,6 +68,8 @@ def resolve(model_id: str | None = None) -> Profile:
         return PROFILES[forced]
     if model_id and "ornith" in model_id.lower():
         return ORNITH
+    if model_id and "qwen3.8" in model_id.lower():
+        return QWEN38
     if model_id:
         return GENERIC
     return ORNITH

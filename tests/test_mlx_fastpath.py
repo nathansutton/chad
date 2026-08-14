@@ -128,3 +128,49 @@ def test_wrong_architecture_is_noop():
     assert mlx_fastpath.install(NotAModel()) is False
 
 
+# --- dense hybrid (Qwen3.8-27B class: GDN + attention + plain swiglu MLP) ---
+
+TINY_DENSE_CFG = {
+    "model_type": "qwen3_5",
+    "text_config": {
+        **TINY_CFG["text_config"],
+        "model_type": "qwen3_5",
+        "num_experts": 0,
+        "intermediate_size": 64,
+    },
+}
+
+
+def build_tiny_dense():
+    mx.random.seed(0)
+    model = Model(ModelArgs.from_dict(TINY_DENSE_CFG))
+    nn.quantize(model, group_size=64, bits=4)
+    model.eval()
+    return model
+
+
+def test_fastpath_dense_greedy_equivalence():
+    model = build_tiny_dense()
+    ref_ids, ref_pre, ref_steps = greedy(model, PROMPT)
+
+    assert mlx_fastpath.install(model) is True
+    got_ids, got_pre, got_steps = greedy(model, PROMPT)
+
+    pre_err = float(mx.abs(ref_pre - got_pre).max())
+    assert pre_err < 5e-2, f"prefill logits drifted {pre_err}"
+    assert got_ids == ref_ids
+    worst = max(float(mx.abs(a - b).max()) for a, b in zip(ref_steps, got_steps))
+    assert worst < 5e-2, f"decode logits drifted {worst}"
+
+
+def test_dense_foreign_instance_falls_back_to_stock():
+    patched = build_tiny_dense()
+    virgin = build_tiny_dense()  # same seed -> same weights
+    ref_ids, ref_pre, _ = greedy(virgin, PROMPT)
+
+    assert mlx_fastpath.install(patched) is True
+    got_ids, got_pre, _ = greedy(virgin, PROMPT)  # virgin NOT installed
+    assert got_ids == ref_ids
+    assert float(mx.abs(ref_pre - got_pre).max()) == 0.0
+
+
