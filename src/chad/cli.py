@@ -46,7 +46,14 @@ _HF_9B = "nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX"     # low-RAM fallback, ~5 
 # `--model 27b` while the wall-clock A/B against the 35B is pending; it is NOT
 # in the RAM-aware default pick. ~16 GB resident is tighter than the 35B on a
 # 24 GB box — the live safe_ctx wall is what makes it survivable there.
-_HF_27B = "mlx-community/Qwen3.8-27B-4bit"
+# Our own conversion rather than mlx-community's: same language weights
+# bit-for-bit, minus the 0.86 GB BF16 vision tower that mlx-lm's qwen3_5
+# discards at load anyway, plus the quantized MTP head as `mtp.safetensors`
+# so mlx_mtp finds it with no build step (candidate 2 in _sidecar_candidates).
+# Net 14.3 GB vs 15.0 GB — smaller AND self-speculating. Measured on an M4 Pro
+# at temp 1.0: 1.38x decode on quote-heavy spans, 1.11x on novel code, 1.0x on
+# free prose; greedy output is token-identical to the non-MTP path.
+_HF_27B = "nathansutton/Qwen3.8-27B-4bit-MTP-MLX"
 # A dev clone that already built the weights locally should use them rather than
 # re-download — prefer these dirs when present.
 _LOCAL_35B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-35B-dyn2-q2_down3")
