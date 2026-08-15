@@ -152,10 +152,11 @@ def build_sidecar(shard_path: str, model_dir: str, out_path: Optional[str] = Non
                   bits: Optional[int] = None, group_size: Optional[int] = None) -> str:
     """Extract `mtp.*` tensors from an original-checkpoint shard, quantize them
     to match the base conversion, and save the sidecar. Returns the output path."""
+    import json
+
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.utils import tree_flatten
-    import json
 
     with open(os.path.join(model_dir, "config.json")) as f:
         cfg = json.load(f)
