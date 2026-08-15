@@ -302,8 +302,12 @@ class Engine:
     # multi-token-prediction head (loaded as a sidecar — mlx_mtp.py), verify in
     # one batched forward, exact rejection sampling at any temp. Engages only
     # when a head loaded (Qwen3.8-class models); CHAD_NO_MTP disables, and
-    # CHAD_MTP_DRAFT overrides the draft width.
-    mtp_num_draft: int = 3
+    # CHAD_MTP_DRAFT overrides the draft width. Default 2: the 27B sweep
+    # (M4 Pro, temp 1.0, coding prompt) measured 19.4 tok/s at k=2 vs 17.3 at
+    # k=3 and 12.3 at k=5 — mlx 0.32's S>1 forward costs ~1.5x plain at S=3
+    # and ~2x at S=4, so deeper drafts lose to verify cost even at good
+    # acceptance. Revisit when the small-batch kernel story changes.
+    mtp_num_draft: int = 2
     # Draft PROPOSAL mode at temp>0. True (default) samples the proposal from
     # the head's distribution (classic Leviathan/Chen): at the recommended
     # temp 1.0 the target is broad and proposal≈target overlap acceptance wins
@@ -432,6 +436,14 @@ class Engine:
         # only; inert unless a QuantizedKVCache is actually in play.
         from . import mlx_qsdpa
         qsdpa_ok = mlx_qsdpa.install()
+        # Fused small-batch quantized matmul (opt-in): bit-exact vs the stock
+        # op but measured only ~par at S 2-4 and behind at S 6-8 on mlx 0.32
+        # (stock qmm_t already part-amortizes; the v1 lane structure is
+        # register-bound at high S). Kept as the scaffold the sparse-decode
+        # kernel builds on; flip on with CHAD_QMMS=1 to experiment.
+        if config.flag("CHAD_QMMS"):
+            from . import mlx_qmm_s
+            mlx_qmm_s.install()
         # MTP head sidecar (Qwen3.8-class): pure speed feature, None on any miss.
         if not config.flag("CHAD_NO_MTP"):
             from . import mlx_mtp
@@ -1586,7 +1598,7 @@ class Engine:
             # below rolls back by reference instead of re-feeding — the
             # re-feed tax is what made speculation a wash on recurrent caches.
             rec_snap = self._snap_recurrent() if hybrid else None
-            coll = {"conv": [], "rec": []} if (hybrid and k) else None
+            coll = {"conv": [], "args": []} if (hybrid and k) else None
             y = mx.array([y_val] + draft, dtype=mx.uint32)
             try:
                 mlx_fastpath.GDN_COLLECTOR = coll
@@ -1664,17 +1676,29 @@ class Engine:
                     arr = [c for c in mc
                            if isinstance(c, cache_utils.ArraysCache)]
                     if coll is not None and len(coll["conv"]) == len(arr):
-                        # Checkpoint restore: land every GDN layer at exactly
-                        # `n_keep` fed tokens. The conv window after n tokens
-                        # of a chunk is conv_input[:, n : n+nk]; the recurrent
-                        # state is the n-th stepped checkpoint. Attention KV
-                        # trims natively. No re-feed forward.
+                        # Lazy replay: land every GDN layer at exactly
+                        # `n_keep` fed tokens by re-running the recurrence
+                        # over the accepted prefix from the captured
+                        # pre-round state — the recurrence is causal, so the
+                        # state after n_keep tokens is independent of the
+                        # rejected tail. One tiny lazy kernel per GDN layer,
+                        # paid only on rejection. The conv window after n
+                        # tokens of a chunk is conv_input[:, n : n+nk];
+                        # attention KV trims natively. No re-feed forward.
+                        from mlx_lm.models.qwen3_5 import gated_delta_update
                         n_keep = n_acc + 1
-                        for c, ci, recs in zip(arr, coll["conv"], coll["rec"]):
+                        for c, ci, (q_, k_, v_, a_, b_, A_log, dt_bias,
+                                    st0, use_k) in zip(
+                                arr, coll["conv"], coll["args"]):
                             nk = ci.shape[1] - (k + 1)
                             c.cache[0] = mx.contiguous(
                                 ci[:, n_keep : n_keep + nk])
-                            c.cache[1] = recs[n_keep - 1]
+                            _, st = gated_delta_update(
+                                q_[:, :n_keep], k_[:, :n_keep],
+                                v_[:, :n_keep], a_[:, :n_keep],
+                                b_[:, :n_keep], A_log, dt_bias, st0, None,
+                                use_kernel=use_k)
+                            c.cache[1] = st
                         self._trim_kv(k - n_acc)
                     else:
                         # Fallback (no fastpath GDN, so no checkpoints):

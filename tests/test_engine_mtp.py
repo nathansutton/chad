@@ -131,6 +131,34 @@ def test_random_head_greedy_is_bit_exact():
     assert len(eng._cached_ids) == len(PROMPT) + len(got) - 1
 
 
+def test_random_head_greedy_bit_exact_through_capture_replay():
+    """Same bit-exactness contract, but through the fastpath's
+    capture-and-replay arm: with install() applied the verify forward records
+    the GDN recurrence inputs and every rejection rebuilds the linear caches
+    by replaying them over the accepted prefix. A random head rejects nearly
+    every draft, so this hammers the replay; output must still be bit-equal
+    to plain decoding."""
+    import mlx.nn as nn
+
+    from chad import mlx_fastpath
+    model = _build_tiny()
+    # install() engages only on quantized hybrids; quantize THEN take the
+    # reference from the installed model itself, so reference and MTP run
+    # share one weight grid and greedy ties resolve identically.
+    nn.quantize(model, group_size=64, bits=4)
+    model.eval()
+    assert mlx_fastpath.install(model) is True
+    ref = _greedy(model, PROMPT, N_TOKENS)
+    eng = _engine(model, _head_for(model))
+    text, stats = eng._generate_mtp(PROMPT, N_TOKENS, None, None)
+    got = [int(t) for t in text.split()]
+    assert stats.draft_proposed > 0, "drafting never ran"
+    assert stats.draft_accepted < stats.draft_proposed, (
+        "random head should reject: replay arm never exercised")
+    assert got == ref, (
+        f"diverged at {next(i for i, (a, b) in enumerate(zip(ref, got)) if a != b)}")
+
+
 def test_zero_model_full_accept_saves_forwards():
     """Drafter and verifier share zeroed weights, so every draft agrees; the
     accept arm plus the drafter catch-up must commit 40 tokens in far fewer

@@ -243,7 +243,7 @@ def _patch_dense_mlp_call() -> None:
     def fused_call(self, x):
         if not hasattr(self, "_fused_w"):
             return stock_call(self, x)
-        gu = mx.quantized_matmul(
+        gu = _qmm(
             x, self._fused_w, scales=self._fused_s, biases=self._fused_b,
             transpose=True, group_size=self._fused_gs, bits=self._fused_bits)
         g, u = mx.split(gu, 2, axis=-1)
@@ -279,17 +279,29 @@ def _concat_gdn_in_projs(model) -> None:
     _patch_gdn_call()
 
 
-# Verify-forward state checkpointing (MTP speculative decoding). When an
-# engine arms a collector dict here, the NEXT S>1 GDN forwards step the
-# recurrence one position at a time — numerically the same path S==1 decode
-# takes — and record, per GDN layer, the conv_input activation plus every
-# position's recurrent state. A partial draft rejection then restores the
-# hybrid cache by reference/slice instead of paying the re-feed forward that
-# made speculative decoding a wash on recurrent models (the PLD lesson). The
-# batched matmuls around the recurrence are untouched, so weights are still
-# read once per verify. Armed per-forward by engine._generate_mtp; always
-# None during prefill and normal decode.
+# Verify-forward input capture (MTP speculative decoding). When an engine
+# arms a collector dict here, the NEXT S>1 GDN forwards record, per GDN
+# layer, the conv_input activation and the recurrence's inputs + pre-round
+# state — all by reference (they are intermediates of the round's graph, held
+# one round). A partial draft rejection then rebuilds the hybrid cache by
+# re-running the tiny recurrence over the accepted prefix instead of paying
+# either the re-feed forward that made speculative decoding a wash on
+# recurrent models (the PLD lesson) or the stepped per-position state
+# checkpoints that made verify forwards ~3x a plain step. The batched matmuls
+# are untouched, so weights are still read once per verify. Armed per-forward
+# by engine._generate_mtp; always None during prefill and normal decode.
 GDN_COLLECTOR = None
+
+# Quantized-matmul indirection for the fused-concat call sites below. Stock
+# mx.quantized_matmul until mlx_qmm_s.install() swaps in its small-batch
+# dispatcher (same signature); S=1 decode and prefill route back to the stock
+# op inside the dispatcher, so this hook only changes verify-shaped calls.
+QMM = None
+
+
+def _qmm(x, w, **kw):
+    import mlx.core as mx
+    return (QMM or mx.quantized_matmul)(x, w, **kw)
 
 
 def _patch_gdn_call() -> None:
@@ -307,7 +319,7 @@ def _patch_gdn_call() -> None:
         if not hasattr(self, "_fused_w"):
             return stock_call(self, inputs, mask=mask, cache=cache)
         B, S, _ = inputs.shape
-        big = mx.quantized_matmul(
+        big = _qmm(
             inputs, self._fused_w, scales=self._fused_s, biases=self._fused_b,
             transpose=True, group_size=self._fused_gs, bits=self._fused_bits)
         qkv, z, b, a = mx.split(
@@ -344,25 +356,23 @@ def _patch_gdn_call() -> None:
         coll = GDN_COLLECTOR
         if (coll is not None and cache is not None and S > 1
                 and mask is None and cache.lengths is None):
-            # Stepped recurrence with per-position state checkpoints: each
-            # step is the exact S==1 kernel call decode uses, so the verify
-            # forward leaves states bit-identical to plain decoding AND every
-            # intermediate state is restorable for free.
-            outs, recs = [], []
-            for t in range(S):
-                o, state = q35.gated_delta_update(
-                    q[:, t:t + 1], k[:, t:t + 1], v[:, t:t + 1],
-                    a[:, t:t + 1], b[:, t:t + 1], self.A_log, self.dt_bias,
-                    state, None, use_kernel=not self.training)
-                outs.append(o)
-                recs.append(state)
-            out = mx.concatenate(outs, axis=1)
+            # Capture-and-replay: run the SAME batched recurrence a plain
+            # S>1 forward uses and record, by reference, this round's inputs
+            # plus the pre-round state — free, they are intermediates of the
+            # graph being built. A partial rejection re-runs the recurrence
+            # over the accepted prefix only (engine rollback: ~one tiny lazy
+            # kernel per GDN layer); full acceptance costs nothing. The
+            # stepped-checkpoint design this replaces serialized S kernel
+            # launches and materialized S recurrent states per layer per
+            # verify (48 layers x S x ~12.6 MB on the 27B), which ate the
+            # entire speculative win.
             coll["conv"].append(conv_input)
-            coll["rec"].append(recs)
-        else:
-            out, state = q35.gated_delta_update(
-                q, k, v, a, b, self.A_log, self.dt_bias, state, mask,
-                use_kernel=not self.training)
+            coll["args"].append(
+                (q, k, v, a, b, self.A_log, self.dt_bias, state,
+                 not self.training))
+        out, state = q35.gated_delta_update(
+            q, k, v, a, b, self.A_log, self.dt_bias, state, mask,
+            use_kernel=not self.training)
         if cache is not None:
             cache[1] = state
             cache.advance(S)
