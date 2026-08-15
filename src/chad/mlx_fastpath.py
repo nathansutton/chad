@@ -29,10 +29,12 @@ Measured (35B q2_down3, M4 Pro 24 GB, stream_generate): decode 67.1→69.6 tok/s
 @8k ctx, 53.2→55.6 @32k; prefill 669→723 tok/s @8k (the concats also feed the
 S>1 path), flat @32k. Peak memory unchanged (±0.5 GB transient).
 
-Scope: applies only when the loaded model looks exactly like the qwen3_5_moe
-hybrid (GDN + attention + SparseMoeBlock with QuantizedSwitchLinear experts).
-Anything unexpected → install() is a silent no-op (stock behavior). Opt out
-with CHAD_NO_FASTPATH=1.
+Scope: applies when the loaded model looks exactly like the qwen3_5_moe
+hybrid (GDN + attention + SparseMoeBlock with QuantizedSwitchLinear experts)
+or the qwen3_5 DENSE hybrid (Qwen3.8-27B class: GDN + attention + quantized
+swiglu MLP), which gets the same GDN concat plus a gate|up MLP concat and the
+compiled S==1 layer step. Anything unexpected → install() is a silent no-op
+(stock behavior). Opt out with CHAD_NO_FASTPATH=1.
 """
 
 from typing import Any
@@ -57,18 +59,25 @@ def install(model: Any) -> bool:
     except ImportError:
         return False
     try:
-        if not _looks_like_hybrid_moe(model):
-            return False
-        _concat_expert_gate_up(model)
-        _concat_gdn_in_projs(model)
-        # Fused MoE decode kernels + router|seg / shared gate|up concats;
-        # engages only on the exact 35B geometry, silent no-op elsewhere.
-        from . import mlx_moe_fused
-        mlx_moe_fused.install(model)
-        _install_layer_fastpath(model)
-        log.info("FASTPATH installed: fused expert/GDN projections + compiled "
-                 "S=1 layer step")
-        return True
+        if _looks_like_hybrid_moe(model):
+            _concat_expert_gate_up(model)
+            _concat_gdn_in_projs(model)
+            # Fused MoE decode kernels + router|seg / shared gate|up concats;
+            # engages only on the exact 35B geometry, silent no-op elsewhere.
+            from . import mlx_moe_fused
+            mlx_moe_fused.install(model)
+            _install_layer_fastpath(model)
+            log.info("FASTPATH installed: fused expert/GDN projections + "
+                     "compiled S=1 layer step")
+            return True
+        if _looks_like_hybrid_dense(model):
+            _concat_dense_gate_up(model)
+            _concat_gdn_in_projs(model)
+            _install_layer_fastpath(model)
+            log.info("FASTPATH installed (dense hybrid): fused MLP/GDN "
+                     "projections + compiled S=1 layer step")
+            return True
+        return False
     except Exception as e:  # noqa: BLE001 — perf path must never break loading
         log.warning("mlx fastpath install failed (%s); running stock", e)
         return False
@@ -102,6 +111,40 @@ def _looks_like_hybrid_moe(model) -> bool:
             or sw0.gate_proj.group_size != sw0.up_proj.group_size):
         return False
     return saw_gdn and saw_moe
+
+
+def _looks_like_hybrid_dense(model) -> bool:
+    """True only for the qwen3_5 DENSE hybrid (Qwen3.8-27B class): per-layer
+    [GDN|attention] + a plain quantized swiglu MLP, no experts anywhere."""
+    import mlx.nn as nn
+    from mlx_lm.models.qwen3_5 import MLP as DenseMLP
+    from mlx_lm.models.qwen3_5 import GatedDeltaNet
+
+    layers = getattr(getattr(getattr(model, "language_model", None), "model", None),
+                     "layers", None)
+    if not layers:
+        return False
+    saw_gdn = saw_attn = False
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(mlp, DenseMLP):
+            return False
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            m = getattr(mlp, name, None)
+            if not isinstance(m, nn.QuantizedLinear) or hasattr(m, "bias"):
+                return False
+        if layer.is_linear:
+            if not isinstance(layer.linear_attn, GatedDeltaNet):
+                return False
+            saw_gdn = True
+        else:
+            saw_attn = True
+    # gate|up must agree on quant params to concat
+    m0 = layers[0].mlp
+    if (m0.gate_proj.bits != m0.up_proj.bits
+            or m0.gate_proj.group_size != m0.up_proj.group_size):
+        return False
+    return saw_gdn and saw_attn
 
 
 def _concat_expert_gate_up(model) -> None:
@@ -161,6 +204,55 @@ def _patch_switch_glu() -> None:
     sl.SwitchGLU.__call__ = fused_call  # type: ignore[method-assign]
 
 
+def _concat_dense_gate_up(model) -> None:
+    """One quantized_matmul instead of two: per layer, stack the dense MLP's
+    gate|up weights along the output axis. Bit-exact per row, same argument as
+    the expert concat; originals keep placeholder arrays."""
+    import mlx.core as mx
+
+    z = mx.zeros((8,), dtype=mx.uint32)
+    for layer in model.language_model.model.layers:
+        mlp = layer.mlp
+        g, u = mlp.gate_proj, mlp.up_proj
+        w = mx.contiguous(mx.concatenate([g.weight, u.weight], axis=0))
+        s = mx.contiguous(mx.concatenate([g.scales, u.scales], axis=0))
+        b = mx.contiguous(mx.concatenate([g.biases, u.biases], axis=0))
+        mx.eval(w, s, b)
+        mlp._fused_w, mlp._fused_s, mlp._fused_b = w, s, b
+        mlp._fused_gs, mlp._fused_bits = g.group_size, g.bits
+        for m in (g, u):
+            m.weight = z
+            m.scales = z
+            m.biases = z
+        mx.clear_cache()
+    _patch_dense_mlp_call()
+
+
+def _patch_dense_mlp_call() -> None:
+    """Replace the dense MLP __call__ with the fused-concat version (all S).
+    The class is shared with qwen3_next models; foreign instances (no _fused_w)
+    take the stock path."""
+    import mlx.core as mx
+    from mlx_lm.models import qwen3_5 as q35
+    from mlx_lm.models.qwen3_next import swiglu
+
+    if getattr(q35.MLP.__call__, "_chad_fastpath", False):
+        return
+    stock_call = q35.MLP.__call__
+
+    def fused_call(self, x):
+        if not hasattr(self, "_fused_w"):
+            return stock_call(self, x)
+        gu = mx.quantized_matmul(
+            x, self._fused_w, scales=self._fused_s, biases=self._fused_b,
+            transpose=True, group_size=self._fused_gs, bits=self._fused_bits)
+        g, u = mx.split(gu, 2, axis=-1)
+        return self.down_proj(swiglu(g, u))
+
+    fused_call._chad_fastpath = True  # type: ignore[attr-defined]
+    q35.MLP.__call__ = fused_call  # type: ignore[method-assign]
+
+
 def _concat_gdn_in_projs(model) -> None:
     """One quantized_matmul instead of four for the GDN input projections."""
     import mlx.core as mx
@@ -185,6 +277,19 @@ def _concat_gdn_in_projs(model) -> None:
             m.biases = z
         mx.clear_cache()
     _patch_gdn_call()
+
+
+# Verify-forward state checkpointing (MTP speculative decoding). When an
+# engine arms a collector dict here, the NEXT S>1 GDN forwards step the
+# recurrence one position at a time — numerically the same path S==1 decode
+# takes — and record, per GDN layer, the conv_input activation plus every
+# position's recurrent state. A partial draft rejection then restores the
+# hybrid cache by reference/slice instead of paying the re-feed forward that
+# made speculative decoding a wash on recurrent models (the PLD lesson). The
+# batched matmuls around the recurrence are untouched, so weights are still
+# read once per verify. Armed per-forward by engine._generate_mtp; always
+# None during prefill and normal decode.
+GDN_COLLECTOR = None
 
 
 def _patch_gdn_call() -> None:
@@ -236,9 +341,28 @@ def _patch_gdn_call() -> None:
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-        out, state = q35.gated_delta_update(
-            q, k, v, a, b, self.A_log, self.dt_bias, state, mask,
-            use_kernel=not self.training)
+        coll = GDN_COLLECTOR
+        if (coll is not None and cache is not None and S > 1
+                and mask is None and cache.lengths is None):
+            # Stepped recurrence with per-position state checkpoints: each
+            # step is the exact S==1 kernel call decode uses, so the verify
+            # forward leaves states bit-identical to plain decoding AND every
+            # intermediate state is restorable for free.
+            outs, recs = [], []
+            for t in range(S):
+                o, state = q35.gated_delta_update(
+                    q[:, t:t + 1], k[:, t:t + 1], v[:, t:t + 1],
+                    a[:, t:t + 1], b[:, t:t + 1], self.A_log, self.dt_bias,
+                    state, None, use_kernel=not self.training)
+                outs.append(o)
+                recs.append(state)
+            out = mx.concatenate(outs, axis=1)
+            coll["conv"].append(conv_input)
+            coll["rec"].append(recs)
+        else:
+            out, state = q35.gated_delta_update(
+                q, k, v, a, b, self.A_log, self.dt_bias, state, mask,
+                use_kernel=not self.training)
         if cache is not None:
             cache[1] = state
             cache.advance(S)
@@ -256,19 +380,24 @@ def _install_layer_fastpath(model) -> None:
     from mlx_lm.models import qwen3_5 as q35
 
     for layer in model.language_model.model.layers:
-        body = _compile_moe_step(layer)
-        fused = getattr(layer.mlp, "_fused_step", None)
-        if fused is not None:
-            # mlx_moe_fused kernels handle the single-token (1,1,2048) decode
-            # step; anything else (batched decode, foreign width) takes the
-            # compiled stock-graph body. Pinning the exact element count keeps
-            # a future geometry change from reaching kernels that hardcode it.
-            from .mlx_moe_fused import HID as moe_hid
-            layer._moe_body_fast = body
-            layer._moe_fast = (lambda h, f=fused, b=body, n=moe_hid:
-                               f(h) if h.size == n else b(h))
+        if hasattr(layer.mlp, "switch_mlp"):
+            body = _compile_moe_step(layer)
+            fused = getattr(layer.mlp, "_fused_step", None)
+            if fused is not None:
+                # mlx_moe_fused kernels handle the single-token (1,1,2048) decode
+                # step; anything else (batched decode, foreign width) takes the
+                # compiled stock-graph body. Pinning the exact element count keeps
+                # a future geometry change from reaching kernels that hardcode it.
+                from .mlx_moe_fused import HID as moe_hid
+                layer._moe_body_fast = body
+                layer._moe_fast = (lambda h, f=fused, b=body, n=moe_hid:
+                                   f(h) if h.size == n else b(h))
+            else:
+                layer._moe_fast = body
+        elif hasattr(layer.mlp, "_fused_w"):
+            layer._moe_fast = _compile_dense_step(layer)
         else:
-            layer._moe_fast = body
+            continue  # unknown mlp shape: layer stays stock
         if layer.is_linear and hasattr(layer.linear_attn, "_fused_w"):
             layer._gdn_fast = _compile_gdn_step(layer)
 
@@ -311,6 +440,37 @@ def _compile_moe_step(layer):
 def _compile_gdn_step(layer):
     import mlx.core as mx
     return mx.compile(_gdn_body(layer))
+
+
+def _compile_dense_step(layer):
+    import mlx.core as mx
+    return mx.compile(_dense_mlp_body(layer))
+
+
+def _dense_mlp_body(layer):
+    """post_attention_layernorm + fused swiglu MLP + residual, UNCOMPILED so the
+    caller decides the compile region (mirrors _moe_body for the dense hybrid)."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    mlp = layer.mlp
+    ln_w = layer.post_attention_layernorm.weight
+    ln_eps = layer.post_attention_layernorm.eps
+    fw, fs, fb = mlp._fused_w, mlp._fused_s, mlp._fused_b
+    gs_, bits = mlp._fused_gs, mlp._fused_bits
+    dp = mlp.down_proj
+
+    def fwd(h):
+        x = mx.fast.rms_norm(h, ln_w, ln_eps)
+        gu = mx.quantized_matmul(x, fw, scales=fs, biases=fb, transpose=True,
+                                 group_size=gs_, bits=bits)
+        g, u = mx.split(gu, 2, axis=-1)
+        y = mx.quantized_matmul(nn.silu(g) * u, dp.weight, scales=dp.scales,
+                                biases=dp.biases, transpose=True,
+                                group_size=dp.group_size, bits=dp.bits)
+        return h + y
+
+    return fwd
 
 
 def _moe_body(layer):

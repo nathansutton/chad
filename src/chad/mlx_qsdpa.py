@@ -75,8 +75,12 @@ _P1_SRC = """
   constexpr int QK = D / BD;           // 8 elements per lane
   constexpr int PW = D / 4;            // 64 packed uint32 per row
   constexpr int GW = D / 64;           // 4 scale groups per row
-  constexpr int CH = 8;                // positions per staged chunk
-  constexpr int RPS = CH / GQA;        // staged rows per simdgroup (1 @gqa8)
+  constexpr int RPS = (8 / GQA) > 0 ? (8 / GQA) : 1;  // staged rows per simdgroup
+  constexpr int CH = RPS * GQA;        // positions per staged chunk: must be a
+                                       // multiple of GQA or the staging loop
+                                       // (slot = sg + rr*GQA) leaves slots
+                                       // unwritten while the math consumes all
+                                       // CH of them (8 @gqa4/8, 6 @gqa6)
 
   const int N      = params[0];
   const int NP     = params[1];
@@ -478,7 +482,9 @@ _P1_SGM_SRC = """
 # n=1024 0.95x, 2048 1.04x, 4096 1.12x, 8192 1.18x, 16384 1.22x, 98304 1.30x.
 _SGM_MIN_N = 2048
 
-_GQAS = (4, 8)   # 35B is 16q/2kv (gqa 8); 9B is 16q/4kv (gqa 4)
+_GQAS = (4, 6, 8)   # 35B is 16q/2kv (gqa 8); 9B is 16q/4kv (gqa 4);
+                    # Qwen3.8-27B is 24q/4kv (gqa 6) — per-head kernel only,
+                    # the simdgroup retile needs 8 q-head rows per score tile
 _D = 256
 
 
@@ -632,7 +638,7 @@ def qsdpa(q: Any, k_quant: tuple, v_quant: tuple, scale: float, n: int) -> Any:
 
 def _eligible(q: Any, cache: Any, mask: Any) -> bool:
     """True iff this call is exactly the validated decode shape: S==1,
-    D==256, GQA==8, 8-bit group-64 quantized cache, no restricting mask."""
+    D==256, GQA in _GQAS, 8-bit group-64 quantized cache, no restricting mask."""
     import mlx.core as mx
 
     if mask is not None and not (isinstance(mask, str) and mask == "causal"):
@@ -682,16 +688,23 @@ def kernel_healthy() -> bool:
         return False
     scale = _D ** -0.5
     try:
-        # The last two are >= _SGM_MIN_N at gqa 8, so they exercise the
+        # The two n=2570 gqa-8 probes are >= _SGM_MIN_N, so they exercise the
         # simdgroup_matrix retile rather than the per-head kernel; without them a
         # GPU could pass this check and still poison every real decode step,
         # since real contexts are never as short as the n=3/n=100 probes.
-        for hkv, n, dtype, tol in ((2, 3, mx.float16, 4e-3), (2, 3, mx.bfloat16, 1.6e-2),
-                                   (4, 3, mx.float16, 4e-3), (2, 100, mx.float16, 4e-3),
-                                   (2, 2570, mx.float16, 4e-3),
-                                   (2, 2570, mx.bfloat16, 1.6e-2)):
+        # The hq=24/hkv=4 probes are gqa 6 (Qwen3.8-27B): a partial-GQA chunk
+        # (CH=6) with its own staging arithmetic, checked at the same edges.
+        for hq, hkv, n, dtype, tol in ((16, 2, 3, mx.float16, 4e-3),
+                                       (16, 2, 3, mx.bfloat16, 1.6e-2),
+                                       (16, 4, 3, mx.float16, 4e-3),
+                                       (16, 2, 100, mx.float16, 4e-3),
+                                       (16, 2, 2570, mx.float16, 4e-3),
+                                       (16, 2, 2570, mx.bfloat16, 1.6e-2),
+                                       (24, 4, 3, mx.float16, 4e-3),
+                                       (24, 4, 100, mx.bfloat16, 1.6e-2),
+                                       (24, 4, 2570, mx.float16, 4e-3)):
             mx.random.seed(7)
-            q = mx.random.normal((1, 16, 1, _D)).astype(dtype)
+            q = mx.random.normal((1, hq, 1, _D)).astype(dtype)
             k = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
             v = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
             c = QuantizedKVCache(group_size=64, bits=8)
@@ -700,10 +713,10 @@ def kernel_healthy() -> bool:
             out = qsdpa(q, c.keys, c.values, scale, n)
             kd = mx.dequantize(*c.keys, group_size=64, bits=8)[..., :n, :]
             vd = mx.dequantize(*c.values, group_size=64, bits=8)[..., :n, :]
-            qf = (q.astype(mx.float32) * scale).reshape(1, hkv, 16 // hkv, 1, _D)
+            qf = (q.astype(mx.float32) * scale).reshape(1, hkv, hq // hkv, 1, _D)
             scores = qf @ mx.expand_dims(kd.astype(mx.float32), 2).swapaxes(-1, -2)
             p = mx.softmax(scores, axis=-1, precise=True)
-            ref = (p @ mx.expand_dims(vd.astype(mx.float32), 2)).reshape(1, 16, 1, _D)
+            ref = (p @ mx.expand_dims(vd.astype(mx.float32), 2)).reshape(1, hq, 1, _D)
             err = mx.abs(out.astype(mx.float32) - ref).max().item()
             if not err < tol:   # NOT '>=': nan compares False both ways — this catches it
                 log.warning("QSDPA self-check FAILED (hkv=%d n=%d %s: err=%s, tol=%s) — "
