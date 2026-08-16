@@ -353,7 +353,15 @@ def install(model, model_path) -> bool:
     if D % (CPT * 8) or D // CPT > 1024:
         log.warning("CATS: down width %d unsupported at CPT=%d", D, CPT)
         return False
-    cap = min(I, int(2 * r * I) // 8 * 8)
+    # Full width: the calibrated thresholds have a fat right tail, and a cap
+    # below it silently truncates the heaviest tokens to an ARBITRARY channel
+    # subset (compaction is unordered across simdgroups). At r=0.25 the
+    # measured per-layer keepfrac runs mean 0.32 / max 0.87, so the 2x-r cap
+    # this replaces fired on ~one layer per token. Threadgroups past the
+    # active count exit immediately: the whole-model cost of never clamping
+    # is 0.4% (21.96 -> 21.87 tok/s), which is not a price worth paying in
+    # silent quality.
+    cap = I
 
     z = mx.zeros((8,), dtype=mx.uint32)
     for i, layer in enumerate(layers):
