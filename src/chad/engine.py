@@ -337,9 +337,8 @@ class Engine:
     # this machine: verifying 31 draft tokens costs the same forward as 11, so
     # once the n-gram evidence clears the bar, maximum width is free. Exact at
     # any temp: point-mass rejection sampling (accept w.p. p(draft)), the same
-    # correction _generate_mtp ships. Fires only when no MTP head is active
-    # (CATS configs), so it composes with CATS S=1 decode: quote spans verify
-    # wide, novel spans decode sparse.
+    # correction _generate_mtp ships. Takes precedence over MTP on the hybrid;
+    # MTP is the fallback when this is disabled or ineligible.
     pld_wide: bool = True
     pld_wide_draft: int = 31        # max draft width (S=32 verify)
     pld_wide_ngram: int = 12        # longest suffix length to try matching
@@ -492,18 +491,7 @@ class Engine:
             from . import mlx_qmm_s
             mlx_qmm_s.install()
         # MTP head sidecar (Qwen3.8-class): pure speed feature, None on any miss.
-        # Mutually exclusive with CATS: the sparse MLP fires only at S==1, so
-        # speculation turns most forwards into dense S>1 verifies that also
-        # pay the wider 4-bit transposed down. Measured on the 27B: CATS alone
-        # 21.9 tok/s, MTP alone 19.4, both 14.3 -- worse than either. CATS is
-        # the better arm today, so it wins; revisit when verify goes sparse.
-        from . import mlx_cats
-        if config.flag("CHAD_NO_MTP"):
-            pass
-        elif mlx_cats.active(self.model):
-            log.info("MTP disabled: CATS sparse decode is active (they do not "
-                     "compose until verify goes sparse)")
-        else:
+        if not config.flag("CHAD_NO_MTP"):
             from . import mlx_mtp
             self._mtp_head = mlx_mtp.load_head(self.model, path)
             nd = config.env_int("CHAD_MTP_DRAFT", 0)
@@ -1123,8 +1111,23 @@ class Engine:
         if config.flag("CHAD_NO_PREFIX_CACHE"):
             self._reset_cache()
 
-        # MTP self-speculative decoding: preferred whenever the checkpoint's own
-        # trained draft head is loaded. Unlike PLD it is exact at ANY temp
+        # Wide prompt-lookup on the hybrid: quote spans verify up to 32 tokens
+        # per forward, novel spans decode plain (S=1) at parity with stock.
+        # Exact at any temp via point-mass rejection sampling; quantized KV is
+        # fine (rollback is the same trim+capture-replay the MTP path uses).
+        # Preferred over MTP when both are available: the cold arm costs only
+        # a host-side lookup vs MTP's ~8% cold win, while matched spans verify
+        # at S=32 instead of k=2 drafts — the traffic mix breaks even at ~11%
+        # span coverage. They do not compose yet (one generate loop each).
+        if (self.prompt_lookup and self.pld_wide
+                and self._pld_hybrid and not self._trimmable):
+            return self._generate_pld_wide(prompt_ids, max_tokens, on_token,
+                                           stop_texts, should_stop, on_prefill,
+                                           on_prefill_progress, stop_condition,
+                                           think_ceiling)
+
+        # MTP self-speculative decoding, when wide-PLD is off or unavailable:
+        # drafts with the checkpoint's own trained head. Exact at ANY temp
         # (rejection sampling preserves the sampling distribution) and tolerates
         # the quantized KV cache: rollback is offset-trim + rewrite, the same
         # mechanism _take_rewind_snapshot documents as safe on a
@@ -1135,17 +1138,6 @@ class Engine:
                                       stop_texts, should_stop, on_prefill,
                                       on_prefill_progress, stop_condition,
                                       think_ceiling)
-
-        # Wide prompt-lookup on the hybrid: quote spans verify up to 32 tokens
-        # per forward, novel spans decode plain (S=1, CATS when installed).
-        # Exact at any temp via point-mass rejection sampling; quantized KV is
-        # fine (rollback is the same trim+capture-replay the MTP path uses).
-        if (self.prompt_lookup and self.pld_wide
-                and self._pld_hybrid and not self._trimmable):
-            return self._generate_pld_wide(prompt_ids, max_tokens, on_token,
-                                           stop_texts, should_stop, on_prefill,
-                                           on_prefill_progress, stop_condition,
-                                           think_ceiling)
 
         # Prompt-lookup decoding path: needs greedy decoding (exact),
         # an unquantized cache, and a trimmable cache (cheap rollback). A qwen3_5-style
@@ -1523,7 +1515,7 @@ class Engine:
         continuation tokens as the draft and verify them in ONE batched
         forward — the batched matmul path is flat from S=12 to S=32, so a wide
         verify costs the same as a narrow one. If not found, take a plain S=1
-        decode step (the CATS sparse fast path when installed). Acceptance is
+        decode step. Acceptance is
         point-mass rejection sampling (accept draft token d w.p. p(d), resample
         the residual on rejection), which preserves the output distribution
         exactly — greedy included.
@@ -1619,8 +1611,8 @@ class Engine:
 
         def _plain_step(tok_arr):
             """One S=1 decode forward on a (possibly lazy) (1,) token array;
-            returns the LAZY sampled next token. The forward takes the CATS
-            fast path when installed (S==1, mask None)."""
+            returns the LAZY sampled next token. The forward takes the compiled
+            S=1 layer fast path when installed (S==1, mask None)."""
             nonlocal key
             hid1 = lm.model(tok_arr[None], cache=mc)
             lg = _logits(hid1)[0, -1]
