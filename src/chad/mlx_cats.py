@@ -315,6 +315,16 @@ def enabled() -> bool:
     return config.env_float("CHAD_CATS_R") is not None
 
 
+def active(model) -> bool:
+    """True if CATS actually installed on this model (requested is not
+    enough -- install bails on missing sidecars or unsupported geometry)."""
+    try:
+        return any(hasattr(ly.mlp, "_cats")
+                   for ly in model.language_model.model.layers)
+    except AttributeError:
+        return False
+
+
 def install(model, model_path) -> bool:
     """Wire CATS into a loaded dense-hybrid model. Returns True on success.
 

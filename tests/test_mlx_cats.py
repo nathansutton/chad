@@ -154,3 +154,26 @@ def test_enabled_flag(monkeypatch):
     assert not mlx_cats.enabled()
     monkeypatch.setenv("CHAD_CATS_R", "0.25")
     assert mlx_cats.enabled()
+
+
+def test_active_requires_installed_layers():
+    """`enabled` is the request, `active` is the fact -- the engine's MTP
+    interlock must key off the fact, since install bails on missing sidecars
+    or unsupported geometry."""
+    class MLP:
+        pass
+
+    class Layer:
+        def __init__(self, tagged):
+            self.mlp = MLP()
+            if tagged:
+                self.mlp._cats = {}
+
+    class Model:
+        def __init__(self, tagged):
+            inner = type("I", (), {"layers": [Layer(tagged)]})()
+            self.language_model = type("L", (), {"model": inner})()
+
+    assert mlx_cats.active(Model(True))
+    assert not mlx_cats.active(Model(False))
+    assert not mlx_cats.active(object())

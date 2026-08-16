@@ -445,7 +445,18 @@ class Engine:
             from . import mlx_qmm_s
             mlx_qmm_s.install()
         # MTP head sidecar (Qwen3.8-class): pure speed feature, None on any miss.
-        if not config.flag("CHAD_NO_MTP"):
+        # Mutually exclusive with CATS: the sparse MLP fires only at S==1, so
+        # speculation turns most forwards into dense S>1 verifies that also
+        # pay the wider 4-bit transposed down. Measured on the 27B: CATS alone
+        # 21.9 tok/s, MTP alone 19.4, both 14.3 -- worse than either. CATS is
+        # the better arm today, so it wins; revisit when verify goes sparse.
+        from . import mlx_cats
+        if config.flag("CHAD_NO_MTP"):
+            pass
+        elif mlx_cats.active(self.model):
+            log.info("MTP disabled: CATS sparse decode is active (they do not "
+                     "compose until verify goes sparse)")
+        else:
             from . import mlx_mtp
             self._mtp_head = mlx_mtp.load_head(self.model, path)
             nd = config.env_int("CHAD_MTP_DRAFT", 0)
