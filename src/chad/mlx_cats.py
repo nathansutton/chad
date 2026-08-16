@@ -33,6 +33,7 @@ from . import config
 from .diag import log
 
 _KERNELS: dict[str, Any] = {}
+_PARAMS: dict[tuple, Any] = {}
 
 _HEADER = r"""
 inline void unpack8_3bit(const device uchar* w, thread float4& lo,
@@ -79,8 +80,36 @@ _SRC_COMPACT = r"""
     }
 """
 
+# 32 3-bit values are exactly 96 bits, so one 12-byte load per lane covers a
+# whole unpack unit and always lands inside a single 64-wide quant group (the
+# lane's span starts at a multiple of 32) -- one scale/bias fetch per row per
+# iteration. The byte offset is lane*12 into a K*3/8 row, so the uint3 load is
+# 4-byte aligned for every lane. Needs K % 1024 == 0.
+_UNPACK32 = r"""
+#define UNPACK32(w0, w1, w2, Q) {                                    \
+  ulong a01 = (ulong)(w0) | ((ulong)(w1) << 32);                     \
+  ulong a12 = (ulong)(w1) | ((ulong)(w2) << 32);                     \
+  Q[0] = float4(float(a01 & 7), float((a01 >> 3) & 7),               \
+                float((a01 >> 6) & 7), float((a01 >> 9) & 7));       \
+  Q[1] = float4(float((a01 >> 12) & 7), float((a01 >> 15) & 7),      \
+                float((a01 >> 18) & 7), float((a01 >> 21) & 7));     \
+  Q[2] = float4(float((a01 >> 24) & 7), float((a01 >> 27) & 7),      \
+                float((a01 >> 30) & 7), float((a12 >> 1) & 7));      \
+  Q[3] = float4(float((a12 >> 4) & 7), float((a12 >> 7) & 7),        \
+                float((a12 >> 10) & 7), float((a12 >> 13) & 7));     \
+  Q[4] = float4(float((a12 >> 16) & 7), float((a12 >> 19) & 7),      \
+                float((a12 >> 22) & 7), float((a12 >> 25) & 7));     \
+  Q[5] = float4(float((a12 >> 28) & 7), float((a12 >> 31) & 7),      \
+                float((a12 >> 34) & 7), float((a12 >> 37) & 7));     \
+  Q[6] = float4(float((a12 >> 40) & 7), float((a12 >> 43) & 7),      \
+                float((a12 >> 46) & 7), float((a12 >> 49) & 7));     \
+  Q[7] = float4(float((a12 >> 52) & 7), float((a12 >> 55) & 7),      \
+                float((a12 >> 58) & 7), float((a12 >> 61) & 7));     \
+}
+"""
+
 # Row-gather up_proj with silu(gate) folded in: h[j] = silu(g[idx[j]]) *
-# dot(dequant3(Wu[idx[j], :]), x). 2 simdgroups x 4 rows per threadgroup.
+# dot(dequant3(Wu[idx[j], :]), x). NSIMD simdgroups x RPS rows each.
 _SRC_GATHER_U = r"""
     uint tg = threadgroup_position_in_grid.x;
     uint simd = simdgroup_index_in_threadgroup;
@@ -88,36 +117,46 @@ _SRC_GATHER_U = r"""
     const uint K = params[0];
     const uint cap = params[1];
     uint nact = min(cnt[0], cap);
-    uint j0 = tg * 8 + simd * 4;
+    uint j0 = (tg * NSIMD + simd) * RPS;
     if (j0 >= nact) return;
     const device uchar* wb = (const device uchar*)wu;
     const uint row_bytes = (K * 3) / 8;
     const uint gstride = K / 64;
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    uint rows[4];
-    for (int r = 0; r < 4; ++r)
+    float acc[RPS];
+    uint rows[RPS];
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < RPS; ++r) {
+      acc[r] = 0.f;
       rows[r] = (j0 + r < nact) ? idx[j0 + r] : 0xffffffff;
-    const uint iters = K / 256;
+    }
+    const uint iters = K / 1024;
     for (uint it = 0; it < iters; ++it) {
-      uint v0 = it * 256 + lane * 8;
+      uint v0 = it * 1024 + lane * 32;
       uint gg = v0 / 64;
       const device half4* xp = (const device half4*)(x + v0);
-      float4 xlo = float4(xp[0]);
-      float4 xhi = float4(xp[1]);
-      float4 xsv = xlo + xhi;
+      float4 X[8];
+      float4 xsv = float4(0.f);
+      #pragma clang loop unroll(full)
+      for (int t = 0; t < 8; ++t) { X[t] = float4(xp[t]); xsv += X[t]; }
       float xs = xsv.x + xsv.y + xsv.z + xsv.w;
-      for (int r = 0; r < 4; ++r) {
+      #pragma clang loop unroll(full)
+      for (int r = 0; r < RPS; ++r) {
         uint row = rows[r];
         if (row == 0xffffffff) continue;
-        float4 qlo, qhi;
-        unpack8_3bit(wb + row * row_bytes + (v0 * 3) / 8, qlo, qhi);
-        float4 d = fma(qhi, xhi, qlo * xlo);
+        const device uint* wp =
+            (const device uint*)(wb + row * row_bytes + (v0 * 3) / 8);
+        float4 Q[8];
+        UNPACK32(wp[0], wp[1], wp[2], Q)
+        float4 d = float4(0.f);
+        #pragma clang loop unroll(full)
+        for (int t = 0; t < 8; ++t) d = fma(Q[t], X[t], d);
         uint soff = row * gstride + gg;
         acc[r] += float(su[soff]) * (d.x + d.y + d.z + d.w)
                 + float(bu[soff]) * xs;
       }
     }
-    for (int r = 0; r < 4; ++r) {
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < RPS; ++r) {
       float v = simd_sum(acc[r]);
       if (lane == 0 && j0 + r < nact)
         h[j0 + r] = half(v * silu_f(float(g[rows[r]])));
@@ -125,8 +164,11 @@ _SRC_GATHER_U = r"""
 """
 
 # Scaled row-accumulate against the transposed 4-bit down: y = sum_j h[j] *
-# dequant4(WdT[idx[j], :]). RCH row-chunks; thread t owns 32 output columns;
-# fp32 partials reduced by the second kernel.
+# dequant4(WdT[idx[j], :]). RCH row-chunks x (D / CPT) threads, each owning
+# CPT output columns; fp32 partials reduced by the second kernel. RCH and CPT
+# move together so the chunk count can drop without dropping thread count --
+# the partials round trip (2 * RCH * D * 4 bytes) is pure overhead on top of
+# the weights, and at RCH=128/CPT=32 it was a quarter of the kernel's traffic.
 _SRC_ACC4 = r"""
     uint chunk = threadgroup_position_in_grid.x;
     uint t = thread_position_in_threadgroup.x;
@@ -140,28 +182,32 @@ _SRC_ACC4 = r"""
     uint per = (nact + nchunks - 1) / nchunks;
     uint j0 = chunk * per;
     uint j1 = min(j0 + per, nact);
-    uint c0 = t * 32;
-    uint g = c0 / 64;
-    float4 acc[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    uint c0 = t * CPT;
+    float4 acc[CPT / 4];
+    #pragma clang loop unroll(full)
+    for (int q = 0; q < CPT / 4; ++q) acc[q] = float4(0.f);
     for (uint j = j0; j < j1; ++j) {
       uint row = idx[j];
       float hc = float(h[j]);
       const device uchar* wr = wb + row * row_bytes + c0 / 2;
-      float sc = float(scales[row * gstride + g]);
-      float bi = float(biases[row * gstride + g]);
-      for (int q8 = 0; q8 < 4; ++q8) {
+      const device half* sr = scales + row * gstride;
+      const device half* br = biases + row * gstride;
+      #pragma clang loop unroll(full)
+      for (int q8 = 0; q8 < CPT / 8; ++q8) {
+        uint gq = (c0 + q8 * 8) / 64;
+        float hs = hc * float(sr[gq]);
+        float hb = hc * float(br[gq]);
         float4 qlo, qhi;
         unpack8_4bit(wr + q8 * 4, qlo, qhi);
-        acc[2*q8]   = fma(float4(hc * sc), qlo, acc[2*q8]);
-        acc[2*q8+1] = fma(float4(hc * sc), qhi, acc[2*q8+1]);
-        acc[2*q8]   += hc * bi;
-        acc[2*q8+1] += hc * bi;
+        acc[2*q8]   = fma(float4(hs), qlo, acc[2*q8]   + hb);
+        acc[2*q8+1] = fma(float4(hs), qhi, acc[2*q8+1] + hb);
       }
     }
     device float* out = partials + chunk * D + c0;
-    for (int q8 = 0; q8 < 8; ++q8) {
-      out[q8*4+0] = acc[q8].x; out[q8*4+1] = acc[q8].y;
-      out[q8*4+2] = acc[q8].z; out[q8*4+3] = acc[q8].w;
+    #pragma clang loop unroll(full)
+    for (int q = 0; q < CPT / 4; ++q) {
+      out[q*4+0] = acc[q].x; out[q*4+1] = acc[q].y;
+      out[q*4+2] = acc[q].z; out[q*4+3] = acc[q].w;
     }
 """
 
@@ -175,7 +221,13 @@ _SRC_REDUCE = r"""
     y[i] = half(s);
 """
 
-RCH = 128  # row chunks for the accumulate (64 was 2x slower: occupancy)
+# Kernel shape tunables, all measured end-to-end on the 27B (see plan 132).
+# RPS/NSIMD: rows per simdgroup and simdgroups per threadgroup in the gather.
+# RCH/CPT: row chunks and output columns per thread in the accumulate.
+RPS = config.env_int("CHAD_CATS_RPS") or 4
+NSIMD = config.env_int("CHAD_CATS_NS") or 1
+RCH = config.env_int("CHAD_CATS_RCH") or 32
+CPT = config.env_int("CHAD_CATS_CPT") or 8
 
 
 def _kernels():
@@ -183,22 +235,39 @@ def _kernels():
         return _KERNELS
     import mlx.core as mx
 
+    defs = (f"\n#define RPS {RPS}\n#define NSIMD {NSIMD}\n"
+            f"#define CPT {CPT}\n")
+    head = _HEADER + _UNPACK32 + defs
     _KERNELS["compact"] = mx.fast.metal_kernel(
         name="chad_cats_compact", input_names=["g", "thr", "params"],
-        output_names=["idx", "cnt"], header=_HEADER, source=_SRC_COMPACT,
+        output_names=["idx", "cnt"], header=head, source=_SRC_COMPACT,
         atomic_outputs=True)
     _KERNELS["gather_u"] = mx.fast.metal_kernel(
         name="chad_cats_gather_u",
         input_names=["x", "g", "wu", "su", "bu", "idx", "cnt", "params"],
-        output_names=["h"], header=_HEADER, source=_SRC_GATHER_U)
+        output_names=["h"], header=head, source=_SRC_GATHER_U)
     _KERNELS["acc4"] = mx.fast.metal_kernel(
         name="chad_cats_acc4",
         input_names=["h", "w", "scales", "biases", "idx", "cnt", "params"],
-        output_names=["partials"], header=_HEADER, source=_SRC_ACC4)
+        output_names=["partials"], header=head, source=_SRC_ACC4)
     _KERNELS["reduce"] = mx.fast.metal_kernel(
         name="chad_cats_reduce", input_names=["partials", "params"],
-        output_names=["y"], header=_HEADER, source=_SRC_REDUCE)
+        output_names=["y"], header=head, source=_SRC_REDUCE)
     return _KERNELS
+
+
+def _params(*vals):
+    """Cached uint32 param vectors. Building these per call cost ~3 host-side
+    array constructions per MLP per token (192 a token on the 27B)."""
+    import mlx.core as mx
+
+    key = vals
+    p = _PARAMS.get(key)
+    if p is None:
+        p = mx.array(list(vals), dtype=mx.uint32)
+        mx.eval(p)
+        _PARAMS[key] = p
+    return p
 
 
 def compact(g, thr, cap):
@@ -206,9 +275,9 @@ def compact(g, thr, cap):
     import mlx.core as mx
 
     n = g.shape[0]
-    params = mx.array([n, cap], dtype=mx.uint32)
     return _kernels()["compact"](
-        inputs=[g, thr, params], grid=(n, 1, 1), threadgroup=(256, 1, 1),
+        inputs=[g, thr, _params(n, cap)], grid=(n, 1, 1),
+        threadgroup=(256, 1, 1),
         output_shapes=[(cap,), (1,)], output_dtypes=[mx.uint32, mx.uint32],
         init_value=0)
 
@@ -217,10 +286,11 @@ def gather_u(x, g, wu, su, bu, idx, cnt, cap, K):
     """h[j] = silu(g[idx[j]]) * (dequant3(Wu) @ x)[idx[j]]; x fp16 (K,)."""
     import mlx.core as mx
 
-    params = mx.array([K, cap], dtype=mx.uint32)
+    per = RPS * NSIMD
     (h,) = _kernels()["gather_u"](
-        inputs=[x, g, wu, su, bu, idx, cnt, params],
-        grid=(((cap + 7) // 8) * 64, 1, 1), threadgroup=(64, 1, 1),
+        inputs=[x, g, wu, su, bu, idx, cnt, _params(K, cap)],
+        grid=(((cap + per - 1) // per) * NSIMD * 32, 1, 1),
+        threadgroup=(NSIMD * 32, 1, 1),
         output_shapes=[(cap,)], output_dtypes=[mx.float16])
     return h
 
@@ -229,10 +299,10 @@ def row_acc4(h, w, sc, bi, idx, cnt, cap, D):
     """y = sum_j h[j] * dequant4(WdT[idx[j], :]); WdT is (I, D) 4-bit gs64."""
     import mlx.core as mx
 
-    params = mx.array([D, cap, RCH], dtype=mx.uint32)
+    params = _params(D, cap, RCH)
     (p,) = _kernels()["acc4"](
         inputs=[h, w, sc, bi, idx, cnt, params],
-        grid=(RCH * (D // 32), 1, 1), threadgroup=(D // 32, 1, 1),
+        grid=(RCH * (D // CPT), 1, 1), threadgroup=(D // CPT, 1, 1),
         output_shapes=[(RCH * D,)], output_dtypes=[mx.float32])
     (y,) = _kernels()["reduce"](
         inputs=[p, params], grid=(D, 1, 1),
@@ -273,13 +343,15 @@ def install(model, model_path) -> bool:
     mlp0 = layers[0].mlp
     K = mlp0.gate_proj.scales.shape[1] * 64
     I = mlp0.gate_proj.scales.shape[0]
+    # K % 1024: the gather's 32-values-per-lane unit spans a 32-lane simdgroup.
     if (mlp0.gate_proj.bits != 3 or mlp0.gate_proj.group_size != 64
-            or K % 256 or I % 8):
+            or K % 1024 or I % 8):
         log.warning("CATS: unsupported MLP geometry; staying dense")
         return False
     sw = mx.load(side)
     D = sw["model.layers.0.mlp.downT.scales"].shape[1] * 64
-    if D % 32:
+    if D % (CPT * 8) or D // CPT > 1024:
+        log.warning("CATS: down width %d unsupported at CPT=%d", D, CPT)
         return False
     cap = min(I, int(2 * r * I) // 8 * 8)
 

@@ -1,8 +1,9 @@
 """Kernel-level tests for the CATS sparse-MLP decode path (mlx_cats).
 
 Small synthetic shapes exercising the same geometry constraints as the 27B
-(K % 256 == 0, D % 32 == 0, rows arbitrary). References are stock mx ops.
-Not bit-exact vs fp math (quantized kernels); tolerances match the measured
+(K % 1024 == 0 for the gather's 32-values-per-lane simdgroup unit, D a
+multiple of CPT*8, rows arbitrary). References are stock mx ops. Not
+bit-exact vs fp math (quantized kernels); tolerances match the measured
 <=0.2% relative error of the prototypes.
 """
 import math
@@ -13,7 +14,7 @@ mx = pytest.importorskip("mlx.core")
 
 from chad import mlx_cats  # noqa: E402
 
-K = 512
+K = 1024
 I_ROWS = 1024
 D = 512
 
