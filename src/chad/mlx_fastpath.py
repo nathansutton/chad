@@ -43,7 +43,7 @@ from . import config
 from .diag import log
 
 
-def install(model: Any) -> bool:
+def install(model: Any, model_path: Any = None) -> bool:
     """Apply the decode fast-path to a loaded mlx_lm model, in place.
 
     Returns True if installed, False if skipped (wrong architecture, flag off,
@@ -71,11 +71,17 @@ def install(model: Any) -> bool:
                      "compiled S=1 layer step")
             return True
         if _looks_like_hybrid_dense(model):
-            _concat_dense_gate_up(model)
+            # CATS sparse decode (opt-in) needs gate and up SEPARATE (gate
+            # dense, up row-gathered), so it excludes the gate|up concat.
+            from . import mlx_cats
+            cats = mlx_cats.enabled() and mlx_cats.install(model, model_path)
+            if not cats:
+                _concat_dense_gate_up(model)
             _concat_gdn_in_projs(model)
             _install_layer_fastpath(model)
-            log.info("FASTPATH installed (dense hybrid): fused MLP/GDN "
-                     "projections + compiled S=1 layer step")
+            log.info("FASTPATH installed (dense hybrid): %s + fused GDN "
+                     "projections + S=1 layer step",
+                     "CATS sparse MLP" if cats else "fused MLP")
             return True
         return False
     except Exception as e:  # noqa: BLE001 — perf path must never break loading
@@ -406,6 +412,10 @@ def _install_layer_fastpath(model) -> None:
                 layer._moe_fast = body
         elif hasattr(layer.mlp, "_fused_w"):
             layer._moe_fast = _compile_dense_step(layer)
+        elif hasattr(layer.mlp, "_cats"):
+            # uncompiled: custom metal kernels inside the body
+            from . import mlx_cats
+            layer._moe_fast = mlx_cats.step_body(layer)
         else:
             continue  # unknown mlp shape: layer stays stock
         if layer.is_linear and hasattr(layer.linear_attn, "_fused_w"):

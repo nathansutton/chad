@@ -430,7 +430,7 @@ class Engine:
         # hybrid MoE checkpoint; silent no-op on any other model or on failure.
         from . import mlx_fastpath
         _log_mlx_provenance()
-        mlx_fastpath.install(self.model)
+        mlx_fastpath.install(self.model, model_path=path)
         # Fused quantized-KV decode attention: makes kv_bits=8 a speed win
         # instead of a loss. Patches mlx_lm's quantized SDPA branch
         # only; inert unless a QuantizedKVCache is actually in play.
