@@ -538,6 +538,40 @@ READ_MAX_CHARS = 10000
 READ_SKELETON_LINES = 250
 
 
+def _num_row(n: int, text: str, width: int, marker: str = " ") -> str:
+    """One numbered line of file content: right-aligned line number, a one-char
+    marker column, one space, then the text. Every tool that shows file lines with
+    numbers renders through this, so a line number the model sees on any surface
+    is anchored the same way on all of them."""
+    return f"{n:>{width}}{marker} {text}"
+
+
+def _skeleton_elided_footer(path: str, skel: str, total: int) -> str:
+    """Name the exact body ranges a skeleton view elides, each as a pasteable read
+    call. The prose note already says paging exists; a concrete range makes the
+    affordance a one-copy action instead of leaving the model to re-derive offsets
+    from the signature numbers."""
+    if not levers.enabled("read_range_footer"):
+        return ""
+    sig_lines = sorted({int(m.group(1)) for m in re.finditer(r"^(\d+):", skel, re.M)})
+    if not sig_lines:
+        return ""
+    gaps = []
+    for a, b in zip(sig_lines, sig_lines[1:] + [total + 1]):
+        if b - a - 1 >= 8:   # elided span big enough to be worth naming
+            gaps.append((a + 1, b - 1))
+    if not gaps:
+        return ""
+    gaps.sort(key=lambda g: g[0] - g[1])   # largest spans first
+    shown = sorted(gaps[:5])
+    levers.fired("read_range_footer", kind="skeleton", ranges=len(shown))
+    rel = _rel(path)
+    items = ", ".join(f"lines {a}-{b} (read({rel}, offset={a - 1}, "
+                      f"limit={b - a + 1}))" for a, b in shown)
+    more = f" (+{len(gaps) - len(shown)} smaller)" if len(gaps) > len(shown) else ""
+    return f"\n[largest elided bodies: {items}{more}]"
+
+
 def tool_read(path: str, offset: int = 0, limit: int = READ_DEFAULT_LIMIT) -> str:
     # Small models often emit a workspace-relative path with a stray leading slash
     # ("/construct.py"). If the absolute path doesn't exist but the relative one does,
@@ -564,7 +598,8 @@ def tool_read(path: str, offset: int = 0, limit: int = READ_DEFAULT_LIMIT) -> st
                     f"({total} lines): every function/class signature with line "
                     f"numbers, bodies omitted to keep context small. The read worked. "
                     f"To see a body: view_symbol(name), or read(path, offset=N, "
-                    f"limit=M) with the line numbers below.]\n{skel}")
+                    f"limit=M) with the line numbers below.]\n{skel}"
+                    + _skeleton_elided_footer(path, skel, total))
 
     # Paging a big code file with offset= defeats the skeleton guard above and racks up
     # prefill page by page. Nudge toward symbol-targeted reads (the bigfile tasks show
@@ -578,12 +613,22 @@ def tool_read(path: str, offset: int = 0, limit: int = READ_DEFAULT_LIMIT) -> st
     limit = max(1, min(limit, READ_MAX_LIMIT))
     chunk = lines[offset : offset + limit]
     width = len(str(offset + len(chunk)))
-    body = "".join(f"{i+offset+1:>{width}}  {ln}" for i, ln in enumerate(chunk))
+    body = "".join(_num_row(i + offset + 1, ln, width) for i, ln in enumerate(chunk))
     note = ""
     if len(body) > READ_MAX_CHARS:  # clip long-line blobs before they bloat context
         body = body[:READ_MAX_CHARS]
         note = (f"\n[…clipped at {READ_MAX_CHARS} chars. This file is dense — use grep "
                 f"or find_symbol/view_symbol to target what you need.]")
+        if levers.enabled("read_range_footer"):
+            # The clip cut mid-line: name the last COMPLETE line shown and the
+            # exact call that continues from it, instead of prose about density.
+            last_full = offset + body.count("\n")
+            if last_full > offset:
+                levers.fired("read_range_footer", kind="clip")
+                note = (f"\n[…clipped at {READ_MAX_CHARS} chars — complete through "
+                        f"line {last_full} of {total}. Continue with "
+                        f"read({_rel(path)}, offset={last_full}), or use grep/"
+                        f"find_symbol/view_symbol to target what you need.]")
     shown_end = offset + len(chunk)
     if shown_end < total:  # more file remains past the window we returned
         note += (f"\n[showed lines {offset+1}-{shown_end} of {total}. To continue, read "
@@ -1604,6 +1649,46 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
         else:
             capped = True
 
+    anchor = levers.enabled("grep_anchor")
+    anchored_files = 0
+
+    def flush(fp: str, rows: list):
+        """Emit one file's matches. Rows are (1-based line, is_match, text), with
+        None marking a break between context groups. Anchor rendering groups them
+        under a `path:` header with read's numbered rows (`*` marks match rows when
+        context lines are interleaved) and records the file as seen, so the numbers
+        shown are line-edit anchors with read's freshness semantics. The legacy
+        rendering is the flat `path:line: text` stream."""
+        nonlocal anchored_files
+        if not rows:
+            return
+        if not anchor:
+            for r in rows:
+                if r is None:
+                    emit("--")
+                else:
+                    n, is_match, txt = r
+                    emit(f"{fp}:{n}{':' if is_match else '-'} {txt}")
+            return
+        before = len(out)
+        width = max(len(str(r[0])) for r in rows if r is not None)
+        emit(f"{fp}:")
+        for r in rows:
+            if r is None:
+                emit("--")
+            else:
+                n, is_match, txt = r
+                emit(_num_row(n, txt, width, "*" if (ctx and is_match) else " "))
+        if len(out) > before:
+            # The same hash `read` records: a rendered match view is a view of the
+            # file, and the stale guard should measure later edits against it.
+            try:
+                with open(fp, errors="replace") as fh:
+                    _mark_seen(fp, fh.read())
+            except OSError:
+                pass
+            anchored_files += 1
+
     # The model routinely passes a file as `path` (the schema says directory); walking
     # a file yields nothing, which used to read as a clean "[no matches]". Search the
     # named file instead — explicit naming also overrides the skip list, like `read`.
@@ -1672,20 +1757,26 @@ def tool_grep(pattern: str, path: str = ".", glob: str = "**/*", ignore_case: bo
                         groups[-1][1] = max(groups[-1][1], e)
                     else:
                         groups.append([s, e])
+                rows: list = []
                 for gi, (s, e) in enumerate(groups):
                     if gi:
-                        emit("--")
+                        rows.append(None)
                     for j in range(s, e + 1):
-                        sep = ":" if rx.search(flines[j]) else "-"
-                        emit(f"{fp}:{j+1}{sep} {_grep_clip(flines[j])}")
+                        rows.append((j + 1, bool(rx.search(flines[j])),
+                                     _grep_clip(flines[j])))
+                flush(fp, rows)
             else:
+                rows = []
                 with src as fh:
                     for i, ln in enumerate(fh, 1):
                         if rx.search(ln):
                             matches += 1
-                            emit(f"{fp}:{i}: {_grep_clip(ln.rstrip())}")
+                            rows.append((i, True, _grep_clip(ln.rstrip())))
+                flush(fp, rows)
         except OSError:
             continue
+    if anchored_files:
+        levers.fired("grep_anchor", files=anchored_files, matches=matches)
 
     if not out:
         # State the searched scope, and NEVER hide truncation on the zero-match path:
@@ -2259,6 +2350,19 @@ def active_schemas():
         schemas = [s for s in schemas if s["function"]["name"] != "task"]
     if config.flag("CHAD_NO_SYMBOLS"):
         schemas = [s for s in schemas if s["function"]["name"] not in _SYMBOLIC]
+    # CHAD_HIDE_TOOLS=a,b removes named builtin tools from the schema (the model
+    # never sees them; dispatch is untouched). The A/B knob for measuring one tool
+    # dialect against another — e.g. exact-match `edit` vs the line-addressed
+    # family — per model. A typo'd name must fail loud, not silently run the
+    # unmodified toolset and report a delta of zero.
+    hidden = {t.strip() for t in os.environ.get("CHAD_HIDE_TOOLS", "").split(",")
+              if t.strip()}
+    if hidden:
+        unknown = hidden - set(DISPATCH)
+        if unknown:
+            raise ValueError(f"CHAD_HIDE_TOOLS names unknown tool(s): "
+                             f"{sorted(unknown)}. Known: {sorted(DISPATCH)}")
+        schemas = [s for s in schemas if s["function"]["name"] not in hidden]
     names = _skills().skill_names()
     if names:
         schemas = schemas + [_activate_skill_schema(names)]

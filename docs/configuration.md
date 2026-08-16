@@ -452,6 +452,7 @@ defenses — leave them unset in normal use; they exist for measurement and edge
 ```bash
 CHAD_NO_SYMBOLS=1            uv run chad  # A/B knob: hide the tree-sitter symbolic tools
 CHAD_NO_TASK=1              uv run chad  # A/B knob: hide the subagent/Task delegation tool
+CHAD_HIDE_TOOLS=a,b         uv run chad  # A/B knob: hide named builtin tools from the schema
 CHAD_NO_VALIDATE=1          uv run chad  # A/B knob: DISABLE arg coercion + schema validation
 CHAD_NO_GOVERNOR=1          uv run chad  # A/B knob: DISABLE the runaway-turn governor
 CHAD_NO_REPEAT_GUARD=1      uv run chad  # A/B knob: DISABLE the degenerate-repetition stop
@@ -474,6 +475,12 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
   sub-agent is read-only by default and cannot spawn further sub-agents (depth 1). This
   knob is the A/B arm for measuring adoption/impact, and the escape hatch if a model
   misuses it.
+- **`CHAD_HIDE_TOOLS`** — comma-separated builtin tool names removed from the schema the
+  model sees (dispatch is untouched). The per-dialect measurement knob: e.g.
+  `CHAD_HIDE_TOOLS=edit` forces the line-addressed edit family,
+  `CHAD_HIDE_TOOLS=replace_lines,insert_lines` forces exact-match `edit`. A name that
+  matches no builtin tool fails loud at the first render rather than silently measuring
+  the unmodified toolset.
 - **`CHAD_NO_VALIDATE`** — **disables** the typia-style lenient-parse → typed-validate →
   self-repair loop for tool-call arguments (`validate.py`), falling back to a strict
   `json.loads` plus a terse missing-required check. This *weakens* input handling (malformed

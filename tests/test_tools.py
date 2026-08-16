@@ -24,6 +24,28 @@ PASS = 0
 FAIL = 0
 
 
+def _with_lever_off(name):
+    """Run a test with one lever subtracted from the suite's CHAD_ENABLE=all — for
+    tests that pin the legacy (lever-OFF) output shape while the rest of the suite
+    exercises everything ON."""
+    import functools
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **k):
+            old = os.environ.get("CHAD_DISABLE")
+            os.environ["CHAD_DISABLE"] = f"{old},{name}" if old else name
+            try:
+                return fn(*a, **k)
+            finally:
+                if old is None:
+                    os.environ.pop("CHAD_DISABLE", None)
+                else:
+                    os.environ["CHAD_DISABLE"] = old
+        return wrapper
+    return deco
+
+
 def check(name, cond, detail=""):
     global PASS, FAIL
     if cond:
@@ -244,6 +266,7 @@ def test_bash_spill():
 
 # --- tool_grep ----------------------------------------------------------------
 
+@_with_lever_off("grep_anchor")
 def test_grep():
     cwd = os.getcwd()
     try:
@@ -271,6 +294,7 @@ def test_grep():
         os.chdir(cwd)
 
 
+@_with_lever_off("grep_anchor")
 def test_grep_default_byte_identical():
     """Default-args output must stay byte-for-byte what the original code emitted:
     `path:line: text` lines joined by \\n, no notices when no cap binds."""
@@ -284,6 +308,7 @@ def test_grep_default_byte_identical():
         os.chdir(cwd)
 
 
+@_with_lever_off("grep_anchor")
 def test_grep_line_cap():
     """A match inside a huge single line is clipped so it can't blow up the transcript."""
     cwd = os.getcwd()
@@ -312,6 +337,7 @@ def test_grep_truncation_notices():
         os.chdir(cwd)
 
 
+@_with_lever_off("grep_anchor")
 def test_grep_path_is_file():
     """A file passed as `path` is searched directly — the old dir-walk treatment made
     it silently match nothing, and the model passes file paths constantly."""
@@ -342,6 +368,7 @@ def test_grep_path_not_found():
         os.chdir(cwd)
 
 
+@_with_lever_off("grep_anchor")
 def test_grep_dirs_do_not_starve_file_cap():
     """The GREP_MAX_FILES budget must count only files we'd actually SEARCH — not the
     directories (and skipped blobs) the walk passes through. The demonstrated
@@ -366,6 +393,7 @@ def test_grep_dirs_do_not_starve_file_cap():
         os.chdir(cwd)
 
 
+@_with_lever_off("grep_anchor")
 def test_grep_ignore_case_and_context():
     cwd = os.getcwd()
     try:
@@ -451,6 +479,7 @@ def test_walk_fast_path_matches_glob():
         os.chdir(cwd)
 
 
+@_with_lever_off("grep_anchor")
 def test_grep_prescreen_edge_patterns():
     """Patterns the whole-file prescreen can't mirror (lookarounds, \\A/\\Z) must skip
     it and still match per-line; anchored patterns must survive the MULTILINE probe."""
@@ -475,6 +504,154 @@ def test_grep_big_file_streams():
         check("grep: match found past the full-read cap", "NEEDLE end" in out, out[:120])
     finally:
         os.chdir(cwd)
+
+
+# --- grep_anchor / read_range_footer (group "contract") -----------------------
+
+def test_grep_anchor_rendering():
+    """grep_anchor ON: matches grouped under a `path:` header with read-style
+    numbered rows, so a grep hit is a line-edit anchor rendered the same way a
+    read is."""
+    cwd = os.getcwd()
+    try:
+        _seed({"a.py": "import os\nNEEDLE here\nbye\nalso NEEDLE\n"})
+        out = tools.tool_grep("NEEDLE")
+        lines = out.splitlines()
+        check("anchor: file header first", lines[0] == "./a.py:", repr(lines))
+        check("anchor: numbered match rows",
+              lines[1] == "2  NEEDLE here" and lines[2] == "4  also NEEDLE",
+              repr(lines))
+        check("anchor: no flat path:line rows", "a.py:2:" not in out, out)
+    finally:
+        os.chdir(cwd)
+
+
+def test_grep_anchor_context_marks_matches():
+    """With context lines interleaved, match rows carry a `*` in the marker column
+    and context rows keep read's plain two-space gutter; group breaks stay `--`."""
+    cwd = os.getcwd()
+    try:
+        _seed({"a.py": "one\nNEEDLE two\nthree\nfour\nfive\nsix\nseven\n"
+                       "NEEDLE eight\nnine\n"})
+        out = tools.tool_grep("NEEDLE", context=1)
+        lines = out.splitlines()
+        check("anchor ctx: header", lines[0] == "./a.py:", repr(lines))
+        check("anchor ctx: context row plain", lines[1] == "1  one", repr(lines))
+        check("anchor ctx: match row starred", lines[2] == "2* NEEDLE two", repr(lines))
+        check("anchor ctx: group break kept", "--" in lines, repr(lines))
+    finally:
+        os.chdir(cwd)
+
+
+def test_grep_anchor_marks_file_seen():
+    """A rendered grep view records the file's content hash, so a later line edit
+    against numbers minted by grep gets the same staleness protection a read gets:
+    change the file underneath and the edit is rejected with a fresh view."""
+    cwd = os.getcwd()
+    try:
+        from chad import levers
+        _seed({"a.py": "one = 1\nNEEDLE = 2\nthree = 3\n"})
+        before = levers.fire_counts().get("grep_anchor", 0)
+        tools.tool_grep("NEEDLE", path="a.py")
+        check("anchor: fired once per rendering grep",
+              levers.fire_counts().get("grep_anchor", 0) == before + 1)
+        with open("a.py", "w") as f:  # the file changes behind the model's back
+            f.write("zero = 0\none = 1\nNEEDLE = 2\nthree = 3\n")
+        res = tools.tool_replace_lines("a.py", 2, 2, "NEEDLE = 99")
+        check("anchor: stale numbers rejected after external change",
+              res.startswith("[edit rejected:") and "changed on disk" in res, res)
+    finally:
+        os.chdir(cwd)
+
+
+@_with_lever_off("grep_anchor")
+def test_grep_no_anchor_never_marks_seen():
+    """Lever OFF: a grep view leaves no seen-hash, so the stale guard stays out of
+    the way of a later line edit (the shipping default)."""
+    cwd = os.getcwd()
+    try:
+        _seed({"b.py": "one = 1\nNEEDLE = 2\nthree = 3\n"})
+        tools.tool_grep("NEEDLE", path="b.py")
+        with open("b.py", "w") as f:
+            f.write("zero = 0\none = 1\nNEEDLE = 2\nthree = 3\n")
+        res = tools.tool_replace_lines("b.py", 3, 3, "NEEDLE = 99")
+        check("no-anchor: edit lands without stale reject",
+              res.startswith("[edited"), res)
+    finally:
+        os.chdir(cwd)
+
+
+def test_read_skeleton_elided_footer():
+    """read_range_footer ON: a skeleton read ends with the exact elided body
+    ranges in directly pasteable read(...) form."""
+    cwd = os.getcwd()
+    try:
+        body = "\n".join(f"    x{i} = {i}" for i in range(140))
+        src = (f"def alpha():\n{body}\n\n\ndef beta():\n{body}\n\n\n"
+               f"def gamma():\n    return 1\n")
+        _seed({"big.py": src})
+        out = tools.tool_read("big.py")
+        check("footer: skeleton mode engaged", "STRUCTURE of" in out, out[:120])
+        check("footer: names elided bodies", "[largest elided bodies:" in out, out[-300:])
+        check("footer: pasteable read call",
+              "read(big.py, offset=" in out and "limit=" in out, out[-300:])
+    finally:
+        os.chdir(cwd)
+
+
+@_with_lever_off("read_range_footer")
+def test_read_skeleton_no_footer_when_off():
+    cwd = os.getcwd()
+    try:
+        body = "\n".join(f"    x{i} = {i}" for i in range(130))
+        _seed({"big.py": f"def alpha():\n{body}\n\n\ndef beta():\n{body}\n"})
+        out = tools.tool_read("big.py")
+        check("footer off: skeleton unchanged",
+              "STRUCTURE of" in out and "elided bodies" not in out, out[-200:])
+    finally:
+        os.chdir(cwd)
+
+
+def test_read_clip_note_names_continuation():
+    """read_range_footer ON: the char-cap clip note names the last complete line
+    shown and the exact read(...) call that continues from it."""
+    cwd = os.getcwd()
+    try:
+        _seed({"dense.txt": ("y" * 60 + "\n") * 300})
+        out = tools.tool_read("dense.txt")
+        check("clip: still clipped", "…clipped at" in out, out[-250:])
+        check("clip: names last complete line", "complete through line" in out,
+              out[-250:])
+        check("clip: pasteable continuation", "read(dense.txt, offset=" in out,
+              out[-250:])
+    finally:
+        os.chdir(cwd)
+
+
+# --- CHAD_HIDE_TOOLS ----------------------------------------------------------
+
+def test_hide_tools_removes_named_schemas():
+    """CHAD_HIDE_TOOLS subtracts named builtin tools from the exposed schemas (the
+    per-dialect A/B knob); a typo'd name fails loud instead of silently measuring
+    the unmodified toolset."""
+    old = os.environ.get("CHAD_HIDE_TOOLS")
+    try:
+        os.environ["CHAD_HIDE_TOOLS"] = "replace_lines,insert_lines"
+        names = {s["function"]["name"] for s in tools.active_schemas()}
+        check("hide: named tools removed",
+              "replace_lines" not in names and "insert_lines" not in names, names)
+        check("hide: others untouched", "edit" in names and "read" in names, names)
+        os.environ["CHAD_HIDE_TOOLS"] = "not_a_tool"
+        try:
+            tools.active_schemas()
+            check("hide: typo fails loud", False)
+        except ValueError as e:
+            check("hide: typo names the tool", "not_a_tool" in str(e), e)
+    finally:
+        if old is None:
+            os.environ.pop("CHAD_HIDE_TOOLS", None)
+        else:
+            os.environ["CHAD_HIDE_TOOLS"] = old
 
 
 # --- tool_write ---------------------------------------------------------------

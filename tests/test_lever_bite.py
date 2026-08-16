@@ -962,6 +962,37 @@ def test_bash_env_guard_bite(monkeypatch):
     assert tools._bash_env() is None
 
 
+# === group "contract" =============================================================
+
+def test_grep_anchor_bite(monkeypatch, tmp_path):
+    """ON, grep groups matches under a `path:` header with read-style numbered rows;
+    OFF, the flat `path:line: text` stream."""
+    n = bite("grep_anchor")
+    f = tmp_path / "a.py"
+    f.write_text("one\nNEEDLE two\nthree\n")
+    monkeypatch.chdir(tmp_path)
+    on(monkeypatch)
+    out = tools.tool_grep("NEEDLE", path=str(f))
+    assert out.splitlines()[0].endswith("a.py:") and "2  NEEDLE two" in out
+    off(monkeypatch, n)
+    out = tools.tool_grep("NEEDLE", path=str(f))
+    assert ":2: NEEDLE two" in out
+
+
+def test_read_range_footer_bite(monkeypatch, tmp_path):
+    """ON, a skeleton read ends with pasteable elided-body ranges; OFF, the prose
+    note alone."""
+    n = bite("read_range_footer")
+    body = "\n".join(f"    x{i} = {i}" for i in range(140))
+    f = tmp_path / "big.py"
+    f.write_text(f"def alpha():\n{body}\n\n\ndef beta():\n{body}\n")
+    monkeypatch.chdir(tmp_path)
+    on(monkeypatch)
+    assert "[largest elided bodies:" in tools.tool_read(str(f))
+    off(monkeypatch, n)
+    assert "[largest elided bodies:" not in tools.tool_read(str(f))
+
+
 def test_every_registered_lever_has_a_bite_test():
     """A lever with no minimal on/off pair is a lever that might not bite. Ablating it
     would report 'no measured effect' and the fix would be deleted on that evidence."""
