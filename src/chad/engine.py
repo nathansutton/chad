@@ -1755,37 +1755,47 @@ class Engine:
             candidate = (ng >= self.pld_wide_min_ngram
                          and len(d) >= self.pld_wide_min_draft + 1)
 
+            draft = []
+            pv = None
             if pend_val is None:
                 # LAZY state. No span candidate: submit the next forward on
                 # the lazy token FIRST, then materialize+commit one behind.
+                # (Falls through to the shared stop_condition / think-ceiling
+                # checks below — an early `continue` here silently disabled
+                # stop_condition on cold decode, which in the agent loop means
+                # every step runs to max_tokens.)
                 if not candidate:
                     nxt = _plain_step(pend)
                     mx.async_eval(nxt)
-                    pv = int(pend)
+                    pvc = int(pend)
                     _mark_first()
-                    fed_ids.append(pv)
-                    stop = _commit(pv)
+                    fed_ids.append(pvc)
+                    stop = _commit(pvc)
                     if not stop and stop_texts \
                             and any(s in detok.text for s in stop_texts):
                         stop = True
                     pend = nxt
-                    continue
-                # Span candidate: materialize the pending token (the only
-                # forward in flight is its own producer). If the lookup
-                # predicted it, verify the continuation; else feed it and
-                # return to the pipeline.
-                pv = int(pend)
-                _mark_first()
-                stop = _commit(pv)
-                if stop:
-                    break
-                pend = None
-                draft = d[1:] if pv == d[0] else []
+                else:
+                    # Span candidate: materialize the pending token (the only
+                    # forward in flight is its own producer). If the lookup
+                    # predicted it, verify the continuation; else feed it and
+                    # return to the pipeline.
+                    pv = int(pend)
+                    _mark_first()
+                    stop = _commit(pv)
+                    if stop:
+                        break
+                    pend = None
+                    if pv == d[0]:
+                        draft = d[1:]
             else:
                 pv = pend_val
                 pend_val = None
-                draft = d[: self.pld_wide_draft] if candidate else []
+                if candidate:
+                    draft = d[: self.pld_wide_draft]
 
+            if stop:
+                break
             if draft:
                 n_acc, next_tok = _wide_verify(pv, draft)
                 _mark_first()
@@ -1799,7 +1809,7 @@ class Engine:
                         and any(s in detok.text for s in stop_texts):
                     stop = True
                 pend_val = next_tok   # committed, unfed: ready to verify again
-            else:
+            elif pv is not None:
                 # Committed pending token, no (confirmed) span: feed it and
                 # return to the lazy pipeline.
                 fed_ids.append(pv)

@@ -50,7 +50,7 @@ def _wide_engine(model):
     return eng
 
 
-def _run(mode, model, reference):
+def _run(mode, model, reference, stop_condition=None):
     prompt_len = len(PROMPT)
 
     def fake_lookup(arr, n, num_draft, ngram_max, ngram_min):
@@ -70,7 +70,8 @@ def _run(mode, model, reference):
     eng_mod.prompt_lookup_draft_arr = fake_lookup
     try:
         eng = _wide_engine(model)
-        text, stats = eng._generate_pld_wide(PROMPT, N_TOKENS, None, None)
+        text, stats = eng._generate_pld_wide(PROMPT, N_TOKENS, None, None,
+                                             stop_condition=stop_condition)
     finally:
         eng_mod.prompt_lookup_draft_arr = real
     return [int(t) for t in text.split()], stats
@@ -124,6 +125,31 @@ def test_total_rejection_is_bit_exact(tiny):
     assert stats.draft_proposed > 0
     assert stats.draft_accepted == 0
     assert got == ref, f"diverged at {_diverge(ref, got)}"
+
+
+def test_stop_condition_fires_on_cold_path(tiny):
+    """Regression: the pipelined cold arm once `continue`d past the shared
+    stop_condition check, so a cold generation NEVER stopped at the agent's
+    tool-call boundary and every step ran to max_tokens (measured as a
+    40-minute eval task). The cold arm must honor stop_condition with the
+    plain path's per-token latency."""
+    ref = _greedy(tiny, PROMPT, N_TOKENS)
+    got, stats = _run("none", tiny, ref,
+                      stop_condition=lambda text, n: n >= 7)
+    assert stats.stop_condition_fired
+    assert stats.generated_tokens == 7, stats.generated_tokens
+    assert got == ref[:7]
+
+
+def test_stop_condition_fires_after_wide_verify(tiny):
+    """Inside a span the check runs per committed batch (documented lag of
+    at most one draft width), but it must still fire and stop the turn."""
+    ref = _greedy(tiny, PROMPT, N_TOKENS)
+    got, stats = _run("correct", tiny, ref,
+                      stop_condition=lambda text, n: n >= 5)
+    assert stats.stop_condition_fired
+    assert stats.generated_tokens < N_TOKENS
+    assert got == ref[: len(got)]
 
 
 def test_lazy_to_span_entry_is_bit_exact(tiny):
