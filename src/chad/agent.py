@@ -219,6 +219,49 @@ def close_unclosed_think(text: str, thinking: bool) -> str:
     return text
 
 
+def split_inline_reasoning(m: dict) -> dict:
+    """Lift an assistant turn's inline `<think>…</think>` out of `content` into the
+    `reasoning_content` field the chat template reads.
+
+    chad stores a generated turn verbatim in `content`, reasoning inline, because that
+    is the exact byte stream the model emitted (and so the stored turn re-renders into a
+    prefix of the live KV cache). Ornith's template reconstructs the split itself: when
+    `reasoning_content` is absent it recovers the reasoning by splitting `content` on
+    `</think>`. Qwen3.8's stock template DROPPED that recovery branch — it reads
+    `reasoning_content` and nothing else, so an inline-think turn renders as an EMPTY
+    `<think>\\n\\n</think>\\n\\n` followed by the whole raw turn. That injected empty block
+    lands at the very first generated token, so the re-render diverges from the cache
+    there and every step re-prefills its own last generation (reasoning + action + tool
+    call). Measured on real ky sessions: 6–11k discarded cache tokens per session,
+    25–32% of all prefill.
+
+    Doing the split here feeds the reasoning through the field BOTH templates read, so
+    the render matches what was decoded. Pure, and a no-op on non-assistant turns, on
+    turns with no `</think>` (a `--no-think`/no-think-escalation step, whose generation
+    prompt already carried the empty block), and on turns compaction has already
+    think-stripped."""
+    content = m.get("content") or ""
+    if m.get("role") != "assistant" or "</think>" not in content:
+        return m
+    head, _, tail = content.partition("</think>")
+    return {**m,
+            "reasoning_content": head.rstrip("\n").split("<think>")[-1].lstrip("\n"),
+            "content": tail.lstrip("\n")}
+
+
+# Probe messages for `_reasoning_split_supported`: a minimal transcript whose assistant
+# turn carries inline reasoning, in the exact shape chad stores (no opening `<think>` —
+# the generation prompt emitted it). Rendered twice, split and unsplit, to classify the
+# template. Distinctive sentinels so the check is a substring test, not a parse.
+_PROBE_REASONING = "chadprobeRSN"
+_PROBE_ANSWER = "chadprobeANS"
+_PROBE_MESSAGES = [
+    {"role": "system", "content": "s"},
+    {"role": "user", "content": "u"},
+    {"role": "assistant", "content": f"{_PROBE_REASONING}\n</think>\n\n{_PROBE_ANSWER}"},
+]
+
+
 # Permission modes (Claude Code parity, cycled with shift-tab in the TUI):
 #   normal — confirm each mutating tool (bash/write/edit)
 #   auto   — auto-approve FILE EDITS only; bash and MCP tools still ask
@@ -590,13 +633,56 @@ class Agent:
         MLX path returns a plain list already — untouched by this guard."""
         return rendered["input_ids"] if hasattr(rendered, "input_ids") else rendered
 
+    def _reasoning_split_supported(self) -> bool:
+        """Does THIS template need `split_inline_reasoning`, and is it safe to apply?
+
+        Behavioral probe, not a substring sniff on the template source: mlx_lm may swap
+        in its own template callable, and a template's real contract is what it renders.
+        Two renders of `_PROBE_MESSAGES` decide it:
+
+        * split render loses the reasoning  -> the template ignores `reasoning_content`
+          entirely (a non-thinking template). NOT safe: splitting would silently drop the
+          model's reasoning from the transcript. Off.
+        * split render == unsplit render    -> the template already recovers inline
+          `</think>` on its own (Ornith). Nothing to fix; off, so Ornith's rendered
+          prompt stays byte-identical to before this change.
+        * otherwise                         -> the template reads `reasoning_content` but
+          does not recover inline think (Qwen3.8). On.
+
+        Resolved once per agent and cached; a failed probe (an exotic template that
+        raises) falls back to OFF, i.e. exactly the pre-existing behavior."""
+        cached = getattr(self, "_split_ok", None)
+        if cached is not None:
+            return cached
+        try:
+            tok = self.engine.tok
+            def render(msgs):
+                return tok.apply_chat_template(msgs, add_generation_prompt=True,
+                                               enable_thinking=True, tokenize=False)
+            plain = render(_PROBE_MESSAGES)
+            split = render([split_inline_reasoning(m) for m in _PROBE_MESSAGES])
+            ok = _PROBE_REASONING in split and _PROBE_ANSWER in split and split != plain
+        except Exception:  # noqa: BLE001 — an unprobeable template must not break startup
+            ok = False
+        log.info("reasoning-content split: %s", "ON (template lacks inline-think "
+                 "recovery)" if ok else "off (template recovers it, or ignores "
+                 "reasoning_content)")
+        self._split_ok = ok
+        return ok
+
     def _render(self, thinking: bool = None):
         # `thinking` overrides self.thinking for THIS render only (no-think
         # escalation renders one step with <think> off, then restores). None => self.thinking.
         if thinking is None:
             thinking = self.thinking
+        # Lift inline reasoning into `reasoning_content` when the template needs it, so
+        # the re-render is a prefix extension of the KV cache instead of diverging at the
+        # first generated token. Off (and byte-identical to before) on Ornith.
+        messages = self.messages
+        if self._reasoning_split_supported():
+            messages = [split_inline_reasoning(m) for m in messages]
         ids = self._template_ids(self.engine.tok.apply_chat_template(
-            self.messages, tools=self._active_schemas(), add_generation_prompt=True,
+            messages, tools=self._active_schemas(), add_generation_prompt=True,
             enable_thinking=thinking,
         ))
         # Debug hook (env-gated, off by default): dump the first decoded render so a

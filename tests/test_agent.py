@@ -16,7 +16,13 @@ import tempfile
 
 import pytest
 
-from chad.agent import _has_open_tool_call, close_unclosed_think, expand_mentions
+from chad.agent import (
+    Agent,
+    _has_open_tool_call,
+    close_unclosed_think,
+    expand_mentions,
+    split_inline_reasoning,
+)
 
 PASS = 0
 FAIL = 0
@@ -100,6 +106,81 @@ def test_close_unclosed_think():
     check("empty untouched", close_unclosed_think("", True) == "")
 
 
+def test_split_inline_reasoning():
+    # A normal completed turn: reasoning up to </think>, action after it. chad stores the
+    # stream verbatim (the generation prompt emitted the opening tag), so there is no
+    # leading <think> to strip.
+    m = {"role": "assistant", "content": "weighing it up\n</think>\n\ncall the tool"}
+    out = split_inline_reasoning(m)
+    check("reasoning lifted", out["reasoning_content"] == "weighing it up", out)
+    check("content is the action", out["content"] == "call the tool", out)
+    check("input not mutated", m["content"].startswith("weighing"), m)
+    # An explicit opening <think> (some backends re-emit it) is dropped from the
+    # reasoning, matching the recovery Ornith's template does.
+    out = split_inline_reasoning({"role": "assistant", "content": "<think>\nwhy\n</think>\n\nans"})
+    check("opening tag stripped", out["reasoning_content"] == "why", out)
+    # No </think> at all: a --no-think / no-think-escalation turn, whose generation prompt
+    # already carried the empty block. Untouched, so its render still matches the cache.
+    nothink = {"role": "assistant", "content": "<tool_call>...</tool_call>"}
+    check("no-think turn untouched", split_inline_reasoning(nothink) is nothink)
+    # Non-assistant turns never carry reasoning.
+    tool = {"role": "tool", "name": "bash", "content": "x\n</think>\ny"}
+    check("tool turn untouched", split_inline_reasoning(tool) is tool)
+    check("user turn untouched",
+          split_inline_reasoning({"role": "user", "content": "a</think>b"})["content"] == "a</think>b")
+
+
+def test_reasoning_split_probe_classifies_templates():
+    """The probe must turn the split ON only for templates that need it. Ornith-class
+    templates (which recover inline `</think>` themselves) must stay OFF so their
+    rendered prompt is byte-identical to before this change; non-thinking templates
+    (which would DROP the reasoning) must stay off too."""
+    class FakeTok:
+        def __init__(self, kind):
+            self.kind = kind
+
+        def apply_chat_template(self, msgs, add_generation_prompt=False,
+                                enable_thinking=True, tokenize=False, **kw):
+            out = []
+            for m in msgs:
+                if m["role"] != "assistant":
+                    out.append(m["content"])
+                    continue
+                r, c = m.get("reasoning_content", ""), m["content"]
+                if self.kind == "ornith" and not r and "</think>" in c:
+                    r, _, c = c.partition("</think>")   # template recovers it itself
+                if self.kind == "plain":
+                    out.append(c)                       # ignores reasoning_content
+                else:
+                    out.append(f"<think>{r.strip()}</think>{c.strip()}")
+            return "|".join(out)
+
+    def probe(kind):
+        a = Agent.__new__(Agent)
+        a.engine = type("E", (), {"tok": FakeTok(kind)})()
+        return a._reasoning_split_supported()
+
+    check("qwen-class template -> split ON", probe("qwen") is True)
+    check("ornith-class template -> split off", probe("ornith") is False)
+    check("non-thinking template -> split off (would lose reasoning)", probe("plain") is False)
+
+    # The verdict is resolved once and cached (it renders two probe transcripts).
+    a = Agent.__new__(Agent)
+    a.engine = type("E", (), {"tok": FakeTok("qwen")})()
+    a._reasoning_split_supported()
+    a.engine = type("E", (), {"tok": FakeTok("ornith")})()
+    check("verdict cached", a._reasoning_split_supported() is True)
+
+    # An exotic template that raises must fall back to OFF (pre-existing behavior),
+    # never break the turn.
+    class Boom:
+        def apply_chat_template(self, *a, **k):
+            raise ValueError("no user query found in messages")
+    a = Agent.__new__(Agent)
+    a.engine = type("E", (), {"tok": Boom()})()
+    check("unprobeable template -> off", a._reasoning_split_supported() is False)
+
+
 if __name__ == "__main__":
     with pytest.MonkeyPatch.context() as mp:
         with tempfile.TemporaryDirectory() as d:
@@ -115,5 +196,7 @@ if __name__ == "__main__":
             test_expand_mentions_dedupes(mp, d)
     test_has_open_tool_call()
     test_close_unclosed_think()
+    test_split_inline_reasoning()
+    test_reasoning_split_probe_classifies_templates()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
