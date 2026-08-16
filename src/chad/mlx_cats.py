@@ -190,13 +190,15 @@ _SRC_ACC4 = r"""
       uint row = idx[j];
       float hc = float(h[j]);
       const device uchar* wr = wb + row * row_bytes + c0 / 2;
-      const device half* sr = scales + row * gstride;
-      const device half* br = biases + row * gstride;
+      // scales/biases indexed through their signature type (fp16 OR bf16 —
+      // the kernel is dtype-generic so the model's native bf16 arrays bind
+      // directly, no fp16 duplicates)
+      uint sr0 = row * gstride;
       #pragma clang loop unroll(full)
       for (int q8 = 0; q8 < CPT / 8; ++q8) {
         uint gq = (c0 + q8 * 8) / 64;
-        float hs = hc * float(sr[gq]);
-        float hb = hc * float(br[gq]);
+        float hs = hc * float(scales[sr0 + gq]);
+        float hb = hc * float(biases[sr0 + gq]);
         float4 qlo, qhi;
         unpack8_4bit(wr + q8 * 4, qlo, qhi);
         acc[2*q8]   = fma(float4(hs), qlo, acc[2*q8]   + hb);
@@ -374,21 +376,28 @@ def install(model, model_path) -> bool:
     cap = I
 
     z = mx.zeros((8,), dtype=mx.uint32)
+    adt = layers[0].mlp.up_proj.scales.dtype  # model's activation/scale dtype
     for i, layer in enumerate(layers):
         mlp = layer.mlp
         base = f"model.layers.{i}.mlp.downT"
+        # One copy, in the model's native dtype: the custom kernels read
+        # scales/biases through float() (dtype-generic), and the dense S>1
+        # path (quantized_matmul) then sees MATCHED x/scales dtypes — the
+        # mismatched combination takes a ~2.6x slower generic path. This also
+        # drops the fp16 duplicates of up_proj scales/biases (+356 MB) the
+        # first version carried.
         dT = (sw[f"{base}.weight"],
-              sw[f"{base}.scales"].astype(mx.float16),
-              sw[f"{base}.biases"].astype(mx.float16))
+              sw[f"{base}.scales"].astype(adt),
+              sw[f"{base}.biases"].astype(adt))
         mx.eval(*dT)
         mlp._cats = {
             "dT": dT, "thr": mx.array([thresholds[str(i)][rkey]],
                                       dtype=mx.float32),
             "cap": cap, "K": K, "D": D,
-            "su": mlp.up_proj.scales.astype(mx.float16),
-            "bu": mlp.up_proj.biases.astype(mx.float16),
+            "su": mlp.up_proj.scales,
+            "bu": mlp.up_proj.biases,
         }
-        mx.eval(mlp._cats["thr"], mlp._cats["su"], mlp._cats["bu"])
+        mx.eval(mlp._cats["thr"])
         dp = mlp.down_proj
         dp.weight = z
         dp.scales = z
