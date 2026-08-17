@@ -72,12 +72,18 @@ class _Tok:
         self.detokenizer = _Detok()
 
 
-def _engine(model, head, temp=0.0, num_draft=4):
+def _engine(model, head, temp=0.0, num_draft=4, adaptive=False):
+    # adaptive=False by default: these tests pin the fixed-width contract
+    # (forwards-count assertions assume a constant k), and the synthetic
+    # stubs emit flat logits whose zero top-2 margin legitimately clamps
+    # the adaptive schedule shallow. Adaptive coverage lives in the
+    # test_adaptive_* tests below.
     eng = object.__new__(Engine)
     eng.model = model
     eng.tok = _Tok()
     eng.kv_bits = None
     eng.temp = temp
+    eng.mtp_adaptive = adaptive
     eng.min_p = eng.top_p = 0.0
     eng.prompt_lookup = False
     eng.pld_num_draft = 8
@@ -176,6 +182,54 @@ def test_zero_model_full_accept_saves_forwards():
     assert stats.draft_accepted == stats.draft_proposed > 0
     assert stats.forwards < N_TOKENS // 2, (
         f"full accept should batch commits: {stats.forwards} forwards")
+
+
+def test_adaptive_greedy_is_bit_exact():
+    """The cost-model schedule changes WHICH depths run, never what commits:
+    greedy output under adaptive drafting must be bit-equal to plain decoding
+    with both a garbage head (collapse to skip + probes) and a perfect one
+    (ramp toward the cap)."""
+    model = _build_tiny()
+    ref = _greedy(model, PROMPT, N_TOKENS)
+    eng = _engine(model, _head_for(model), adaptive=True)
+    text, _ = eng._generate_mtp(PROMPT, N_TOKENS, None, None)
+    assert [int(t) for t in text.split()] == ref
+
+    zmodel = _build_tiny(zero=True)
+    zref = _greedy(zmodel, PROMPT, N_TOKENS)
+    from mlx.utils import tree_map
+    zhead = mlx_mtp.build(zmodel.language_model.args)
+    zhead.update(tree_map(mx.zeros_like, zhead.parameters()))
+    zhead.eval()
+    zeng = _engine(zmodel, zhead, adaptive=True)
+    ztext, zstats = zeng._generate_mtp(PROMPT, N_TOKENS, None, None)
+    assert [int(t) for t in ztext.split()] == zref
+    assert zstats.draft_accepted == zstats.draft_proposed
+
+
+def test_depth_policy_dynamics():
+    """Pure-policy contract: hot content ramps to the cap, sustained rejection
+    collapses to the free skip but probes its way back, and a near-tie pending
+    margin clamps the first positions."""
+    from chad.mlx_mtp import DepthPolicy
+    hot = DepthPolicy(7, 0.35)
+    for _ in range(40):
+        d = hot.depth()
+        hot.record(d, d, False)
+    assert hot.depth() == 7
+
+    cold = DepthPolicy(7, 0.35)
+    for _ in range(12):
+        d = cold.depth()
+        if d:
+            cold.record(d, 0, False)
+    assert cold.depth() == 0
+    # the 16-skip probe must eventually re-offer depth 1
+    assert any(cold.depth() == 1 for _ in range(20))
+
+    tie = DepthPolicy(7, 0.35)
+    tie.margin = 0.0
+    assert tie.depth() <= 1
 
 
 def test_second_turn_extends_cleanly():

@@ -26,12 +26,113 @@ Build one from an original-checkpoint shard holding the `mtp.*` tensors:
   uv run python -m chad.mlx_mtp <shard.safetensors> --model <model_dir>
 """
 
+import math
 import os
 from typing import Any, Optional
 
 from .diag import log
 
 _SIDECAR_DIR = os.path.expanduser("~/.cache/chad/mtp")
+
+
+class DepthPolicy:
+    """Cost-model draft schedule: choose the depth that maximizes expected
+    committed tokens per unit round time.
+
+    A round of depth d costs T(d) = V + d*H (one width-(d+1) verify plus d
+    head steps) and commits E[tokens](d) = 1 + sum_{k=1..d} prod_{i<k} p_i,
+    where p_i is the estimated acceptance of draft position i GIVEN the
+    prefix before it was accepted. Greedy marginal rule: extend to position
+    d+1 exactly while
+
+        prod_{i<=d+1} p_i  >  h * (1 + E_d) / (1 + d*h)
+
+    with h = H/V the head step's cost relative to the verify forward. The
+    p_i are per-position EMAs seeded with an optimistic, gently decaying
+    prior (the first rounds should draft, not stall); a fully accepted round
+    also transfers bounded optimism to the first unreached position, so deep
+    depths become reachable inside a short window. On hot prose this runs
+    to the cap; on cold prompts it collapses to 1 and then to 0 (an adaptive
+    skip costs exactly what a serial step costs).
+
+    The pending top-2 logit margin (of the row that produced the pending
+    token) additionally caps p_0/p_1: a near-tie next token is exactly where
+    the head is about to be wrong, whatever its recent streak says.
+    """
+
+    MAX_DEPTH = 8
+
+    def __init__(self, max_depth: int, h: float, costs: Optional[list] = None):
+        """`costs`, when given, is the measured round cost T(d) for depth
+        d = 0..max_depth (any unit): T(d) = V(d+1) + d*H with the verify-width
+        ladder as measured on THIS stack, which is not width-flat (the S>1
+        forward pays nearly per-row above S=2 outside the fused envelopes).
+        The scalar-h model is the width-flat special case T(d) = 1 + d*h."""
+        self.max_depth = max(0, min(max_depth, self.MAX_DEPTH))
+        self.h = h
+        if costs is not None and len(costs) >= self.max_depth + 1:
+            self.costs = [float(c) for c in costs]
+        else:
+            self.costs = [1.0 + d * h for d in range(self.MAX_DEPTH + 1)]
+        self.ema = [0.85 * (0.98 ** i) for i in range(self.MAX_DEPTH)]
+        self.alpha = 0.15
+        self.margin: Optional[float] = None   # pending top-2 logit margin
+        self.streak = 0                       # consecutive fully-accepted rounds
+        self._skips = 0                       # consecutive adaptive skips
+
+    def depth(self) -> int:
+        cap = self.max_depth
+        if cap <= 0:
+            return 0
+        reach, expected, d = 1.0, 0.0, 0
+        while d < cap:
+            p = self.ema[d]
+            if self.margin is not None:
+                # Confidence gates on the first two positions only; deeper
+                # positions are governed by the EMAs' chained product.
+                if d == 0:
+                    p = min(p, 1.0 / (1.0 + math.exp(-self.margin / 2.0)))
+                elif d == 1:
+                    p = min(p, 1.0 / (1.0 + math.exp(-self.margin / 3.0)))
+            reach *= p
+            # Extend to d+1 iff tokens-per-time improves:
+            #   (1+E+reach)/T(d+1) > (1+E)/T(d)
+            if reach * self.costs[d] <= \
+                    (1.0 + expected) * (self.costs[d + 1] - self.costs[d]):
+                break
+            expected += reach
+            d += 1
+        if d == 0:
+            # An adaptive skip is free, but the EMAs only observe drafted
+            # rounds — a hard stretch would otherwise lock drafting out for
+            # the rest of the turn even after the content turns easy. Probe
+            # depth 1 every 16th consecutive skip (~one EMA half-life).
+            self._skips += 1
+            if self._skips >= 16:
+                self._skips = 0
+                return 1
+        else:
+            self._skips = 0
+        return d
+
+    def record(self, proposed: int, accepted: int, stopped_early: bool) -> None:
+        """Fold one round's outcome into the per-position EMAs. Positions
+        before `accepted` observed a success; the position AT `accepted`
+        observed a failure only when the walk actually rejected there (not
+        when the round ended on a committed stop token); deeper positions
+        observe nothing. A FULLY accepted round transfers bounded optimism
+        (toward 0.95, never past it) to the first unreached position."""
+        a = self.alpha
+        e = self.ema
+        for i in range(min(accepted, len(e))):
+            e[i] += a * (1.0 - e[i])
+        if accepted < proposed and not stopped_early and accepted < len(e):
+            e[accepted] += a * (0.0 - e[accepted])
+        elif accepted == proposed and proposed > 0 and accepted < len(e):
+            if e[accepted] < 0.95:
+                e[accepted] += a * (0.95 - e[accepted])
+        self.streak = self.streak + 1 if (proposed > 0 and accepted == proposed) \
+            else 0
 
 
 def build(args: Any):
@@ -118,19 +219,83 @@ def load_head(model: Any, model_dir: str) -> Optional[Any]:
         if path is None:
             return None
         weights = mx.load(path)
+        islands = {k: v for k, v in weights.items()
+                   if k.startswith("precision_islands.")}
+        if islands:
+            weights = {k: v for k, v in weights.items()
+                       if not k.startswith("precision_islands.")}
         meta_gs, meta_bits = _read_meta(path)
+        if not meta_bits and "fc.scales" in weights:
+            # Foreign sidecar (e.g. an arena head artifact) without build
+            # metadata: infer the packing from fc's shapes. fc is (H, 2H):
+            # 2H / packed-cols u32 values per word -> bits, 2H / scale-cols
+            # -> group size.
+            in_dim = 2 * int(args.hidden_size)
+            meta_bits = 32 // (in_dim // int(weights["fc.weight"].shape[1]))
+            meta_gs = in_dim // int(weights["fc.scales"].shape[1])
         head = build(args)
         if meta_bits:
             nn.quantize(head, group_size=meta_gs, bits=meta_bits)
         head.load_weights(list(weights.items()))
+        n_isl = _install_islands(head, islands) if islands else 0
         head.eval()
         mx.eval(head.parameters())
-        log.info("MTP head loaded (%s, %s)", path,
-                 f"{meta_bits}-bit g{meta_gs}" if meta_bits else "unquantized")
+        log.info("MTP head loaded (%s, %s%s)", path,
+                 f"{meta_bits}-bit g{meta_gs}" if meta_bits else "unquantized",
+                 f", {n_isl} bf16 precision-island rows" if n_isl else "")
         return head
     except Exception as e:  # noqa: BLE001 — never break model load over MTP
         log.warning("MTP head load failed (%s); decoding without MTP", e)
         return None
+
+
+def _install_islands(head: Any, islands: dict) -> int:
+    """Wrap the head's q/k/v projections with exact-row precision islands.
+
+    A sidecar may carry `precision_islands.{q,k,v}.{weight,indices}`: selected
+    output rows of the proposal head's attention projections kept in bf16
+    (the rows with the largest fp32 reconstruction error under the packed
+    4-bit quantization — a draft-quality recovery, worth ~real acceptance at
+    depth). The wrapped projection runs the packed QMV unchanged, computes the
+    island rows exactly, and overwrites just those outputs. Head-only: the
+    main model never sees these arrays. Returns the number of island rows."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    class _IslandLinear(nn.Module):
+        def __init__(self, inner, w, idx):
+            super().__init__()
+            self.inner = inner
+            self.island_w = w
+            self.island_idx = idx.astype(mx.int32)
+
+        def __call__(self, x):
+            y = self.inner(x)
+            w = self.island_w
+            if w.dtype != x.dtype:
+                # One-time cast to the compute dtype (a per-call astype in the
+                # matmul would re-launch the cast kernel every draft step).
+                w = w.astype(x.dtype)
+                self.island_w = w
+            exact = x @ w.T
+            idx = self.island_idx.reshape((1,) * (y.ndim - 1) + (-1,))
+            return mx.put_along_axis(y, idx, exact, axis=-1)
+
+    attn = head.layers[0].self_attn
+    total = 0
+    for name in ("q", "k", "v"):
+        w = islands.get(f"precision_islands.{name}.weight")
+        idx = islands.get(f"precision_islands.{name}.indices")
+        if w is None or idx is None:
+            continue
+        if w.shape[0] != idx.shape[0]:
+            raise ValueError(
+                f"precision island {name}: weight rows {w.shape[0]} != "
+                f"indices {idx.shape[0]}")
+        proj = f"{name}_proj"
+        setattr(attn, proj, _IslandLinear(getattr(attn, proj), w, idx))
+        total += int(w.shape[0])
+    return total
 
 
 def _read_meta(path: str) -> tuple:

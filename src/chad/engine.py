@@ -441,6 +441,32 @@ class Engine:
     # and ~2x at S=4, so deeper drafts lose to verify cost even at good
     # acceptance. Revisit when the small-batch kernel story changes.
     mtp_num_draft: int = 2
+    # Adaptive draft schedule (cost-model, mlx_mtp.DepthPolicy): per round,
+    # draft the depth 0..mtp_max_draft that maximizes expected committed
+    # tokens per unit round time under per-position acceptance EMAs and the
+    # measured head-step/verify cost ratio mtp_h. Hot prose runs deep, cold
+    # prompts collapse to 1 or a free skip (0); the fixed-k sweep behind
+    # mtp_num_draft is the degenerate constant-depth version. Default OFF by
+    # measurement (M4 Pro, 4-bit 27B, 8-prompt 512-token protocol): this
+    # stack's verify forward pays ~20-25 ms PER ROW above S=2, so depth past
+    # 2 cannot pay — fixed k=2 measured 29.0 tok/s median vs 27.1 for
+    # adaptive-cap-4 even at 97%+ acceptance. The schedule itself is sound
+    # (it protects hard prompts and ramps where acceptance holds); flip on
+    # with CHAD_MTP_ADAPTIVE=1 once a fused multi-row verify flattens the
+    # ladder. CHAD_MTP_DRAFT forces a fixed width; CHAD_MTP_MAX_DRAFT /
+    # CHAD_MTP_H override the cap and the cost ratio.
+    mtp_adaptive: bool = False
+    # Cap 4 = verify width 5. Two independent walls above it, both measured:
+    # (1) numeric drift — wider verifies flip near-tie argmaxes and the
+    # generation leaves the serial trajectory (the same width wall the
+    # qwen-3.8 arena pinned at 5 for bit-exactness); (2) cost — width >= 7
+    # falls off the fused wide-SDPA envelope (mlx_qsdpa._wide_s_max) and the
+    # ladder turns per-row. Raise only with a bit-exact wide-verify audit.
+    mtp_max_draft: int = 4
+    mtp_h: float = 0.35             # head-step cost / verify-forward cost
+    # Measured per-depth round costs T(0)..T(max), any unit; None = the
+    # width-flat scalar-h model. See mlx_mtp.DepthPolicy.
+    mtp_costs: Optional[list] = None
     # Draft PROPOSAL mode at temp>0. True (default) samples the proposal from
     # the head's distribution (classic Leviathan/Chen): at the recommended
     # temp 1.0 the target is broad and proposal≈target overlap acceptance wins
@@ -587,9 +613,18 @@ class Engine:
         if not config.flag("CHAD_NO_MTP"):
             from . import mlx_mtp
             self._mtp_head = mlx_mtp.load_head(self.model, path)
+            if config.flag("CHAD_MTP_ADAPTIVE"):
+                self.mtp_adaptive = True
             nd = config.env_int("CHAD_MTP_DRAFT", 0)
             if nd:
                 self.mtp_num_draft = nd
+                self.mtp_adaptive = False   # an explicit width is an order
+            md = config.env_int("CHAD_MTP_MAX_DRAFT", 0)
+            if md:
+                self.mtp_max_draft = min(md, 8)
+            hv = config.env_float("CHAD_MTP_H", 0.0)
+            if hv:
+                self.mtp_h = hv
         self._resolve_kv_bits(qsdpa_ok)
         self._warm_verify_widths()
         self._install_memory_clamp()
@@ -657,7 +692,12 @@ class Engine:
             return          # fp16 cache: no fused kernel, so no variants exist
         widths: set[int] = set()
         if self._mtp_head is not None:
-            widths.add(self.mtp_num_draft + 1)
+            if self.mtp_adaptive:
+                # The adaptive schedule can verify at any width up to the cap;
+                # an unwarmed width is a Metal compile inside a scored round.
+                widths.update(range(2, self.mtp_max_draft + 2))
+            else:
+                widths.add(self.mtp_num_draft + 1)
         if (config.flag("CHAD_USE_PLD") and self.prompt_lookup and self.pld_wide
                 and self.pld_wide_draft >= self.pld_wide_min_draft):
             # _wide_verify feeds [pending] + draft, and the draft runs from
@@ -2156,6 +2196,11 @@ class Engine:
             y_val = suffix[-1]
 
         mtp_cache = head.make_cache()
+        # Fresh per-turn policy state: acceptance statistics are a property of
+        # the current prompt/content, not of the session.
+        from .mlx_mtp import DepthPolicy
+        policy = (DepthPolicy(self.mtp_max_draft, self.mtp_h, self.mtp_costs)
+                  if self.mtp_adaptive else None)
         key = mx.random.key(int.from_bytes(os.urandom(4), "little"))
         first_token_at = None
         out_ids = []
@@ -2181,7 +2226,15 @@ class Engine:
         while len(out_ids) < max_tokens:
             if should_stop and should_stop():
                 break
-            k = self.mtp_num_draft if h_last is not None else 0
+            if h_last is None:
+                k = 0
+            elif policy is not None:
+                k = policy.depth()
+            else:
+                k = self.mtp_num_draft
+            # Never draft past the token budget: the tail of the window is a
+            # plain (or shallower) step, not a wasted deep round.
+            k = min(k, max(0, max_tokens - len(out_ids) - 1))
 
             # -- draft: chain the head k times ------------------------------
             # The chain stays LAZY: each drafted token feeds the next step's
@@ -2300,7 +2353,11 @@ class Engine:
                     next_tok = int(nt)
             else:
                 toks = mx.argmax(logits, axis=-1)
-                mx.eval(toks, d_arrs)
+                # Top-2 values feed the policy's pending-margin gate: a
+                # near-tie next token is where the head is about to miss,
+                # whatever its streak says. Same eval — no extra host sync.
+                t2 = mx.topk(logits, 2, axis=-1) if policy is not None else None
+                mx.eval(toks, d_arrs) if t2 is None else mx.eval(toks, d_arrs, t2)
                 if k and not draft:
                     draft = [int(x) for x in d_arrs]
                 toks = [int(t) for t in toks.tolist()]
@@ -2308,12 +2365,22 @@ class Engine:
                 while n_acc < k and toks[n_acc] == draft[n_acc]:
                     n_acc += 1
                 next_tok = toks[n_acc]
+                if t2 is not None:
+                    row = t2[n_acc]
+                    policy.margin = abs(float(row[0]) - float(row[1]))
             if first_token_at is None:
                 first_token_at = time.time()
                 stats.prefill_s = first_token_at - t0
             stats.forwards += 1
             stats.draft_proposed += k
             stats.draft_accepted += n_acc
+            if policy is not None and k:
+                # An accepted draft that IS a stop token ends the walk without
+                # indicting the next position — the round ended because the
+                # generation did, not because the head missed.
+                policy.record(k, n_acc,
+                              stopped_early=(n_acc > 0
+                                             and draft[n_acc - 1] in eos))
 
             # -- roll the main cache back over rejected drafts --------------
             if k - n_acc > 0:
