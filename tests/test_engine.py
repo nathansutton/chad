@@ -304,6 +304,39 @@ def test_draft_length():
     check("draft truncated near end of context", got2 == [1, 2], repr(got2))
 
 
+def test_wide_gate_demands_the_full_ngram():
+    """The wide-PLD gate is `min_ngram == ngram_max`, so the matcher accepts ONE
+    match length and rejects everything shorter. This is the evidence bar that keeps
+    a wide verify from firing on weak recurrence: an S=32 verify costs ~7.5 plain
+    steps, so a match that yields fewer accepted tokens than that is a net loss, and
+    short matches in a large code context are exactly that case (measured 6.50
+    accepted/verify at a 6-gram bar vs 11.22 at a 16-gram bar).
+    """
+    import numpy as np
+
+    from chad.engine import Engine, prompt_lookup_draft_arr
+
+    # a 6-token recurrence, with the shipped 16-token bar applied to it
+    ctx = np.array([7, 8, 9, 10, 11, 12, 40, 41, 7, 8, 9, 10, 11, 12], dtype=np.int32)
+    d, ng = prompt_lookup_draft_arr(ctx, len(ctx), 32, 16, 16)
+    check("6-gram recurrence is rejected by the 16-gram bar", d == [] and ng == 0,
+          repr((d, ng)))
+
+    # the same matcher still finds a recurrence that DOES clear the bar, and copies
+    # what followed it (here: the 99 sentinel after the first run of 20 tokens)
+    run = list(range(100, 120))          # 20 distinct tokens
+    ctx2 = np.array(run + [99, 55] + run, dtype=np.int32)
+    d2, ng2 = prompt_lookup_draft_arr(ctx2, len(ctx2), 32, 16, 16)
+    check("20-token recurrence clears the 16-gram bar", ng2 == 16, repr(ng2))
+    check("draft copies what followed the earlier occurrence", d2[:2] == [99, 55],
+          repr(d2[:2]))
+
+    # and the shipped defaults are the ones just characterized
+    check("shipped gate is a single exact length",
+          Engine.pld_wide_ngram == Engine.pld_wide_min_ngram == 16,
+          f"{Engine.pld_wide_ngram}/{Engine.pld_wide_min_ngram}")
+
+
 # === Tier 2: PLD == plain-greedy equivalence (model-gated, self-skipping) =====
 
 # A small dense Qwen2.5-Coder is trimmable; Ornith is not (so PLD never engages).

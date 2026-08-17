@@ -339,10 +339,20 @@ class Engine:
     # any temp: point-mass rejection sampling (accept w.p. p(draft)), the same
     # correction _generate_mtp ships. Takes precedence over MTP on the hybrid;
     # MTP is the fallback when this is disabled or ineligible.
+    # Gate sizing is measured, not guessed: replaying this exact matcher over real
+    # dogfood traces gives accepted-tokens-per-verify, and a wide verify only pays for
+    # itself above ~7.5 (the S=32-forward vs plain-step cost ratio on this machine).
+    # A 6-token match in tens of thousands of tokens of code context is not evidence —
+    # it fired constantly and landed 6.50 accepted/verify, i.e. BELOW break-even. A
+    # 16-token match is evidence: 11.22 accepted/verify. Requiring one exact length
+    # (min == max) also collapses the descending-ngram search to a single vectorized
+    # pass, which is 4x cheaper host-side than the old 6..12 ladder — so this is both a
+    # better gate and a cheaper one. Longer maxima (24, 32) were swept and rejected:
+    # they add ~1% acceptance and 6x the host-side lookup cost, a net loss per step.
     pld_wide: bool = True
     pld_wide_draft: int = 31        # max draft width (S=32 verify)
-    pld_wide_ngram: int = 12        # longest suffix length to try matching
-    pld_wide_min_ngram: int = 6     # shortest match that justifies a wide verify
+    pld_wide_ngram: int = 16        # longest suffix length to try matching
+    pld_wide_min_ngram: int = 16    # shortest match that justifies a wide verify
     pld_wide_min_draft: int = 8     # skip verify if the source span is shorter
     # MTP self-speculative decoding: draft with the checkpoint's own trained
     # multi-token-prediction head (loaded as a sidecar — mlx_mtp.py), verify in

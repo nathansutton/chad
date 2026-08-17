@@ -1491,6 +1491,17 @@ TURN_THINK_MIN_WALL_S = 300.0  # below this wall budget the mechanism is inert: 
 TURN_THINK_REARM_TOK = 3000    # past exhaustion, one forced no-think step is owed per
                                # this many FURTHER think tokens spent
 
+# Default close-and-continue think ceiling, applied when CHAD_THINK_CEILING is unset.
+# Sized off the measured per-step think distribution on a real dogfood session (29 steps:
+# p50 111, p75 215, p90 524, max 934 tokens). The distribution is long-tailed — most steps
+# reason briefly and a minority run away — so a cap here leaves the median and p75 step
+# byte-identical and bites only the tail, which is where the degenerate cap-spirals live.
+# This is deliberately far below the ~6000 "pathological backstop" the ceiling was first
+# written for: at 6000 it never fired once in an entire session, and ungoverned reasoning
+# was 42% of that session's wall clock. Set CHAD_THINK_CEILING=0 to restore the old
+# always-off behavior; any positive value overrides.
+THINK_CEILING_DEFAULT = 384
+
 
 def turn_think_budget(wall_budget_s, decode_tps, frac: float = TURN_THINK_BUDGET_FRAC,
                       lo: int = TURN_THINK_BUDGET_LO, hi: int = TURN_THINK_BUDGET_HI) -> int:

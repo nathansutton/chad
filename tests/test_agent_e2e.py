@@ -19,8 +19,9 @@ Mirrors the fake-engine style of test_completion_engine.py; hermetic via `tmp_pa
 
 import json
 
+from chad import guardrails
 from chad.agent import Agent
-from chad.base_engine import BaseEngine, GenStats
+from chad.base_engine import BaseEngine, GenStats, think_ceiling_hit
 
 
 class _FakeTok:
@@ -843,8 +844,13 @@ def _run_capped_think(monkeypatch, *, ablated: bool):
     eng = _BigThinkEngine([truncated] * 6)
     tok = _ThinkFlagTok()
     eng.tok = tok
+    # think_ceiling pinned OFF so this stays a clean A/B of `capped_think_credit`.
+    # The ceiling is defaulted ON in production, and arming it also arms
+    # `no_think_escalation` (which flips the very same thinking flag these arms read,
+    # after two capped stalls) — leaving it at the default would let that lever, not
+    # the one under test, decide the OFF arm's result.
     agent = Agent(eng, mode="yolo", thinking=True, max_gen_tokens=15000,
-                  turn_budget_s=1e9)
+                  turn_budget_s=1e9, think_ceiling=0)
     agent.run_turn("change the config value")
     return tok.flags
 
@@ -865,6 +871,42 @@ def test_capped_think_uncredited_leaves_the_budget_blind(monkeypatch):
     flags = _run_capped_think(monkeypatch, ablated=True)
     assert flags, "the turn should have taken at least one step"
     assert False not in flags, flags
+
+
+def test_think_ceiling_defaults_on_and_stays_overridable(monkeypatch):
+    """The close-and-continue ceiling is armed by DEFAULT. It shipped env-armed as a
+    ~6000-token pathological backstop, which measured against a real session never
+    fired once while 42% of that session's wall clock went to ungoverned reasoning.
+    The three-way precedence (explicit arg > env > default) is what lets a bench pin
+    it and a user turn it off, so pin all three."""
+    monkeypatch.delenv("CHAD_THINK_CEILING", raising=False)
+    eng = ScriptedEngine(["done"])
+    eng.tok = _ThinkFlagTok()
+    assert Agent(eng, mode="yolo").think_ceiling == guardrails.THINK_CEILING_DEFAULT
+
+    # 0 disables it — the pre-default behavior, still reachable.
+    monkeypatch.setenv("CHAD_THINK_CEILING", "0")
+    assert Agent(eng, mode="yolo").think_ceiling == 0
+
+    # env overrides the default, and an explicit argument overrides the env.
+    monkeypatch.setenv("CHAD_THINK_CEILING", "1234")
+    assert Agent(eng, mode="yolo").think_ceiling == 1234
+    assert Agent(eng, mode="yolo", think_ceiling=77).think_ceiling == 77
+
+
+def test_think_ceiling_default_clears_the_measured_typical_step(monkeypatch):
+    """The default must be a TAIL cap, not a cap on reasoning generally: on the
+    measured dogfood distribution (p50 111, p75 215, p90 524, max 934 think tokens
+    per step) it has to leave a p75 step untouched and only bite beyond it. A default
+    at or below p75 would rewrite ordinary steps, which is a capability change, not a
+    throughput one."""
+    assert guardrails.THINK_CEILING_DEFAULT > 215      # p75 step is untouched
+    assert guardrails.THINK_CEILING_DEFAULT < 934      # the worst spiral is still cut
+    # and it must actually fire on a runaway, while a typical step never reaches it
+    assert think_ceiling_hit("reasoning with no close tag", 900,
+                             guardrails.THINK_CEILING_DEFAULT)
+    assert not think_ceiling_hit("reasoning with no close tag", 111,
+                                 guardrails.THINK_CEILING_DEFAULT)
 
 
 def test_closed_think_accounting_is_unchanged_by_the_lever(monkeypatch):

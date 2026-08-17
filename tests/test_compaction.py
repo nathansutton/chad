@@ -338,9 +338,69 @@ def test_overlimit_latch():
     check("stateless call still works (legacy path)", len(out) > ctx, len(out))
 
 
+def test_low_yield_compaction_latches():
+    """A compaction that lands just BARELY under the limit is a treadmill, and must
+    latch exactly like one that failed to get under at all.
+
+    The cost of compacting is fixed and large (the whole transcript past the stable
+    prefix is re-prefilled); the benefit is only the runway it buys. As the protected
+    recent window fills, each pass reclaims less while the re-prefill grows — measured
+    on a completed ky session: five passes freed 20,253 tokens and paid 73,220 tokens
+    of re-prefill, the last one freeing 884 for a cost of 17,667 (20x). Landing under
+    the limit with no runway left is the signature; only the runway test catches it,
+    because `len(new_ids) > ctx_limit` is false every time."""
+    from chad.compaction import _OVERLIMIT_REARM
+
+    # A big protected system prompt sits just under ctx_limit, and the droppable
+    # middle is what pushes it over. Compaction therefore SUCCEEDS (lands under the
+    # limit) but lands with almost no runway — the degenerate case the old
+    # `len(new_ids) > ctx_limit` test cannot see.
+    ctx = 4000
+    KEEP_RECENT = 6                  # matches compaction's trailing protected window
+    msgs = ([{"role": "system", "content": "S" * (ctx - 100)}]
+            + [{"role": "user", "content": "q"}]
+            + [{"role": "tool", "name": "read", "content": "d" * 500}
+               for _ in range(10)]                      # droppable middle
+            + [{"role": "tool", "name": "read", "content": "r" * 5}
+               for _ in range(KEEP_RECENT)])            # protected recent window
+    render = make_render(msgs)
+    state = {}
+
+    out = compact_if_needed(msgs, render, noop_emit, ctx, render(), state=state)
+    check("low-yield compaction lands under the limit", len(out) <= ctx, str(len(out)))
+    check("low-yield compaction leaves less than the rearm margin of runway",
+          ctx - len(out) < _OVERLIMIT_REARM, str(ctx - len(out)))
+    check("low-yield compaction still latches a floor",
+          state.get("overlimit_floor"), str(state))
+
+    # ...and the latch actually suppresses the next attempt, which is the whole point:
+    # without it the next over-limit step re-prefills the entire transcript again.
+    msgs.append({"role": "tool", "name": "read", "content": "x" * 200})
+    snapshot = [dict(m) for m in msgs]
+    compact_if_needed(msgs, render, noop_emit, ctx, render(), state=state)
+    check("latched: low-yield transcript not re-compacted",
+          [dict(m) for m in msgs] == snapshot)
+
+    # A compaction that DOES buy real runway must not latch — otherwise the guard
+    # would suppress the healthy first pass too (only pass #1 paid for itself above).
+    roomy = ([{"role": "system", "content": "s"}, {"role": "user", "content": "q"}]
+             + [{"role": "tool", "name": "read", "content": "d" * 800}
+                for _ in range(6)]                      # droppable
+             + [{"role": "tool", "name": "read", "content": "r" * 5}
+                for _ in range(KEEP_RECENT)])           # small protected window
+    r4 = make_render(roomy)
+    st2 = {}
+    out4 = compact_if_needed(roomy, r4, noop_emit, ctx, r4(), state=st2)
+    check("high-yield compaction leaves real runway",
+          ctx - len(out4) >= _OVERLIMIT_REARM, str(ctx - len(out4)))
+    check("high-yield compaction does NOT latch",
+          "overlimit_floor" not in st2, str(st2))
+
+
 if __name__ == "__main__":
     test_compaction()
     test_subagent_compaction()
     test_overlimit_latch()
+    test_low_yield_compaction_latches()
     print(f"\n{passed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)

@@ -280,12 +280,30 @@ def compact_if_needed(messages, render, emit, ctx_limit, prompt_ids, state=None)
              before, len(new_ids), ctx_limit, target, len(messages), len(dropped), noticed,
              " OVER-LIMIT" if len(new_ids) > ctx_limit else "")
     if state is not None:
-        if len(new_ids) > ctx_limit:
-            # Couldn't get under the limit: the protected floor is bigger than the
-            # window. Latch, so the next steps don't thrash the warm cache retrying.
+        # Latch on RUNWAY, not merely on "did we get under the limit". The cost of a
+        # compaction is fixed and large — the whole transcript past the stable prefix
+        # gets re-prefilled — while the benefit is only the headroom it buys before the
+        # next one. Landing a hair under the limit is therefore nearly as bad as landing
+        # over it: the next step re-crosses and pays the full re-prefill again. Measured
+        # on a completed ky session, where the floor rises as the protected recent window
+        # fills, so each successive pass reclaims less and costs more:
+        #   freed 9777 / re-prefilled 9069  (0.9x)
+        #   freed 5325 / re-prefilled 13552 (2.5x)
+        #   freed 2720 / re-prefilled 15984 (5.9x)
+        #   freed 1547 / re-prefilled 16948 (11x)
+        #   freed  884 / re-prefilled 17667 (20x)
+        # 73,220 tokens re-prefilled to free 20,253 — 43% of that session's wall clock.
+        # Only the first pass paid for itself; the latch below stops the treadmill after
+        # it. Same excursion-safety argument as the over-limit case: the engine's memory
+        # clamps cover the small overshoot.
+        runway = ctx_limit - len(new_ids)
+        if runway < _OVERLIMIT_REARM:
             if not state.get("overlimit_floor"):
-                log.warning("COMPACT floor-bound: latching until context grows past "
-                            "%d (+%d)", len(new_ids), _OVERLIMIT_REARM)
+                log.warning("COMPACT low-yield (%d→%d, %d tokens of runway): latching "
+                            "until context grows past %d (+%d) rather than re-prefilling "
+                            "%d tokens again next step",
+                            before, len(new_ids), runway, len(new_ids),
+                            _OVERLIMIT_REARM, len(new_ids))
             state["overlimit_floor"] = len(new_ids)
         else:
             state.pop("overlimit_floor", None)

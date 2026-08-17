@@ -445,14 +445,21 @@ class Agent:
         if think_budget is None:
             think_budget = config.env_int("CHAD_THINK_BUDGET")
         self.think_budget = think_budget
-        # Close-and-continue think ceiling. None => OFF (byte-identical to
-        # before), like think_budget. Distinct from it: think_budget is a low soft-cap that
-        # ENDS the step (the model re-derives next step — 084 confirmed that inflates total
-        # think 3.8x); this is a HIGH pathological cap (~6000) that force-closes the runaway
-        # <think> and CONTINUES decoding the action in the same step, so the reasoning so
-        # far stays in context and nothing is re-derived. Env-armed for the eval harness.
+        # Close-and-continue think ceiling. Distinct from think_budget: think_budget is a
+        # low soft-cap that ENDS the step (the model re-derives next step — 084 confirmed
+        # that inflates total think 3.8x); this force-closes the runaway <think> and
+        # CONTINUES decoding the action in the same step, so the reasoning so far stays in
+        # context and nothing is re-derived.
+        #
+        # Defaulted ON (THINK_CEILING_DEFAULT) rather than env-armed. It was written as a
+        # ~6000-token pathological backstop for the eval harness, but measured against a
+        # real session that cap never fires — the worst observed step thought 934 tokens
+        # while 42% of the wall clock went to reasoning nobody was governing. The default
+        # is sized to the tail of the measured distribution, not to the pathological case.
+        # CHAD_THINK_CEILING=0 restores the old off-by-default behavior.
         if think_ceiling is None:
-            think_ceiling = config.env_int("CHAD_THINK_CEILING")
+            think_ceiling = config.env_int("CHAD_THINK_CEILING",
+                                           guardrails.THINK_CEILING_DEFAULT)
         self.think_ceiling = think_ceiling
         # Degenerate-repetition stop (see guardrails.degenerate_tail): default ON —
         # it only fires on output that is already garbage (a literal decode loop), so
@@ -1445,9 +1452,23 @@ class Agent:
                     self._emit("info", "  [reasoning budget exhausted for this turn — "
                                        "throttling further <think>]")
 
-            log.info("step %d: %d tok @ %.1f tok/s | prefill %d new + %d cached | "
-                     "accept %.2f", step, stats.generated_tokens, stats.tok_per_s,
-                     stats.prompt_tokens, stats.cached_tokens, self.accept_rate)
+            # Per-step first, turn-cumulative second. The cumulative ratio alone can't
+            # show a step where drafting actually paid: a run of span-heavy tool-call
+            # args is a few hundred tokens against a whole turn's proposals, so it moves
+            # the average by ~0.01 and reads as "drafting does nothing". `think` is the
+            # step's reasoning slice (_think_delta above), which is what separates a slow
+            # step that reasoned from a slow step that decoded badly.
+            # `fwd` is the count of SPECULATIVE forwards only (the plain S=1 steps
+            # around them aren't counted), so accepted/fwd is the per-verify yield —
+            # the quantity that decides whether a wide verify paid for itself, and the
+            # one thing the accept ratio alone can't give: the same ratio is a win at a
+            # wide draft and a loss at a narrow one.
+            log.info("step %d: %d tok @ %.1f tok/s (think %d) | prefill %d new + %d "
+                     "cached | accept %.2f step (%d/%d over %d fwd) / %.2f turn",
+                     step, stats.generated_tokens, stats.tok_per_s, _think_delta,
+                     stats.prompt_tokens, stats.cached_tokens, stats.accept_rate,
+                     stats.draft_accepted, stats.draft_proposed, stats.forwards,
+                     self.accept_rate)
             # Env-gated per-step prefill telemetry (one row per prefill event).
             # Guarded so an unset trace pays only this truthiness check — no string/dict/IO.
             # sync_kind names *why* this step prefilled what it did, derived purely from
