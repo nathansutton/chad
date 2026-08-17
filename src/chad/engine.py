@@ -262,6 +262,51 @@ def enforce_cache_budget(cache_dir: str, max_bytes: int, protect: set) -> int:
     return freed
 
 
+def apply_top_k(scores, k: int):
+    """Keep the k highest-scoring tokens, -inf the rest. Pure; mirrors the shape
+    contract of mlx_lm's apply_top_p/apply_min_p (last axis is the vocab, leading
+    axes are batch rows) so it composes with them in either order.
+
+    Qwen3.8 asks for top_k=20 in BOTH sampling recipes, and it is the one filter
+    mlx_lm does not ship, so it lives here rather than being silently skipped."""
+    if not k or k <= 0 or k >= scores.shape[-1]:
+        return scores
+    # Cut everything below the kth largest. Take the MIN of the top-k block
+    # rather than indexing an end of it: mx.topk's ordering within the block is
+    # not part of its contract (it returns ascending today, so [..., -1:] would
+    # be the maximum and keep exactly one token). Ties at the threshold are kept
+    # (>= cutoff), which can leave slightly more than k candidates — the safe
+    # direction: never drop the argmax, never empty a row.
+    cutoff = mx.min(mx.topk(scores, k, axis=-1), axis=-1, keepdims=True)
+    return mx.where(scores >= cutoff, scores, mx.array(-float("inf"),
+                                                       dtype=scores.dtype))
+
+
+def apply_presence_penalty(scores, seen_ids, penalty: float):
+    """Subtract `penalty` from the score of each DISTINCT id in `seen_ids`
+    (any sequence of ints, or an mx array).
+
+    Presence, not frequency: the penalty applies ONCE per distinct token no
+    matter how often it appeared, which is what "presence_penalty" means and what
+    the Qwen recipe specifies. Duplicates would otherwise stack into a frequency
+    penalty — a different (and much harsher) filter — so they are removed here
+    rather than at every call site.
+
+    Cost is O(distinct seen), not O(vocab): a scatter over a few hundred ids
+    instead of building a 248k-wide adjustment vector every token."""
+    if not penalty or seen_ids is None:
+        return scores
+    ids = sorted({int(t) for t in seen_ids})
+    if not ids:
+        return scores
+    uniq = mx.array(ids, dtype=mx.uint32)
+    if scores.ndim == 1:
+        return scores.at[uniq].add(-penalty)
+    # batched rows (verify forward): penalize the same ids in every row; callers
+    # needing per-row histories call this once per row.
+    return scores.at[..., uniq].add(-penalty)
+
+
 class _KeyedSampler:
     """Categorical sampler on an explicit PRNG key chain.
 
@@ -277,16 +322,36 @@ class _KeyedSampler:
     """
 
     def __init__(self, temp: float, seed: Optional[int] = None,
-                 min_p: float = 0.0, top_p: float = 0.0):
+                 min_p: float = 0.0, top_p: float = 0.0, top_k: int = 0,
+                 presence_penalty: float = 0.0, seen: Optional[list] = None):
         self._inv_t = 1.0 / temp
         self._min_p = min_p
         self._top_p = top_p
+        self._top_k = top_k
+        self._presence = presence_penalty
+        # Read-only view of the engine's generated-token list, for the presence
+        # penalty. The engine owns it and appends already-materialized ints as it
+        # commits them; the sampler must never append the token it just drew,
+        # which is a lazy array — realizing it here would force a host sync every
+        # single token purely for bookkeeping.
+        self.seen: list = seen if seen is not None else []
         self._key = mx.random.key(
             int.from_bytes(os.urandom(4), "little") if seed is None else seed)
 
     def __call__(self, logprobs):
         self._key, sub = mx.random.split(self._key)
         scaled = logprobs * self._inv_t
+        # Penalty BEFORE the tail filters: it reshapes the distribution the
+        # filters then trim, so a heavily-penalized repeat can fall out of the
+        # top-k/top-p set entirely — which is the point. Doing it after would let
+        # a loop token survive the cut and only then be nudged.
+        if self._presence:
+            scaled = apply_presence_penalty(scaled, self.seen, self._presence)
+        # (this path receives already-scaled logprobs from mlx_lm, so the penalty
+        # lands post-temp here; _spec_scaled owns the pre-temp ordering that the
+        # model card's numbers assume. Kept consistent by keeping the DEFAULT 0.)
+        if self._top_k:
+            scaled = apply_top_k(scaled, self._top_k)
         if 0 < self._top_p < 1.0:
             scaled = apply_top_p(scaled, self._top_p)
         if self._min_p != 0.0:
@@ -306,6 +371,18 @@ class Engine:
     # pending an eval-gated sign-off before flipping the shipped default.
     min_p: float = 0.0
     top_p: float = 0.0
+    top_k: int = 0                  # keep only the k highest-scoring tokens (0 = off)
+    # Presence penalty: a flat subtraction from the score of every token ALREADY
+    # generated in this turn (OpenAI semantics — once-seen is once-penalized, the
+    # count does not matter). Off by default for thinking mode, but it is the
+    # mechanism the model card calls for in NON-thinking mode ("adjust
+    # presence_penalty between 0 and 2 to reduce endless repetition"), where there
+    # is no reasoning block to absorb a loop and degenerate repetition is the
+    # documented failure. Applied INSIDE the sampling distribution, so speculative
+    # paths stay exact: the penalized distribution simply IS the target p that
+    # rejection sampling preserves (see _spec_scaled, which penalizes each verify
+    # row against the tokens preceding it).
+    presence_penalty: float = 0.0
     # KV cache quantization. None = AUTO: 8-bit when the fused decode kernel
     # (mlx_qsdpa) covers the model's attention shape — both shipped Ornith
     # models qualify — else off. 0 forces off; an explicit bit width forces on
@@ -382,6 +459,12 @@ class Engine:
     effective_ctx: int = field(init=False, default=32768)
     _cache: Any = field(init=False, default=None)
     _cached_ids: list = field(init=False, default_factory=list)
+    # Token ids generated in the CURRENT turn, for the presence penalty. Reset at
+    # the top of every generate() so the penalty is per-response (matching the
+    # API semantics the Qwen recipe is written against) and cannot leak across
+    # turns — a session-lifetime history would penalize the whole vocabulary into
+    # noise after a few thousand tokens.
+    _seen_ids: list = field(init=False, default_factory=list)
     _trimmable: bool = field(init=False, default=False)
     _pld_hybrid: bool = field(init=False, default=False)
     _model_path: str = field(init=False, default="")  # resolved weights dir
@@ -747,6 +830,24 @@ class Engine:
     # their state each step, so a snapshot is just a reference copy (no array data
     # moved) and restore is instant. The attention layers trim natively. Together
     # these let PLD roll a rejected draft back exactly on a "non-trimmable" cache.
+
+    @property
+    def _seen(self) -> list:
+        """Per-turn generated-token history backing the presence penalty.
+
+        Lazily created rather than read straight off the dataclass field: the
+        private `_generate_*` methods are independently callable entry points
+        (the bit-exactness tests drive them directly, bypassing `generate()`),
+        and Engines are routinely built with `object.__new__` in tests, which
+        skips dataclass defaults entirely. A per-turn scratch list is exactly the
+        kind of state that should not make those call paths crash — and this way
+        adding the next piece of scratch state does not mean editing a dozen
+        hand-built fixtures. `generate()` still clears it per turn."""
+        try:
+            return self._seen_ids
+        except AttributeError:
+            self._seen_ids = []
+            return self._seen_ids
 
     def _snap_recurrent(self):
         return [list(c.cache) for c in self._cache
@@ -1121,26 +1222,34 @@ class Engine:
         if config.flag("CHAD_NO_PREFIX_CACHE"):
             self._reset_cache()
 
-        # Wide prompt-lookup on the hybrid: quote spans verify up to 32 tokens
-        # per forward, novel spans decode plain (S=1) at parity with stock.
-        # Exact at any temp via point-mass rejection sampling; quantized KV is
-        # fine (rollback is the same trim+capture-replay the MTP path uses).
-        # Preferred over MTP when both are available: the cold arm costs only
-        # a host-side lookup vs MTP's ~8% cold win, while matched spans verify
-        # at S=32 instead of k=2 drafts — the traffic mix breaks even at ~11%
-        # span coverage. They do not compose yet (one generate loop each).
-        if (self.prompt_lookup and self.pld_wide
+        # Presence-penalty history is per-response: clear it here, before any
+        # decode path is chosen, so every loop below starts from an empty one.
+        self._seen_ids = []
+
+        # Wide prompt-lookup on the hybrid, now OPT-IN behind CHAD_USE_PLD.
+        #
+        # PLD drafts from CONTEXT RECURRENCE, so it can only accelerate text that
+        # already appeared. Measured on real agentic traces, that is a minority of
+        # what this agent generates: ~62-66% of generated tokens are <think>, and
+        # reasoning prose replays at only ~2.3%. Whole-session contribution came out
+        # at +2.2% of generated tokens — and was NEGATIVE before the n-gram gate was
+        # raised from 6 to 16. MTP drafts from the model itself, so it is
+        # traffic-independent and covers the think mass PLD structurally cannot.
+        # They do not compose (one generate loop each), so this is a real choice;
+        # MTP is the default and PLD is available for quote-heavy workloads
+        # (file rewrites, large verbatim edits) where recurrence is the norm.
+        if (config.flag("CHAD_USE_PLD") and self.prompt_lookup and self.pld_wide
                 and self._pld_hybrid and not self._trimmable):
             return self._generate_pld_wide(prompt_ids, max_tokens, on_token,
                                            stop_texts, should_stop, on_prefill,
                                            on_prefill_progress, stop_condition,
                                            think_ceiling)
 
-        # MTP self-speculative decoding, when wide-PLD is off or unavailable:
-        # drafts with the checkpoint's own trained head. Exact at ANY temp
-        # (rejection sampling preserves the sampling distribution) and tolerates
-        # the quantized KV cache: rollback is offset-trim + rewrite, the same
-        # mechanism _take_rewind_snapshot documents as safe on a
+        # MTP self-speculative decoding — the DEFAULT speculative path (see the
+        # PLD note above for why). Drafts with the checkpoint's own trained head.
+        # Exact at ANY temp (rejection sampling preserves the sampling distribution)
+        # and tolerates the quantized KV cache: rollback is offset-trim + rewrite,
+        # the same mechanism _take_rewind_snapshot documents as safe on a
         # quantized-from-the-start cache.
         if (self._mtp_head is not None
                 and (self._trimmable or self._pld_hybrid)):
@@ -1211,7 +1320,13 @@ class Engine:
 
         kwargs = dict(
             max_tokens=max_tokens,
-            sampler=(_KeyedSampler(self.temp, min_p=self.min_p, top_p=self.top_p)
+            # `seen` is passed by reference: the loop below appends each decoded
+            # id to self._seen_ids as it materializes it, so the sampler reads a
+            # live history without ever forcing a sync of its own draw.
+            sampler=(_KeyedSampler(self.temp, min_p=self.min_p, top_p=self.top_p,
+                                   top_k=self.top_k,
+                                   presence_penalty=self.presence_penalty,
+                                   seen=self._seen)
                      if self.temp > 0
                      else make_sampler(temp=self.temp, min_p=self.min_p, top_p=self.top_p)),
             prompt_cache=self._cache,
@@ -1255,6 +1370,7 @@ class Engine:
                     stats.prefill_s = first_token_at - t0
                 text += resp.text
                 gen_ids.append(resp.token)
+                self._seen.append(resp.token)
                 if on_token:
                     on_token(resp.text)
                 if stop_texts and any(s in text for s in stop_texts):
@@ -1605,6 +1721,7 @@ class Engine:
             if tid in eos or len(out_ids) >= max_tokens:
                 return True
             out_ids.append(tid)
+            self._seen.append(tid)
             _push_ctx(tid)
             detok.add_token(tid)
             if on_token:
@@ -1876,13 +1993,38 @@ class Engine:
 
     # -- MTP self-speculative decoding -------------------------------------
 
-    def _spec_scaled(self, logits):
-        """Temp-scaled (+ top_p/min_p filtered) logprobs over the last axis —
-        exactly the scores _KeyedSampler hands to mx.random.categorical, so
-        softmax of this IS the sampling distribution rejection sampling must
-        preserve. Callers guarantee temp > 0."""
+    def _spec_scaled(self, logits, seen_rows=None):
+        """Temp-scaled (+ presence/top_k/top_p/min_p filtered) logprobs over the
+        last axis — exactly the scores _KeyedSampler hands to
+        mx.random.categorical, so softmax of this IS the sampling distribution
+        rejection sampling must preserve. Callers guarantee temp > 0.
+
+        This function is the single definition of "the target distribution", which
+        is why the presence penalty belongs here and not at the call sites: the
+        speculative paths stay exact for free, because a penalized p is still just
+        p. Both the draft chain and the verify use it, so drafts are scored under
+        the same distribution they are accepted against.
+
+        `seen_rows`, for a batched verify, is one already-generated-id list per
+        row; row j must be penalized against the tokens preceding IT (history +
+        the drafts before j), not against the pre-forward history alone, or the
+        penalty would be a step behind inside every accepted run."""
         lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        # Penalty BEFORE the temperature divide, matching the API semantics the
+        # model card's numbers are quoted in (logit - penalty, then scale). Applying
+        # it after would divide the penalty by temp, making a "1.5" behave like a
+        # 1.05 at temp 0.7 — the same knob quietly meaning something else per mode.
+        if self.presence_penalty:
+            if seen_rows is not None and lp.ndim > 1:
+                lp = mx.stack([
+                    apply_presence_penalty(lp[j], seen_rows[j],
+                                           self.presence_penalty)
+                    for j in range(lp.shape[0])])
+            else:
+                lp = apply_presence_penalty(lp, self._seen, self.presence_penalty)
         scaled = lp * (1.0 / self.temp)
+        if self.top_k:
+            scaled = apply_top_k(scaled, self.top_k)
         if 0 < self.top_p < 1.0:
             scaled = apply_top_p(scaled, self.top_p)
         if self.min_p != 0.0:
@@ -2041,7 +2183,18 @@ class Engine:
             finally:
                 mlx_fastpath.GDN_COLLECTOR = None
             if self.temp > 0:
-                scaled = self._spec_scaled(logits)
+                # Row j of the verify predicts the token AFTER draft[:j], so its
+                # presence history is the committed history plus exactly those
+                # drafts — which are already materialized ints by here, so this
+                # costs no extra sync. Getting this right is what keeps the
+                # speculative output distribution identical to plain decoding:
+                # rejection sampling preserves whatever p is, so p must be the
+                # SAME p a plain step would have built at that position. (The
+                # draft chain above is free to use the round-start history — it
+                # only defines the proposal q, which the correction cancels.)
+                seen_rows = ([self._seen + draft[:j] for j in range(k + 1)]
+                             if (self.presence_penalty and k) else None)
+                scaled = self._spec_scaled(logits, seen_rows=seen_rows)
                 p = mx.softmax(scaled, axis=-1)
                 n_acc = 0
                 if k:
@@ -2169,6 +2322,7 @@ class Engine:
                     stop = True
                     break
                 out_ids.append(tid)
+                self._seen.append(tid)
                 detok.add_token(tid)
                 if on_token:
                     seg = detok.last_segment

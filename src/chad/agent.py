@@ -461,6 +461,10 @@ class Agent:
             think_ceiling = config.env_int("CHAD_THINK_CEILING",
                                            guardrails.THINK_CEILING_DEFAULT)
         self.think_ceiling = think_ceiling
+        # Template-level reasoning budget (Qwen3.8: xhigh | medium | low). Unset =>
+        # the template's own default, and the argument is not passed at all, so
+        # templates without the knob are unaffected. See _render.
+        self.reasoning_effort = config.env_str("CHAD_REASONING_EFFORT") or None
         # Degenerate-repetition stop (see guardrails.degenerate_tail): default ON —
         # it only fires on output that is already garbage (a literal decode loop), so
         # unlike the think-budget there is no capability trade. A/B off via env.
@@ -688,9 +692,21 @@ class Agent:
         messages = self.messages
         if self._reasoning_split_supported():
             messages = [split_inline_reasoning(m) for m in messages]
+        # Qwen3.8's template exposes a reasoning_effort knob (xhigh | medium | low,
+        # defaulting to medium) that chad had no way to reach — so every run silently
+        # took the default. It is the middle ground this model badly needs: measured
+        # on the ky task, full thinking spends ~64% of generated tokens and is the
+        # only mode that produces correct code, while --no-think is fast but emits
+        # malformed TypeScript it cannot repair. `low` keeps the reasoning block and
+        # shrinks it. Passed only when set, and via **kwargs, so templates that do not
+        # accept the argument (q3_s6's, which has no reasoning_effort at all) render
+        # byte-identically to before.
+        extra = {}
+        if self.reasoning_effort:
+            extra["reasoning_effort"] = self.reasoning_effort
         ids = self._template_ids(self.engine.tok.apply_chat_template(
             messages, tools=self._active_schemas(), add_generation_prompt=True,
-            enable_thinking=thinking,
+            enable_thinking=thinking, **extra,
         ))
         # Debug hook (env-gated, off by default): dump the first decoded render so a
         # rendered-prompt difference across environments can be diffed. Best-effort.

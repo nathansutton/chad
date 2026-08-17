@@ -1174,6 +1174,94 @@ def test_keyed_sampler_default_off_is_full_support():
     check("low-prob tail token still reachable with filters off", 1 in draws, set(draws))
 
 
+def test_top_k_keeps_exactly_the_top_k():
+    """top_k is the one filter in Qwen3.8's recipe that mlx_lm does not ship, so
+    it lives in engine.py. The trap it was written around: mx.topk returns its
+    block ASCENDING, so taking the last element as the cutoff keeps only the
+    maximum — a silently-greedy sampler. Pin the actual survivor set."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        skip("top_k", "mlx not installed")
+        return
+    from chad.engine import apply_top_k
+
+    s = mx.array([1.0, 5.0, 3.0, 2.0, 4.0])
+    kept2 = [i for i, v in enumerate(apply_top_k(s, 2).tolist()) if v != -float("inf")]
+    check("top_k=2 keeps the two largest (not just the max)", kept2 == [1, 4], kept2)
+    kept3 = [i for i, v in enumerate(apply_top_k(s, 3).tolist()) if v != -float("inf")]
+    check("top_k=3 keeps the three largest", kept3 == [1, 2, 4], kept3)
+    check("top_k=0 is a no-op", apply_top_k(s, 0).tolist() == s.tolist())
+    check("top_k >= vocab is a no-op", apply_top_k(s, 99).tolist() == s.tolist())
+    # batched rows (the verify forward's shape) filter independently
+    b = mx.array([[1.0, 5.0, 3.0], [2.0, 0.0, 1.0]])
+    check("batched top_k filters per row",
+          apply_top_k(b, 2).tolist() == [[-float("inf"), 5.0, 3.0],
+                                         [2.0, -float("inf"), 1.0]],
+          apply_top_k(b, 2).tolist())
+
+
+def test_presence_penalty_is_presence_not_frequency():
+    """Once-seen is once-penalized, however many times it appeared. If duplicates
+    stacked, this would silently become a FREQUENCY penalty — a much harsher
+    filter than the model card's recipe asks for, and one that would escalate
+    without bound inside a long generation."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        skip("presence penalty", "mlx not installed")
+        return
+    from chad.engine import apply_presence_penalty
+
+    s = mx.array([1.0, 5.0, 3.0])
+    once = apply_presence_penalty(s, [1], 1.5).tolist()
+    thrice = apply_presence_penalty(s, [1, 1, 1], 1.5).tolist()
+    check("a token seen 3x is penalized the same as seen 1x", once == thrice,
+          (once, thrice))
+    check("penalty is subtracted once", once == [1.0, 3.5, 3.0], once)
+    check("unseen tokens untouched", once[0] == 1.0 and once[2] == 3.0, once)
+    check("penalty 0 is a no-op", apply_presence_penalty(s, [1], 0.0).tolist()
+          == s.tolist())
+    check("empty history is a no-op", apply_presence_penalty(s, [], 1.5).tolist()
+          == s.tolist())
+
+
+def test_spec_scaled_penalizes_each_verify_row_against_its_own_prefix():
+    """The speculative-exactness contract. Rejection sampling preserves whatever
+    target p it is given, so p at verify row j must equal the p a PLAIN step
+    would have built at that position — i.e. penalized against the committed
+    history PLUS the drafts before j. If every row shared the pre-forward
+    history, MTP output would drift from plain output inside every accepted run,
+    silently breaking the 'exact at any temp' property."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        skip("spec_scaled rows", "mlx not installed")
+        return
+    from chad.engine import Engine
+
+    eng = object.__new__(Engine)
+    eng.temp, eng.top_p, eng.min_p, eng.top_k = 1.0, 0.0, 0.0, 0
+    eng.presence_penalty = 1.5
+    eng._seen_ids = [0]                     # token 0 already committed
+    logits = mx.zeros((3, 4))               # 3 verify rows, vocab 4
+    draft = [1, 2]                          # rows predict after [], [1], [1,2]
+
+    rows = [eng._seen + draft[:j] for j in range(3)]
+    out = eng._spec_scaled(logits, seen_rows=rows)
+    base = eng._spec_scaled(mx.zeros((4,)))  # single-row reference (history only)
+
+    # row 0 sees {0}; row 1 sees {0,1}; row 2 sees {0,1,2}
+    r = out.tolist()
+    check("row 0 penalizes only the committed history",
+          r[0][0] < r[0][1] and r[0][1] == r[0][2], r[0])
+    check("row 1 also penalizes the first draft", r[1][1] < r[1][2], r[1])
+    check("row 2 also penalizes the second draft", r[2][2] < r[2][3], r[2])
+    check("row 0 matches a plain step's distribution at that position",
+          [round(v, 5) for v in r[0]] == [round(v, 5) for v in base.tolist()],
+          (r[0], base.tolist()))
+
+
 def test_make_sampler_argmax_unchanged_by_min_p_top_p():
     """`Engine.generate`'s kwargs construction picks
     `make_sampler(temp=0.0, ...)` on the greedy path regardless of min_p/top_p

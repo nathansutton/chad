@@ -97,7 +97,38 @@ def _env_float(name):
 # failure shape is that sibling settings drift ONE AT A TIME: a later fix honors the field
 # it touched, looks complete, and leaves its neighbours silently dead. There is one
 # function now, so a caller cannot honor `temp` and forget `min_p`.
-SAMPLER_ENV = (("temp", "CHAD_TEMP"), ("min_p", "CHAD_MIN_P"), ("top_p", "CHAD_TOP_P"))
+SAMPLER_ENV = (("temp", "CHAD_TEMP"), ("min_p", "CHAD_MIN_P"), ("top_p", "CHAD_TOP_P"),
+               ("top_k", "CHAD_TOP_K"), ("presence_penalty", "CHAD_PRESENCE_PENALTY"))
+
+# Qwen3.8's two published sampling recipes. The model card gives DIFFERENT settings
+# per mode, and the difference is not cosmetic: non-thinking mode has no reasoning
+# block to absorb a loop, so the card calls for a presence penalty ("adjust
+# presence_penalty between 0 and 2 to reduce endless repetition") and a tighter
+# nucleus. Running --no-think while silently inheriting the thinking recipe is the
+# configuration the card warns produces endless repetition — and degenerate
+# repetition is already this stack's known failure mode, so the preset is applied
+# rather than left to the operator to remember.
+#
+# Explicit CHAD_* env always wins over the preset (see apply_sampler_env).
+THINKING_SAMPLER = {"temp": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+                    "presence_penalty": 0.0}
+# presence_penalty stays 0.0 despite the card suggesting up to 1.5 for this mode.
+# The card's range is written for chat; CODE is inherently repetitive — identifiers,
+# keywords and punctuation must be reused — so a flat penalty on every already-emitted
+# token pushes the model off valid syntax. Measured on the ky task at 1.5: 45 steps of
+# pure exploration, zero edits, and visibly corrupted tool arguments
+# (`Search 'KyOptions|interface KyOptions!!'`). Treat it as a tunable to probe, not a
+# default to ship: CHAD_PRESENCE_PENALTY still sets it.
+NONTHINKING_SAMPLER = {"temp": 0.7, "top_p": 0.80, "top_k": 20, "min_p": 0.0,
+                       "presence_penalty": 0.0}
+
+
+def apply_sampler_preset(eng, thinking: bool):
+    """Apply the model-card sampling recipe for the active reasoning mode.
+
+    Call BEFORE apply_sampler_env so an explicit CHAD_* override still wins."""
+    for attr, val in (THINKING_SAMPLER if thinking else NONTHINKING_SAMPLER).items():
+        setattr(eng, attr, val)
 
 
 def apply_sampler_env(eng):
@@ -110,14 +141,22 @@ def apply_sampler_env(eng):
     should set e.g. CHAD_TEMP=0.7 (what the field harnesses run) so retries can take a
     different path.
 
-    CHAD_MIN_P / CHAD_TOP_P: quant-tail anti-confabulation knobs, off (0.0) by default —
-    trim the sub-noise-floor logit tail without touching temp."""
+    CHAD_MIN_P / CHAD_TOP_P / CHAD_TOP_K: quant-tail anti-confabulation knobs, off
+    (0.0 / 0) by default — trim the sub-noise-floor logit tail without touching temp.
+
+    CHAD_PRESENCE_PENALTY: flat score penalty on already-generated tokens; the
+    model card's anti-repetition knob for non-thinking mode (useful range 0-2).
+
+    Applied AFTER any mode preset, so an explicit env var always wins."""
     for attr, var in SAMPLER_ENV:
         raw = config.env_str(var)
         if not raw:
             continue
         try:
-            setattr(eng, attr, float(raw))
+            # top_k indexes a vocab axis and is passed to mx.topk — it must stay an
+            # int, where every other knob here is a float. Coercing the whole family
+            # to float would make CHAD_TOP_K=20 a TypeError deep in the sampler.
+            setattr(eng, attr, int(float(raw)) if attr == "top_k" else float(raw))
         except ValueError:
             sys.stderr.write(f"[ignoring {var}={raw!r}: not a number]\n")
 
@@ -707,6 +746,10 @@ def _main(argv=None):
             kv_cache_max_bytes=kv_cache_max_bytes,
         )
 
+    # Mode preset first, explicit env second — so CHAD_* always wins. `--no-think`
+    # switches the whole recipe, not just the reasoning block: see NONTHINKING_SAMPLER
+    # for why running it on the thinking recipe is the documented repetition case.
+    apply_sampler_preset(eng, thinking=not args.no_think)
     apply_sampler_env(eng)
 
     # The full-screen TUI loads the 11 GB of weights on a BACKGROUND thread so the banner
