@@ -436,6 +436,12 @@ def _install_layer_fastpath(model) -> None:
             else:
                 r = self.self_attn(self.input_layernorm(x), mask, cache)
                 return self._moe_fast(x + r)
+        # NOTE (plan 138): a compiled S=2..4 verify step was built and
+        # measured HERE — round time did not move (dispatch was not the
+        # verify cost), and the compiled bodies bypass the QMM hook that
+        # mlx_qmm_s routes small-S weight matmuls through, which IS the
+        # verify cost under production memory residency. So S>1 stays on the
+        # stock graph, where every projection reaches the hook.
         return stock_layer_call(self, x, mask=mask, cache=cache)
 
     layer_call._chad_fastpath = True  # type: ignore[attr-defined]

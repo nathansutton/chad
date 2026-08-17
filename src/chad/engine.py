@@ -591,6 +591,7 @@ class Engine:
             if nd:
                 self.mtp_num_draft = nd
         self._resolve_kv_bits(qsdpa_ok)
+        self._warm_verify_widths()
         self._install_memory_clamp()
         self._reset_cache()
         self.kv_bytes_per_token = self._measure_kv_bytes_per_token()
@@ -641,6 +642,49 @@ class Engine:
                         "kernel does not cover (head_dim=%s gqa=%s) — decode "
                         "will use the slow unfused path", self.kv_bits,
                         getattr(self, "_head_dim", "?"), gqa or "?")
+
+    def _warm_verify_widths(self) -> None:
+        """Build the fused verify kernel's per-width variants at load instead of
+        inside the first span that needs one.
+
+        The kernel is templated on the verify width, so a width that has never
+        run is a Metal compile on the critical path of a real step. Warming only
+        the widths THIS configuration can produce is the point: MTP verifies at
+        exactly one width, wide-PLD at any of 9..32, and warming the union of
+        everything would pay for variants the run will never dispatch. Opt out
+        with CHAD_NO_KERNEL_WARM."""
+        if not self.kv_bits or config.flag("CHAD_NO_KERNEL_WARM"):
+            return          # fp16 cache: no fused kernel, so no variants exist
+        widths: set[int] = set()
+        if self._mtp_head is not None:
+            widths.add(self.mtp_num_draft + 1)
+        if (config.flag("CHAD_USE_PLD") and self.prompt_lookup and self.pld_wide
+                and self.pld_wide_draft >= self.pld_wide_min_draft):
+            # _wide_verify feeds [pending] + draft, and the draft runs from
+            # pld_wide_min_draft up to pld_wide_draft tokens.
+            widths.update(range(self.pld_wide_min_draft + 1,
+                                self.pld_wide_draft + 2))
+        if not widths:
+            return
+        try:
+            from mlx.utils import tree_flatten
+
+            from . import mlx_qsdpa
+            # Scales/norms carry the model's compute dtype; quantized weights
+            # are uint32, so take the first float parameter rather than guess.
+            dt = next((p.dtype for _, p in tree_flatten(self.model.parameters())
+                       if p.dtype in (mx.float16, mx.bfloat16)), None)
+            if dt is None:
+                return
+            t0 = time.time()
+            done = mlx_qsdpa.warm_widths(widths, self._n_attn_heads,
+                                         self._n_kv_heads, dt)
+            if done:
+                log.info("QSDPA warm-up: %d verify width(s) compiled in %.2fs "
+                         "(%s)", done, time.time() - t0,
+                         ",".join(str(w) for w in sorted(widths)))
+        except Exception as e:  # noqa: BLE001 — never let a warm-up break load
+            log.warning("QSDPA warm-up skipped (%s)", e)
 
     def _install_memory_clamp(self) -> None:
         """Give the Metal allocator explicit limits instead of the
@@ -2143,11 +2187,10 @@ class Engine:
             # The chain stays LAZY: each drafted token feeds the next step's
             # embedding as an mx array, and one eval at the end fetches all k
             # ids — one host sync instead of k.
-            draft, q_rows = [], []
+            draft, q_rows, d_arrs = [], [], []
             if k:
                 e = embed(mx.array([[y_val]], dtype=mx.uint32))
                 hin = h_last
-                d_arrs = []
                 for _ in range(k):
                     hout = head(e, hin, cache=mtp_cache)
                     dl = _logits(hout)[0, -1]
@@ -2164,8 +2207,14 @@ class Engine:
                     d_arrs.append(d)
                     e = embed(d.reshape(1, 1))
                     hin = hout
-                mx.eval(d_arrs)
-                draft = [int(x) for x in d_arrs]
+                if self.presence_penalty and self.temp > 0:
+                    # seen_rows (below) needs the draft ids on the host BEFORE
+                    # the verify graph is built. Everyone else reads them after
+                    # the accept eval, so the pp-off path (the thinking-mode
+                    # recipe) defers this sync into that one — one host
+                    # round-trip per step instead of two.
+                    mx.eval(d_arrs)
+                    draft = [int(x) for x in d_arrs]
 
             # -- verify: one batched main forward ---------------------------
             # On the hybrid, arm the GDN checkpoint collector: the verify
@@ -2175,7 +2224,12 @@ class Engine:
             # re-feed tax is what made speculation a wash on recurrent caches.
             rec_snap = self._snap_recurrent() if hybrid else None
             coll = {"conv": [], "args": []} if (hybrid and k) else None
-            y = mx.array([y_val] + draft, dtype=mx.uint32)
+            # Build the verify input from the (possibly still-lazy) draft
+            # arrays — no host ids needed to construct the graph.
+            y = (mx.concatenate([mx.array([y_val], dtype=mx.uint32)]
+                                + [d.reshape(1).astype(mx.uint32)
+                                   for d in d_arrs])
+                 if k else mx.array([y_val], dtype=mx.uint32))
             try:
                 mlx_fastpath.GDN_COLLECTOR = coll
                 hid = lm.model(y[None], cache=mc)
@@ -2204,7 +2258,7 @@ class Engine:
                     # Leviathan/Chen correction that keeps the joint output
                     # distribution exactly p — and candidate k is the bonus
                     # token; the host then just indexes with n_acc.
-                    dr = mx.array(draft, dtype=mx.uint32)
+                    dr = y[1:]                 # the k draft ids, still lazy
                     p_sel = mx.take_along_axis(p[:k], dr[:, None], axis=-1)[:, 0]
                     key, sub = mx.random.split(key)
                     u = mx.random.uniform(shape=(k,), key=sub)
@@ -2232,7 +2286,9 @@ class Engine:
                             mx.random.categorical(scaled[j], key=sub)))
                     key, sub = mx.random.split(key)
                     cand.append(mx.random.categorical(scaled[k], key=sub))
-                    mx.eval(ok, cand)
+                    mx.eval(ok, cand, d_arrs)   # the round's ONE host sync
+                    if not draft:
+                        draft = [int(x) for x in d_arrs]
                     okl = ok.tolist()
                     while n_acc < k and okl[n_acc]:
                         n_acc += 1
@@ -2244,7 +2300,9 @@ class Engine:
                     next_tok = int(nt)
             else:
                 toks = mx.argmax(logits, axis=-1)
-                mx.eval(toks)
+                mx.eval(toks, d_arrs)
+                if k and not draft:
+                    draft = [int(x) for x in d_arrs]
                 toks = [int(t) for t in toks.tolist()]
                 n_acc = 0
                 while n_acc < k and toks[n_acc] == draft[n_acc]:

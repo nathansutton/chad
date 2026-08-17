@@ -114,6 +114,104 @@ def test_eligibility_gates():
     assert not mlx_qsdpa._eligible(q, empty, None)
 
 
+def _make_wide(hq, hkv, n, s, dtype, seed=5):
+    mx.random.seed(seed)
+    q = mx.random.normal((B, hq, s, D)).astype(dtype)
+    k = (0.7 * mx.random.normal((B, hkv, n, D))).astype(dtype)
+    v = (0.7 * mx.random.normal((B, hkv, n, D))).astype(dtype)
+    mx.eval(q, k, v)
+    return q, k, v
+
+
+def _reference_wide(q, cache, n):
+    """Per-row tail-causal reference at arbitrary hq (the module-level
+    _reference is pinned to HQ=16)."""
+    kd = mx.dequantize(*cache.keys, group_size=64, bits=8)[..., :n, :]
+    vd = mx.dequantize(*cache.values, group_size=64, bits=8)[..., :n, :]
+    hq, s = q.shape[1], q.shape[2]
+    hkv = kd.shape[1]
+    qf = (q.astype(mx.float32) * SCALE).reshape(B, hkv, hq // hkv, s, D)
+    scores = qf @ mx.expand_dims(kd.astype(mx.float32), 2).swapaxes(-1, -2)
+    qi = mx.arange(n - s, n)[:, None]
+    ki = mx.arange(n)[None]
+    scores = mx.where(qi >= ki, scores, -mx.inf)
+    p = mx.softmax(scores, axis=-1, precise=True)
+    return (p @ mx.expand_dims(vd.astype(mx.float32), 2)).reshape(B, hq, s, D)
+
+
+@requires_healthy_kernel
+@pytest.mark.parametrize("dispatch", ["per_row", "wide_kernel"])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("hq,hkv", [(24, 4), (16, 2), (16, 4)])  # gqa 6/8/4
+@pytest.mark.parametrize("n", [9, 100, 1024, 5000])
+@pytest.mark.parametrize("s", [2, 3, 4])
+def test_wide_matches_causal_reference(dispatch, dtype, hq, hkv, n, s,
+                                       monkeypatch):
+    """S>1 is the MTP verify forward's attention: both dispatches (the
+    default per-row S=1 calls and the CHAD_QSDPA_WIDE_KERNEL one-read
+    kernel) must match the per-row tail-causal dequantize->fp32 reference,
+    including the partial-chunk edges (n=9 with S=4 leaves rows with
+    sub-chunk limits) that the S=1 kernel's history says are where silent
+    poison lives."""
+    if s > mlx_qsdpa._wide_s_max(hq // hkv):
+        pytest.skip("S over threadgroup budget at this gqa")
+    if dispatch == "wide_kernel":
+        monkeypatch.setenv("CHAD_QSDPA_WIDE_KERNEL", "1")
+    else:
+        monkeypatch.delenv("CHAD_QSDPA_WIDE_KERNEL", raising=False)
+    q, k, v = _make_wide(hq, hkv, n, s, dtype)
+    cache = _fill_cache(k, v, dtype)
+    out = mlx_qsdpa.qsdpa(q, cache.keys, cache.values, SCALE, n)
+    ref = _reference_wide(q, cache, n)
+    err = mx.abs(out.astype(mx.float32) - ref).max().item()
+    tol = 2e-3 if dtype == mx.float16 else 8e-3
+    assert err < tol, f"{dispatch} hq={hq} n={n} s={s} err={err}"
+
+
+@requires_healthy_kernel
+def test_wide_kernel_ignores_padded_tail():
+    n, s = 300, 3
+    q, k, v = _make_wide(24, 4, n, s, mx.float16)
+    cache = _fill_cache(k, v, mx.float16)
+    out1 = mlx_qsdpa.qsdpa(q, cache.keys, cache.values, SCALE, n)
+    kw, ks, kb = cache.keys
+    kw[..., n:, :] = mx.full(kw[..., n:, :].shape, 0xFFFFFFFF, dtype=mx.uint32)
+    ks[..., n:, :] = mx.full(ks[..., n:, :].shape, 100.0, dtype=ks.dtype)
+    mx.eval(kw, ks)
+    out2 = mlx_qsdpa.qsdpa(q, (kw, ks, kb), cache.values, SCALE, n)
+    assert mx.array_equal(out1, out2).item()
+
+
+def test_wide_eligibility_gates(monkeypatch):
+    """S>1 requires the causal mask string, an S within the threadgroup
+    budget for its gqa, and enough cache; CHAD_NO_QSDPA_WIDE opts out without
+    touching the S==1 path."""
+    n = 64
+    q, k, v = _make_wide(24, 4, n, 3, mx.float16)
+    cache = _fill_cache(k, v, mx.float16)
+    assert mlx_qsdpa._eligible(q, cache, "causal")
+    assert not mlx_qsdpa._eligible(q, cache, None)          # full-tail attention: not ours
+    smax = mlx_qsdpa._wide_s_max(6)
+    q_big, *_ = _make_wide(24, 4, n, smax + 1, mx.float16)
+    assert not mlx_qsdpa._eligible(q_big, cache, "causal")  # over TG budget
+    monkeypatch.setenv("CHAD_NO_QSDPA_WIDE", "1")
+    assert not mlx_qsdpa._eligible(q, cache, "causal")
+    q1, *_ = _make_wide(24, 4, n, 1, mx.float16)
+    assert mlx_qsdpa._eligible(q1, cache, None)             # S==1 path untouched
+    monkeypatch.delenv("CHAD_NO_QSDPA_WIDE")
+
+
+def test_wide_s_max_budget():
+    """The S cap tracks the 32 KB threadgroup allocation: K/V double buffers
+    (CH rows) plus GQA*S staged q rows, all halves."""
+    for gqa in (4, 6, 8):
+        smax = mlx_qsdpa._wide_s_max(gqa)
+        ch = max(8 // gqa, 1) * gqa
+        assert (4 * ch * 256 + gqa * smax * 256) * 2 <= 32768
+        assert (4 * ch * 256 + gqa * (smax + 1) * 256) * 2 > 32768 or smax == 6
+        assert smax >= 2   # every supported tier can serve at least k=1 verify
+
+
 def test_pick_blocks_table():
     """Below 16k both gqa tiers keep 32 (measured neutral-or-better). At
     n >= 16384 the split widens to the measured end-to-end winner: 64 at gqa 8
@@ -290,3 +388,41 @@ def test_sgm_retile_declines_gqa4():
     err = mx.abs(out.astype(mx.float32) - ref).max().item()
     assert err == err, "gqa4 produced nan (retile must not engage here)"
     assert err < 8e-3, f"gqa4 err={err}"
+
+
+@requires_healthy_kernel
+def test_warm_widths_builds_only_the_templated_variants():
+    """Pass 1 is templated on the verify width, so warm_widths exists to build
+    those variants off the critical path. Widths under 3 dispatch the per-head
+    kernel the self-check already built, so they are not variants and must not
+    be counted."""
+    warmed = mlx_qsdpa.warm_widths([1, 2, 3, 5, 9, 32], hq=24, hkv=4,
+                                   dtype=mx.float16)
+    assert warmed == 4, f"expected S in 3,5,9,32 warmed, got {warmed}"
+    # idempotent and deduped: a repeat run rebuilds nothing new but still
+    # reports what the configuration asked for
+    assert mlx_qsdpa.warm_widths([5, 5, 5], hq=24, hkv=4,
+                                 dtype=mx.float16) == 1
+
+
+@requires_healthy_kernel
+def test_warm_widths_matches_reference_after_warming():
+    """Warming must be a pure compile: the same width run afterwards still has
+    to agree with the dequantize->fp32 reference."""
+    n, s = 2570, 9
+    mlx_qsdpa.warm_widths([s], hq=24, hkv=4, dtype=mx.float16)
+    q, k, v = _make(n, mx.float16, hkv=4, s=s)
+    cache = _fill_cache(k, v, mx.float16)
+    out = mlx_qsdpa.qsdpa(q, cache.keys, cache.values, SCALE, n)
+    ref = _reference(q, cache, n, mask="causal")
+    err = mx.abs(out.astype(mx.float32) - ref).max().item()
+    assert err < 4e-3, f"S={s} after warm-up err={err}"
+
+
+def test_warm_widths_declines_uncovered_shapes():
+    """A shape the kernel does not serve, or a width list with nothing
+    templated in it, warms nothing — and never raises into load()."""
+    assert mlx_qsdpa.warm_widths([4], hq=24, hkv=5, dtype=mx.float16) == 0
+    assert mlx_qsdpa.warm_widths([4], hq=24, hkv=0, dtype=mx.float16) == 0
+    assert mlx_qsdpa.warm_widths([1, 2], hq=24, hkv=4, dtype=mx.float16) == 0
+    assert mlx_qsdpa.warm_widths([], hq=24, hkv=4, dtype=mx.float16) == 0
