@@ -391,6 +391,114 @@ def test_single_form_unchanged():
     check("single: missing new reported", "missing new" in res, res)
 
 
+# --- Brace-language tab files: the class of miss dogfooding measured. Indentation is
+# --- not syntax in TypeScript, so nothing downstream catches a mis-indented edit; the
+# --- fit has to be right on the way in.
+
+TS = ("class Ky {\n"
+      "\tasync #fetch() {\n"
+      "\t\ttry {\n"
+      "\t\t\tthrow new TimeoutError(this.request);\n"
+      "\t\t} catch {}\n"
+      "\t}\n"
+      "}\n")
+
+
+def test_ts_tab_file_flush_left_payload_is_fitted():
+    """The dominant dogfood shape: a tab-indented .ts file, a payload sent flush left.
+    It must land at the target's depth, in TABS."""
+    res, after = run(TS, 4, 4,
+                     "throw new TimeoutError(this.request, this.#options.timeoutMessage);",
+                     name="Ky.ts")
+    check("ts flush-left: landed", res.startswith("[edited"), res)
+    check("ts flush-left: disclosed the fit", "fit indentation" in res, res)
+    check("ts flush-left: three tabs",
+          "\t\t\tthrow new TimeoutError(this.request, this.#options.timeoutMessage);\n" in after,
+          repr(after))
+
+
+def test_ts_tab_file_wrong_depth_payload_is_fitted():
+    """The second dogfood shape: the payload carries tabs, just not enough of them."""
+    res, after = run(TS, 4, 4, "\t\tthrow new TimeoutError(this.request, msg);", name="Ky.ts")
+    check("ts wrong-depth: landed", res.startswith("[edited"), res)
+    check("ts wrong-depth: three tabs",
+          "\t\t\tthrow new TimeoutError(this.request, msg);\n" in after, repr(after))
+
+
+def test_ts_tab_file_correct_payload_untouched():
+    """A payload already at the target depth is left byte-identical — no churn, and the
+    result must not claim a fit that didn't happen."""
+    res, after = run(TS, 4, 4, "\t\t\tthrow new TimeoutError(this.request, msg);", name="Ky.ts")
+    check("ts aligned: no fit claimed", "fit indentation" not in res, res)
+    check("ts aligned: exact",
+          "\t\t\tthrow new TimeoutError(this.request, msg);\n" in after, repr(after))
+
+
+def test_ts_tab_file_multiline_keeps_relative_depth():
+    """Relative structure survives the rebuild: a two-level block sent flush left lands
+    at the target depth with its own nesting intact, all in tabs, no spaces."""
+    res, after = run(TS, 4, 4, "if (x) {\n\tthrow new TimeoutError(this.request);\n}",
+                     name="Ky.ts")
+    check("ts multiline: landed", res.startswith("[edited"), res)
+    check("ts multiline: outer at 3 tabs", "\t\t\tif (x) {\n" in after, repr(after))
+    check("ts multiline: inner at 4 tabs",
+          "\t\t\t\tthrow new TimeoutError(this.request);\n" in after, repr(after))
+    check("ts multiline: no spaces leaked",
+          not any(l.startswith(" ") for l in after.split("\n")), repr(after))
+
+
+def test_ts_tab_file_space_payload_converted_to_tabs():
+    """A payload written in spaces must not leave spaces in a tab file — it is rebuilt in
+    the file's unit, not slid by a character count."""
+    res, after = run(TS, 4, 4, "    throw new TimeoutError(this.request, msg);", name="Ky.ts")
+    check("ts space payload: landed", res.startswith("[edited"), res)
+    check("ts space payload: tabs only",
+          "\t\t\tthrow new TimeoutError(this.request, msg);\n" in after, repr(after))
+    check("ts space payload: no spaces leaked",
+          not any(l.startswith(" ") for l in after.split("\n")), repr(after))
+
+
+def test_ts_batch_fits_every_item_and_says_so():
+    """The batched form takes the same fit as the single form — the dogfood loss was a
+    13-edit batch landing mis-indented and being re-decoded verbatim a turn later."""
+    res, after = run_batch(TS, [
+        {"start": 4, "end": 4, "new": "throw new TimeoutError(this.request, msg);"},
+        {"start": 5, "end": 5, "new": "} catch (error) {}"},
+    ], name="Ky.ts")
+    check("ts batch: landed", res.startswith("[edited"), res)
+    check("ts batch: fit disclosed", "re-indented to fit" in res, res)
+    check("ts batch: item 1 at 3 tabs",
+          "\t\t\tthrow new TimeoutError(this.request, msg);\n" in after, repr(after))
+    check("ts batch: item 2 at 2 tabs", "\t\t} catch (error) {}\n" in after, repr(after))
+
+
+def test_space_unit_file_behavior_unchanged():
+    """The space-only path is the measured-good one and must not move: a 4-space file
+    still takes the plain character-delta slide."""
+    fitted, shifted = _fit_indent("if x:\n    y = 1", "    ")
+    check("space path: shifted", shifted and fitted == "    if x:\n        y = 1", repr(fitted))
+    fitted, shifted = _fit_indent("        a = 1\n    b = 2", "    ")
+    check("space path: relative dedent kept",
+          fitted == "    a = 1\nb = 2", repr(fitted))
+
+
+def test_insert_after_blank_line_inherits_the_block_indent():
+    """A blank anchor line has no indentation to inherit; taking its empty one dropped a
+    method to column 0 inside a class body. Walk up to the nearest real line instead."""
+    before = "class Ky {\n\tasync #fetch() {\n\t\treturn 1;\n\t}\n\n}\n"
+    d = tempfile.mkdtemp(prefix="rlblank_")
+    p = os.path.join(d, "Ky.ts")
+    with open(p, "w") as f:
+        f.write(before)
+    res = tool_insert_lines(p, 5, "#timeoutError(request) {\n\treturn new TimeoutError(request);\n}")
+    with open(p) as f:
+        after = f.read()
+    check("blank anchor: landed", res.startswith("[edited"), res)
+    check("blank anchor: method at one tab", "\n\t#timeoutError(request) {\n" in after, repr(after))
+    check("blank anchor: body at two tabs",
+          "\n\t\treturn new TimeoutError(request);\n" in after, repr(after))
+
+
 if __name__ == "__main__":
     test_fit_indent_unit()
     test_basic_replace()
@@ -420,5 +528,13 @@ if __name__ == "__main__":
     test_batch_deletion_item()
     test_batch_garbled_edits_rejected()
     test_single_form_unchanged()
+    test_ts_tab_file_flush_left_payload_is_fitted()
+    test_ts_tab_file_wrong_depth_payload_is_fitted()
+    test_ts_tab_file_correct_payload_untouched()
+    test_ts_tab_file_multiline_keeps_relative_depth()
+    test_ts_tab_file_space_payload_converted_to_tabs()
+    test_ts_batch_fits_every_item_and_says_so()
+    test_space_unit_file_behavior_unchanged()
+    test_insert_after_blank_line_inherits_the_block_indent()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

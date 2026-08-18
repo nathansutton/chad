@@ -1038,31 +1038,74 @@ def _indent_unit(data: str) -> str:
     return " " * (step if step in (2, 4, 8) else 4)
 
 
-def _fit_indent(new: str, target_indent: str) -> tuple[str, bool]:
+def _lead(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
+
+
+def _indent_depth(lead: str, unit: str) -> int:
+    """How many `unit` levels deep a leading-whitespace run is. A tab counts as one level
+    in a tab-unit file and as one unit's width in a space-unit one, so a block written in
+    the other whitespace kind still lands at the right DEPTH."""
+    if not lead:
+        return 0
+    tabs = lead.count("\t")
+    spaces = len(lead) - tabs
+    if unit == "\t":
+        return tabs + (spaces // 4 if not tabs else 0)
+    width = max(1, len(unit))
+    return (tabs * width + spaces) // width
+
+
+def _fit_indent(new: str, target_indent: str, unit: str | None = None) -> tuple[str, bool]:
     """Slide the whole `new` block so its first non-blank line carries `target_indent`,
     preserving every line's indentation RELATIVE to that first line (dedents included).
 
     This is what lets replace_lines take the indentation burden off the model: it can
     send the block at any base column — flush left, or copied verbatim from a numbered
     read — and we shift it to where it lands. Returns (fitted, shifted); shifted is False
-    and `new` is returned untouched when the block is already at the target column, has no
-    non-blank line, OR the target is tab-indented (a char-delta shift would emit spaces and
-    mix them with tabs — the unit-aware recoveries in _splice handle that case)."""
+    and `new` is returned untouched when the block is already at the target column or has
+    no non-blank line.
+
+    Two whitespace kinds meet here, and a plain character-delta shift only works when both
+    sides are spaces: sliding a tab-led block by a character count emits spaces and mixes
+    them with tabs. So when EITHER side carries a tab, the block is instead rebuilt level
+    by level in the file's own `unit` — each line keeps its depth relative to the first,
+    re-rendered in the unit the file actually uses. Dogfooding a tab-indented TypeScript
+    repo measured what the old bail-out cost: the model sent 42 of 61 line-edit payloads
+    at the wrong column (32 of them flush left), every one landed verbatim because
+    brace-language indentation is not syntax and no parse gate could see it, and the run
+    paid for it later in lint failures, re-sent batches, and one discarded file."""
     lines = new.split("\n")
     first = next((l for l in lines if l.strip()), None)
-    if first is None or "\t" in target_indent:
+    if first is None:
         return new, False
-    delta = len(target_indent) - (len(first) - len(first.lstrip()))
-    if delta == 0:
-        return new, False
-    out = []
+    leads = [_lead(ln) for ln in lines if ln.strip()]
+    if "\t" not in target_indent and not any("\t" in l for l in leads):
+        delta = len(target_indent) - len(leads[0])
+        if delta == 0:
+            return new, False
+        out = []
+        for ln in lines:
+            if not ln.strip():
+                out.append("")
+            else:
+                out.append(" " * max(0, len(_lead(ln)) + delta) + ln.lstrip())
+        return "\n".join(out), True
+    # Tabs on one side or both: rebuild in the file's unit rather than shifting chars.
+    unit = unit or ("\t" if "\t" in target_indent else "    ")
+    src_unit = _indent_unit(new)
+    base = _indent_depth(leads[0], src_unit)
+    target_depth = _indent_depth(target_indent, unit)
+    out, changed = [], False
     for ln in lines:
         if not ln.strip():
             out.append("")
-        else:
-            cur = len(ln) - len(ln.lstrip())
-            out.append(" " * max(0, cur + delta) + ln.lstrip())
-    return "\n".join(out), True
+            continue
+        lead = _lead(ln)
+        rebuilt = unit * max(0, _indent_depth(lead, src_unit) - base + target_depth)
+        changed = changed or rebuilt != lead
+        out.append(rebuilt + ln.lstrip())
+    return ("\n".join(out), True) if changed else (new, False)
 
 
 def _snap_indent(new: str, target_indent: str) -> str:
@@ -1194,7 +1237,8 @@ def _splice(path: str, data: str, prefix: str, suffix: str, new: str,
     reject message so it can name the severed statement and echo current numbers."""
     def shape(t: str) -> str:
         return _shape_nl(t, ended_nl)
-    fitted, shifted = _fit_indent(new, target_indent)
+    unit = _indent_unit(data)
+    fitted, shifted = _fit_indent(new, target_indent, unit)
     after = prefix + shape(fitted) + suffix
     note = f" ({label}{'; fit indentation' if shifted else ''})"
     if not syntaxgate.edit_reject(path, data, after, edit_range):
@@ -1202,7 +1246,6 @@ def _splice(path: str, data: str, prefix: str, suffix: str, new: str,
     # Fitted breaks the parse — recover. Each candidate is gated by edit_reject, which
     # only clears when the file parses cleanly again, so a bad recovery can never land;
     # we just fall through to the next.
-    unit = _indent_unit(data)
     if (levers.enabled("structural_reindent")
             and repomap.service().lang_for(path) == "python"):
         cand = prefix + shape(_reindent_python(new, target_indent, unit)) + suffix
@@ -1334,9 +1377,12 @@ def _build_batch(lines: list[str], ordered: list[tuple[int, int, str]]):
     """Splice every (start, end, new) in `ordered` (ascending by start, already checked
     disjoint) into `lines`, fitting each replacement's indentation to its target region.
     Applies the highest line numbers FIRST so an earlier edit never shifts the indices a
-    later one still refers to. Returns (after_text, landed) where landed lists
-    (orig_start, orig_end, new_start, new_end, deleted, preview) against the RESULTING file."""
+    later one still refers to. Returns (after_text, landed, fitted_n) where landed lists
+    (orig_start, orig_end, new_start, new_end, deleted, preview) against the RESULTING
+    file and fitted_n counts the replacements whose indentation had to be re-fitted."""
     prepared = []   # (start, end, repl_lines), one per edit, ascending by start
+    unit = _indent_unit("".join(lines))
+    fitted_n = 0
     for (start, end, new) in ordered:
         replaced = "".join(lines[start - 1:end])
         if new == "":
@@ -1344,7 +1390,8 @@ def _build_batch(lines: list[str], ordered: list[tuple[int, int, str]]):
         else:
             anchor = next((ln for ln in replaced.split("\n") if ln.strip()), "")
             target_indent = anchor[: len(anchor) - len(anchor.lstrip())]
-            fitted, _ = _fit_indent(new, target_indent)
+            fitted, shifted = _fit_indent(new, target_indent, unit)
+            fitted_n += bool(shifted)
             fitted = _shape_nl(fitted, replaced.endswith("\n"))
             repl_lines = fitted.splitlines(keepends=True)
         prepared.append((start, end, repl_lines))
@@ -1362,7 +1409,7 @@ def _build_batch(lines: list[str], ordered: list[tuple[int, int, str]]):
         else:
             landed.append((start, end, ls, ls + span - 1, False, repl_lines[0].strip()))
         offset += span - (end - start + 1)
-    return after, landed
+    return after, landed, fitted_n
 
 
 def _replace_lines_batch(path: str, edits: Any) -> str:
@@ -1401,7 +1448,7 @@ def _replace_lines_batch(path: str, edits: Any) -> str:
     stale = _stale_check(path, data, (ordered[0][0], ordered[-1][1]))
     if stale:
         return stale
-    after, landed = _build_batch(lines, ordered)
+    after, landed, fitted_n = _build_batch(lines, ordered)
     if after == data:
         return "[no-op edit: the batched edits leave the file unchanged]"
     edit_range = (ordered[0][0], ordered[-1][1])
@@ -1415,7 +1462,9 @@ def _replace_lines_batch(path: str, edits: Any) -> str:
             delta = len(f.readlines()) - n
     except OSError:
         delta = 0
-    summary = [f"{len(ordered)} edits applied; line numbers below reflect the new file."]
+    fit_note = f" ({fitted_n} re-indented to fit the file)" if fitted_n else ""
+    summary = [f"{len(ordered)} edits applied{fit_note}; line numbers below reflect "
+               f"the new file."]
     for (o_start, o_end, l_start, l_end, deleted, preview) in landed:
         if deleted:
             summary.append(f"  lines {o_start}-{o_end} deleted")
@@ -1451,19 +1500,29 @@ def tool_insert_lines(path: str, after_line: int, code: str) -> str:
     stale = _stale_check(path, data, (max(1, after_line), min(n, after_line + 1)))
     if stale:
         return stale
-    anchor = (lines[after_line - 1] if after_line >= 1 else (lines[0] if lines else "")).rstrip("\n")
+    # Indentation comes from the nearest NON-BLANK line at or above the insertion point
+    # (falling back below), not from the anchor line itself: a blank anchor has no
+    # indentation to inherit, and taking its empty one drops the insert to column 0 —
+    # measured in dogfood as a method landing flush-left inside a class body.
+    anchor = ""
+    for j in range(min(after_line, len(lines)) - 1, -1, -1):
+        if lines[j].strip():
+            anchor = lines[j].rstrip("\n")
+            break
+    else:
+        anchor = next((ln.rstrip("\n") for ln in lines[after_line:] if ln.strip()), "")
     target_indent = anchor[: len(anchor) - len(anchor.lstrip())]
     prefix = "".join(lines[:after_line])
     suffix = "".join(lines[after_line:])
     # Inserting right after a block opener (a line ending in ':') means the new code
     # belongs to that block's BODY, one level deeper — inherit the existing body's indent
-    # when there is one, else add four spaces to the opener's. Sibling inserts (a field
+    # when there is one, else add one of the file's own indent units. Sibling inserts (a field
     # after a field) don't end in ':', so they keep the anchor's own indent.
     if anchor.rstrip().endswith(":"):
         body = next((ln for ln in suffix.split("\n") if ln.strip()), "")
         body_indent = body[: len(body) - len(body.lstrip())]
         target_indent = body_indent if len(body_indent) > len(target_indent) \
-            else target_indent + "    "
+            else target_indent + _indent_unit(data)
     # Start the insert on its own line. prefix lacks a trailing newline only when we insert
     # after an unterminated final line (after_line == n at a no-newline EOF): add one, and
     # keep the file's no-trailing-newline shape for the new last line.
