@@ -28,6 +28,15 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _XML_FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
 _XML_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 _INT_PARAMS = {"offset", "limit", "timeout"}
+# Params whose value is file/command text, where leading whitespace on the FIRST line
+# is content: a wholesale .strip() eats the opening tab/spaces of an `edit` old/new
+# block (the value starts on the line after the tag), silently forcing every
+# correctly-indented call through the whitespace-flexible match + reindent recovery —
+# and making a whitespace-only edit unexpressible (old == new after the strip). These
+# get framing-newline trim only; scalar params (paths, patterns, names) keep the full
+# strip that keeps `<parameter=path> foo.ts </parameter>` working.
+_TEXT_PARAMS = {"old", "new", "content", "code", "command"}
+_FRAME_RE = re.compile(r"\A[ \t]*\r?\n|\r?\n[ \t]*\Z")
 # Hybrid dialect: a JSON-style `{"name": "bash"` opener followed by XML-style
 # `<parameter=…>…</parameter>` blocks — NOT the `<function=name>` form. Quantized Ornith
 # emits this constantly under temp-1.0 sampling (30 occurrences in a single run), most
@@ -88,9 +97,16 @@ def _parse_params(body: str) -> dict:
     args = {}
     for pm in _XML_PARAM_RE.finditer(body):
         key = pm.group(1).strip()
-        val = pm.group(2).strip()
-        if key in _INT_PARAMS and val.lstrip("-").isdigit():
-            val = int(val)
+        if key in _TEXT_PARAMS and "\n" in pm.group(2):
+            # Multi-line text value: the first line's indentation is content. A
+            # single-line value keeps the legacy full strip — models emit inline
+            # `<parameter=command> ls / </parameter>` padding, and single-line edits
+            # are what the whitespace-flexible matcher already handles well.
+            val = _FRAME_RE.sub("", pm.group(2))
+        else:
+            val = pm.group(2).strip()
+            if key in _INT_PARAMS and val.lstrip("-").isdigit():
+                val = int(val)
         args[key] = val
     return args
 

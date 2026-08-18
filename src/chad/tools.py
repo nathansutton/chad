@@ -2372,6 +2372,15 @@ SCHEMAS: list[dict[str, Any]] = [
 _SYMBOLIC = {"repo_map", "overview", "view_symbol", "find_symbol", "definition",
              "find_refs", "hover", "replace_symbol", "insert_symbol", "rename_symbol"}
 
+# A/B knob: with CHAD_LEAN set, expose only the tools the model already knows from
+# pretraining — bash (unix toolbox: rg/sed/awk for search+read), one exact-match
+# editor, write for new files, plus the plan and terminal tools. Everything else
+# (line-addressed edits, the symbolic layer, dedicated read/grep/glob) is a chad
+# dialect the model must learn in-context; hiding it removes both the schema prefill
+# and the which-tool deliberation. Dispatch stays intact (same contract as
+# CHAD_HIDE_TOOLS), and the env is read per render for in-process A/B flips.
+_LEAN = {"bash", "edit", "write", "write_todos", "done"}
+
 
 def _activate_skill_schema(names):
     """The activate_skill tool schema, with `name` constrained to the set of installed
@@ -2409,6 +2418,8 @@ def active_schemas():
         schemas = [s for s in schemas if s["function"]["name"] != "task"]
     if config.flag("CHAD_NO_SYMBOLS"):
         schemas = [s for s in schemas if s["function"]["name"] not in _SYMBOLIC]
+    if config.flag("CHAD_LEAN"):
+        schemas = [s for s in schemas if s["function"]["name"] in _LEAN]
     # CHAD_HIDE_TOOLS=a,b removes named builtin tools from the schema (the model
     # never sees them; dispatch is untouched). The A/B knob for measuring one tool
     # dialect against another — e.g. exact-match `edit` vs the line-addressed

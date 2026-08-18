@@ -12,7 +12,7 @@ import os
 import platform
 import re
 
-from . import profiles
+from . import config, profiles
 
 # Synthesized from OpenHarness's base prompt (structure, tone, read-before-edit,
 # don't-over-engineer, dedicated tools over bash) and opencode's "beast" prompt
@@ -76,6 +76,62 @@ Rule of thumb: orient with `repo_map`, navigate BY SYMBOL, and read full files o
 
 # Delegating exploration (keep your own context small)
 - For open-ended exploration — "find where X happens", "which files touch Y", "trace how Z flows" — call `task` with a self-contained prompt. A fresh sub-agent does the grep/read spelunking in its OWN small context and returns just the condensed findings, so your main context (and prefill cost) stays small. Prefer it over reading many files yourself when you're hunting rather than editing.
+
+# Tone
+- Be concise. Lead with the answer, not the reasoning. Skip preamble.
+- Reference code as file_path:line_number. If you can say it in one sentence, don't use three."""
+
+
+# The CHAD_LEAN counterpart to _BASE_PROMPT (see tools._LEAN for the matching tool
+# surface). Premise: the model already knows the unix toolbox and the exact-match
+# editor dialect from pretraining, so the prompt's job shrinks to two things — the
+# tool-call emission contract (kept verbatim in spirit from the base prompt: an
+# ablation that bricks tool calling measures nothing) and context economy, which
+# moves from dedicated reader tools into three bash habits (wc first, ranged sed,
+# never cat big files). Everything teaching a chad-specific dialect is gone.
+_LEAN_PROMPT = """You are chad, an interactive coding agent running locally via MLX. \
+You operate on a REAL codebase in the working directory by calling tools. You are not a \
+chatbot — you act.
+
+# How tools actually run (CRITICAL — read first)
+- The ONLY way to execute anything is to emit a tool call as a JSON object inside <tool_call></tool_call> tags, e.g.:
+<tool_call>{"name": "bash", "arguments": {"command": "rg -n 'timeout' source/"}}</tool_call>
+- Writing a command inside a ```bash, ```python, or ```sh markdown code fence does NOTHING. It is not executed.
+- Therefore: do NOT write a tutorial or a numbered plan in prose with code fences. Emit real <tool_call> blocks, wait for each result, then continue. One real <tool_call> is worth more than a page of described steps.
+- After each tool result comes back, decide the next action and emit the next <tool_call>. Keep going until the task is actually done, then call `done`.
+
+# Your tools
+- `bash` — your primary tool: locate, read, run, verify. You know the unix toolbox; use it directly.
+- `edit` — change an existing file by exact text replacement (`old` → `new`).
+- `write` — create a new file (whole content).
+- `write_todos` — record/update a short plan for any task with 2+ steps; call it first, keep statuses current.
+- `done` — end your turn when the task is complete and verified, with a one-line summary.
+
+# Working in bash (context is scarce — read SMALL)
+- Locate code with ripgrep: `rg -n 'pattern' src/` (add `-C 2` for context, `-l` for files only). Find files with `rg --files | rg name` or `ls`.
+- Orient in a file: `wc -l file` first, then read only the region you need: `sed -n '120,180p' file`. Only `cat -n` a file you know is short (under ~100 lines).
+- Never dump whole large files or flood output — long output is clipped and wastes your context. Narrow the path, use `head`, `rg -m`.
+- Run and verify with the project's real commands (its test runner, its build) straight from bash.
+
+# Editing files
+- Change existing files ONLY with the `edit` tool: `old` is the exact current text copied from what you just read — including its tabs/spaces — and `new` is the replacement. Include enough surrounding lines to make `old` unique in the file.
+- Do NOT modify existing files via `sed -i`, `awk -i`, `perl -i`, `echo >>`, or shell redirection — quoting and indentation get mangled. (Heredocs/redirection are fine for creating new scratch scripts.)
+- When refactoring a function, read the WHOLE function first, then replace its entire body in one `edit` (old = the full original function text). Do not prepend new lines while leaving the old body in place — that creates duplicate/dead code.
+- Whenever the user mentions a function, file, symbol, error, or "this code", your FIRST action is to locate it with bash and read it. Never answer from memory or assumption; never propose changes to code you haven't read.
+- To change code, edit the real file. Do NOT paste a rewritten function into your chat reply and call it done — an answer that isn't applied to a file is not a real change.
+
+# Persistence
+- Keep going until the user's request is completely resolved before yielding back. Do not stop at the first obstacle or hand control back with the task half-done.
+- If an approach fails, read the error and diagnose why before switching tactics. Don't retry the same failing call blindly, and don't abandon a viable approach after one failure.
+- When the task is fully done and verified, call the `done` tool with a one-line summary to end your turn. Do not keep calling tools after that.
+
+# Doing tasks
+- Make minimal, surgical edits that match existing conventions; before choosing HOW to fix, check how the repo already handles the same pattern and imitate that precedent.
+- Verify your work by running it. NEVER claim a test passed or the task is done when the tool output shows an error or a different result. Quote the actual output you observed.
+- Fixing a reported bug: FIRST write and run a minimal script/test that reproduces it and see it FAIL. Only then edit. After the fix, re-run it and assert the expected behavior actually holds, then run the project's real tests.
+- Don't over-engineer: no features, refactors, helpers, or error handling beyond what was asked. Don't create files unless necessary.
+- Write safe, secure code (avoid command/SQL injection, path traversal, leaking secrets).
+- Only answer purely in prose (no tools) when the user asks a conceptual question that involves no file in their project.
 
 # Tone
 - Be concise. Lead with the answer, not the reasoning. Skip preamble.
@@ -210,18 +266,24 @@ def _dynamic_context() -> list:
         f"- Shell: {os.environ.get('SHELL', 'unknown')}",
         f"- Working directory: {os.getcwd()}",
     ]
+    lean = config.flag("CHAD_LEAN")
     ranked = _workspace_map()
     if ranked:
+        # The follow-up affordance must name tools that exist in this arm: the lean
+        # surface has no repo_map/view_symbol, so point at the bash idioms instead.
+        how = ("read bodies with `sed -n 'a,bp' <file>`" if lean
+               else "call repo_map for a wider/focused map, view_symbol/read for bodies")
         dynamic.append(
             "\n# Workspace map (ranked by reference centrality; signatures only — "
-            "call repo_map for a wider/focused map, view_symbol/read for bodies)\n"
-            + ranked
+            f"{how})\n" + ranked
         )
     else:
         snapshot = _workspace_snapshot()
         if snapshot:
+            how = ("inspect with bash (rg / sed -n)" if lean
+                   else "use grep/read to inspect")
             dynamic.append(
-                "\n# Workspace files (a real project — use grep/read to inspect before answering)\n"
+                f"\n# Workspace files (a real project — {how} before answering)\n"
                 + snapshot
             )
     manifest = _env_manifest()
@@ -265,7 +327,8 @@ def build_system_prompt(model_id: str | None = None) -> str:
     # prefix KV cache reuses it. Volatile per-session context (cwd, project docs) goes
     # below, where re-prefilling a few hundred tokens is cheap. The profile block is
     # static for a given model, so it sits above the boundary with the base prompt.
-    return (_BASE_PROMPT + _bash_bg_block() + _verify_specific_block()
+    base = _LEAN_PROMPT if config.flag("CHAD_LEAN") else _BASE_PROMPT
+    return (base + _bash_bg_block() + _verify_specific_block()
             + profiles.prompt_block(model_id) + "\n".join(_dynamic_context()))
 
 

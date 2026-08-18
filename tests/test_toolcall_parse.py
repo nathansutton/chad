@@ -221,10 +221,44 @@ def test_salvage_closed_block_unclosed_json():
        [("glob", {"pattern": "*.py"})])
 
 
+def test_text_param_first_line_indent_preserved():
+    """A multi-line old/new/content value keeps its first line's leading whitespace.
+    The wholesale .strip() ate the opening tab of every indented edit block (the value
+    starts on the line after the tag), which forced correct calls through the
+    whitespace-flexible recovery and made a whitespace-only edit unexpressible
+    (old == new after the strip). Framing newlines around the value still go;
+    single-line values keep the legacy full strip (inline space padding is common)."""
+    t1 = ("<tool_call><function=edit><parameter=path>a.ts</parameter>"
+          "<parameter=old>\n\tfoo();\n\tbar();\n</parameter>"
+          "<parameter=new>\n\t\tfoo();\n\t\tbar();\n</parameter></function></tool_call>")
+    eq("t1 tabs survive", parse_tool_calls(t1),
+       [("edit", {"path": "a.ts", "old": "\tfoo();\n\tbar();",
+                  "new": "\t\tfoo();\n\t\tbar();"})])
+
+    # Whitespace-only change stays a change after parsing.
+    t2 = ("<tool_call><function=edit><parameter=path>a.ts</parameter>"
+          "<parameter=old>\n'fetch' | 'prefix'\n</parameter>"
+          "<parameter=new>\n\t'fetch' | 'prefix'\n</parameter></function></tool_call>")
+    (name, args), = parse_tool_calls(t2)
+    check("t2 ws-only edit not collapsed", args["old"] != args["new"],
+          f"old={args['old']!r} new={args['new']!r}")
+
+    # Indented closing tag: its indentation belongs to the frame, not the value.
+    t3 = ("<tool_call><function=write><parameter=path>b.py</parameter>"
+          "<parameter=content>\n\tx = 1\n\t</parameter></function></tool_call>")
+    eq("t3 closing-tag indent dropped", parse_tool_calls(t3),
+       [("write", {"path": "b.py", "content": "\tx = 1"})])
+
+    # Single-line value: legacy strip still applies.
+    t4 = "<tool_call><function=bash><parameter=command> ls / </parameter></function></tool_call>"
+    eq("t4 single-line strip", parse_tool_calls(t4), [("bash", {"command": "ls /"})])
+
+
 if __name__ == "__main__":
     test_parse()
     test_salvage_garbled_tool_name()
     test_hybrid_name_parameter_dialect()
     test_salvage_closed_block_unclosed_json()
+    test_text_param_first_line_indent_preserved()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
