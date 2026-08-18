@@ -433,7 +433,8 @@ def build_draft_readout(model: Any, model_dir: str) -> Optional[Any]:
         head = getattr(lm, "lm_head", None)
         if head is None or not hasattr(head, "group_size"):
             return None
-        if getattr(head, "mode", "affine") != "affine" or head.bits != 4:
+        if getattr(head, "mode", "affine") != "affine" \
+                or head.bits not in (3, 4, 5, 6, 8):
             return None
         gs = head.group_size
         w4, s4, b4 = head["weight"], head["scales"], head.get("biases")
@@ -459,7 +460,7 @@ def build_draft_readout(model: Any, model_dir: str) -> Optional[Any]:
                 r1 = min(V, r0 + step)
                 deq = mx.dequantize(
                     w4[r0:r1], scales=s4[r0:r1], biases=b4[r0:r1],
-                    group_size=gs, bits=4)
+                    group_size=gs, bits=head.bits)
                 qw, qs, qb = mx.quantize(deq, group_size=gs, bits=2)
                 mx.eval(qw, qs, qb)
                 ws.append(qw); ss.append(qs); bs.append(qb)
@@ -469,7 +470,7 @@ def build_draft_readout(model: Any, model_dir: str) -> Optional[Any]:
             mx.save_safetensors(
                 cache, {"weight": w2, "scales": s2, "biases": b2},
                 metadata={"bits": "2", "group_size": str(gs),
-                          "source": "lm_head-4bit-requant"})
+                          "source": f"lm_head-{head.bits}bit-requant"})
         log.info("draft shortlist readout ready (2-bit lm_head shadow, "
                  "top-%d rerank)", DraftReadout.K)
         return DraftReadout(head, w2, s2, b2)
