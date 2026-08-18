@@ -523,6 +523,26 @@ LEVERS: dict[str, Lever] = {
         "consulted; absent one, silence.",
         "ctxengine"),
 
+    # --- group "contract": one line-number rendering across every surface that
+    #     shows file lines, so a number the model sees anywhere is a valid edit
+    #     anchor and carries the same freshness bookkeeping. Read and the edit
+    #     echoes already share it; these levers extend it to the remaining
+    #     surfaces. ------------------------------------------------------------
+    "grep_anchor": Lever(
+        "grep renders matches grouped per file in read's numbered format (a "
+        "`path:` header, right-aligned line numbers, `*` marking match rows when "
+        "context lines are shown) and records each rendered file as seen, so a "
+        "grep hit is a first-class line-edit anchor with the same staleness "
+        "bookkeeping a read gets. OFF keeps the flat `path:line: text` rows. "
+        "Fires per grep that rendered anchors, with file and match counts.",
+        "contract"),
+    "read_range_footer": Lever(
+        "Skeleton and clipped reads name the exact un-shown line ranges in "
+        "directly pasteable form (a concrete `read(path, offset=N, limit=M)` per "
+        "elided span) instead of describing the paging mechanism in prose. Fires "
+        "per read that emitted a concrete continuation.",
+        "contract"),
+
     # --- group "safety": blast-radius containment for unattended mutation. ---------
     "yolo_seatbelt": Lever(
         "In yolo mode on macOS, each bash command's shell child runs under a "

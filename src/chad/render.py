@@ -370,10 +370,21 @@ def render_tool_result(emit, name: str, args: dict, result: str):
         emit("muted", f"  ⎿ sub-agent returned {n} line{'s' * (n != 1)}")
         _indent_block(emit, result, max_lines=4)
     elif name == "grep":
-        # `[`-leading lines are notices ("[results truncated: …]"), not path:line: hits.
-        lines = [l for l in result.splitlines() if ":" in l and not l.startswith("[")]
-        files = len({l.split(":", 1)[0] for l in lines})
-        n = len(lines)
+        # `[`-leading lines are notices ("[results truncated: …]"), not hits. Two
+        # result shapes exist: the flat `path:line: text` stream, and the per-file
+        # numbered rendering (`path:` header, then read-style numbered rows where a
+        # `*` marker distinguishes match rows from interleaved context lines).
+        rows = [l for l in result.splitlines()
+                if l and l != "--" and not l.startswith("[")]
+        headers = [l for l in rows if re.match(r"^\S.*:$", l)]
+        if headers:
+            starred = sum(1 for l in rows if re.match(r"^\s*\d+\* ", l))
+            numbered = sum(1 for l in rows if re.match(r"^\s*\d+[* ] ", l))
+            files, n = len(headers), (starred or numbered)
+        else:
+            lines = [l for l in rows if ":" in l]
+            files = len({l.split(":", 1)[0] for l in lines})
+            n = len(lines)
         emit("muted", f"  ⎿ {n} match{'es' * (n != 1)} in {files} file{'s' * (files != 1)}")
     elif name == "glob":
         n = 0 if result == "[no matches]" else _nlines(result)
