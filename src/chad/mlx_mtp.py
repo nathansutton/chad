@@ -58,51 +58,170 @@ class DepthPolicy:
     The pending top-2 logit margin (of the row that produced the pending
     token) additionally caps p_0/p_1: a near-tie next token is exactly where
     the head is about to be wrong, whatever its recent streak says.
+
+    THE COST SURFACE IS NOT CONVEX (measured, M4 Pro / 4-bit 27B): verify
+    width pays ~25 ms PER ROW through S=8 (ALU-bound qmv region), jumps at
+    S=9-10 where dispatch crosses to the tiled GEMM path, then goes FLAT to
+    S=32 (342->356 ms, and the plateau holds at 12k context). A greedy
+    marginal rule walks to the cliff, sees one negative marginal, and never
+    finds the far side — where a width-32 round at hot-prose acceptance
+    prices out ~3x better per token than any depth in the qmv region. So
+    depth() is an ARGMAX of expected-tokens-per-time over a candidate set
+    that spans both regimes, and the deep candidates open only behind a
+    full-accept streak (any reject collapses the tail estimate back to the
+    prior, so cold or hard content never sees a deep round).
     """
 
-    MAX_DEPTH = 8
+    MAX_DEPTH = 31
+    # Widths 1..6 cover the qmv region up to the fused-SDPA envelope; widths
+    # 10/12/16/20/24/32 sample the flat tile plateau. Bounded on purpose:
+    # each width is a Metal-compile family the engine warms at load, and the
+    # E/T frontier between neighbors is nearly linear.
+    CANDIDATES = (0, 1, 2, 3, 4, 5, 9, 11, 15, 19, 23, 31)
+    STREAK_GATE = 2      # deep candidates need this many perfect rounds
+    RETRY_GATE = 6       # perfect shallow rounds that re-open deep inference
+    SHALLOW_MAX = 5      # deepest candidate below the cliff
+    TAIL_SPLIT = 5       # positions >= this share the pooled tail estimate
 
     def __init__(self, max_depth: int, h: float, costs: Optional[list] = None):
         """`costs`, when given, is the measured round cost T(d) for depth
         d = 0..max_depth (any unit): T(d) = V(d+1) + d*H with the verify-width
-        ladder as measured on THIS stack, which is not width-flat (the S>1
-        forward pays nearly per-row above S=2 outside the fused envelopes).
-        The scalar-h model is the width-flat special case T(d) = 1 + d*h."""
+        ladder as measured on THIS stack. Without it, a default table built
+        from the measured M4 ladder shape (per-row to S=8, flat plateau
+        after) seeds the choice; observe_cost() then corrects both online
+        from real round wall-times, so a wrong seed only shapes the first
+        rounds."""
         self.max_depth = max(0, min(max_depth, self.MAX_DEPTH))
         self.h = h
+        # Seed cost RATIOS (unit-free). Observed wall-times override per
+        # depth; unobserved depths are priced as seed * unit, with the unit
+        # anchored at the most-observed depth. Never mix a raw observation
+        # into the seed list directly: E/T argmax is scale-invariant only
+        # while the whole table shares one scale, and a partially-observed
+        # mixed-scale table silently prices the unobserved depths out (the
+        # depth-1 lock bug this replaces).
         if costs is not None and len(costs) >= self.max_depth + 1:
-            self.costs = [float(c) for c in costs]
+            self._seed = [float(c) for c in costs]
         else:
-            self.costs = [1.0 + d * h for d in range(self.MAX_DEPTH + 1)]
-        self.ema = [0.85 * (0.98 ** i) for i in range(self.MAX_DEPTH)]
+            self._seed = [self._default_cost(d, h)
+                          for d in range(self.MAX_DEPTH + 1)]
+        self._obs: dict = {}      # depth -> (ema wall, count)
+        self.ema = [0.85 * (0.98 ** i) for i in range(self.TAIL_SPLIT)]
         self.alpha = 0.15
+        # Pooled tail acceptance for positions >= TAIL_SPLIT. Per-position
+        # EMAs starve there — only deep rounds visit those positions, so each
+        # gets single-sample evidence and one miss craters it (measured: one
+        # rejected plateau round locked the plateau out for the whole turn).
+        # Pooling is sound because conditional acceptance is near-flat in
+        # position for a trained head on stationary content, and one deep
+        # round contributes ~25 real samples instead of one.
+        self.tail = 0.80          # pooled estimate (prior until observed)
+        self.tail_n = 0           # samples folded in
         self.margin: Optional[float] = None   # pending top-2 logit margin
         self.streak = 0                       # consecutive fully-accepted rounds
         self._skips = 0                       # consecutive adaptive skips
+
+    @staticmethod
+    def _default_cost(d: int, h: float) -> float:
+        """Round cost prior in serial-step units: measured M4 verify ladder
+        (per-row through width 8, cliff at 9, flat plateau after) plus d head
+        steps at h each. observe_cost() overwrites these with reality."""
+        w = d + 1
+        if w <= 2:
+            v = 1.0 + 0.08 * (w - 1)
+        elif w <= 8:
+            v = 1.08 + 0.37 * (w - 2)      # ~25 ms / 66 ms per extra row
+        else:
+            v = 5.2 + 0.008 * (w - 9)      # the flat tile plateau
+        return v + d * h
+
+    def observe_cost(self, depth: int, cost: float) -> None:
+        """Fold one measured round wall-time (seconds) into the per-depth
+        observations. Round costs are noisy (rollback, detok, host work),
+        hence the light EMA."""
+        if not (0 <= depth < len(self._seed) and cost > 0):
+            return
+        ema, n = self._obs.get(depth, (cost, 0))
+        self._obs[depth] = (ema + 0.25 * (cost - ema), n + 1)
+
+    def _unit(self) -> float:
+        """Seconds per seed-unit, anchored at the most-observed depth (the
+        depth the loop actually lives at — a stable, representative sample;
+        a one-off inflated round elsewhere cannot skew the whole table)."""
+        if not self._obs:
+            return 1.0
+        d0 = max(self._obs, key=lambda d: self._obs[d][1])
+        return self._obs[d0][0] / self._seed[d0]
+
+    def cost(self, depth: int) -> float:
+        ob = self._obs.get(depth)
+        if ob is not None and ob[1] >= 2:
+            return ob[0]
+        return self._seed[depth] * self._unit()
+
+    def _tail_p(self) -> float:
+        """Acceptance estimate for positions >= TAIL_SPLIT. Real pooled
+        observations once any deep round has run; before that, INFERENCE
+        from the near positions on a qualifying full-accept streak (capped
+        at 0.95 — the chain being ended by the schedule, not the head, is
+        evidence about the tail, but never certainty), else the prior."""
+        inference = min(0.95, sum(self.ema) / len(self.ema))
+        if self.tail_n > 0:
+            pooled = min(0.95, self.tail)
+            # A long full-accept streak at shallow depth is fresh evidence
+            # the content turned hot: let inference override stale pooled
+            # pessimism so deep gets re-probed (one bad early probe must not
+            # lock the plateau out for the rest of the turn — the probe's
+            # ~25 new samples then speak for themselves).
+            if self.streak >= self.RETRY_GATE:
+                return max(pooled, inference)
+            return pooled
+        if self.streak >= self.STREAK_GATE:
+            return inference
+        return self.tail   # prior
+
+    def _position_p(self, i: int, tail_p: float) -> float:
+        # No continuous margin cap here: the arena's sigmoid(margin/2) gates
+        # were fitted to a different logit scale and measured WRONG on this
+        # stack — they capped p0 at ~0.7 while realized first-draft
+        # acceptance was 0.988, locking the schedule at depth 1. Margins
+        # participate only through the extreme-tie clamp in depth(); ongoing
+        # calibration belongs to the EMAs, which are calibrated to realized
+        # acceptance by construction.
+        return self.ema[i] if i < self.TAIL_SPLIT else tail_p
 
     def depth(self) -> int:
         cap = self.max_depth
         if cap <= 0:
             return 0
-        reach, expected, d = 1.0, 0.0, 0
-        while d < cap:
-            p = self.ema[d]
-            if self.margin is not None:
-                # Confidence gates on the first two positions only; deeper
-                # positions are governed by the EMAs' chained product.
-                if d == 0:
-                    p = min(p, 1.0 / (1.0 + math.exp(-self.margin / 2.0)))
-                elif d == 1:
-                    p = min(p, 1.0 / (1.0 + math.exp(-self.margin / 3.0)))
-            reach *= p
-            # Extend to d+1 iff tokens-per-time improves:
-            #   (1+E+reach)/T(d+1) > (1+E)/T(d)
-            if reach * self.costs[d] <= \
-                    (1.0 + expected) * (self.costs[d + 1] - self.costs[d]):
-                break
+        if self.margin is not None and self.margin < 0.25:
+            # The pending token is a near coin-flip: the head's next draft is
+            # close to a guess whatever the recent streak says. Probe at most
+            # one draft; the EMAs stay in charge of everything else.
+            cap = min(cap, 1)
+        tail_p = self._tail_p()
+        best_d, best_rate = 0, 1.0 / self.cost(0)
+        reach, expected = 1.0, 0.0
+        limit = min(cap, self.MAX_DEPTH)
+        # Deep candidates open on a qualifying streak (first unlock, priced
+        # by inference) or once the pooled tail holds real samples.
+        gate_shallow = self.streak < self.STREAK_GATE and self.tail_n == 0
+        d = 0
+        for nxt in range(1, limit + 1):
+            reach *= self._position_p(nxt - 1, tail_p)
             expected += reach
-            d += 1
-        if d == 0:
+            d = nxt
+            if d not in self.CANDIDATES:
+                continue
+            if gate_shallow and d > self.SHALLOW_MAX:
+                break
+            rate = (1.0 + expected) / self.cost(d)
+            # 2% hysteresis toward shallower rounds: at equal throughput the
+            # shallow round wastes less on a reject and stays inside the
+            # fused-kernel envelope.
+            if rate > best_rate * 1.02:
+                best_d, best_rate = d, rate
+        if best_d == 0:
             # An adaptive skip is free, but the EMAs only observe drafted
             # rounds — a hard stretch would otherwise lock drafting out for
             # the rest of the turn even after the content turns easy. Probe
@@ -113,7 +232,7 @@ class DepthPolicy:
                 return 1
         else:
             self._skips = 0
-        return d
+        return best_d
 
     def record(self, proposed: int, accepted: int, stopped_early: bool) -> None:
         """Fold one round's outcome into the per-position EMAs. Positions
@@ -131,6 +250,20 @@ class DepthPolicy:
         elif accepted == proposed and proposed > 0 and accepted < len(e):
             if e[accepted] < 0.95:
                 e[accepted] += a * (0.95 - e[accepted])
+        # Pooled tail: positions TAIL_SPLIT..accepted-1 observed successes;
+        # the position AT `accepted` observed the failure when the walk
+        # genuinely rejected there. Batch-fold with per-sample weight so one
+        # deep round's ~25 samples count like 25 observations, not one.
+        ts = self.TAIL_SPLIT
+        if proposed > ts:
+            succ = max(0, min(accepted, proposed) - ts)
+            fail = 1 if (ts <= accepted < proposed and not stopped_early) else 0
+            n = succ + fail
+            if n:
+                obs = succ / n
+                w = 1.0 - (1.0 - 0.05) ** n
+                self.tail += w * (obs - self.tail)
+                self.tail_n += n
         self.streak = self.streak + 1 if (proposed > 0 and accepted == proposed) \
             else 0
 
@@ -246,6 +379,102 @@ def load_head(model: Any, model_dir: str) -> Optional[Any]:
         return head
     except Exception as e:  # noqa: BLE001 — never break model load over MTP
         log.warning("MTP head load failed (%s); decoding without MTP", e)
+        return None
+
+
+class DraftReadout:
+    """Cheap argmax for the DRAFT chain: a 2-bit shadow of lm_head proposes a
+    top-K shortlist, the real 4-bit rows exactly rerank it.
+
+    The chained draft step's cost is dominated by the full-vocab lm_head
+    readout (~3.0 ms of the 4.3 ms step on the 27B: 248320 x 5120 at 4-bit is
+    ~620 MB of weight traffic per draft). The 2-bit shadow halves that
+    stream, argpartition keeps the K best, and the exact rerank over K rows
+    costs microseconds — measured 1.33x on the readout with 93% argmax
+    agreement on RANDOM logits (worst case; real logits are peaky, so the
+    true argmax is in a 2-bit top-32 essentially always). DRAFT-SIDE ONLY:
+    a shortlist miss is just a draft the verify rejects; the emitted-token
+    distribution is untouched.
+    """
+
+    K = 32
+
+    def __init__(self, lm_head: Any, w2: Any, s2: Any, b2: Any):
+        self._lm = lm_head
+        self._w2, self._s2, self._b2 = w2, s2, b2
+
+    def argmax_token(self, hidden: Any) -> Any:
+        """(1, 1, H) hidden -> scalar token id array (lazy)."""
+        import mlx.core as mx
+        lm = self._lm
+        lg2 = mx.quantized_matmul(
+            hidden, self._w2, scales=self._s2, biases=self._b2,
+            transpose=True, group_size=lm.group_size, bits=2)[0, -1]
+        v = lg2.shape[-1]
+        idx = mx.argpartition(lg2, v - self.K)[v - self.K:]
+        ex = mx.quantized_matmul(
+            hidden, lm["weight"][idx], scales=lm["scales"][idx],
+            biases=lm["biases"][idx], transpose=True,
+            group_size=lm.group_size, bits=lm.bits)[0, -1]
+        return idx[mx.argmax(ex)]
+
+
+def build_draft_readout(model: Any, model_dir: str) -> Optional[Any]:
+    """2-bit lm_head shadow for DraftReadout, built once and cached beside
+    the MTP sidecars. None when ineligible (tied embeddings, non-4-bit or
+    non-affine lm_head, tiny vocab) or on any failure — the shortlist is a
+    pure speed feature, never load-bearing."""
+    try:
+        import mlx.core as mx
+
+        lm = getattr(model, "language_model", model)
+        if getattr(lm.args, "tie_word_embeddings", False):
+            return None
+        head = getattr(lm, "lm_head", None)
+        if head is None or not hasattr(head, "group_size"):
+            return None
+        if getattr(head, "mode", "affine") != "affine" or head.bits != 4:
+            return None
+        gs = head.group_size
+        w4, s4, b4 = head["weight"], head["scales"], head.get("biases")
+        if b4 is None:
+            return None
+        V = w4.shape[0]
+        if V < DraftReadout.K * 64:   # shortlist over a tiny vocab is noise
+            return None
+
+        os.makedirs(_SIDECAR_DIR, exist_ok=True)
+        cache = os.path.join(
+            _SIDECAR_DIR,
+            os.path.basename(os.path.normpath(model_dir)) + "-draft2b.safetensors")
+        if os.path.isfile(cache):
+            t = mx.load(cache)
+            w2, s2, b2 = t["weight"], t["scales"], t["biases"]
+        else:
+            # Chunked dequantize -> requantize (a full-vocab dequant is a
+            # ~2.5 GB transient; 32k-row blocks keep it to ~340 MB).
+            step = 32768
+            ws, ss, bs = [], [], []
+            for r0 in range(0, V, step):
+                r1 = min(V, r0 + step)
+                deq = mx.dequantize(
+                    w4[r0:r1], scales=s4[r0:r1], biases=b4[r0:r1],
+                    group_size=gs, bits=4)
+                qw, qs, qb = mx.quantize(deq, group_size=gs, bits=2)
+                mx.eval(qw, qs, qb)
+                ws.append(qw); ss.append(qs); bs.append(qb)
+            w2 = mx.concatenate(ws); s2 = mx.concatenate(ss)
+            b2 = mx.concatenate(bs)
+            mx.eval(w2, s2, b2)
+            mx.save_safetensors(
+                cache, {"weight": w2, "scales": s2, "biases": b2},
+                metadata={"bits": "2", "group_size": str(gs),
+                          "source": "lm_head-4bit-requant"})
+        log.info("draft shortlist readout ready (2-bit lm_head shadow, "
+                 "top-%d rerank)", DraftReadout.K)
+        return DraftReadout(head, w2, s2, b2)
+    except Exception as e:  # noqa: BLE001 — never break load over a speedup
+        log.warning("draft shortlist build failed (%s); full readout", e)
         return None
 
 

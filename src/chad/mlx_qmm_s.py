@@ -22,7 +22,9 @@ headroom for until S ~ 8 (the ALU/bandwidth crossover).
 
 Scope (fall back to mx.quantized_matmul outside it — correctness first):
   - affine mode, group_size 64, bits in {2, 3, 4, 6, 8}
-  - transpose=True (the nn.QuantizedLinear orientation), fp16 activations
+  - transpose=True (the nn.QuantizedLinear orientation), fp16/bf16 activations
+    (dtype-templated: the fp16-only v1 was a SILENT NO-OP on the bf16 27B —
+    the ladder it was built to remove was never actually being removed)
   - batch 1, 2 <= S <= 8, K % 256 == 0, N % 8 == 0
   (every projection in the Qwen3.8-27B text stack qualifies: K in
    {5120, 6144, 10240, 17408}, N from 48 to 248320.)
@@ -95,19 +97,23 @@ inline void chad_unpack8(const device uchar* w, thread float* q) {
 # (32 lanes x 8 values); a lane's 8-value chunk lives in one scale group.
 # y is (S, N) fp16; accumulation fp32.
 _SRC = """
+    // R = output rows per simdgroup. 4 amortizes best while the acc[R][S]
+    // register block fits; past S=4 that block spills, so deep widths trade
+    // amortization for pressure (R=2) and win it back in occupancy.
+    constexpr int R = (S <= 4) ? 4 : 2;
     uint tg = threadgroup_position_in_grid.x;
     uint simd = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
     const uint N = params[0];
     const uint K = params[1];
-    uint row0 = tg * 8 + simd * 4;
+    uint row0 = tg * (2 * R) + simd * R;
     if (row0 >= N) return;
     const device uchar* wb = (const device uchar*)w;
     const uint row_bytes = (K * BITS) / 8;
     const uint gstride = K / 64;
 
-    float acc[4][S];
-    for (int r = 0; r < 4; ++r)
+    float acc[R][S];
+    for (int r = 0; r < R; ++r)
       for (int s = 0; s < S; ++s) acc[r][s] = 0.0f;
 
     const uint iters = K / 256;
@@ -115,20 +121,20 @@ _SRC = """
       uint v0 = it * 256 + lane * 8;
       uint g = v0 / 64;
 
-      float qv[4][8];
-      float sc[4], bi[4];
-      for (int r = 0; r < 4; ++r) {
+      float qv[R][8];
+      float sc[R], bi[R];
+      for (int r = 0; r < R; ++r) {
         uint row = row0 + r;
         chad_unpack8<BITS>(wb + row * row_bytes + (v0 * BITS) / 8, qv[r]);
         sc[r] = float(scales[row * gstride + g]);
         bi[r] = float(biases[row * gstride + g]);
       }
       for (int s = 0; s < S; ++s) {
-        const device half* xp = x + s * K + v0;
+        const device T* xp = x + s * K + v0;
         float xv[8];
         float xs = 0.0f;
         for (int i = 0; i < 8; ++i) { xv[i] = float(xp[i]); xs += xv[i]; }
-        for (int r = 0; r < 4; ++r) {
+        for (int r = 0; r < R; ++r) {
           float d = 0.0f;
           for (int i = 0; i < 8; ++i) d += qv[r][i] * xv[i];
           acc[r][s] += sc[r] * d + bi[r] * xs;
@@ -136,10 +142,10 @@ _SRC = """
       }
     }
 
-    for (int r = 0; r < 4; ++r) {
+    for (int r = 0; r < R; ++r) {
       for (int s = 0; s < S; ++s) {
         float v = simd_sum(acc[r][s]);
-        if (lane == 0) y[s * N + row0 + r] = half(v);
+        if (lane == 0) y[s * N + row0 + r] = T(v);
       }
     }
 """
@@ -166,7 +172,8 @@ def eligible(x: Any, biases: Any, group_size: int, bits: int,
     import mlx.core as mx
     if mode != "affine" or group_size != _GS or bits not in _BITS:
         return False
-    if biases is None or x.dtype != mx.float16 or x.ndim != 3:
+    if biases is None or x.ndim != 3 \
+            or x.dtype not in (mx.float16, mx.bfloat16):
         return False
     B, S, K = x.shape
     return B == 1 and 2 <= S <= _MAX_S and K % 256 == 0
@@ -183,10 +190,11 @@ def qmm_s(x: Any, w: Any, scales: Any, biases: Any, bits: int) -> Any:
             x, w, scales=scales, biases=biases, transpose=True,
             group_size=_GS, bits=bits)
     params = mx.array([N, K], dtype=mx.uint32)
+    rows_per_tg = 8 if S <= 4 else 4   # 2 simdgroups x R, R matching _SRC
     (y,) = _get_kernel()(
         inputs=[x.reshape(S, K), w, scales, biases, params],
-        template=[("BITS", bits), ("S", S)],
-        grid=((N // 8) * 64, 1, 1),
+        template=[("T", x.dtype), ("BITS", bits), ("S", S)],
+        grid=((N // rows_per_tg) * 64, 1, 1),
         threadgroup=(64, 1, 1),
         output_shapes=[(S, N)],
         output_dtypes=[x.dtype],

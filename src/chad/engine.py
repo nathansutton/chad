@@ -446,24 +446,34 @@ class Engine:
     # tokens per unit round time under per-position acceptance EMAs and the
     # measured head-step/verify cost ratio mtp_h. Hot prose runs deep, cold
     # prompts collapse to 1 or a free skip (0); the fixed-k sweep behind
-    # mtp_num_draft is the degenerate constant-depth version. Default OFF by
-    # measurement (M4 Pro, 4-bit 27B, 8-prompt 512-token protocol): this
-    # stack's verify forward pays ~20-25 ms PER ROW above S=2, so depth past
-    # 2 cannot pay — fixed k=2 measured 29.0 tok/s median vs 27.1 for
-    # adaptive-cap-4 even at 97%+ acceptance. The schedule itself is sound
-    # (it protects hard prompts and ramps where acceptance holds); flip on
-    # with CHAD_MTP_ADAPTIVE=1 once a fused multi-row verify flattens the
-    # ladder. CHAD_MTP_DRAFT forces a fixed width; CHAD_MTP_MAX_DRAFT /
-    # CHAD_MTP_H override the cap and the cost ratio.
-    mtp_adaptive: bool = False
-    # Cap 4 = verify width 5. Two independent walls above it, both measured:
-    # (1) numeric drift — wider verifies flip near-tie argmaxes and the
-    # generation leaves the serial trajectory (the same width wall the
-    # qwen-3.8 arena pinned at 5 for bit-exactness); (2) cost — width >= 7
-    # falls off the fused wide-SDPA envelope (mlx_qsdpa._wide_s_max) and the
-    # ladder turns per-row. Raise only with a bit-exact wide-verify audit.
-    mtp_max_draft: int = 4
-    mtp_h: float = 0.35             # head-step cost / verify-forward cost
+    # mtp_num_draft is the degenerate constant-depth version. Default ON by
+    # measurement (M4 Pro, 4-bit 27B, 8-prompt 512-token arena protocol):
+    # the verify ladder pays ~25 ms PER ROW through S=8 but is FLAT from
+    # S=10 to S=32 (the tiled-GEMM plateau, holds at 12k ctx), and the
+    # plateau-aware argmax beat fixed k=2 on 8/8 prompts — median 29.1 vs
+    # 26.5 tok/s (1.90x vs 1.73x over serial), +25-40% on hot prose (6-7
+    # committed tokens/round), +23% on the hardest prompt (the schedule
+    # collapses to depth 1-2 or a free skip where acceptance drops, so
+    # low-acceptance regimes like temp-1 thinking degrade to k2-like
+    # behavior, not below it). CHAD_MTP_ADAPTIVE=0 restores fixed-width;
+    # CHAD_MTP_DRAFT forces a width (and implies adaptive off);
+    # CHAD_MTP_MAX_DRAFT / CHAD_MTP_H override the cap and cost seed.
+    mtp_adaptive: bool = True
+    # 31 = verify width 32, the far edge of the measured FLAT tile plateau
+    # (S>=10 verifies cost ~the same through S=32; see DepthPolicy). The
+    # policy itself keeps rounds at width <= 6 (the fused-SDPA envelope)
+    # until a full-accept streak qualifies a plateau jump, so cold or hard
+    # content never sees a wide round. Width >5 verifies can flip near-tie
+    # argmaxes off the serial trajectory — the same numerics chad already
+    # accepts from wide-PLD's width-32 verifies on this model class.
+    mtp_max_draft: int = 31
+    # Head-step cost / serial-step cost, MEASURED: 4.3 ms chained head step
+    # (1-layer head + lm_head readout) against the 66 ms serial trunk step
+    # (M4 Pro, 4-bit 27B). This seeds DepthPolicy's cost ratios; getting it
+    # wrong is a depth lock — at the old flat-model 0.35 the seed priced
+    # depth 2 below depth 1 and the schedule never explored past 1, so no
+    # observation could ever correct the table.
+    mtp_h: float = 0.065
     # Measured per-depth round costs T(0)..T(max), any unit; None = the
     # width-flat scalar-h model. See mlx_mtp.DepthPolicy.
     mtp_costs: Optional[list] = None
@@ -502,6 +512,7 @@ class Engine:
     # unfused head_dim-256 attention's transient scales with heads*chunk*kv_len.
     _is_moe: bool = field(init=False, default=False)
     _mtp_head: Any = field(init=False, default=None)
+    _mtp_draft_readout: Any = field(init=False, default=None)
     _n_attn_heads: int = field(init=False, default=16)
     _n_kv_heads: int = field(init=False, default=0)
     _head_dim: int = field(init=False, default=0)
@@ -613,8 +624,17 @@ class Engine:
         if not config.flag("CHAD_NO_MTP"):
             from . import mlx_mtp
             self._mtp_head = mlx_mtp.load_head(self.model, path)
-            if config.flag("CHAD_MTP_ADAPTIVE"):
-                self.mtp_adaptive = True
+            # 2-bit shortlist readout for the greedy draft chain — pure speed
+            # (the chained drafts' full-vocab lm_head read is ~70% of the
+            # head-step cost). Draft-side only, never load-bearing.
+            self._mtp_draft_readout = None
+            if (self._mtp_head is not None
+                    and not config.flag("CHAD_NO_DRAFT_SHORTLIST")):
+                self._mtp_draft_readout = mlx_mtp.build_draft_readout(
+                    self.model, path)
+            av = config.env_str("CHAD_MTP_ADAPTIVE")
+            if av is not None and av != "":
+                self.mtp_adaptive = av.strip().lower() not in ("0", "false")
             nd = config.env_int("CHAD_MTP_DRAFT", 0)
             if nd:
                 self.mtp_num_draft = nd
@@ -693,9 +713,13 @@ class Engine:
         widths: set[int] = set()
         if self._mtp_head is not None:
             if self.mtp_adaptive:
-                # The adaptive schedule can verify at any width up to the cap;
-                # an unwarmed width is a Metal compile inside a scored round.
-                widths.update(range(2, self.mtp_max_draft + 2))
+                # The adaptive schedule only dispatches the policy's candidate
+                # widths (bounded on purpose — an unwarmed width is a Metal
+                # compile inside a live round, and warming all of 2..32 would
+                # pay for variants no round dispatches).
+                from .mlx_mtp import DepthPolicy
+                widths.update(d + 1 for d in DepthPolicy.CANDIDATES
+                              if 0 < d <= self.mtp_max_draft)
             else:
                 widths.add(self.mtp_num_draft + 1)
         if (config.flag("CHAD_USE_PLD") and self.prompt_lookup and self.pld_wide
@@ -2226,6 +2250,7 @@ class Engine:
         while len(out_ids) < max_tokens:
             if should_stop and should_stop():
                 break
+            round_t0 = time.time()
             if h_last is None:
                 k = 0
             elif policy is not None:
@@ -2242,21 +2267,29 @@ class Engine:
             # ids — one host sync instead of k.
             draft, q_rows, d_arrs = [], [], []
             if k:
+                # Greedy proposals can take the shortlist readout (2-bit
+                # lm_head shadow + exact top-32 rerank — mlx_mtp.DraftReadout)
+                # instead of the full-vocab read. Sampled proposals need the
+                # whole distribution, so they keep the full readout.
+                sampled = self.temp > 0 and self.mtp_sample_drafts
+                readout = None if sampled else \
+                    getattr(self, "_mtp_draft_readout", None)
                 e = embed(mx.array([[y_val]], dtype=mx.uint32))
                 hin = h_last
                 for _ in range(k):
                     hout = head(e, hin, cache=mtp_cache)
-                    dl = _logits(hout)[0, -1]
-                    if self.temp > 0 and self.mtp_sample_drafts:
-                        scaled = self._spec_scaled(dl)
+                    if sampled:
+                        scaled = self._spec_scaled(_logits(hout)[0, -1])
                         key, sub = mx.random.split(key)
                         d = mx.random.categorical(scaled, key=sub)
                         q_rows.append(mx.softmax(scaled, axis=-1))
+                    elif readout is not None:
+                        d = readout.argmax_token(hout)
                     else:
                         # argmax proposal — also correct at temp>0 (point-mass
                         # q; see mtp_sample_drafts). argmax of raw logits ==
                         # argmax after temp/top_p/min_p, which never drop the max.
-                        d = mx.argmax(dl)
+                        d = mx.argmax(_logits(hout)[0, -1])
                     d_arrs.append(d)
                     e = embed(d.reshape(1, 1))
                     hin = hout
@@ -2381,6 +2414,11 @@ class Engine:
                 policy.record(k, n_acc,
                               stopped_early=(n_acc > 0
                                              and draft[n_acc - 1] in eos))
+            if policy is not None:
+                # The measured wall of THIS round (draft + verify + the one
+                # host sync) re-prices its depth in the policy's cost table —
+                # the seed ladder only has to be right about shape, not units.
+                policy.observe_cost(k, time.time() - round_t0)
 
             # -- roll the main cache back over rejected drafts --------------
             if k - n_acc > 0:

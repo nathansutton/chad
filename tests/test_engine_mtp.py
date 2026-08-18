@@ -208,17 +208,29 @@ def test_adaptive_greedy_is_bit_exact():
 
 
 def test_depth_policy_dynamics():
-    """Pure-policy contract: hot content ramps to the cap, sustained rejection
-    collapses to the free skip but probes its way back, and a near-tie pending
-    margin clamps the first positions."""
+    """Pure-policy contract: a full-accept streak jumps the cost cliff onto
+    the flat plateau (candidate depths >= 9), a single reject collapses back
+    below the fused-envelope cap, sustained rejection reaches the free skip
+    but probes its way back, and a near-tie pending margin clamps the first
+    positions."""
     from chad.mlx_mtp import DepthPolicy
-    hot = DepthPolicy(7, 0.35)
+    hot = DepthPolicy(31, 0.065)
+    seen = []
     for _ in range(40):
         d = hot.depth()
+        seen.append(d)
         hot.record(d, d, False)
-    assert hot.depth() == 7
+    assert max(seen) >= 9, f"never jumped the cliff: {seen}"
+    assert seen[0] <= DepthPolicy.SHALLOW_MAX, "deep round before any streak"
+    # sustained rejection drains the pooled tail and closes the plateau
+    # (a SINGLE reject must NOT — that is one Bernoulli miss against ~25
+    # pooled samples per deep round, the exact lockout the pool fixes)
+    for _ in range(6):
+        d = hot.depth()
+        hot.record(max(d, 6), 0, False)
+    assert hot.depth() <= DepthPolicy.SHALLOW_MAX
 
-    cold = DepthPolicy(7, 0.35)
+    cold = DepthPolicy(31, 0.065)
     for _ in range(12):
         d = cold.depth()
         if d:
@@ -227,7 +239,7 @@ def test_depth_policy_dynamics():
     # the 16-skip probe must eventually re-offer depth 1
     assert any(cold.depth() == 1 for _ in range(20))
 
-    tie = DepthPolicy(7, 0.35)
+    tie = DepthPolicy(31, 0.065)
     tie.margin = 0.0
     assert tie.depth() <= 1
 
