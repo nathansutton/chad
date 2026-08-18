@@ -25,6 +25,7 @@ import time
 from . import config, guardrails, levers
 from .agent import Agent, repl
 from .base_engine import BackendError
+from .diag import log
 from .engine import Engine
 
 # Package dir is src/chad/; the project root (two levels up) is the dev clone. If a
@@ -204,41 +205,69 @@ def _host_avail_bytes():
         return None
 
 
+# Prefill/decode scratch that is live at the same moment the KV cache is: chunked
+# prefill materializes an attention transient sized by chunk x kv_len, and the adaptive
+# chunker shrinks the chunk as the free band closes, so it climbs with context and then
+# SATURATES rather than growing per-token. Measured on the 27B (q3, 8-bit KV, clamp on,
+# one load): 1.82 GB at 8k, 3.19 at 32k, 4.15 at 49k, 4.14 at 65k — flat by 49k, and past
+# that point peak grows at 33,936 B/token against a 34,816 B/token KV cache, i.e. the
+# marginal cost of a token IS its KV cost. Used as a floor only; `_compute_ctx_limit`
+# prefers the live `peak - active` once a real prefill has been through.
+PREFILL_TRANSIENT_BYTES = 4.3e9
+
+
 def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
-                        reserve_gb=1.5, safety=0.90, gen_margin=2048, floor=8192,
-                        host_avail_bytes=None, slope_factor=1.75):
+                        safety=0.975, gen_margin=2048, floor=8192,
+                        host_avail_bytes=None, slope_factor=1.0,
+                        transient_bytes=PREFILL_TRANSIENT_BYTES):
     """Largest prompt-token budget (= the compaction trigger) that keeps the
     growing KV cache inside a safe slice of the Metal *recommended working set*, given the
     model's already-resident footprint and the *measured* per-token KV cost. Pure +
-    measured — replaces the magic `CTX_CAP = 120_000`, which was an OOM guard set blind to
-    the real per-token cost (it over-compacts: on a 24 GB M4 Pro the 20 KiB/token hybrid
-    cache fits ~175 k tokens, not 120 k).
+    measured — replaces the magic `CTX_CAP = 120_000`, an OOM guard set blind to both the
+    real per-token cost and the real fixed cost, and so wrong in both directions depending
+    on the model.
 
-    `budget*safety` leaves a headroom band below Apple's recommendation; subtract the
-    resident model+SSM floor (`active_bytes`) and a scratch reserve for prefill/decode
-    buffers to get the bytes free for KV; divide by `kv_bytes_per_token` for the token
-    ceiling. Capped at `eff_ctx − gen_margin` (the model's real window) and floored so a
-    tight box still gets a usable window. Self-calibrates per machine (16 GB → small,
-    64 GB → near the window). Returns None if inputs are unusable so the caller can keep
-    the old fixed cap."""
+    `safety` is the ONLY headroom knob, and it holds back 2.5 %. It replaces a pair —
+    `safety=0.90` alongside a flat `reserve_gb=1.5` — that guarded one wall with two
+    numbers, neither derived from anything measured on the model being run. The rule now
+    is that a knob is the wrong home for anything measurable: what the percentage does not
+    cover is the prefill transient, and that gets *measured* and subtracted below rather
+    than tuned.
+
+    So: `budget*safety`, minus the resident model+SSM floor (`active_bytes`) and the
+    prefill transient live alongside the cache (`transient_bytes`), is the bytes free for
+    KV; divide by `kv_bytes_per_token` for the token ceiling. Capped at
+    `eff_ctx − gen_margin` (the model's real window) and floored so a tight box still gets
+    a usable window. Self-calibrates per machine (16 GB → small, 64 GB → near the window).
+    Returns None if inputs are unusable so the caller can keep the old fixed cap.
+
+    `slope_factor` multiplies the per-token cost and now defaults to 1.0, because the
+    measurement says a token's marginal cost is its KV cost and nothing more. It was 1.75,
+    which was the old way of paying for the transient: smear a fixed multi-gigabyte term
+    across the per-token divisor and it comes out roughly right at ONE context length on
+    ONE box, and wrong everywhere else — over-charging long windows, under-charging short
+    ones. The term is fixed, so it is subtracted like one. Kept as a knob for A/B only."""
     if not (budget_bytes and kv_bytes_per_token and active_bytes):
         return None
-    usable = budget_bytes * safety - active_bytes - reserve_gb * 1e9
+    usable = budget_bytes * safety - active_bytes - (transient_bytes or 0)
     # The Metal budget is blind to other processes' physical pressure (Docker VM,
     # harbor, browsers). When the host's reclaimable band is tighter than the Metal
     # band, IT is the binding constraint — the KV cache grows into physical pages
     # 1:1, and jetsam kills on physical pressure, not on Metal accounting.
     if host_avail_bytes:
-        usable = min(usable, host_avail_bytes * 0.85 - reserve_gb * 1e9)
+        # NOT symmetric with the Metal branch, on purpose: the transient is not charged
+        # here. Metal is a hard allocator wall — the scratch either fits or the allocation
+        # fails — whereas the host band is a soft pressure signal the OS can compress and
+        # evict around for a spike that lives for one prefill chunk. What it cannot absorb
+        # is the KV cache, which stays resident for the session, so that is what this
+        # branch sizes. Charging the transient here instead turns a guard meant to bite
+        # only under real pressure into the primary constraint: measured right after a
+        # 12.3 GB load the reclaimable band reads 3.9 GB (down from 11.4 — the weights
+        # just took it, and nothing has been reclaimed yet), and subtracting a 4.3 GB
+        # transient from that lands negative, i.e. the floor, on a box with room to spare.
+        usable = min(usable, host_avail_bytes * safety)
     if usable <= 0:
         return floor
-    # Peak memory grows FASTER than the KV cache alone: prefill/decode scratch also
-    # scales with resident context (2026-07-12 ram_safety_check fit on the 35B, fused
-    # wheel: 35.7 KB/token all-in vs 20.5 KB/token KV — the raw KV divisor picked a
-    # 175k trigger that extrapolated to 102.9% of budget — over the wall). The fixed
-    # `reserve_gb` cannot cover a term that grows per-token, so fold it into the
-    # divisor. 1.75 is the 35B measurement; unmeasured on the 9B, where it errs safe
-    # (over-compaction costs a re-prefill, undershoot costs a jetsam kill).
     ram_ctx = int(usable / (kv_bytes_per_token * slope_factor))
     return max(floor, min(eff_ctx - gen_margin, ram_ctx))
 
@@ -248,10 +277,10 @@ def _compute_ctx_limit(eng):
     cache, compaction forces a full body re-prefill (~79 % of all prefill), so
     we compact as rarely as RAM safely allows: size the trigger from the live Metal
     budget + the model's *measured* per-token KV cost instead of a blind 120 k
-    cap that over-compacts. CHAD_CTX_LIMIT still wins (used by tests); CHAD_CTX_RESERVE_GB
-    tunes the scratch headroom. Falls back to the old fixed cap if the memory APIs or the
-    KV measurement are unavailable. Needs eng.load() to have run (reads effective_ctx +
-    kv_bytes_per_token)."""
+    cap that over-compacts. CHAD_CTX_LIMIT still wins (used by tests); CHAD_CTX_SAFETY is
+    the single headroom knob (default 0.975 — hold back 2.5 % of the Metal budget). Falls
+    back to the old fixed cap if the memory APIs or the KV measurement are unavailable.
+    Needs eng.load() to have run (reads effective_ctx + kv_bytes_per_token)."""
     ctx_limit = _env_int("CHAD_CTX_LIMIT")
     if not ctx_limit:
         try:
@@ -265,14 +294,53 @@ def _compute_ctx_limit(eng):
                 eng.effective_ctx,
                 mx.device_info()["max_recommended_working_set_size"],
                 active_floor, eng.kv_bytes_per_token,
-                reserve_gb=_env_float("CHAD_CTX_RESERVE_GB") or 1.5,
+                safety=_env_float("CHAD_CTX_SAFETY") or 0.975,
                 host_avail_bytes=_host_avail_bytes(),
-                slope_factor=_env_float("CHAD_CTX_SLOPE_FACTOR") or 1.75)
+                slope_factor=_env_float("CHAD_CTX_SLOPE_FACTOR") or 1.0)
+            # The governor sets the shape of the whole session and used to explain
+            # nothing, which made a wrong pick indistinguishable from a tight box.
+            log.info("GOVERNOR ctx_limit=%s | budget=%.2f GB active=%.2f GB "
+                     "transient=%.2f GB host_avail=%.2f GB kv=%.0f B/tok",
+                     f"{ctx_limit:,}" if ctx_limit else ctx_limit,
+                     mx.device_info()["max_recommended_working_set_size"] / 1e9,
+                     active_floor / 1e9, PREFILL_TRANSIENT_BYTES / 1e9,
+                     (_host_avail_bytes() or 0) / 1e9, eng.kv_bytes_per_token)
         except Exception:  # noqa: BLE001 — never let memory probing break startup
             ctx_limit = None
     if not ctx_limit:
         ctx_limit = min(max(4096, eng.effective_ctx - 2048), 120_000)  # old fixed cap
     return ctx_limit
+
+
+def peek_ctx_limit(model_id, window):
+    """The compaction trigger estimated BEFORE the weights load, so the banner can
+    advertise the window this session actually gets instead of a native window the box
+    cannot hold. Same governor and the same live memory probes as `_compute_ctx_limit` —
+    only the two model-side inputs are config/disk estimates rather than measurements
+    (`engine.peek_kv_footprint`), and the measured value replaces this the moment load
+    returns. Returns None when the estimate isn't available, leaving the caller on the
+    old window-derived provisional."""
+    if not window:
+        return None
+    try:
+        import mlx.core as mx
+
+        from .engine import peek_kv_footprint
+        kv_bpt, weights = peek_kv_footprint(model_id)
+        if not (kv_bpt and weights):
+            return None
+        # The weights are not resident yet, so the host's reclaimable band still counts
+        # the pages they are about to take. Subtract them, or this reads the box as
+        # roomier than the session will ever see it.
+        avail = _host_avail_bytes()
+        return ram_aware_ctx_limit(
+            window, mx.device_info()["max_recommended_working_set_size"],
+            weights, kv_bpt,
+            safety=_env_float("CHAD_CTX_SAFETY") or 0.975,
+            host_avail_bytes=max(0, avail - weights) if avail else None,
+            slope_factor=_env_float("CHAD_CTX_SLOPE_FACTOR") or 1.0)
+    except Exception:  # noqa: BLE001 — never let a banner estimate break startup
+        return None
 
 
 def _preflight(backend="mlx"):
@@ -918,7 +986,11 @@ def _main(argv=None):
         # shown instantly; `finalize` runs the real load on the TUI's background thread and
         # returns (load_s, ctx_limit) once weights are in.
         window = peek_context_window(model_id, max_context)
+        # The banner states the EFFECTIVE window — what the RAM governor will hand this
+        # session — not the model's native one. On a box where the two differ by 2.5x,
+        # advertising the native number is advertising context the run cannot spend.
         provisional = ctx_limit or _env_int("CHAD_CTX_LIMIT") \
+            or peek_ctx_limit(model_id, window) \
             or min(max(4096, (window or 32768) - 2048), 120_000)
 
         def finalize():
@@ -926,7 +998,8 @@ def _main(argv=None):
             return load_s, _compute_ctx_limit(eng)
 
         run_tui(eng, provisional, mode=start_mode, thinking=thinking, resume=resume,
-                ctx_window=window, finalize=finalize, ctx_limit_fn=ctx_limit_fn)
+                ctx_window=provisional, native_ctx=window, finalize=finalize,
+                ctx_limit_fn=ctx_limit_fn)
 
 
 if __name__ == "__main__":

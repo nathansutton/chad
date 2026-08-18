@@ -28,7 +28,7 @@ import sys
 import tempfile
 from typing import Optional
 
-from . import levers
+from . import config, levers
 
 log = logging.getLogger("chad")
 
@@ -252,4 +252,4 @@ def wrap_argv(command: str) -> Optional[list]:
         # but killing every bash call is worse — log loudly and run unconfined.
         log.warning("SEATBELT profile write failed (%s) — running unconfined", e)
         return None
-    return [SANDBOX_EXEC, "-f", profile, "/bin/sh", "-c", command]
+    return [SANDBOX_EXEC, "-f", profile, config.shell_path(), "-c", command]

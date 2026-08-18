@@ -116,6 +116,10 @@ def test_edit_truth_table():
 
 # --- tool_bash ----------------------------------------------------------------
 
+# Line clipping ablated: every oversized fixture here is one 40k-char blob, and
+# this test pins the head/tail budget's shape on it. test_bash_line_clip covers the
+# clip path, including that a blob is what it exists for.
+@_with_lever_off("bash_line_clip")
 def test_bash():
     # short output passes through untouched
     check("bash: short echo", tools.tool_bash("printf hi") == "hi")
@@ -184,6 +188,43 @@ def _spill_path_from(result):
     return result.split("FULL output saved to ", 1)[1].split(";", 1)[0]
 
 
+@_with_lever_off("bash_trim_keep_failures")
+def test_bash_line_clip():
+    """One absurdly long line is capped instead of eating the whole budget, and the
+    full text stays recoverable. The measured case: a search that reached a gitignored
+    build directory returned a 92k-char .js.map line, and head+tail handed back 20k
+    chars sliced out of the middle of base64 — ~5k tokens of prefill, no information."""
+    old = os.environ.get("CHAD_SPILL_DIR")
+    d = tempfile.mkdtemp(prefix="clip_")
+    os.environ["CHAD_SPILL_DIR"] = d
+    try:
+        blob = "M" * 92000
+        out = tools._bash_headtail(f"head.js.map:1:{blob}\nreal line\n")
+        check("clip: result is small", len(out) < 1200, len(out))
+        check("clip: keeps the line's start", out.startswith("head.js.map:1:MMM"), out[:40])
+        check("clip: marks the line", "…[line clipped]" in out, out[:800])
+        check("clip: other lines intact", "real line" in out, out)
+        check("clip: names the amount", "chars clipped from over-long lines" in out, out)
+        with open(_spill_path_from(out)) as f:
+            full = f.read()
+        check("clip: spill holds the UNCLIPPED original", blob in full, len(full))
+
+        # a small clip is not worth a file; the notice just says what happened
+        small = tools._bash_headtail("x" * (tools.BASH_LINE_CHARS + 50) + "\n")
+        check("clip: small clip has no spill", "saved to" not in small, small[-120:])
+        check("clip: small clip still marked", "…[line clipped]" in small, small[-120:])
+
+        # normal line-shaped output is byte-identical
+        plain = "line one\nline two\n"
+        check("clip: normal output untouched", tools._bash_headtail(plain) == plain)
+    finally:
+        if old is None:
+            os.environ.pop("CHAD_SPILL_DIR", None)
+        else:
+            os.environ["CHAD_SPILL_DIR"] = old
+
+
+@_with_lever_off("bash_line_clip")  # single-blob fixtures; see test_bash
 def test_bash_spill():
     """Truncation spills the FULL output to a session-scoped file: the
     omitted middle is a `grep <path>` away instead of a full re-run away."""

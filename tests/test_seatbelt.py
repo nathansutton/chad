@@ -13,7 +13,7 @@ import subprocess
 
 import pytest
 
-from chad import levers, seatbelt, tools
+from chad import config, levers, seatbelt, tools
 
 
 @pytest.fixture(autouse=True)
@@ -54,7 +54,10 @@ def test_wrap_argv_shape(monkeypatch, tmp_path):
     argv = seatbelt.wrap_argv("echo hi > f.txt")
     assert argv is not None
     assert argv[0] == seatbelt.SANDBOX_EXEC and argv[1] == "-f"
-    assert argv[3:] == ["/bin/sh", "-c", "echo hi > f.txt"]
+    # The shell is bash where one exists (process substitution is a syntax error
+    # under /bin/sh), falling back to /bin/sh on a host without it.
+    assert argv[3:] == [config.shell_path(), "-c", "echo hi > f.txt"]
+    assert os.path.basename(argv[3]) in ("bash", "sh")
     with open(argv[2], encoding="utf-8") as fh:
         assert str(tmp_path.resolve()) in fh.read()
 

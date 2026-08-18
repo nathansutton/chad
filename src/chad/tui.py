@@ -308,11 +308,16 @@ def _make_history():
 class TUI:
     def __init__(self, engine: BaseEngine, ctx_limit: int, mode: str = "normal",
                  thinking: bool = True, max_chars: int = 400_000, resume: list = None,
-                 ctx_window: int = None, finalize=None, ctx_limit_fn=None):
+                 ctx_window: int = None, finalize=None, ctx_limit_fn=None,
+                 native_ctx: int = None):
         self.engine = engine
         self.ctx_limit = ctx_limit
         self._ctx_limit_fn = ctx_limit_fn  # live per-turn recheck
         self.ctx_window = ctx_window or ctx_limit  # window shown in the banner
+        # The model's native window, kept only to say so when the RAM governor is what
+        # actually sets the session's window. Naming both is the honest form: "103k" alone
+        # looks like a small model, "262k" alone is a number the run can never reach.
+        self.native_ctx = native_ctx
         self.thinking = thinking
         self._resume = resume
 
@@ -1245,8 +1250,11 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
             load_s, ctx_limit = self._finalize()
             self.ctx_limit = ctx_limit
             self.agent.ctx_limit = ctx_limit
-            self._emit("info", f"ready in {load_s:.0f}s · context {self.engine.effective_ctx:,} "
-                               f"(compact at {ctx_limit:,})")
+            native = self.engine.effective_ctx
+            detail = (f"context {ctx_limit:,} · RAM-limited from {native:,} native"
+                      if native and ctx_limit < native * 0.95
+                      else f"context {ctx_limit:,}")
+            self._emit("info", f"ready in {load_s:.0f}s · {detail}")
         except Exception as e:  # noqa: BLE001 — surface load failure; don't hang the worker
             self._load_error = f"{type(e).__name__}: {e}"
             self._emit("error", f"[model load failed: {self._load_error}]")
@@ -1271,7 +1279,7 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
         worker.start()
         refresher = asyncio.create_task(self._refresher())
         art = banner(self.engine.model_id.split("/")[-1], self.ctx_window,
-                     mode=self.agent.mode)
+                     mode=self.agent.mode, native_ctx=self.native_ctx)
         with self._lock:
             self._pending.append("\n" + art + "\n")
         self._emit("info", "shift-tab for modes · /help")
@@ -1292,6 +1300,8 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
 
 
 def run_tui(engine: BaseEngine, ctx_limit: int, mode: str = "normal", thinking: bool = True,
-            resume: list = None, ctx_window: int = None, finalize=None, ctx_limit_fn=None):
+            resume: list = None, ctx_window: int = None, finalize=None, ctx_limit_fn=None,
+            native_ctx: int = None):
     asyncio.run(TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume,
-                    ctx_window=ctx_window, finalize=finalize, ctx_limit_fn=ctx_limit_fn).run())
+                    ctx_window=ctx_window, finalize=finalize, ctx_limit_fn=ctx_limit_fn,
+                    native_ctx=native_ctx).run())

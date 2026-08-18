@@ -626,12 +626,22 @@ GARBLE_SCRUBBED = "[a malformed tool call was removed here — it did not run]"
 
 # Appended to the garble nudge from the 2nd consecutive garbled step: the model is
 # clearly stuck in a wrong dialect, so show the contract instead of describing it.
+# It must be the dialect the chat template mandates. This exemplar previously showed a
+# JSON object and ended "No <function=...>, no <parameter=...> tags" — the exact shape
+# the template requires — so the one message whose whole job is to break a wrong-dialect
+# streak was telling the model to write the wrong dialect, on the second consecutive
+# garble, when it is already unsure.
 TOOLCALL_EXEMPLAR = (
     "\nThis is the ONLY valid format — copy its shape exactly:\n"
     "<tool_call>\n"
-    '{"name": "bash", "arguments": {"command": "ls /app"}}\n'
+    "<function=bash>\n"
+    "<parameter=command>\n"
+    "ls /app\n"
+    "</parameter>\n"
+    "</function>\n"
     "</tool_call>\n"
-    "No <function=...>, no <parameter=...> tags, nothing else inside the block.")
+    "One <function=…> block per call, one <parameter=…> block per argument, "
+    "and nothing else inside the tags.")
 
 
 def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_intent,
@@ -678,7 +688,8 @@ def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_inte
                 nudge = ("[your last tool call was malformed and did not run — it opened a "
                          "<tool_call> (or <function=…>) that was never properly closed, so no "
                          "tool executed and nothing happened. Re-emit it now as ONE complete, "
-                         "well-formed <tool_call> block with valid JSON arguments.]")
+                         "well-formed <tool_call> block with a closed <function=…> and one "
+                         "<parameter=…> per argument.]")
             else:
                 # garbled_call: the block WAS closed but nothing inside parsed — mixed
                 # JSON/XML dialects, invalid JSON the repair pass couldn't reconstruct,
@@ -686,10 +697,10 @@ def nudge_for_no_calls(text, hit_cap, made_edit, unverified_edit, read_only_inte
                 # e.g. a `{"name": "bash", … </parameter></function></tool_call>` mash
                 # that ends the task with budget still left.
                 nudge = ("[your last tool call was malformed and did not run — the "
-                         "<tool_call> block did not contain one valid JSON object, so no "
+                         "<tool_call> block did not contain one valid tool call, so no "
                          "tool executed and nothing happened. Re-emit it now as ONE "
-                         "complete <tool_call> block: a single JSON object with \"name\" "
-                         "and \"arguments\", no XML tags inside.]")
+                         "complete <tool_call> block containing a single closed "
+                         "<function=…> with one <parameter=…> per argument.]")
             if kind == "garble" and consecutive_garbles >= 2:
                 nudge = nudge[:-1] + TOOLCALL_EXEMPLAR + "]"
             if kind == "garble":

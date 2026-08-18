@@ -28,10 +28,42 @@ def test_all_levers_default_off(monkeypatch):
     """The 1.10.0 contract: a default run is the bare model + tool loop. The measured
     record (2026-08 clean-slate arms) is what earned this polarity; a lever ships ON
     only behind a positive pre-registered contrast."""
-    _clear(monkeypatch, "CHAD_ENABLE", "CHAD_DISABLE")
+    _clear(monkeypatch, "CHAD_ENABLE", "CHAD_DISABLE", "CHAD_LEAN")
     assert levers.active() == []
     for name in levers.LEVERS:
         assert not levers.enabled(name), f"{name} should default OFF"
+
+
+def test_lean_arm_starts_with_the_bash_route_levers_on(monkeypatch):
+    """CHAD_LEAN hides `read`/`grep`, and four of their guarantees live INSIDE those
+    tools. Re-arming the bash-route equivalents is what keeps hiding the tools an
+    experiment about tool surface rather than a silent repeal of the result contract —
+    and a lever bound to a hidden tool cannot fire, so an ablation would misread it as
+    "exercised and useless"."""
+    _clear(monkeypatch, "CHAD_ENABLE", "CHAD_DISABLE")
+    monkeypatch.setenv("CHAD_LEAN", "1")
+    assert levers.active() == sorted(levers.LEAN_DEFAULTS)
+    for name in levers.LEAN_DEFAULTS:
+        assert levers.enabled(name)
+    # everything else stays at the bare default
+    assert not levers.enabled("session_ledger")
+
+
+def test_lean_defaults_still_compose_with_enable_and_disable(monkeypatch):
+    """The lean set is a starting point, not an override: CHAD_ENABLE still adds and
+    CHAD_DISABLE still subtracts, so leave-one-out stays a valid arm inside lean."""
+    monkeypatch.setenv("CHAD_LEAN", "1")
+    monkeypatch.setenv("CHAD_ENABLE", "session_ledger")
+    monkeypatch.setenv("CHAD_DISABLE", "verify_baseline")
+    assert levers.enabled("session_ledger")           # added
+    assert levers.enabled("bash_read_skeleton")       # lean default kept
+    assert not levers.enabled("verify_baseline")      # subtracted
+    monkeypatch.setenv("CHAD_ENABLE", "all")
+    assert levers.enabled("compact_notice"), "'all' must not be narrowed by the lean set"
+
+
+def test_lean_defaults_are_all_registered():
+    assert levers.LEAN_DEFAULTS <= set(levers.LEVERS)
 
 
 def test_enable_all_turns_everything_on(monkeypatch):

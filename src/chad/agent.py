@@ -457,9 +457,21 @@ class Agent:
         # while 42% of the wall clock went to reasoning nobody was governing. The default
         # is sized to the tail of the measured distribution, not to the pathological case.
         # CHAD_THINK_CEILING=0 restores the old off-by-default behavior.
+        #
+        # OFF by default under the lean arm. Force-closing </think> mid-generation is the
+        # most invasive thing the harness does to the token stream, and lean is the arm
+        # whose whole premise is the model plus a tool loop with the scaffolding removed —
+        # inheriting a silent mid-thought intervention there measures the scaffold, not the
+        # ablation. It is also the one behavior of this weight that was never a lever, so
+        # it neither appears in `chad levers` nor answers to CHAD_DISABLE, and lean was
+        # carrying it without anyone choosing to. Measured on the shipped base: the ceiling
+        # force-closed 20-38% of steps across a day of lean sessions, where the value was
+        # sized to bite a ~10% tail — on a DIFFERENT base's think distribution. An explicit
+        # CHAD_THINK_CEILING (or an explicit argument) still wins in either arm, so the
+        # ceiling-on lean arm stays one env var away for the A/B.
         if think_ceiling is None:
-            think_ceiling = config.env_int("CHAD_THINK_CEILING",
-                                           guardrails.THINK_CEILING_DEFAULT)
+            arm_default = 0 if config.flag("CHAD_LEAN") else guardrails.THINK_CEILING_DEFAULT
+            think_ceiling = config.env_int("CHAD_THINK_CEILING", arm_default)
         self.think_ceiling = think_ceiling
         # Template-level reasoning budget (Qwen3.8: xhigh | medium | low). Unset =>
         # the template's own default, and the argument is not passed at all, so

@@ -306,8 +306,9 @@ def _bash_auto_background(command: str, timeout: int, should_stop) -> str:
     argv = seatbelt.wrap_argv(command)
     try:
         p = subprocess.Popen(argv if argv is not None else command,
-                             shell=argv is None, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, text=True, errors="replace",
+                             shell=argv is None,
+                             executable=config.shell_path() if argv is None else None,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
                              start_new_session=True, env=_bash_env())
     except OSError as e:
         return f"[failed to launch: {e}]"
@@ -348,8 +349,9 @@ def tool_bash(command: str, timeout: int = 120, should_stop=None) -> str:
         # the command's whole output AND its exit code vanished into a "[no output]" that
         # read as a quiet success (and could spoof the verify gate).
         p = subprocess.Popen(argv if argv is not None else command,
-                             shell=argv is None, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, text=True, errors="replace",
+                             shell=argv is None,
+                             executable=config.shell_path() if argv is None else None,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
                              start_new_session=True, env=_bash_env())
     except OSError as e:
         return f"[failed to launch: {e}]"
@@ -498,19 +500,111 @@ def _spill_bash(s: str) -> str | None:
         return None
 
 
+# Lines that name a specific failure — the rows a trimmed test/build output must not
+# lose. Deliberately narrow: a marker glyph, a FAIL/ERROR word at a row's start, or the
+# first line of a traceback. Anything looser matches the word "error" inside passing
+# test NAMES ("✔ throws if …") and would spend the whole budget on rows that say nothing
+# failed.
+_FAILURE_LINE_RE = re.compile(
+    r"^[ \t]*(?:[✘✗✖×]\s|\[?(?:FAIL|FAILED|ERROR|ERR)\b|not ok\b|E\s{2,}|"
+    r"Traceback \(most recent call last\)|\S+:\d+:\d+:?\s+error\b|"
+    r"\S+\(\d+,\d+\):\s+error\b).*$",
+    re.M | re.I)
+_TRIM_KEEP_MAX_LINES = 10
+_TRIM_KEEP_MAX_CHARS = 700
+
+
+def _kept_failures(middle: str) -> str:
+    """Failure rows lifted out of the slice head/tail trimming is about to drop, or "".
+
+    Head+tail is the right default (runners put the summary at the bottom), but it
+    assumes the middle is filler. For a test runner it isn't: ava prints each failing
+    test's NAME and assertion in the body and only the count at the end, so a trimmed
+    run can say `2 tests failed` while the two names it failed on are exactly what got
+    cut. Measured on a real run — the model saw the counts, never the names."""
+    hits = []
+    seen = set()
+    for m in _FAILURE_LINE_RE.finditer(middle):
+        line = m.group(0).strip()[:200]
+        if line and line not in seen:
+            seen.add(line)
+            hits.append(line)
+        if len(hits) >= _TRIM_KEEP_MAX_LINES:
+            break
+    if not hits:
+        return ""
+    out = "\n".join(hits)
+    return out[:_TRIM_KEEP_MAX_CHARS - 1] + "…" if len(out) > _TRIM_KEEP_MAX_CHARS else out
+
+
+# Per-line cap for bash output. head+tail budgets the TOTAL, which silently assumes
+# output is made of lines; a source map, a minified bundle, or a one-line JSON blob is a
+# single line of tens of thousands of chars, and the budget then hands back 20k chars
+# sliced out of the middle of base64. Measured: one `rg --no-ignore` that reached a
+# gitignored `distribution/` returned a 92k-char .js.map line, of which 20k was prefilled
+# — ~5k tokens and a 147s stall for zero information. `tool_grep` has capped its rows at
+# GREP_LINE_CHARS since it shipped; this is the same guarantee for the route that has no
+# grep tool. Slightly looser than grep's 500 because bash carries wrapped compiler errors
+# and stack frames that are legitimately long.
+BASH_LINE_CHARS = 600
+# Clipping this much means the transcript no longer holds the output, so the full text
+# goes to a spill file the model can grep — never silently destroyed.
+BASH_CLIP_SPILL_AT = BASH_MAX_CHARS // 4
+
+
+def _clip_long_lines(s: str) -> tuple[str, int]:
+    """(text with over-long lines capped, chars removed). Byte-identical and 0 when
+    every line already fits, so the common case pays only the scan."""
+    if not levers.enabled("bash_line_clip"):
+        return s, 0
+    removed = 0
+    out = []
+    for line in s.split("\n"):
+        if len(line) > BASH_LINE_CHARS:
+            removed += len(line) - BASH_LINE_CHARS
+            line = line[:BASH_LINE_CHARS] + "…[line clipped]"
+        out.append(line)
+    return ("\n".join(out), removed) if removed else (s, 0)
+
+
 def _bash_headtail(s: str, spill: bool = True) -> str:
-    if len(s) <= BASH_MAX_CHARS:
-        return s
+    # Clip pathological lines FIRST: the head/tail budget below assumes the output is
+    # made of lines, and one 92k-char source-map line defeats it completely. Whatever
+    # spills is the ORIGINAL text, never the clipped view — a spill file the model is
+    # told to grep must hold what the command actually printed.
+    clipped, removed = _clip_long_lines(s)
+    clip_note, path = "", None
+    if removed:
+        levers.fired("bash_line_clip", removed=removed)
+        if spill and removed >= BASH_CLIP_SPILL_AT:
+            path = _spill_bash(s)
+        where = (f"; FULL output saved to {path}; grep/sed that file for the rest"
+                 if path else "")
+        clip_note = (f"\n[… {removed} chars clipped from over-long lines "
+                     f"(each capped at {BASH_LINE_CHARS} chars){where} …]")
+    s = clipped
+    if len(s) + len(clip_note) <= BASH_MAX_CHARS:
+        return s + clip_note
     omitted = len(s) - BASH_HEAD_CHARS - BASH_TAIL_CHARS
-    path = _spill_bash(s) if spill else None
+    if path is None and spill:
+        path = _spill_bash(s)
     if path:
-        notice = (f"\n[… {omitted} chars omitted — FULL output saved to {path}; "
-                  f"grep/sed that file instead of re-running the command. The TAIL "
-                  f"below is usually the failure summary …]\n")
+        where = (f"FULL output saved to {path}; grep/sed that file instead of "
+                 f"re-running the command")
     else:
-        notice = (f"\n[… {omitted} chars omitted — output truncated; the TAIL below is "
-                  f"usually the failure summary …]\n")
-    return s[:BASH_HEAD_CHARS] + notice + s[-BASH_TAIL_CHARS:]
+        where = "output truncated"
+    kept = ""
+    if levers.enabled("bash_trim_keep_failures"):
+        kept = _kept_failures(s[BASH_HEAD_CHARS:len(s) - BASH_TAIL_CHARS])
+    if kept:
+        levers.fired("bash_trim_keep_failures", lines=kept.count("\n") + 1)
+        notice = (f"\n[… {omitted} chars omitted — {where}. The failure rows from the "
+                  f"omitted middle, kept verbatim …]\n{kept}\n"
+                  f"[… end of kept rows; the TAIL below is usually the summary …]\n")
+    else:
+        notice = (f"\n[… {omitted} chars omitted — {where}. The TAIL below is usually "
+                  f"the failure summary …]\n")
+    return s[:BASH_HEAD_CHARS] + notice + s[-BASH_TAIL_CHARS:] + clip_note
 
 
 # Local-model read budget. Every token a read returns must be PREFILLED into the
@@ -851,10 +945,17 @@ def _closest_hint(data: str, old: str) -> str:
         return ""
     best = difflib.get_close_matches(
         target, [l.strip() for l in data.split("\n") if l.strip()], n=1, cutoff=0.6)
-    return (f" Closest line in the file is {best[0]!r} — copy it exactly (mind "
-            f"indentation), or use replace_lines(path, start, end, new) with the line "
-            f"numbers from read (it fits indentation for you), or replace_symbol to "
-            f"rewrite the whole function.") if best else ""
+    if not best:
+        return ""
+    # The fallbacks have to be tools this arm exposes. Under CHAD_LEAN `edit` is the
+    # ONLY editor and there is no `read`/`replace_lines`/`replace_symbol`, so naming
+    # them turns the arm's most important error message into three dead suggestions —
+    # measured, it shipped that way on all four failed edits of a lean run.
+    fallbacks = ("" if config.flag("CHAD_LEAN") else
+                 ", or use replace_lines(path, start, end, new) with the line numbers "
+                 "from read (it fits indentation for you), or replace_symbol to rewrite "
+                 "the whole function")
+    return f" Closest line in the file is {best[0]!r} — copy it exactly{fallbacks}."
 
 
 def _show_ws(line: str) -> str:
@@ -866,25 +967,91 @@ def _show_ws(line: str) -> str:
     return indent.replace("\t", "→").replace(" ", "·") + stripped
 
 
-def _indent_hint(data: str, old: str) -> str:
-    """Echo the run of file lines that `old` was trying to match, with leading whitespace
-    made visible, so a failed/no-op edit hands back the exact current indentation to copy.
-    Empty when no plausible location is found."""
-    olines = old.strip("\n").split("\n")
-    key = next((l.strip() for l in olines if l.strip()), "")
-    if not key:
-        return ""
+def _locate_block(data: str, old: str):
+    """(index of the file line `old` was probably aiming at, the file's lines), or
+    (None, lines). Exact stripped match on `old`'s first non-blank line, then a fuzzy
+    one. Shared by every failed-edit hint so they all describe the SAME region — a
+    diagnosis that points somewhere the indentation echo doesn't is worse than none."""
     dlines = data.split("\n")
+    key = next((l.strip() for l in old.strip("\n").split("\n") if l.strip()), "")
+    if not key:
+        return None, dlines
     idx = next((i for i, l in enumerate(dlines) if l.strip() == key), None)
     if idx is None:
         import difflib
         near = difflib.get_close_matches(
             key, [l.strip() for l in dlines if l.strip()], n=1, cutoff=0.6)
         if not near:
-            return ""
+            return None, dlines
         idx = next((i for i, l in enumerate(dlines) if l.strip() == near[0]), None)
-        if idx is None:
+    return idx, dlines
+
+
+def _already_applied_hint(data: str, old: str, new: str) -> str:
+    """An observation when every line `new` would ADD is already in the file: this site
+    may have been edited already. Measured: on a nine-site threading edit the model lost
+    track, re-sent one site's original text, and read "closest line … copy it exactly
+    (mind indentation)" as an indentation problem — so it went hunting for tabs instead
+    of noticing the change was in. Stated as an observation, never a verdict: the added
+    line can also legitimately exist at a DIFFERENT site of the same repeated edit."""
+    added = [l.strip() for l in new.strip("\n").split("\n")
+             if l.strip() and l.strip() not in {o.strip() for o in old.split("\n")}]
+    if not added:
+        return ""
+    dstripped = [l.strip() for l in data.split("\n")]
+    where = []
+    for line in added:
+        if line not in dstripped:
             return ""
+        where.append(dstripped.index(line) + 1)
+    return (f"\n[note: every line your `new` would add is ALREADY in this file "
+            f"(first at line {where[0]}) — check whether this site is already edited, "
+            f"or whether you are looking at a different site of the same change.]")
+
+
+def _first_diff_hint(data: str, old: str) -> str:
+    """Where `old` first stops matching the file region it was aiming at: line, column,
+    and both texts with whitespace made visible. The generic "copy it exactly (mind
+    indentation)" names one hypothesis, and when it is the wrong one the model spends
+    its next calls on it — measured twice in one run: a stray leading quote read as a
+    tab problem (two identical retries, then `cat -A`, then `sed -n l`), and a
+    hallucinated second line read the same way."""
+    idx, dlines = _locate_block(data, old)
+    if idx is None:
+        return ""
+    olines = old.strip("\n").split("\n")
+    for n, oline in enumerate(olines):
+        fline = dlines[idx + n] if idx + n < len(dlines) else ""
+        if oline == fline:
+            continue
+        col = next((c for c in range(min(len(oline), len(fline)) + 1)
+                    if c == len(oline) or c == len(fline) or oline[c] != fline[c]), 0)
+        which = "your first line" if n == 0 else f"line {n + 1} of your `old`"
+        return (f"\n[{which} differs from the file at column {col + 1}:\n"
+                f"  you sent: {_show_ws(oline)[:120]}\n"
+                f"  the file: {_show_ws(fline)[:120]}\n]")
+    return ""
+
+
+def _edit_miss_hints(data: str, old: str, new: str) -> str:
+    """The two diagnoses a bare "old string not found" leaves the model to derive."""
+    if not levers.enabled("edit_miss_diagnose"):
+        return ""
+    hint = _already_applied_hint(data, old, new) or _first_diff_hint(data, old)
+    if hint:
+        levers.fired("edit_miss_diagnose",
+                     kind="already_applied" if hint.startswith("\n[note:") else "first_diff")
+    return hint
+
+
+def _indent_hint(data: str, old: str) -> str:
+    """Echo the run of file lines that `old` was trying to match, with leading whitespace
+    made visible, so a failed/no-op edit hands back the exact current indentation to copy.
+    Empty when no plausible location is found."""
+    olines = old.strip("\n").split("\n")
+    idx, dlines = _locate_block(data, old)
+    if idx is None:
+        return ""
     region = dlines[idx: idx + max(1, len(olines))]
     shown = "\n".join(_show_ws(l) for l in region)
     if len(shown) > 800:
@@ -1056,7 +1223,7 @@ def tool_edit(path: str, old: str, new: str) -> str:
                 f"more surrounding lines to make it unique]")
 
     return (f"[old string not found; no change made.{_closest_hint(data, old)}]"
-            + _indent_hint(data, old))
+            + _indent_hint(data, old) + _edit_miss_hints(data, old, new))
 
 
 def _indent_unit(data: str) -> str:
@@ -2381,6 +2548,71 @@ _SYMBOLIC = {"repo_map", "overview", "view_symbol", "find_symbol", "definition",
 # CHAD_HIDE_TOOLS), and the env is read per render for in-process A/B flips.
 _LEAN = {"bash", "edit", "write", "write_todos", "done"}
 
+# Cross-references between tool descriptions, and what to do with them when the other
+# tool is not on the schema.
+#
+# A tool's description is the most-attended model-facing text about that tool. A clause
+# in it that names a tool the current arm hides is a dead instruction on the channel
+# that can least afford one, and it fails silently — the model spends a call on a name
+# that was never in its schema and the trace reads as the model's own mistake.
+# Demonstrated: with the lean tool surface, `edit` is the ONLY editor and its
+# description still told the model to prefer `replace_lines` with the line numbers
+# "from read", neither of which that arm exposes. The same hole distorts any
+# hide-one-dialect A/B — the surviving dialect advertises the one just removed, which
+# is precisely the variable the measurement is about.
+#
+# Each entry is an EXACT substring of that tool's description, the tools the clause
+# depends on, and what it becomes when they are absent (default: deleted). Spans are
+# applied at render, so with every tool exposed the description is byte-identical to
+# the literal above. A span that no longer occurs in its description is a hard gate
+# failure, so editing the text without updating this table cannot silently un-gate a
+# clause.
+_XREF_SPANS: dict[str, tuple[tuple, ...]] = {
+    "task": ((r"grep/read churn", {"grep"}, "search/read churn"),),
+    "read": ((r"view_symbol(name) for a function's body, or ", {"view_symbol"}, ""),),
+    "edit": ((r"; when you already know the line numbers (from read), prefer "
+              r"replace_lines, which doesn't make you re-quote the text or its "
+              r"whitespace", {"read", "replace_lines"}, ""),),
+    "replace_lines": (
+        (r"addressed by the line numbers `read` prints", {"read"},
+         "addressed by line number"),
+        (r", or use replace_symbol for a whole function", {"replace_symbol"}, ""),
+        (r" Prefer this over `edit` whenever you know the line numbers, and over "
+         r"rewriting a whole function when only a few lines change.", {"edit"}, ""),
+    ),
+    "insert_lines": (
+        (r"a given line number (from read)", {"read"}, "a given line number"),
+        (r" For a whole new function/method, insert_symbol is better.",
+         {"insert_symbol"}, ""),
+    ),
+    "repo_map": ((r" Then use find_symbol/view_symbol to drill in.",
+                  {"find_symbol", "view_symbol"}, ""),),
+    "view_symbol": ((r"Prefer this over `read` for inspecting code.", {"read"},
+                     "Cheaper than opening the whole file."),),
+    "find_symbol": ((r" Use this instead of grep to locate a definition.", {"grep"}, ""),),
+    "definition": ((r" Use find_symbol instead when you only want to list everything "
+                    r"with that name.", {"find_symbol"}, ""),),
+    "find_refs": ((r"; far better than grep before a rename/refactor", {"grep"}, ""),),
+}
+
+
+def _apply_xrefs(schemas: list, exposed: set) -> list:
+    """`schemas` with every cross-reference clause whose tools are absent from `exposed`
+    rewritten or dropped. Copies only the schemas that actually change, so the full
+    surface returns the same objects it always did."""
+    out = []
+    for s in schemas:
+        name = s["function"]["name"]
+        desc = s["function"]["description"]
+        for span, needs, repl in _XREF_SPANS.get(name, ()):
+            if not needs <= exposed:
+                desc = desc.replace(span, repl)
+        if desc == s["function"]["description"]:
+            out.append(s)
+        else:
+            out.append({**s, "function": {**s["function"], "description": desc}})
+    return out
+
 
 def _activate_skill_schema(names):
     """The activate_skill tool schema, with `name` constrained to the set of installed
@@ -2433,6 +2665,9 @@ def active_schemas():
             raise ValueError(f"CHAD_HIDE_TOOLS names unknown tool(s): "
                              f"{sorted(unknown)}. Known: {sorted(DISPATCH)}")
         schemas = [s for s in schemas if s["function"]["name"] not in hidden]
+    # Every subtraction is now settled, so the descriptions can be made consistent with
+    # the surface that actually ships this turn (see _XREF_SPANS).
+    schemas = _apply_xrefs(schemas, {s["function"]["name"] for s in schemas})
     names = _skills().skill_names()
     if names:
         schemas = schemas + [_activate_skill_schema(names)]

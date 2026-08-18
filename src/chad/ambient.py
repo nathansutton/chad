@@ -8,11 +8,12 @@ make the harness's knowledge ambient IN that route — facts appended to results
 the model already reads, never a new tool, never an admonition, never a blocked
 command.
 
-Three levers, all default OFF (the 1.10.0 contract), each with its own
-trace-measured target:
+Five levers, each with its own trace-measured target. Default OFF under the
+1.10.0 contract, except where `levers.LEAN_DEFAULTS` re-arms the bash-route ones
+for an arm that has no dedicated read/grep tools to carry them:
 
-  env_manifest        session-start toolchain/package inventory in the system
-                      prompt tail. Target: the environment-probe class
+  env_manifest        session-start toolchain/package/search-toolbox inventory in
+                      the system prompt tail. Target: the environment-probe class
                       (which/--version/pip list…), measured fail-enriched at
                       3.33/trial in fails vs 2.46 in passes, 37% failing.
   session_ledger      one cumulative fact line — what changed, what was created,
@@ -27,6 +28,15 @@ trace-measured target:
                       known symbol comes back empty. Target: blind re-reads and
                       the product story (structure ambient in the channel a
                       shell-native model actually uses).
+  bash_empty_diagnose why a bash command produced nothing — a sed range past the
+                      end of the file, or the pipeline stage whose filter matched
+                      nothing. Target: bare `[no output]`/`[exit 1]` results,
+                      5% of the tool calls in a measured lean run and a wasted
+                      round trip every time.
+  verify_baseline     the pre-edit outcome of the project's own test command,
+                      recalled on a failing post-edit run. Target: the nine turns
+                      a measured run spent working out which failures pre-dated
+                      its first edit.
 
 STATE is module-global and session-scoped, like tools._FILE_SEEN: one chad
 process is one session. `Agent.__init__` resets it for a fresh main agent;
@@ -69,6 +79,7 @@ _calls = 0                       # tool results seen (main agent)
 _edited: dict[str, set] = {}     # rel path -> symbol names (empty set = file-level)
 _wrote: list = []                # rel paths written whole (order kept, deduped)
 _last_run: dict | None = None    # {"call": int, "head": str, "exit": int}
+_baselines: dict = {}            # run key -> the run's outcome BEFORE any edit landed
 _last_ledger_key: str = ""       # dedup key of the last emitted ledger line
 _skeleton_shown: set = set()     # abs paths whose skeleton line already rode a result
 _manifest_cache: str | None = None
@@ -78,6 +89,7 @@ def reset() -> None:
     """Fresh session (a new main Agent). Clears all ambient bookkeeping."""
     global _calls, _last_run, _last_ledger_key, _manifest_cache
     _calls = 0
+    _baselines.clear()
     _edited.clear()
     _wrote.clear()
     _last_run = None
@@ -122,6 +134,33 @@ def _cmd_head(command: str) -> str:
     if not m:
         return ""
     return re.sub(r"^[^\w./]+", "", m.group(0)).strip()
+
+
+# Prefixes that wrap the real program without being it — dropped from the run key so
+# `time npm test` and `npm test` are the same check.
+_KEY_WRAPPERS = frozenset(("nohup", "time", "env", "command", "exec", "stdbuf",
+                           "nice", "caffeinate"))
+
+
+def _run_key(bare: str) -> str:
+    """A stable identity for "the same check, run again": the command's leading one or
+    two non-flag words (`npm test`, `npx ava`, `pytest`, `cargo test`). Coarser than the
+    full command on purpose — `npx ava test/main.ts` and `npx ava test/retry.ts` are the
+    same suite at different scopes — but never so coarse that `npx tsc` and `npx ava`
+    collide, which would let a baseline be recalled against a different tool's failure.
+    "" for a command with no word-shaped head, which then records no baseline."""
+    words = []
+    for tok in _shell_tokens(bare)[:6]:
+        if os.path.basename(tok) in _KEY_WRAPPERS:
+            continue
+        if tok.startswith("-"):
+            break
+        words.append(os.path.basename(tok))
+        if len(words) == 2:
+            break
+    if not words or not re.match(r"^[\w.+-]+$", words[0]):
+        return ""
+    return " ".join(words)
 
 
 def _landed(name: str, result: str) -> bool:
@@ -171,8 +210,16 @@ def note_call(name: str, args: dict, result: str) -> None:
         if guardrails._is_trivial_check(bare) or not guardrails._is_executing_command(bare):
             return
         m = _EXIT_RE.match(result)
+        key = _run_key(bare)
         _last_run = {"call": _calls, "head": _cmd_head(bare) or "bash",
-                     "exit": int(m.group(1)) if m else 0}
+                     "exit": int(m.group(1)) if m else 0, "key": key}
+        if key and key not in _baselines and not _edited and not _wrote:
+            # This runner's state BEFORE the session touched anything. Captured only
+            # here: once an edit lands, no observation can separate a failure that was
+            # already there from one the model just caused. Keyed per runner so a `tsc`
+            # baseline is never recalled against an `ava` failure.
+            _baselines[key] = {"call": _calls, "exit": _last_run["exit"],
+                               "summary": _summary_lines(result)}
 
 
 # ---------------------------------------------------------------------------
@@ -308,8 +355,10 @@ def _skeleton_line(path: str) -> str:
 
 
 def _def_pointer(ident: str) -> str:
-    """`[file] 'x' is defined at rel:line` when a zero-hit grep named a symbol
-    the tags cache knows — the definition answer delivered on the bash route."""
+    """`[file] this came back empty; 'x' is defined at rel:line` when a bash search that
+    returned nothing named a symbol the tags cache knows — the definition answer
+    delivered on the bash route. The wording is about the RESULT, not the grep: in
+    `rg X src/ | grep -v y` the grep matched fine and a later stage emptied it."""
     from . import repomap
     try:
         hits = repomap.service()._find_defs(ident)
@@ -318,7 +367,7 @@ def _def_pointer(ident: str) -> str:
     if not hits or len(hits) > 3:  # a pile of same-named defs is not an answer
         return ""
     where = " · ".join(f"{d.rel}:{d.line}" for d in hits)
-    return f"[file] no match, but `{ident}` is defined at {where}"
+    return f"[file] this came back empty; `{ident}` is defined at {where}"
 
 
 def _skeleton_suffix(name: str, args: dict, result: str, step=None) -> str:
@@ -358,6 +407,217 @@ def _skeleton_suffix(name: str, args: dict, result: str, step=None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# E4 — verify baseline
+# ---------------------------------------------------------------------------
+
+# Lines a test runner uses to state its own bottom line. Matched against the tail of a
+# run's output so the baseline carries WHAT the suite did, not just its exit code:
+# "2 known failures" is the fact that answers "was this failing before I started?".
+_SUMMARY_RE = re.compile(
+    r"^\s*[\-=✔✘✗•]*\s*\d+\s+(?:tests?\s+)?"
+    r"(?:passed|failed|failing|passing|errors?|known failures?|skipped|pending)\b"
+    r"|^\s*(?:OK|FAILED|PASSED)\b|^=+\s*\d+\s+\w+.*=+$",
+    re.I | re.M)
+_SUMMARY_MAX = 120
+
+
+def _summary_lines(result: str) -> str:
+    """The runner's own bottom-line rows from a result, joined and clipped — "" when the
+    output states no such summary. Verbatim slices only: a paraphrase of a test result
+    is exactly the confabulation the ledger rule forbids."""
+    hits = [m.group(0).strip() for m in _SUMMARY_RE.finditer(result)]
+    if not hits:
+        return ""
+    out = " · ".join(dict.fromkeys(hits[-3:]))
+    return out[:_SUMMARY_MAX - 1] + "…" if len(out) > _SUMMARY_MAX else out
+
+
+def _baseline_suffix(name: str, args: dict, result: str, step: int | None = None) -> str:
+    """The `[baseline]` fact line for a FAILING verifying run made after the session's
+    first edit, or "".
+
+    The measured cost of not having it: a run whose post-edit suite came back with two
+    failures spent nine turns re-running subsets and grepping the tests for
+    `test.failing` markers to work out which failures pre-dated it. The harness watched
+    the pre-edit run go by and said nothing. Emitted only on a non-zero exit, because
+    that is the only moment the question is live; only for the same runner that was
+    baselined; and never as a verdict about the current failure — the line states what
+    that command did before the first edit and stops."""
+    if not levers.enabled("verify_baseline"):
+        return ""
+    if name != "bash" or _last_run is None or _last_run["call"] != _calls:
+        return ""
+    if _last_run["exit"] == 0 or not (_edited or _wrote):
+        return ""            # it passed, or nothing has been changed to blame
+    base = _baselines.get(_last_run["key"])
+    if base is None or base["call"] == _calls:
+        return ""            # never baselined, or this IS the baseline run
+    status = "exit 0" if base["exit"] == 0 else f"exit {base['exit']}"
+    summary = f' · "{base["summary"]}"' if base["summary"] else ""
+    levers.fired("verify_baseline", step=step)
+    return (f"\n[baseline] before your first edit, `{_last_run['key']}` → "
+            f"{status}{summary}")
+
+
+# ---------------------------------------------------------------------------
+# E5 — empty-result diagnosis on the bash route
+# ---------------------------------------------------------------------------
+
+# A bash result with no output at all. `[exit N]` with nothing after it is the same
+# event as `[no output]` — the command ran, printed nothing, and the model is left to
+# guess whether that means "no matches", "wrong path", or "the tool is broken".
+_EMPTY_RE = re.compile(r"\A\[exit -?\d+\]\s*\Z")
+# `sed -n '120,180p' file` / `sed -n 120,180p file` — the ranged read the lean prompt
+# teaches, and the one whose silent failure mode (range past EOF) is indistinguishable
+# from "this file is empty here".
+_SED_RANGE_RE = re.compile(r"""sed\s+(?:-[a-zA-Z]+\s+)*-n\s+['"]?(\d+)\s*,\s*(\d+)p['"]?""")
+_GREP_TAIL_RE = re.compile(r"(?:^|[|;&])\s*(?:sudo\s+)?(grep|rg|ag)\b([^|;&]*)")
+
+
+def _inverts(tok: str) -> bool:
+    """Whether a grep argument turns the match inside out (`-v`, `--invert-match`, or
+    `v` bundled into a short cluster like `-rnv`) — but never a long option that merely
+    contains a v, and never a `-v` that is some other tool's version flag, since only
+    the grep segment's own tokens are scanned."""
+    if tok in ("--invert-match", "-v"):
+        return True
+    return (tok.startswith("-") and not tok.startswith("--")
+            and "v" in tok[1:] and tok[1:].isalpha())
+
+
+def _is_empty_result(result: str) -> bool:
+    return result == "[no output]" or bool(_EMPTY_RE.match(result))
+
+
+def _past_eof_note(command: str) -> str:
+    """`file has N lines` when the command asked sed for a range that starts past the
+    end of the file, else "". The measured loss is one whole turn: a `sed -n '330,420p'`
+    on a 324-line file returned `[no output]`, which the model could only resolve by
+    spending its next call on `wc -l`."""
+    m = _SED_RANGE_RE.search(command)
+    if not m:
+        return ""
+    start, end = int(m.group(1)), int(m.group(2))
+    for path in _shell_tokens(command[m.end():]):
+        if not _PATHISH_RE.match(path) or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                total = sum(1 for _ in f)
+        except OSError:
+            return ""
+        if start > total:
+            return (f"[file] {_rel(path)} has {total} lines — the requested "
+                    f"{start}-{end} is past the end")
+        return ""
+    return ""
+
+
+def _no_match_note(command: str) -> str:
+    """What the pipeline's LAST filter did with its input, or "". An empty result from
+    `rg X src/ | grep -v y` is a fact about that final stage, not about the tree; naming
+    the stage that came up empty is what stops the model re-running the same pipeline
+    with a different tail. An inverting filter gets its own wording — "nothing matched"
+    would be exactly backwards for `-v`, which comes up empty when everything did."""
+    hits = list(_GREP_TAIL_RE.finditer(command))
+    if not hits:
+        return ""
+    tool, rest = hits[-1].group(1), hits[-1].group(2)
+    toks = _shell_tokens(rest)
+    staged = " (the last stage of the pipeline)" if "|" in command else ""
+    if any(_inverts(t) for t in toks):
+        # Not "nothing matched": for `-v` an empty result means everything did — or
+        # that an earlier stage sent it nothing. Both are true of "let no rows
+        # through", and neither is a claim about the tree the first stage searched.
+        return (f"[grep] the `{tool} -v` filter{staged} let no rows through — it "
+                f"either received none or excluded them all")
+    pattern, scope, skip = "", [], False
+    for t in toks:
+        if skip:
+            skip = False
+            continue
+        if t.startswith("-"):
+            skip = t in _GREP_SKIP_ARG and "=" not in t
+            continue
+        if not pattern:
+            pattern = t
+        else:
+            scope.append(t)
+    if not pattern:
+        return ""
+    where = " in " + " ".join(scope[:3]) if scope else ""
+    return f"[grep] nothing matched {pattern!r}{where}{staged} — {tool} found no rows"
+
+
+# `rg -r X` / `rg --replace X`: ripgrep prints matches with the matched text REWRITTEN.
+# A short-flag cluster is the trap — `-rn` is `--replace n`, not grep's recursive `-n`
+# pair — so the letters after `r` become the replacement and the rows on screen stop
+# being the file's text.
+_RG_SEGMENT_RE = re.compile(r"(?:^|[|;&(])\s*(?:sudo\s+)?rg\b([^|;&]*)")
+
+
+def _replace_flag(tok: str) -> str:
+    """The `--replace` form this rg argument is, or "". Short clusters count (`-rn` is
+    `--replace n`); long options that merely start with the letters do not (`--regexp`
+    is not `-r`), which is why this inspects tokens instead of pattern-matching the
+    command string."""
+    if tok == "--replace" or tok.startswith("--replace="):
+        return "--replace"
+    if (tok.startswith("-") and not tok.startswith("--")
+            and tok[1:].isalpha() and "r" in tok[1:]):
+        return tok
+    return ""
+
+
+def _rg_replace_note(command: str) -> str:
+    """One line naming what an `rg -r` result actually is, or "". Fires on the command,
+    not on the output: the whole failure mode is that the output looks plausible. A run
+    that hit this twice read `test('n option', …)` back from its own test file and
+    concluded the file had been corrupted."""
+    for seg in _RG_SEGMENT_RE.finditer(command):
+        for tok in _shell_tokens(seg.group(1)):
+            flag = _replace_flag(tok)
+            if not flag:
+                continue
+            how = (f"`{flag}` is `--replace` with `{flag[flag.index('r') + 1:]}` as the "
+                   f"replacement text" if len(flag) > 2 and not flag.startswith("--")
+                   else "`-r` is `--replace`, not grep's recursive flag")
+            return ("[grep] these rows are rg's REWRITTEN output, not the file's text — "
+                    f"{how} (rg recurses by default). Re-run without it to see the "
+                    f"real lines.")
+    return ""
+
+
+def _rg_replace_suffix(name: str, args: dict, result: str, step: int | None = None) -> str:
+    if not levers.enabled("rg_replace_flag_note"):
+        return ""
+    if name != "bash" or not result.strip():
+        return ""
+    note = _rg_replace_note(str(args.get("command", "") or ""))
+    if not note:
+        return ""
+    levers.fired("rg_replace_flag_note", step=step)
+    return "\n" + note
+
+
+def _empty_suffix(name: str, args: dict, result: str, step: int | None = None) -> str:
+    """Why a bash command produced nothing, when the harness can say so from facts it
+    already has. Bare `[no output]` / `[exit 1]` results were 5% of the tool calls in a
+    measured lean-mode run and every one of them cost a full round trip."""
+    if not levers.enabled("bash_empty_diagnose"):
+        return ""
+    if name != "bash" or not _is_empty_result(result):
+        return ""
+    command = str(args.get("command", "") or "")
+    note = _past_eof_note(command) or _no_match_note(command)
+    if not note:
+        return ""
+    levers.fired("bash_empty_diagnose", step=step,
+                 kind="past_eof" if note.startswith("[file]") else "no_match")
+    return "\n" + note
+
+
+# ---------------------------------------------------------------------------
 # the one agent-facing hook
 # ---------------------------------------------------------------------------
 
@@ -372,6 +632,9 @@ def annotate(name: str, args: dict, result: str, step: int | None = None) -> str
     if landed:
         suffix += ledger_suffix(step=step)
     suffix += _skeleton_suffix(name, args, result, step=step)
+    suffix += _empty_suffix(name, args, result, step=step)
+    suffix += _rg_replace_suffix(name, args, result, step=step)
+    suffix += _baseline_suffix(name, args, result, step=step)
     return result + suffix
 
 
@@ -394,6 +657,13 @@ _NOTABLE_ABSENT = ("python3", "pip", "gcc", "g++", "make", "cmake", "node",
                    "npm", "cargo", "go", "java", "docker")
 _ALIAS_FAMILY = {"python3": ("python3", "python"), "pip": ("pip", "pip3")}
 _PKG_MANAGERS = ("apt-get", "dnf", "yum", "apk", "brew", "pacman")
+# The search/read toolbox itself — the verbs a shell-first arm does all of its looking
+# with. Reported presence-only (no version probe): what costs a turn is `rg` not being
+# installed on the host, not which ripgrep it is. This matters most where bash is the
+# only route: the prompt there teaches `rg -n` as the first move, and chad's own grep is
+# pure Python, so ripgrep is a dependency the SESSION acquires and the harness never
+# had. An exit-127 answers it in one wasted round trip; this answers it in zero.
+_SEARCH_TOOLS = ("rg", "grep", "sed", "awk", "find", "jq")
 _VERSION_NUM_RE = re.compile(r"\d+\.\d+[\w.\-]*")
 
 
@@ -434,6 +704,11 @@ def _build_manifest() -> str:
     if pkgs or "pip" in have or "pip3" in have:
         pip = ["pip"] if ("pip" in have or "pip3" in have) else []
         lines.append("- package managers: " + ", ".join(pkgs + pip))
+    search = [t for t in _SEARCH_TOOLS if shutil.which(t)]
+    if search:
+        line = "- search/text: " + " · ".join(search)
+        gone = [t for t in _SEARCH_TOOLS if t not in search]
+        lines.append(line + (" — NOT present: " + ", ".join(gone) if gone else ""))
     return "\n".join(lines)
 
 

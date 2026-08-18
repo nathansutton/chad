@@ -17,7 +17,9 @@ ablation script would otherwise run the *unmodified* harness and report a delta 
 which reads as "this lever does nothing" — the single most expensive way for this
 machinery to lie to you. `validate_env()` runs it at startup, not at first use.
 
-Levers default OFF (since 1.10.0). Every lever here was born from a plausible failure
+Levers default OFF (since 1.10.0), with one scoped exception: `LEAN_DEFAULTS` below,
+which re-arms the bash-route levers under CHAD_LEAN because that arm deletes the tools
+those guarantees were living in. Every lever here was born from a plausible failure
 narrative, but the measured record says the bare model + tool loop matches or beats the
 full stack on the benchmark that motivated them (the 2026-08 clean-slate arms: BARE-0
 within noise of FULL, at substantially less token spend). Default-on made the scaffold
@@ -259,15 +261,19 @@ LEVERS: dict[str, Lever] = {
         "iter9"),
 
     # --- Think-spiral salvage: close-and-continue force-closes a runaway
-    #     <think> at CHAD_THINK_CEILING and keeps decoding the action in-step (the engine
-    #     mechanism, env-gated, has no lever — off by default like CHAD_THINK_BUDGET). This
-    #     lever is the ESCALATION on top of it. --------------------------------------
+    #     <think> at the think ceiling and keeps decoding the action in-step (the engine
+    #     mechanism has no lever of its own — it is a constructor default, so it shows up
+    #     neither here nor under CHAD_DISABLE). This lever is the ESCALATION on top of it.
+    #     ---------------------------------------------------------------------------
     "no_think_escalation": Lever(
         "After 2 consecutive steps that hit the gen cap (or were salvaged) yet produced no "
         "tool call — the think-spiral signature — run the next step with <think> disabled "
         "to force an action, then restore. Mechanical 'act now', replacing a third prose "
-        "nudge that demonstrably does not land. Only active when the close-and-continue "
-        "ceiling is armed (CHAD_THINK_CEILING), so default chad is unaffected.",
+        "nudge that demonstrably does not land. Requires the close-and-continue ceiling to "
+        "be armed, which is now the DEFAULT in the full arm (it was env-only when this "
+        "lever shipped, and the old note that 'default chad is unaffected' no longer "
+        "holds) — and OFF by default in the lean arm, where this lever is therefore inert "
+        "unless CHAD_THINK_CEILING re-arms it.",
         "iter9"),
 
     # --- Done-audit: the largest measured fail bucket (20/43)
@@ -487,7 +493,8 @@ LEVERS: dict[str, Lever] = {
     #     class at ~0.
     "env_manifest": Lever(
         "Append a session-start environment manifest (toolchains present with "
-        "versions, notable absences, package managers) to the system-prompt tail, "
+        "versions, notable absences, package managers, and the search/text toolbox "
+        "the shell route does its looking with) to the system-prompt tail, "
         "answering the which/--version/pip-list probe class up front. Measured "
         "fail-enriched: 3.33 probes/trial in fails vs 2.46 in passes, 37% of probes "
         "failing outright. Stamped once at session start and never updated in place "
@@ -510,6 +517,64 @@ LEVERS: dict[str, Lever] = {
         "known symbol returns nothing, append its real definition site. Symbol "
         "intelligence delivered on the route the model actually uses — it never "
         "has to learn a tool name. Once per file per session.",
+        "ambient"),
+    "edit_miss_diagnose": Lever(
+        "An `old string not found` says WHY it missed instead of only offering the "
+        "closest line: the first line and column where `old` stops matching the file "
+        "(both rendered with whitespace visible), or — when every line `new` would add "
+        "is already in the file — that the site may already be edited. OFF leaves the "
+        "generic 'copy it exactly (mind indentation)', which names one hypothesis; "
+        "measured, a run spent four calls on that hypothesis for a stray leading quote "
+        "and re-sent an already-applied edit reading the same text as an indent "
+        "problem.",
+        "ambient"),
+    "bash_empty_diagnose": Lever(
+        "A bash command that printed nothing gets one line saying why, from facts "
+        "the harness already holds: a `sed -n 'A,Bp'` whose range starts past the "
+        "end of the file is told the file's real length, and an empty pipeline is "
+        "told which filter stage matched nothing. Bare `[no output]`/`[exit 1]` "
+        "results were 5% of the tool calls in a measured lean run, and each one "
+        "cost a whole round trip to re-derive (the `wc -l` the model had to spend "
+        "its next call on). The `read`/`grep` tools already refuse to report an "
+        "empty result without its scope; this is that contract on the bash route, "
+        "where a lean arm does all of its reading.",
+        "ambient", REGRESSION_GUARD),
+    "bash_line_clip": Lever(
+        "Cap any single line of bash output at BASH_LINE_CHARS, spilling the full text "
+        "to a file when the clip is large. head+tail budgets the total and assumes "
+        "output is made of LINES; a source map or minified bundle is one line of tens "
+        "of thousands of chars, so the budget returns 20k chars sliced out of the "
+        "middle of base64. Measured: a search that reached a gitignored build dir "
+        "returned a 92k-char .js.map line, ~5k tokens of it prefilled for a 147s stall "
+        "and zero information. `tool_grep` has capped its rows since it shipped; OFF "
+        "restores the uncapped bash route.",
+        "ambient", REGRESSION_GUARD),
+    "bash_trim_keep_failures": Lever(
+        "When a bash result is too long and gets head+tail trimmed, the failure rows "
+        "in the dropped MIDDLE ride along verbatim (capped, deduped). Head+tail "
+        "assumes the middle is filler, which holds for build logs and not for test "
+        "runners: ava prints each failing test's NAME and assertion in the body and "
+        "only the counts at the end, so a trimmed run measured out as `2 tests "
+        "failed` with both names cut. OFF restores counts-without-names.",
+        "ambient", REGRESSION_GUARD),
+    "rg_replace_flag_note": Lever(
+        "An `rg -r/--replace` result is labelled as rewritten output. ripgrep's `-r` "
+        "takes a REPLACEMENT (it recurses by default), so a model reaching for grep's "
+        "recursive flag writes `rg -rn PATTERN` and silently gets rows whose matched "
+        "text has been replaced by `n`. Measured twice in one run, the second time "
+        "convincing the model its own test file had been corrupted — it spent three "
+        "calls investigating and closed with a wrong explanation. The rows on screen "
+        "are not the file's text, and only the harness can see that from the flags.",
+        "ambient", REGRESSION_GUARD),
+    "verify_baseline": Lever(
+        "Record the project test command's outcome the first time it runs BEFORE "
+        "any edit lands, and recall it — exit code plus the runner's own summary "
+        "rows, verbatim — on a failing verifying run afterwards. A measured run "
+        "spent nine turns re-running subsets and grepping for `test.failing` "
+        "markers to work out which of two failures pre-dated its first edit, a "
+        "question no observation can answer once the edit has landed. Adds the "
+        "prompt line that asks for the pre-edit run in the first place; without "
+        "it there is nothing to recall.",
         "ambient"),
 
     # --- group "ctxengine": the uniform-symbols work. -------------------------------
@@ -535,6 +600,18 @@ LEVERS: dict[str, Lever] = {
         "grep hit is a first-class line-edit anchor with the same staleness "
         "bookkeeping a read gets. OFF keeps the flat `path:line: text` rows. "
         "Fires per grep that rendered anchors, with file and match counts.",
+        "contract"),
+    "catalog_clip": Lever(
+        "Each `<available_skills>` row is trimmed to whole sentences within a "
+        "260-char budget (first sentence always kept, later ones while they fit, "
+        "'…' when any were dropped). The catalog is the largest block in the "
+        "system prompt and survives every turn in the warm prefix: on a host with "
+        "62 installed skills the descriptions alone measure 19.0k chars — median "
+        "305 per row, so it is the whole distribution, not a few outliers — and "
+        "this takes it to 9.8k with 34 rows clipped. A row is TRIGGER text the "
+        "model matches a task against, so the contrast this has to win is skill "
+        "selection, not prompt size; the detail it drops is procedure, which "
+        "activation serves in full. Fires per render that clipped, with the count.",
         "contract"),
     "read_range_footer": Lever(
         "Skeleton and clipped reads name the exact un-shown line ranges in "
@@ -604,13 +681,42 @@ def _parse(var: str) -> frozenset[str]:
     return names
 
 
+# Levers the lean arm (CHAD_LEAN) starts with ON. Not an exception to the
+# default-OFF contract so much as its consequence: default-OFF is a statement about
+# levers that ADD behavior on top of a full tool surface, and lean deletes the tool
+# surface. `read` and `grep` carry four of these behaviors themselves — grep refuses
+# to report an empty result without its scope (`grep_zero_match_notice`), read names
+# the ranges it did not show (`read_range_footer`) — and hiding those tools silently
+# repeals the contract rather than testing it. Worse, it repeals it invisibly: a lever
+# bound to a hidden tool cannot fire, so an ablation reads it as "exercised and
+# useless" when it was never reachable. These four put the same guarantees on the bash
+# route, which is the only route lean has.
+#
+# CHAD_ENABLE still adds and CHAD_DISABLE still subtracts, so `CHAD_LEAN=1
+# CHAD_DISABLE=bash_empty_diagnose` is a valid leave-one-out arm and `active()` keeps
+# reporting exactly what ran.
+LEAN_DEFAULTS = frozenset({
+    "env_manifest",             # bash is the only route, so its toolbox IS the surface
+    "bash_read_skeleton",       # the only structure signal left once repo_map is gone
+    "bash_empty_diagnose",      # grep_zero_match_notice / read_range_footer, on bash
+    "bash_trim_keep_failures",  # bash IS the test channel here
+    "verify_baseline",          # ditto, and the pre-edit run is otherwise unrecorded
+    "bash_line_clip",           # no tool_grep row cap on this route either
+    "edit_miss_diagnose",       # `edit` is the ONLY editor in this arm
+    "rg_replace_flag_note",     # ripgrep is the whole search surface here
+})
+
+
 def _enabled_set() -> frozenset[str]:
-    """Levers ON right now: CHAD_ENABLE (default none, 'all' = everything) minus
-    CHAD_DISABLE. Read live, never cached — the eval harness flips these between
-    tasks in-process."""
+    """Levers ON right now: LEAN_DEFAULTS (only under CHAD_LEAN) plus CHAD_ENABLE
+    ('all' = everything), minus CHAD_DISABLE. Read live, never cached — the eval
+    harness flips these between tasks in-process."""
+    from . import config
     on = _parse("CHAD_ENABLE")
     if "all" in on:
         on = frozenset(LEVERS)
+    elif config.flag("CHAD_LEAN"):
+        on = on | LEAN_DEFAULTS
     off = _parse("CHAD_DISABLE")
     if "all" in off:
         off = frozenset(LEVERS)

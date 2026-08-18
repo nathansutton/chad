@@ -437,17 +437,29 @@ def _tilde(path: str) -> str:
 
 
 def banner(model: str, ctx_limit: int | None, mode: str = "normal",
-           version: str | None = None, cwd: str | None = None) -> str:
+           version: str | None = None, cwd: str | None = None,
+           native_ctx: int | None = None) -> str:
     """The startup banner: bone-club art on the left, live session info on the right.
 
     Mirrors Claude Code's header — name+version, model+context, and the working
     directory — so a fresh session states what it is at a glance. Returns a plain
-    multi-line ANSI string (no trailing newline); the caller emits it verbatim."""
+    multi-line ANSI string (no trailing newline); the caller emits it verbatim.
+
+    `ctx_limit` is the window the session will actually get (the RAM governor's
+    compaction trigger), NOT the checkpoint's native window: on a memory-tight box the
+    two differ by more than 2x, and the native number is context the run can never
+    spend. When `native_ctx` says the governor is what bound it, the banner says so —
+    otherwise a 103k line on a 262k model reads as the wrong model having loaded."""
     if version is None:
         from . import __version__ as version
     if cwd is None:
         cwd = os.getcwd()
-    ctx = f"{ctx_limit / 1000:.0f}k context" if ctx_limit else "context tbd"
+    if not ctx_limit:
+        ctx = "context tbd"
+    elif native_ctx and ctx_limit < native_ctx * 0.95:
+        ctx = f"{ctx_limit / 1000:.0f}k of {native_ctx / 1000:.0f}k context"
+    else:
+        ctx = f"{ctx_limit / 1000:.0f}k context"
     info = [
         f"{C_BOLD}chad{C_RST} {C_DIM}v{version}{C_RST}",
         f"{model} {C_DIM}· {ctx} · {mode} mode{C_RST}",

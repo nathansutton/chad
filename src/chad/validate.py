@@ -350,9 +350,9 @@ def render_repair(name: str, args: Any, errors: List[Err]) -> str:
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(name)):
             return (f"[malformed tool call — the tool name parsed as {name!r}, which "
                     "means your call syntax was garbled. Do not retry the same text. "
-                    "Re-emit the call as ONE json object in this exact shape: "
-                    '<tool_call>{"name": "grep", "arguments": {"pattern": "..."}}'
-                    "</tool_call> — substituting your intended tool and arguments.]")
+                    "Re-emit the call in this exact shape: <tool_call><function=grep>"
+                    "<parameter=pattern>...</parameter></function></tool_call> — "
+                    "substituting your intended tool and arguments.]")
         return (f"[unknown tool {name!r}. Available tools: {', '.join(_known_tools())}. "
                 "Re-emit the call using one of these names.]")
     lines = [f"[invalid arguments for `{name}` — fix ONLY the fields marked ✗ below, "
@@ -362,11 +362,27 @@ def render_repair(name: str, args: Any, errors: List[Err]) -> str:
             lines.append(f"  ✗ {e.path}  → required, but missing (expected {e.expected})")
         else:
             lines.append(f"  ✗ {e.path} = {e.got}  → expected {e.expected}")
-    try:
-        echo = json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
-    except (TypeError, ValueError):
-        echo = str({"name": name, "arguments": args})
-    if len(echo) <= 600:
+    echo = _echo_call(name, args)
+    if echo and len(echo) <= 600:
         lines.append("your call was:")
-        lines.append(f"<tool_call>{echo}</tool_call>")
+        lines.append(echo)
     return "\n".join(lines)
+
+
+def _echo_call(name: str, args: Any) -> str:
+    """The model's own call, re-rendered in the dialect the chat template mandates.
+    This echo sits directly above the model's retry, so it is a few-shot example of the
+    call shape whether or not it is meant as one; rendering it as a JSON object showed
+    the model a format its template forbids, and misquoted what it had actually sent."""
+    if not isinstance(args, dict):
+        return ""
+    parts = [f"<tool_call>\n<function={name}>"]
+    for k, v in args.items():
+        if not isinstance(v, str):
+            try:
+                v = json.dumps(v, ensure_ascii=False)
+            except (TypeError, ValueError):
+                v = str(v)
+        parts.append(f"<parameter={k}>\n{v}\n</parameter>")
+    parts.append("</function>\n</tool_call>")
+    return "\n".join(parts)

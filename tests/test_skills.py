@@ -175,10 +175,12 @@ def test_catalog_block_lists_skills(tmp_path):
                  description="Do alpha things. Use for alpha.")
     block = skills.catalog_block(str(cwd))
     assert "<available_skills>" in block
-    assert "<name>alpha</name>" in block
-    assert "Do alpha things" in block
+    assert "- alpha: Do alpha things. Use for alpha." in block
     assert "activate_skill" in block  # behavioral instruction present
-    assert "/SKILL.md" in block       # location present
+    # No per-skill location: `activate()` reports the skill directory and its bundled
+    # resources itself, and on a host with ~60 skills the framing this drops was a
+    # third of the largest block in the system prompt.
+    assert "/SKILL.md" not in block
 
 
 def test_registry_cached_and_rebuilt_on_cwd_change(tmp_path, monkeypatch):
@@ -301,3 +303,35 @@ def test_compaction_does_not_truncate_skill_content():
     survivor = next(m for m in messages if skills.is_skill_message(m))
     assert big in survivor["content"]  # skill instructions kept verbatim
     assert compaction._COLLAPSED not in survivor["content"]
+
+
+# --- catalog row budget (`catalog_clip`) --------------------------------------
+
+def test_clip_keeps_whole_sentences_and_never_drops_the_trigger(monkeypatch):
+    """The row is trigger text, so the cut lands on sentence boundaries only: a row
+    sliced mid-clause can read as a different trigger than its author wrote. The first
+    sentence rides whatever its length — it is the trigger in every description measured
+    — and a row that already fits is returned untouched, character for character."""
+    monkeypatch.setenv("CHAD_ENABLE", "catalog_clip")
+    cap = skills.CATALOG_ROW_CHARS
+
+    short = "Runs the thing. Then checks it."
+    assert skills._clip_description(short) is short
+
+    long_first = "A " + "very " * 80 + "long single sentence with no break."
+    assert len(long_first) > cap
+    assert skills._clip_description(long_first) == long_first   # nothing to cut on
+
+    body = " ".join(f"Sentence number {i} says something useful." for i in range(20))
+    out = skills._clip_description(body)
+    assert out.endswith("…")
+    assert out.startswith("Sentence number 0 says something useful.")
+    assert len(out) <= cap + 2
+    # every kept sentence is whole — no partial clause before the marker
+    assert out[:-2].rstrip().endswith(".")
+
+
+def test_clip_is_inert_while_the_lever_is_off(monkeypatch):
+    monkeypatch.setenv("CHAD_DISABLE", "catalog_clip")
+    body = " ".join(f"Sentence number {i} says something useful." for i in range(20))
+    assert skills._clip_description(body) == body

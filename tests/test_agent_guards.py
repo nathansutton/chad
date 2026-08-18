@@ -277,7 +277,7 @@ def test_nudge_for_no_calls():
         '<tool_call>{"name": "bash", …</parameter></function></tool_call>',
         hit_cap=False, garbled_call=True, **base)
     check("garbled closed block -> garble kind", kind6g == "garble")
-    check("garbled nudge text", "did not contain one valid JSON" in nudge6g)
+    check("garbled nudge text", "did not contain one valid tool call" in nudge6g)
     # …and it is bounded by its own counter, NOT the truncation counter.
     b6h = dict(base); b6h["truncation_nudges"] = 2
     kind6h, _ = nudge_for_no_calls("<tool_call>garbage</tool_call>", hit_cap=False,
@@ -349,7 +349,12 @@ def test_garble_invariant_nudges():
     _, n2 = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
                                garble_nudges=1, consecutive_garbles=2, **base)
     check("second consecutive garble: exemplar shown", TOOLCALL_EXEMPLAR in n2)
-    check("exemplar shows the JSON contract", '"arguments"' in n2)
+    # The exemplar must show the dialect the chat template mandates. It used to show a
+    # JSON object and forbid <function=…>/<parameter=…> — i.e. the message whose whole
+    # job is to break a wrong-dialect streak taught the wrong dialect.
+    check("exemplar shows the template's dialect",
+          "<function=bash>" in n2 and "<parameter=command>" in n2)
+    check("exemplar does not teach the JSON form", '"arguments"' not in n2)
 
     # Legacy arm (lever off): shared counter, kind counted as truncation — the OFF
     # state must reproduce the legacy behavior exactly for the ablation to price it.

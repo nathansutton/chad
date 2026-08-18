@@ -285,60 +285,96 @@ def test_pick_model_default_equals_auto(monkeypatch):
 
 def test_ram_aware_ctx_limit():
     GB = 1e9
-    # Measured 24 GB M4 Pro numbers: 19.07 GB working set, 12.06 GB resident after
-    # load, 20,578 B/token KV, 262 k window. The divisor is kv × slope_factor (1.75,
-    # the 2026-07-12 ram_safety_check all-in fit: peak grows 35.7 KB/token, not the
-    # KV-only 20.5) — the raw-KV pick of ~175k extrapolated to 102.9% of budget.
-    n = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                reserve_gb=1.5, safety=0.90)
-    check("24GB box: below the window", n < 262144 - 2048, n)
-    check("24GB box: in the safe ~100k range", 90_000 < n < 110_000, n)
-    # The measured worst case (peak ≈ active + 1.0 GB + 35.7 KB/tok × (ctx + 8k gen))
-    # must stay under the working-set budget at the picked trigger.
-    worst = 12.06 * GB + 1.0 * GB + 35_700 * (n + 8192)
-    check("24GB box: worst-case peak under budget", worst < 19.07 * GB, worst / GB)
-    # slope_factor=1.0 recovers the old raw-KV behavior (env override escape hatch).
-    raw = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                  slope_factor=1.0)
-    check("slope_factor=1.0 recovers raw-KV pick", 150_000 < raw < 200_000, raw)
+    # Measured on a 24 GB M4 Pro running the 27B (q3, 8-bit KV, memory clamp on, ONE
+    # load — load/teardown cycling panics the GPU): 19.07 GB Metal working set, 12.329 GB
+    # resident after load, 34,816 B/token KV, 262 k window. Peak memory over ctx:
+    #   8k 14.59 GB | 16k 15.60 | 32k 16.82 | 49k 18.35 | 65k 18.91
+    # The gap between peak and active — the prefill transient — climbs to 4.15 GB by 49k
+    # and is FLAT from there (the adaptive chunker shrinks the chunk as the free band
+    # closes), and past that point peak grows 33,936 B/token against a 34,816 B/token
+    # cache. So the cost model is a fixed transient plus KV at its raw rate, which is
+    # what the governor subtracts and divides by.
+    BUDGET, ACTIVE, KV, TRANSIENT = 19.07 * GB, 12.329 * GB, 34_816, 4.3 * GB
+
+    def peak_at(ctx):
+        """The measured cost model, extrapolated to a candidate trigger."""
+        return ACTIVE + TRANSIENT + KV * ctx
+
+    n = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV)
+    check("27B on 24GB: below the window", n < 262144 - 2048, n)
+    # This is the assertion that keeps the defaults honest: whatever trigger the governor
+    # picks, the measured peak at that trigger must stay inside the Metal budget. It is
+    # the reason `safety` alone cannot be the whole story — the 4.3 GB transient and the
+    # 12.3 GB of weights spend 87% of the budget before the first cached token.
+    check("27B: measured peak at the trigger is under budget", peak_at(n) < BUDGET,
+          peak_at(n) / GB)
+    check("27B: and is not leaving the box idle", peak_at(n) > 0.95 * BUDGET,
+          peak_at(n) / GB)
+
+    # `safety` is the single headroom lever: tightening it strictly shrinks the window,
+    # and it is the ONLY knob that does (the flat reserve_gb it replaced is gone).
+    tighter = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV, safety=0.80)
+    check("tighter safety shrinks window", tighter < n, (tighter, n))
+    check("default safety holds back 2.5%",
+          cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV, safety=0.975) == n)
+
+    # The transient is a FIXED subtraction, not a per-token slope. A model that ignores
+    # it (transient_bytes=0) over-picks by exactly its worth in tokens, which on this box
+    # is the difference between 97% of budget and walking over the wall.
+    blind = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV, transient_bytes=0)
+    check("ignoring the transient over-picks", blind > n, (blind, n))
+    check("...and that over-pick busts the budget", peak_at(blind) > BUDGET,
+          peak_at(blind) / GB)
+    check("transient costs exactly its worth in tokens",
+          abs((blind - n) - TRANSIENT / KV) <= 1, (blind - n, TRANSIENT / KV))
 
     # Tight box (less working set) compacts sooner — strictly smaller window.
-    tight = cli.ram_aware_ctx_limit(262144, 10.0 * GB, 8.0 * GB, 20578)
+    tight = cli.ram_aware_ctx_limit(262144, 10.0 * GB, 8.0 * GB, KV)
     check("tight box compacts sooner", tight < n, (tight, n))
 
     # Huge box is capped at the model window minus the gen margin, never above it.
-    huge = cli.ram_aware_ctx_limit(262144, 400.0 * GB, 12.0 * GB, 20578)
+    huge = cli.ram_aware_ctx_limit(262144, 400.0 * GB, ACTIVE, KV)
     check("huge box capped at window-margin", huge == 262144 - 2048, huge)
 
     # Degenerate inputs -> None so the caller keeps the old fixed cap.
     check("no KV cost -> None", cli.ram_aware_ctx_limit(262144, 19 * GB, 12 * GB, 0) is None)
-    check("no budget -> None", cli.ram_aware_ctx_limit(262144, 0, 12 * GB, 20578) is None)
-
-    # Reserve eats into the budget: a bigger scratch reserve -> a smaller window.
-    big_reserve = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                          reserve_gb=4.0)
-    check("bigger reserve shrinks window", big_reserve < n, (big_reserve, n))
+    check("no budget -> None", cli.ram_aware_ctx_limit(262144, 0, 12 * GB, KV) is None)
 
     # Over-subscribed (model already past the safe budget) -> floor, never negative.
-    floored = cli.ram_aware_ctx_limit(262144, 14 * GB, 18 * GB, 20578)
+    floored = cli.ram_aware_ctx_limit(262144, 14 * GB, 18 * GB, KV)
     check("over-subscribed -> floor", floored == 8192, floored)
 
     # Host physical pressure: when the host's reclaimable band is
     # tighter than the Metal band, IT binds — Docker/harbor pressure the Metal
     # budget cannot see must shrink the window.
-    baseline = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578)
-    pressured = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                        host_avail_bytes=3.0 * GB)
-    check("tight host band binds below the Metal band", pressured < baseline,
-          (pressured, baseline))
+    pressured = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
+                                        host_avail_bytes=1.5 * GB)
+    check("tight host band binds below the Metal band", pressured < n, (pressured, n))
     check("tight host band still floored, never negative",
-          cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                  host_avail_bytes=0.5 * GB) == 8192)
+          cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
+                                  host_avail_bytes=0.02 * GB) == 8192)
     # A roomy host band changes nothing — the Metal band stays the binding one.
-    roomy = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                    host_avail_bytes=200 * GB)
-    check("roomy host band leaves the Metal result", roomy == baseline,
-          (roomy, baseline))
+    roomy = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV, host_avail_bytes=200 * GB)
+    check("roomy host band leaves the Metal result", roomy == n, (roomy, n))
+
+
+def test_host_band_is_a_guard_not_the_primary_constraint():
+    GB = 1e9
+    BUDGET, ACTIVE, KV = 19.07 * GB, 12.329 * GB, 34_816
+    metal = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV)
+    # Measured right after a 12.3 GB load the reclaimable band reads 3.9 GB — the weights
+    # took it and nothing has been reclaimed yet. The host branch must NOT bind there:
+    # it is a soft pressure signal the OS compresses around, so it sizes the resident KV
+    # cache only and never charges the short-lived prefill transient against it. Charging
+    # it there put a box with room to spare on the 8192 floor.
+    just_loaded = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
+                                          host_avail_bytes=3.936 * GB)
+    check("band right after load does not bind", just_loaded == metal,
+          (just_loaded, metal))
+    # It still bites when the box is genuinely oversubscribed by another process.
+    squeezed = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
+                                       host_avail_bytes=1.2 * GB)
+    check("real pressure still binds", squeezed < metal, (squeezed, metal))
 
 
 def test_host_avail_bytes():
@@ -413,6 +449,7 @@ def test_home_dir_note_absent_in_project(monkeypatch, capsys):
 
 if __name__ == "__main__":
     test_ram_aware_ctx_limit()
+    test_host_band_is_a_guard_not_the_primary_constraint()
     with pytest.MonkeyPatch.context() as mp:
         test_env_float(mp)
     with pytest.MonkeyPatch.context() as mp:

@@ -15,7 +15,7 @@ import os
 
 import pytest
 
-from chad import compaction, guardrails, levers, profiles, syntaxgate, tools
+from chad import compaction, guardrails, levers, profiles, skills, syntaxgate, tools
 
 # Every lever exercised below. The last test asserts this equals levers.LEVERS.
 COVERED = set()
@@ -889,6 +889,108 @@ def test_bash_read_skeleton_bite(tmp_path, monkeypatch):
         "bash", {"command": "cat m.py"}, "def a(): ...") == "def a(): ..."
 
 
+def test_bash_empty_diagnose_bite(tmp_path, monkeypatch):
+    """ON, an empty bash result says WHY it was empty; OFF, it stays bare."""
+    from chad import ambient
+    n = bite("bash_empty_diagnose")
+    (tmp_path / "short.py").write_text("x = 1\n" * 10)
+    monkeypatch.chdir(tmp_path)
+    cmd = {"command": "sed -n '80,120p' short.py"}
+    grep = {"command": "rg -n 'NoSuchThing' src/"}
+    on(monkeypatch)
+    ambient.reset()
+    assert "short.py has 10 lines" in ambient.annotate("bash", cmd, "[no output]")
+    assert "nothing matched 'NoSuchThing'" in ambient.annotate("bash", grep, "[exit 1]")
+    off(monkeypatch, n)
+    ambient.reset()
+    assert ambient.annotate("bash", cmd, "[no output]") == "[no output]"
+    assert ambient.annotate("bash", grep, "[exit 1]") == "[exit 1]"
+
+
+def test_verify_baseline_bite(monkeypatch):
+    """ON, a failing post-edit run recalls what that command did before the first
+    edit; OFF, the result is bare — and the prompt line asking for the pre-edit run
+    disappears with it."""
+    from chad import ambient, prompt
+    n = bite("verify_baseline")
+
+    def run_sequence():
+        ambient.reset()
+        ambient.annotate("bash", {"command": "pytest -q"}, "[exit 1]\n2 failed")
+        ambient.annotate("edit", {"path": "a.py"}, "[edited a.py]")
+        return ambient.annotate("bash", {"command": "pytest -q"}, "[exit 1]\n3 failed")
+
+    on(monkeypatch)
+    assert "[baseline] before your first edit, `pytest`" in run_sequence()
+    assert "before your first edit" in prompt.build_system_prompt()
+    off(monkeypatch, n)
+    assert run_sequence() == "[exit 1]\n3 failed"
+    assert "before your first edit" not in prompt.build_system_prompt()
+
+
+def test_bash_trim_keep_failures_bite(monkeypatch):
+    """ON, the failure rows in the dropped middle survive the trim; OFF, only the
+    head and tail do."""
+    n = bite("bash_trim_keep_failures")
+    middle = "  \u2718 the one failing test\n" + "  filler\n" * 900
+    out = "pass\n" * 4000 + middle + "tail\n" * 6000
+    on(monkeypatch)
+    assert "the one failing test" in tools._bash_headtail(out, spill=False)
+    off(monkeypatch, n)
+    assert "the one failing test" not in tools._bash_headtail(out, spill=False)
+
+
+def test_edit_miss_diagnose_bite(tmp_path, monkeypatch):
+    """ON, a failed edit says where `old` stopped matching (or that the change is
+    already in); OFF, only the generic closest-line advice."""
+    n = bite("edit_miss_diagnose")
+    f = tmp_path / "m.ts"
+    f.write_text("export type T = Required<\n\tOmit<Options, 'a'>,\n>;\n")
+    monkeypatch.chdir(tmp_path)
+    stray = ("'Omit<Options, 'a'>,", "'Omit<Options, 'a' | 'b'>,")
+    on(monkeypatch)
+    assert "differs from the file at column 1" in tools.tool_edit(str(f), *stray)
+    off(monkeypatch, n)
+    assert "differs from the file at column" not in tools.tool_edit(str(f), *stray)
+
+    # the already-applied branch
+    g = tmp_path / "k.ts"
+    g.write_text("\t\tthrow new TimeoutError(this.request, options.message);\n")
+    done = ("\t\t\tthrow new TimeoutError(this.request);",
+            "\t\t\tthrow new TimeoutError(this.request, options.message);")
+    on(monkeypatch)
+    assert "ALREADY in this file" in tools.tool_edit(str(g), *done)
+    off(monkeypatch, n)
+    assert "ALREADY in this file" not in tools.tool_edit(str(g), *done)
+
+
+def test_rg_replace_flag_note_bite(monkeypatch):
+    """ON, an `rg -rn` result is labelled as rewritten output; OFF, it stands as if it
+    were the file's text."""
+    from chad import ambient
+    n = bite("rg_replace_flag_note")
+    args = {"command": 'rg -rn "timeoutMessage|Registry" test/main.ts'}
+    on(monkeypatch)
+    ambient.reset()
+    assert "REWRITTEN output" in ambient.annotate("bash", args, "test('n option', …)")
+    off(monkeypatch, n)
+    ambient.reset()
+    assert ambient.annotate("bash", args, "test('n option', …)") == "test('n option', …)"
+
+
+def test_bash_line_clip_bite(monkeypatch):
+    """ON, one 92k-char line is capped and the result stays small; OFF, head+tail hands
+    back 20k chars of it."""
+    n = bite("bash_line_clip")
+    blob = "M" * 92000
+    on(monkeypatch)
+    small = tools._bash_headtail(f"map:1:{blob}\nreal line\n", spill=False)
+    assert len(small) < 1200 and "…[line clipped]" in small
+    off(monkeypatch, n)
+    huge = tools._bash_headtail(f"map:1:{blob}\nreal line\n", spill=False)
+    assert len(huge) > tools.BASH_MAX_CHARS - 1
+
+
 # === the coverage contract =================================================
 
 # === group "safety" ===============================================================
@@ -991,6 +1093,29 @@ def test_read_range_footer_bite(monkeypatch, tmp_path):
     assert "[largest elided bodies:" in tools.tool_read(str(f))
     off(monkeypatch, n)
     assert "[largest elided bodies:" not in tools.tool_read(str(f))
+
+
+def test_catalog_clip_bite(monkeypatch, tmp_path):
+    """ON, a long catalog row keeps whole sentences within the budget and marks the
+    drop; OFF, the author's full description rides in the prompt every turn."""
+    n = bite("catalog_clip")
+    d = tmp_path / ".agents" / "skills" / "alpha"
+    d.mkdir(parents=True)
+    tail = " Then it does another documented thing in a further long sentence."
+    (d / "SKILL.md").write_text(
+        f"---\nname: alpha\ndescription: Trigger on alpha tasks.{tail * 6}\n---\nBody.\n")
+    monkeypatch.setattr(os.path, "expanduser",
+                        lambda p: str(tmp_path / "nohome") if p == "~" else p)
+    def row(block):
+        return next(l for l in block.splitlines() if l.startswith("- alpha:"))
+
+    on(monkeypatch)
+    clipped = row(skills.catalog_block(str(tmp_path)))
+    assert clipped.startswith("- alpha: Trigger on alpha tasks.")
+    assert clipped.endswith("…") and len(clipped) <= skills.CATALOG_ROW_CHARS + 12
+    off(monkeypatch, n)
+    full = row(skills.catalog_block(str(tmp_path)))
+    assert full.endswith("sentence.") and len(full) > len(clipped)
 
 
 def test_every_registered_lever_has_a_bite_test():

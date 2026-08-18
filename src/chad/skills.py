@@ -8,7 +8,7 @@ client-side responsibilities from the spec's "adding skills support" guide:
   1. Discover  — scan project- and user-level skill dirs for `SKILL.md` files.
   2. Parse     — leniently extract frontmatter + body (warn, don't crash, on cosmetic
                  issues; skip only when there's no usable description / unparseable YAML).
-  3. Disclose  — `catalog_block()` lists name+description+location for the system prompt
+  3. Disclose  — `catalog_block()` lists name+description for the system prompt
                  (tier 1: ~50-100 tokens/skill, loaded at session start).
   4. Activate  — `activate(name)` returns the full body wrapped in <skill_content> with a
                  bundled-resource listing (tier 2: loaded only when the model asks).
@@ -23,7 +23,9 @@ Agent / `/reset` starts so activations don't bleed across sessions.
 """
 
 import os
+import re
 
+from . import config, levers
 from .diag import log, warn_footer
 from .ignore import IGNORE_DIRS
 
@@ -292,33 +294,57 @@ def has_skills() -> bool:
 # Disclosure (tier 1) + activation (tier 2)
 # ---------------------------------------------------------------------------
 
-_CATALOG_INSTRUCTIONS = (
-    "# Skills\n"
-    "The following skills provide specialized instructions for specific tasks. Each "
-    "lists what it does and when to use it. When a task matches a skill's description, "
-    "call the `activate_skill` tool with the skill's `name` to load its full "
-    "instructions BEFORE proceeding — do not guess the procedure from the name alone. "
-    "A skill's instructions may reference bundled files (scripts/, references/, "
-    "assets/); read those on demand with the `read` tool, resolving relative paths "
-    "against the skill directory reported when you activate it.\n"
-)
+def _catalog_instructions() -> str:
+    """The behavioral header above the catalog. The reader it names has to be a tool the
+    current arm actually exposes: under CHAD_LEAN there is no `read`, and naming a tool
+    that isn't in the schema is the same staleness bug the workspace-map affordance
+    already fixes — the model either burns a call discovering it is gone or skips the
+    bundled resource entirely."""
+    reader = ("read those on demand from bash (`sed -n '1,120p' <file>`)"
+              if config.flag("CHAD_LEAN")
+              else "read those on demand with the `read` tool")
+    return (
+        "# Skills\n"
+        "The following skills provide specialized instructions for specific tasks. Each "
+        "lists what it does and when to use it. When a task matches a skill's "
+        "description, call the `activate_skill` tool with the skill's `name` to load "
+        "its full instructions BEFORE proceeding — do not guess the procedure from the "
+        "name alone. A skill's instructions may reference bundled files (scripts/, "
+        "references/, assets/); " + reader + ", resolving relative paths against the "
+        "skill directory reported when you activate it.\n"
+    )
 
 
 def catalog_block(cwd: str = None) -> str:
     """The tier-1 skills section for the system prompt: behavioral instructions plus a
-    compact <available_skills> catalog (name + description + location). Returns "" when
-    no skills are installed, so an empty block never confuses the model."""
+    compact <available_skills> catalog, one `- name: description` line per skill.
+    Returns "" when no skills are installed, so an empty block never confuses the model.
+
+    The catalog is the largest single block in the prompt — on a host with ~60 user
+    skills it measured 30k chars, 82% of the system prompt and 28% of a whole finished
+    task's context, which also swamps any prompt-size contrast an A/B arm is trying to
+    measure. Two thirds of the cut here is pure framing: the per-skill XML wrapper cost
+    more than the descriptions it wrapped, and `<location>` restated what `activate()`
+    already reports in its own header (skill directory + bundled-resource listing), so
+    dropping both loses no routing information. The descriptions themselves are left
+    intact — they ARE the trigger text the model matches a task against, and trimming
+    them would trade prompt size for worse skill selection. What remains after that cut
+    is the descriptions themselves, and on the same host they still measure 19k chars
+    across 62 skills — a median of 305 chars per row, so it is the distribution and not
+    a few outliers. `catalog_clip` (default OFF) is the arm for trimming them; the
+    contrast it has to win is skill SELECTION, not prompt size."""
     reg = get_registry() if cwd is None else _Registry(cwd)
     if not reg.order:
         return ""
-    lines = ["\n\n" + _CATALOG_INSTRUCTIONS, "<available_skills>"]
+    lines = ["\n\n" + _catalog_instructions(), "<available_skills>"]
+    clipped = 0
     for name in reg.order:
-        s = reg.by_name[name]
-        lines.append("  <skill>")
-        lines.append(f"    <name>{name}</name>")
-        lines.append(f"    <description>{_one_line(s.description)}</description>")
-        lines.append(f"    <location>{s.location}</location>")
-        lines.append("  </skill>")
+        full = _one_line(reg.by_name[name].description)
+        row = _clip_description(full)
+        clipped += row != full
+        lines.append(f"- {name}: {row}")
+    if clipped:
+        levers.fired("catalog_clip", rows=clipped, skills=len(reg.order))
     lines.append("</available_skills>")
     return "\n".join(lines)
 
@@ -326,6 +352,31 @@ def catalog_block(cwd: str = None) -> str:
 def _one_line(text: str) -> str:
     """Collapse whitespace so a multi-line description stays on one catalog line."""
     return " ".join(text.split())
+
+
+# Where one catalog row stops. Whole sentences only: a description is trigger text the
+# model matches a task against, and a row cut mid-clause can read as a different trigger
+# than the author wrote. The first sentence is always kept whatever its length (it is the
+# trigger in every description measured — median 56 chars), and later sentences are kept
+# while they fit; what a long row loses is the procedure/detail tail, which `activate()`
+# serves in full anyway. Measured over 62 installed skills: 19.0k chars → 9.8k, with 34
+# rows clipped and every one of them still a complete, well-formed sentence.
+CATALOG_ROW_CHARS = 260
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def _clip_description(text: str) -> str:
+    """`text` reduced to whole sentences within the row budget, or unchanged when the
+    lever is off or it already fits."""
+    if not levers.enabled("catalog_clip") or len(text) <= CATALOG_ROW_CHARS:
+        return text
+    parts = _SENTENCE_SPLIT.split(text)
+    out = parts[0]
+    for part in parts[1:]:
+        if len(out) + 1 + len(part) > CATALOG_ROW_CHARS:
+            return out + " …"
+        out += " " + part
+    return out
 
 
 def _list_resources(base_dir: str, skill_md: str):

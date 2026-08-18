@@ -17,13 +17,22 @@ from . import config, profiles
 # Synthesized from OpenHarness's base prompt (structure, tone, read-before-edit,
 # don't-over-engineer, dedicated tools over bash) and opencode's "beast" prompt
 # (persistence + verify-by-running) — the two failure modes a small local model has.
+#
+# The call-format bullets defer to the chat template rather than restating a format of
+# their own. The template renders the tool list, the format, and an <IMPORTANT> block
+# saying calls MUST be a <function=…> nested in <tool_call> — and it renders all of it
+# IMMEDIATELY ABOVE this text. The prompt used to answer that with "the ONLY way … is a
+# JSON object inside <tool_call>", so the model read two mutually exclusive "ONLY"
+# contracts back to back, on the one thing it cannot get wrong. The observed cost is in
+# toolcall_parse's hybrid branch: `<tool_call>{"name": "bash" <parameter=command>…` is
+# not a random garble, it is a splice of the two formats, one clause from each. Teach
+# the template's dialect; the parser stays permissive and still accepts the JSON form.
 _BASE_PROMPT = """You are chad, an interactive coding agent running locally via MLX. \
 You operate on a REAL codebase in the working directory by calling tools. You are not a \
 chatbot — you act.
 
 # How tools actually run (CRITICAL — read first)
-- The ONLY way to execute anything is to emit a tool call as a JSON object inside <tool_call></tool_call> tags, e.g.:
-<tool_call>{"name": "grep", "arguments": {"pattern": "def construct_addendum"}}</tool_call>
+- The ONLY way to execute anything is to emit a real tool call, in the exact <tool_call>/<function=…> format specified above: one <function=…> block per call, one <parameter=…> block per argument.
 - Writing a command inside a ```bash, ```python, or ```sh markdown code fence does NOTHING. It is not executed. Pseudo-syntax like `edit file.py <<EOF ...` is NOT real and does nothing.
 - Therefore: do NOT write a tutorial or a numbered plan in prose with code fences. Emit real <tool_call> blocks, wait for each result, then continue. One real <tool_call> is worth more than a page of described steps.
 - After each tool result comes back, decide the next action and emit the next <tool_call>. Keep going until the task is actually done, then call `done`.
@@ -58,7 +67,7 @@ chatbot — you act.
 
 # Tools
 - Prefer dedicated tools over `bash`: `read` (not cat), `edit`/`write` (not sed/echo), `glob` (not find/ls), `grep` (not grep/rg). Reserve `bash` for running commands.
-- Emit each tool call as ONE JSON object in a <tool_call> block, e.g.: <tool_call>{"name": "grep", "arguments": {"pattern": "def resolve", "path": "src"}}</tool_call>. You may issue several when they are independent.
+- Emit each tool call as ONE <function=…> block inside <tool_call> tags, with one <parameter=…> block per argument. You may issue several when they are independent.
 
 # Symbolic navigation — use these to keep context (and prefill) small, in ANY language
 Reading whole files is the main thing that bloats context and slows you down. These
@@ -85,7 +94,7 @@ Rule of thumb: orient with `repo_map`, navigate BY SYMBOL, and read full files o
 # The CHAD_LEAN counterpart to _BASE_PROMPT (see tools._LEAN for the matching tool
 # surface). Premise: the model already knows the unix toolbox and the exact-match
 # editor dialect from pretraining, so the prompt's job shrinks to two things — the
-# tool-call emission contract (kept verbatim in spirit from the base prompt: an
+# tool-call emission contract (kept in step with the base prompt: an
 # ablation that bricks tool calling measures nothing) and context economy, which
 # moves from dedicated reader tools into three bash habits (wc first, ranged sed,
 # never cat big files). Everything teaching a chad-specific dialect is gone.
@@ -94,8 +103,7 @@ You operate on a REAL codebase in the working directory by calling tools. You ar
 chatbot — you act.
 
 # How tools actually run (CRITICAL — read first)
-- The ONLY way to execute anything is to emit a tool call as a JSON object inside <tool_call></tool_call> tags, e.g.:
-<tool_call>{"name": "bash", "arguments": {"command": "rg -n 'timeout' source/"}}</tool_call>
+- The ONLY way to execute anything is to emit a real tool call, in the exact <tool_call>/<function=…> format specified above: one <function=…> block per call, one <parameter=…> block per argument.
 - Writing a command inside a ```bash, ```python, or ```sh markdown code fence does NOTHING. It is not executed.
 - Therefore: do NOT write a tutorial or a numbered plan in prose with code fences. Emit real <tool_call> blocks, wait for each result, then continue. One real <tool_call> is worth more than a page of described steps.
 - After each tool result comes back, decide the next action and emit the next <tool_call>. Keep going until the task is actually done, then call `done`.
@@ -106,6 +114,10 @@ chatbot — you act.
 - `write` — create a new file (whole content).
 - `write_todos` — record/update a short plan for any task with 2+ steps; call it first, keep statuses current.
 - `done` — end your turn when the task is complete and verified, with a one-line summary.
+
+# Plan first, then work the plan
+- For any task with 2+ steps, your FIRST call is `write_todos` laying out a short plan; then work it, marking each item `in_progress` before you start it and `completed` right after.
+- A typical turn is: write_todos → bash (locate, then read the region) → edit → bash (run the project's tests) → done. Do not skip straight to a final text answer.
 
 # Working in bash (context is scarce — read SMALL)
 - Locate code with ripgrep: `rg -n 'pattern' src/` (add `-C 2` for context, `-l` for files only). Find files with `rg --files | rg name` or `ls`.
@@ -328,7 +340,7 @@ def build_system_prompt(model_id: str | None = None) -> str:
     # below, where re-prefilling a few hundred tokens is cheap. The profile block is
     # static for a given model, so it sits above the boundary with the base prompt.
     base = _LEAN_PROMPT if config.flag("CHAD_LEAN") else _BASE_PROMPT
-    return (base + _bash_bg_block() + _verify_specific_block()
+    return (base + _bash_bg_block() + _verify_specific_block() + _verify_baseline_block()
             + profiles.prompt_block(model_id) + "\n".join(_dynamic_context()))
 
 
@@ -343,6 +355,23 @@ def _bash_bg_block() -> str:
             "running and its output streams to a file named in the result. Read or "
             "grep that file to check on it, and do other work while it runs — never "
             "sit in a loop re-reading it.\n")
+
+
+def _verify_baseline_block() -> str:
+    """Ask for one test run BEFORE the first edit. The pre-existing failures of a real
+    project are unknowable after the fact — the measured cost of finding out late was
+    nine turns of re-running subsets and grepping the suite for `test.failing` markers
+    to decide which of two failures the model had caused. The run is also what the
+    verify_baseline ambient line has to recall; without it there is nothing recorded.
+    Static for the session, so it sits above the cache boundary."""
+    from . import levers
+    if not levers.enabled("verify_baseline"):
+        return ""
+    return ("\n- Run the project's test command ONCE before your first edit and read "
+            "the result. A suite you have not seen pass cannot tell you later whether "
+            "a failure is yours or the project's, and that question is unanswerable "
+            "after you have edited — the one run up front is cheaper than the turns "
+            "spent reconstructing it.\n")
 
 
 def _verify_specific_block() -> str:

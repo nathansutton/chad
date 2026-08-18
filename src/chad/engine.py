@@ -136,6 +136,70 @@ def peek_context_window(model_id: str, max_context: Optional[int] = None) -> Opt
         return None
 
 
+def peek_kv_footprint(model_id: str) -> tuple:
+    """`(kv_bytes_per_token, weight_bytes)` from `config.json` plus the on-disk weight
+    file sizes alone — no weights loaded, no MLX allocation. These are the two model-side
+    inputs the RAM governor needs, so the startup banner can state the window the box
+    will ACTUALLY give this session instead of advertising a native window it cannot
+    hold. Both are re-derived exactly once the weights are in (the measured
+    `_measure_kv_bytes_per_token` and a live `mx.get_active_memory()`); this is a
+    deliberate pre-load estimate of the same two quantities.
+
+    Only the attention layers grow with context — on the hybrid checkpoints most layers
+    are `linear_attention` and hold a fixed recurrent state — so the per-token cost is
+    `n_full_attention * n_kv_heads * head_dim * 2 (K+V)`, at the width `_resolve_kv_bits`
+    will pick for this shape. Returns `(None, None)` if the config or the weight files
+    can't be read locally, which puts the caller back on the model window."""
+    try:
+        import glob
+        import json
+        from . import mlx_qsdpa
+        path = _local_path(model_id)
+        cfg_path = os.path.join(path, "config.json")
+        if not os.path.isfile(cfg_path):
+            from huggingface_hub import hf_hub_download
+            cfg_path = hf_hub_download(model_id, "config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        tc = cfg.get("text_config", cfg)
+        n_layers = int(tc.get("num_hidden_layers") or 0)
+        types = tc.get("layer_types") or []
+        if types:
+            n_full = sum(1 for t in types if "full" in str(t))
+        elif tc.get("full_attention_interval"):
+            n_full = n_layers // int(tc["full_attention_interval"])
+        else:
+            n_full = n_layers          # no hybrid marker: every layer is attention
+        n_q = int(tc.get("num_attention_heads") or 0)
+        n_kv = int(tc.get("num_key_value_heads") or n_q)
+        head_dim = int(tc.get("head_dim") or 0)
+        if not head_dim and n_q and tc.get("hidden_size"):
+            head_dim = int(tc["hidden_size"]) // n_q
+        if not (n_full and n_kv and head_dim):
+            return None, None
+        # Mirror _resolve_kv_bits: 8-bit group-64 exactly when the fused decode kernel
+        # covers the shape, else the fp16 cache. Read from the same `covers` predicate so
+        # the estimate cannot drift from the decision — but WITHOUT `mlx_qsdpa.install()`,
+        # whose side effects belong to load, not to drawing a banner. If install then
+        # fails, load's own measurement corrects this downward.
+        gqa = n_q // n_kv if n_kv else 0
+        env_bits = config.env_int("CHAD_KV_BITS", -1)
+        bits = env_bits if env_bits >= 0 else (8 if mlx_qsdpa.covers(head_dim, gqa) else 0)
+        if bits == 8:
+            # packed 8-bit weights + one fp16 scale and bias per group of 64
+            per_head = head_dim + (head_dim / 64) * 4
+        elif bits:
+            per_head = head_dim * bits / 8 + (head_dim / 64) * 4
+        else:
+            per_head = head_dim * 2    # fp16 cache
+        kv_bpt = n_full * n_kv * per_head * 2      # K and V
+        weights = sum(os.path.getsize(f)
+                      for f in glob.glob(os.path.join(path, "*.safetensors")))
+        return kv_bpt, (weights or None)
+    except Exception:  # noqa: BLE001 — an estimate for a banner is never worth a crash
+        return None, None
+
+
 def prompt_lookup_draft(context, num_draft, ngram_max=3, ngram_min=1):
     """Prompt-lookup (n-gram) drafting: propose the next `num_draft` tokens by
     finding the most recent earlier occurrence of the current suffix in `context`

@@ -73,6 +73,19 @@ def test_banner_handles_unknown_context():
     assert "context tbd" in banner("m", None)
 
 
+def test_banner_advertises_the_window_the_box_gives():
+    # The headline number is what the session ACTUALLY gets. When the RAM governor is
+    # what bound it, both numbers are named — "84k" alone reads as the wrong model
+    # having loaded, "262k" alone is context the run can never spend.
+    limited = banner("Qwen3.8-27B", 84_300, native_ctx=262_144, version="0.1.0")
+    assert "84k of 262k context" in limited
+    # Governor not binding (big-RAM box): no second number to explain, so don't add one.
+    roomy = banner("Qwen3.8-27B", 260_096, native_ctx=262_144, version="0.1.0")
+    assert "260k context" in roomy and " of " not in roomy.split("\n")[1]
+    # No native window known (config unreadable) -> the plain form, never a crash.
+    assert "84k context" in banner("m", 84_300)
+
+
 def _stub_tui(finalize):
     # A TUI shell exercising just the background-load handoff, without a real engine/app.
     import threading
@@ -84,6 +97,7 @@ def _stub_tui(finalize):
     tui.ctx_limit = 8192  # provisional, set pre-load
     tui.agent = SimpleNamespace(ctx_limit=8192)
     tui.engine = SimpleNamespace(effective_ctx=262144)
+    tui.native_ctx = 262144
     tui._emit = lambda kind, text: None
     tui._finalize = finalize
     return tui

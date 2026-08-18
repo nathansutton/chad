@@ -122,7 +122,7 @@ def test_render():
                          coerce_and_validate("grep</argstr", {})[1])
     check("render malformed name says malformed", "malformed tool call" in msg3)
     check("render malformed name shows exemplar",
-          '<tool_call>{"name": "grep"' in msg3, f"msg={msg3!r}")
+          "<tool_call><function=grep><parameter=pattern>" in msg3, f"msg={msg3!r}")
     check("render malformed name does not list tools", "Available tools" not in msg3)
 
 

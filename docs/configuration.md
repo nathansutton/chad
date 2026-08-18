@@ -21,13 +21,15 @@ optionally bundling `scripts/`, `references/`, and `assets/`.
 **Progressive disclosure** keeps context small (the point, on a local model):
 
 1. **Catalog** — at startup, only every skill's `name` + `description` go into the system
-   prompt as an `<available_skills>` block (~50-100 tokens each). `/skills` prints it.
+   prompt as an `<available_skills>` block, one `- name: description` line each (~40-80
+   tokens). `/skills` prints it.
 2. **Activation** — when a task matches, the model calls the `activate_skill` tool (its
    `name` argument is enum-constrained to real skills, so it can't invent one). That loads
    *that one* skill's full instructions, wrapped in `<skill_content>`, with its bundled
    files listed.
 3. **Resources** — referenced `scripts/`/`references/`/`assets/` files are read on demand
-   with the normal `read` tool, against the skill's directory.
+   against the skill's directory, with the `read` tool (or from `bash` in the lean tool
+   arm, which has no `read`).
 
 Parsing is lenient (a name that doesn't match its directory, an over-long field, or an
 unquoted `colon: value` in YAML loads anyway, with a warning); only a missing description
@@ -206,9 +208,10 @@ The rarely-touched tuning knobs live in environment variables so they stay off t
 CHAD_MAX_CONTEXT=131072 uv run chad      # YaRN-extend to the model's full 128k window
 CHAD_KV_BITS=0          uv run chad      # fp16 KV cache (8-bit fused is the default where covered)
 CHAD_CTX_LIMIT=28000    uv run chad      # force the compaction threshold (overrides the RAM-aware default)
-CHAD_CTX_RESERVE_GB=2.5 uv run chad      # scratch RAM held back when auto-sizing that threshold
-CHAD_CTX_SLOPE_FACTOR=1.0 uv run chad    # per-token cost multiplier for that auto-sizing (default
-                                         # 1.75: measured peak grows ~1.75x the raw KV bytes/token)
+CHAD_CTX_SAFETY=0.95    uv run chad      # the single headroom lever: fraction of the Metal budget
+                                         # the auto-sizing may spend (default 0.975 — hold back 2.5%)
+CHAD_CTX_SLOPE_FACTOR=1.5 uv run chad    # A/B knob: per-token cost multiplier for that auto-sizing
+                                         # (default 1.0 — a token's marginal cost is its KV cost)
 CHAD_MODEL=/path/to/mlx-model uv run chad  # power-user escape hatch: run a different MLX model
                                          # (also: --model 9b|35b|auto|<repo> — the CLI twin, wins over this)
 CHAD_PREFILL_CHUNK=1024 uv run chad      # force a fixed prefill chunk (default: adaptive — MoE 2048
@@ -219,15 +222,26 @@ CHAD_NO_MEMORY_CLAMP=1  uv run chad      # A/B knob: skip the Metal allocator cl
 By default the auto-compaction threshold (when chad reclaims old context — a full
 re-prefill on this non-trimmable cache, so we do it as rarely as RAM allows) is **sized
 automatically** from the live Metal memory budget and the model's measured per-token
-cost, then capped at the model's window. The per-token cost is the KV bytes/token times
-a slope factor (default 1.75) because measured peak memory grows faster than the KV
-cache alone — prefill/decode scratch scales with resident context too. On a 24 GB Mac
-running the 35B that lands around ~100k tokens. It self-calibrates per machine: less
-RAM compacts sooner, more RAM runs nearer the full window. `CHAD_CTX_LIMIT` forces an
-exact threshold (used by tests); `CHAD_CTX_RESERVE_GB` (default 1.5) tunes how
-much headroom is held back for prefill/decode scratch — raise it if you run other
-memory-hungry apps alongside chad; `CHAD_CTX_SLOPE_FACTOR` tunes the per-token
-multiplier (1.0 recovers the old raw-KV sizing).
+cost, then capped at the model's window. Three things are subtracted before the division:
+the resident weights, a headroom band (`CHAD_CTX_SAFETY`), and the **prefill transient** —
+the attention scratch that is live at the same moment the cache is. That last one is fixed,
+not per-token: it climbs with context and then flattens once the adaptive chunker starts
+shrinking the chunk (measured on the 27B: 1.8 GB at 8k, 4.15 GB at 49k, flat thereafter),
+and past that point peak memory grows at exactly the KV rate. On a 24 GB Mac the 27B's
+12.3 GB of weights plus that 4.3 GB transient spend 87% of the budget before the first
+cached token, which is why it lands near ~56k rather than its 262k native window. It
+self-calibrates per machine: less RAM compacts sooner, more RAM runs nearer the full
+window. `CHAD_CTX_LIMIT` forces an
+exact threshold (used by tests); `CHAD_CTX_SAFETY` (default 0.975) is the single
+headroom lever — the fraction of the Metal budget the sizing may spend, so lower it if
+you run other memory-hungry apps alongside chad; `CHAD_CTX_SLOPE_FACTOR` tunes the
+per-token multiplier (1.0 recovers the raw-KV sizing).
+
+The banner states the window you will **actually get**, not the checkpoint's native one.
+On a memory-tight box the two differ by more than 2x — a 262k model on a 24 GB Mac gets
+tens of thousands of tokens once the weights and the KV cache are paid for — and the
+native number is context the run can never spend. When the governor is what bound it,
+the banner says so: `84k of 262k context`.
 
 `--model` (or `CHAD_MODEL`) takes `35b`, `9b`, `auto`, or any Hugging Face repo id /
 local MLX model directory. The two shorthands are the supported choices; an arbitrary
@@ -323,8 +337,8 @@ window. The Metal budget is blind to other processes, so a container stack or a 
 started after the server took physical pages the KV cache needs one-for-one; a prompt that
 fit at load may not fit now. `GET /health` reports both — `n_ctx` (advertised) and
 `safe_ctx` (what fits right now), plus `ctx_pressure` when they diverge — so you can see a
-tightened wall coming instead of meeting it as a `400`. `CHAD_CTX_RESERVE_GB` tunes the
-scratch headroom the estimate holds back (default 1.5).
+tightened wall coming instead of meeting it as a `400`. `CHAD_CTX_SAFETY` tunes the
+headroom the estimate holds back (default 0.975).
 
 Two things it does that a stock llama.cpp server can't, because both ends are chad's — it
 advertises them in `/props` and the client feature-detects, so nothing changes when you
@@ -359,7 +373,7 @@ rather than a silent no-op.
 
 ```bash
 CHAD_THINK_BUDGET=1500        uv run chad  # soft-cap each step's <think> at N tokens, then force-close + continue
-CHAD_THINK_CEILING=6000       uv run chad  # force-close a runaway <think> but keep decoding the action in the SAME step
+CHAD_THINK_CEILING=384        uv run chad  # force-close a runaway <think> but keep decoding the action in the SAME step (ON by default; 0 disables)
 CHAD_TURN_BUDGET_TOKENS=90000 uv run chad  # governor token budget (default 3× the context limit)
 CHAD_TURN_BUDGET_S=600        uv run chad  # wall-clock variant (seconds); off by default
 CHAD_AUTO_CONTINUE=2          uv run chad  # on a hard stop, relaunch a fresh turn seeded with the progress note, N times
@@ -386,6 +400,17 @@ CHAD_REVIEW_PASS=1            uv run chad  # if a one-shot finishes early and cl
   When the cap fires during a turn, the TUI status line shows a small **`✂N`** counter (N =
   steps trimmed this turn) alongside the live ↑prefill / ↓generated readouts — so you can see
   it acting. With the cap off (the default) nothing renders.
+- **`CHAD_THINK_CEILING`** — the **close-and-continue** ceiling, and the one to reach for
+  before `CHAD_THINK_BUDGET`. Where the think-cap force-closes `<think>` and *ends* the
+  step (so the model re-derives its reasoning next step), this force-closes the runaway
+  block and **keeps decoding the action in the same step** — the reasoning so far stays in
+  context and nothing is re-derived. Unlike the think-cap it is **ON by default at 384
+  tokens** in the full arm, sized to bite the tail of a measured per-step think
+  distribution rather than the median. **OFF by default under `CHAD_LEAN`**, which exists
+  to measure the model without that kind of intervention. `0` disables it in either arm;
+  any positive value overrides. It is a constructor default rather than a lever, so it
+  does not appear in `chad levers` and `CHAD_DISABLE` cannot reach it — this env var is
+  the only switch. Steps it fires on are counted as *salvaged* in the session log.
 - **`CHAD_TURN_BUDGET_TOKENS`** — the governor's cumulative-prefill budget per turn; defaults
   to 3× the context limit. Disable the governor entirely with `CHAD_NO_GOVERNOR=1` (below).
 - **`CHAD_TURN_BUDGET_S`** — a wall-clock (seconds) variant of the same governor; off by
@@ -453,6 +478,7 @@ defenses — leave them unset in normal use; they exist for measurement and edge
 CHAD_NO_SYMBOLS=1            uv run chad  # A/B knob: hide the tree-sitter symbolic tools
 CHAD_NO_TASK=1              uv run chad  # A/B knob: hide the subagent/Task delegation tool
 CHAD_HIDE_TOOLS=a,b         uv run chad  # A/B knob: hide named builtin tools from the schema
+CHAD_LEAN=1                 uv run chad  # A/B knob: the five-tool, shell-first arm
 CHAD_NO_VALIDATE=1          uv run chad  # A/B knob: DISABLE arg coercion + schema validation
 CHAD_NO_GOVERNOR=1          uv run chad  # A/B knob: DISABLE the runaway-turn governor
 CHAD_NO_REPEAT_GUARD=1      uv run chad  # A/B knob: DISABLE the degenerate-repetition stop
@@ -480,7 +506,25 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
   `CHAD_HIDE_TOOLS=edit` forces the line-addressed edit family,
   `CHAD_HIDE_TOOLS=replace_lines,insert_lines` forces exact-match `edit`. A name that
   matches no builtin tool fails loud at the first render rather than silently measuring
-  the unmodified toolset.
+  the unmodified toolset. Tool descriptions that cross-reference each other are rewritten
+  to match whatever surface survives, so a dialect arm never advertises the dialect it
+  just removed.
+- **`CHAD_LEAN`** — the **shell-first arm**: the schema shrinks to `bash`, `edit`,
+  `write`, `write_todos`, `done` (plus `activate_skill` where skills are installed), and
+  the system prompt is replaced with one that teaches only those. The premise is an
+  ablation — everything hidden is a chad dialect the model must learn in-context, while
+  the unix toolbox and exact-match editing it already knows from pretraining. Reading,
+  searching and verifying all move into `bash` (`wc -l` first, ranged `sed -n`, `rg`),
+  and `edit` becomes the only editor, so batched and line-addressed edits are
+  unavailable in this arm. The close-and-continue **think ceiling is OFF** here (the full
+  arm defaults it to 384): force-closing `</think>` mid-generation is harness scaffolding,
+  and this arm exists to measure its absence — set `CHAD_THINK_CEILING` to re-arm it.
+  Because `read`/`grep` carry guarantees of their own, lean
+  starts with a small set of bash-route levers ON (`levers.LEAN_DEFAULTS` — see
+  [Harness levers](#harness-levers--model-profiles)); `CHAD_ENABLE`/`CHAD_DISABLE`
+  still add and subtract on top, so
+  leave-one-out stays a valid arm inside lean. Distinct from `CHAD_HIDE_TOOLS`, which
+  subtracts named tools but keeps the full system prompt.
 - **`CHAD_NO_VALIDATE`** — **disables** the typia-style lenient-parse → typed-validate →
   self-repair loop for tool-call arguments (`validate.py`), falling back to a strict
   `json.loads` plus a terse missing-required check. This *weakens* input handling (malformed
