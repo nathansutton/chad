@@ -31,7 +31,7 @@ from typing import Any, List, Optional, Tuple
 from . import config
 from .tools import active_schemas
 
-# A/B knob (mirrors CHAD_NO_SYMBOLS), the single source of truth for both the
+# A/B knob, the single source of truth for both the
 # typed-validate path here and the lenient tool-call parse in toolcall_parse.py.
 # With CHAD_NO_VALIDATE set, callers bypass the typia-style lenient-parse +
 # typed-validate + self-repair loop and fall back to strict json.loads + the terse

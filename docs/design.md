@@ -142,67 +142,34 @@ So where a trimmable model would lean on PLD and partial-prefix repair, chad lea
 append-only reuse + a warm on-disk base — and gets the responsive agentic loop anyway.
 Implementation lives in `engine.py` (`_trimmable`, `warm_prefix`, the prefix diff).
 
-## Why a language server matters — *more* on a small model
+## Why the tool surface is five tools
 
-A frontier model can often hold a repo's structure in its head: it reads a few files,
-infers the call graph, and keeps "which `save()` is the method and which is the free
-function" straight while it works. A 35B model on a laptop can't. It has weaker reasoning
-*and* a smaller context window where — as the whole prefill argument above shows — every
-extra token it reads to orient itself is wall-clock you pay for. So the two things a small
-local model is worst at, **navigation** and **context economy**, are exactly the two
-things a language server fixes. That makes the LSP layer disproportionately valuable here:
-it's not a nicety, it's how a small model navigates a real repo without flailing.
+chad 2.0.0 exposes exactly `bash`, `edit`, `write`, `write_todos`, and `done`. The
+1.x releases carried a much larger surface — dedicated `read`/`grep`/`glob`, a
+line-addressed edit family, a tree-sitter repo map, and an LSP-precise symbolic
+layer — and a registry of ~56 behavioral levers around it. All of it was measured
+against the bare loop, repeatedly, with pre-registered paired contrasts, and none of
+it beat the model plus a shell: trace measurement showed the model routes its
+searching through `bash` regardless of what else is on the schema (routing follows
+the trained prior, and steering text does not move it), and the lever packs all
+landed inside the two-bare-arm null band.
 
-chad's code intelligence is a **two-phase symbolic stack**, deliberately split by what
-each phase is good at:
+So the design leans into the route the model actually takes:
 
-- **Structure (tree-sitter, `repomap.py`).** Fast and language-agnostic. `repo_map` ranks
-  every definition with a built-in PageRank over the file→symbol reference graph;
-  `overview` / `find_symbol` / `view_symbol` / `find_refs` read one symbol at a time. This
-  is the cheap, always-available skeleton.
-- **Precision (chad's own LSP client, `lspclient.py` + `lspservers.py` + `lsp.py`).**
-  Semantic resolution that name-matching *cannot* give: true go-to-definition,
-  cross-file find-all-references that follow imports, respect scoping, and don't
-  confuse a method with an unrelated function of the same name, hover types, and
-  post-edit typecheck diagnostics. The client is ~350 lines of chad-owned JSON-RPC
-  with zero language knowledge; which server speaks for which language is *data* in
-  `lspservers.py` (the nvim-lspconfig shape) — pyright via uvx for Python, the
-  TypeScript 7 native LSP via npx, gopls / rust-analyzer / clangd from PATH. Servers
-  start **lazily** on first use, bound to one project root.
-
-Why each of those earns its place specifically on a *small* model:
-
-- **Fewer steps = less prefill = less dead air.** Every grep-and-read the model does to
-  answer "where is this defined / who calls this" appends tokens to the transcript, and
-  prefill is the bill (see the top of this doc). A `find_refs` that returns the three
-  real call sites replaces a flailing sequence of greps and full-file reads, and a
-  `rename_symbol` that rewrites every call site in one call replaces a long, error-prone
-  grep-and-edit loop — fewer steps, fewer transcripts re-prefilled.
-- **Deterministic ground truth the model doesn't have to reason about.** A small model
-  genuinely confuses two same-named symbols. The `repo_map`/`overview` output annotates
-  each definition with a short **"used by …" hint** pulled from the LSP, so the model can
-  tell them apart *at a glance* instead of guessing — disambiguation baked into the map
-  rather than left to weak reasoning.
-- **All-or-nothing correctness on multi-site edits.** A rename that misses one of eight
-  call sites is a broken build, and a small model doing it by grep+edit *will* miss one.
-  `rename_symbol` follows scope and renames every site or none.
-
-**Ships by default, never a hard dependency.** The precision layer is in the base
-install — no extra, no vendored language server. `uvx chad-code` itself proves uv is
-installed, so Python precision (pyright via `uvx`) works on the primary install path
-with zero configuration; other languages light up when their server is on PATH or
-fetchable via npx. If a server can't start — no Node, offline, unsupported language,
-or a project missing its honesty gate (a C++ tree without `compile_commands.json`, a
-TS tree without a `tsconfig`) — every caller falls back to the tree-sitter backend,
-which labels its references NAME-MATCH ONLY instead of lying with confidence. The
-LSP is a precision *upgrade*, and the harness runs fine without it.
-
-The honest payoff is **reliability, not raw prefill savings**. On a small repo a capable
-model can often just `grep` its way to a name-greppable symbol, so the symbolic tools don't
-necessarily cut prefill there — what they buy is fewer flailing steps and a rename that's
-correct at every call site instead of one that misses the eighth. The win grows with the
-repo: once a name is shared across dozens of look-alikes, `grep` drowns and precise
-resolution is the only thing that lands.
+- **The model already knows the unix toolbox.** `rg`, `sed -n`, `wc -l`, the
+  project's own test runner — these are in pretraining. Every chad-specific dialect
+  had to be taught in-context, which costs prompt tokens and which the model then
+  mostly declined to use.
+- **The harness's knowledge lives in the result channel, not in more tools**
+  (`ambient.py`). Eight levers — all ON, each ablatable via `CHAD_DISABLE` — make
+  the bash route more honest and more informative: a first read of a source file
+  carries a one-line symbol map, an empty grep explains which pipeline stage came up
+  empty, a trimmed test run keeps its failure rows verbatim, a failed edit shows the
+  first character where the sent text diverges from the file.
+- **One editor, exact-match.** `edit` (old → new, unique match) is the editing
+  dialect every model knows. It recovers mechanically from the two dominant
+  near-misses (literal `\n` escapes; indentation drift) without ever risking a
+  wrong edit — each recovery still requires a unique match.
 
 ## Architecture
 
@@ -213,16 +180,16 @@ src/chad/        importable package (uv installs it as the `chad` console script
   cli.py         argument parsing + the one entrypoint (chad.cli:main)
   agent.py       agentic loop + guardrails
   engine.py      MLX inference + persistent prefix cache
-  tools.py       bash/read/write/edit/glob/grep toolset
+  tools.py       the bash/edit/write toolset
   tui.py         full-screen prompt_toolkit UI
-  ...            prompt, render, repomap, symbols, lsp, validate, … (modular)
+  ...            prompt, render, ambient, repomap, validate, … (modular)
 tests/           pytest suites (uv run pytest)
 ```
 
 ```
 cli.py ──▶ agent.py (agentic loop + guardrails) ──▶ engine.py (MLX + persistent prefix cache)
                  │                                          │
-                 └─ tools.py (bash/read/write/edit/glob/grep)
+                 └─ tools.py (bash/edit/write)
 ```
 
 - **engine.py** — loads Ornith once, keeps its KV cache alive across turns, and on every

@@ -33,49 +33,21 @@ from chad import guardrails, prompt, validate
 _JSON_CALL = re.compile(r'\{\s*["\']name["\']\s*:\s*["\'][a-z_]+["\']')
 
 
-def _model_facing_prompts():
-    """Every system prompt chad renders, by name."""
-    return {
-        "main": prompt.build_system_prompt(),
-        "subagent": prompt.build_subagent_prompt(),
-    }
-
-
-@pytest.mark.parametrize("lean", [False, True])
-def test_no_prompt_teaches_the_json_call_form(lean, monkeypatch, tmp_path):
+def test_no_prompt_teaches_the_json_call_form(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    if lean:
-        monkeypatch.setenv("CHAD_LEAN", "1")
-    else:
-        monkeypatch.delenv("CHAD_LEAN", raising=False)
-    for name, text in _model_facing_prompts().items():
-        assert not _JSON_CALL.search(text), (
-            f"the {name} prompt (lean={lean}) shows a JSON-dialect tool call, which the "
-            f"chat template rendered directly above it forbids")
+    text = prompt.build_system_prompt()
+    assert not _JSON_CALL.search(text), (
+        "the system prompt shows a JSON-dialect tool call, which the chat "
+        "template rendered directly above it forbids")
 
 
-@pytest.mark.parametrize("lean", [False, True])
-def test_prompts_point_at_the_template_dialect(lean, monkeypatch, tmp_path):
+def test_prompts_point_at_the_template_dialect(monkeypatch, tmp_path):
     """Not naming the wrong dialect is half of it; the model must still be told which
     format is real, because chad's own contribution here — that a fenced code block
     executes nothing — only makes sense next to what a real call looks like."""
     monkeypatch.chdir(tmp_path)
-    if lean:
-        monkeypatch.setenv("CHAD_LEAN", "1")
-    else:
-        monkeypatch.delenv("CHAD_LEAN", raising=False)
     text = prompt.build_system_prompt()
     assert "<function=" in text and "<parameter=" in text
-
-
-def test_the_garble_exemplar_is_in_the_template_dialect():
-    """The exemplar fires on the second consecutive garble — the moment the model is
-    demonstrably confused about the format. It must show the format the template
-    mandates, and must not forbid it."""
-    ex = guardrails.TOOLCALL_EXEMPLAR
-    assert "<function=bash>" in ex and "<parameter=command>" in ex
-    assert not _JSON_CALL.search(ex)
-    assert "No <function=" not in ex
 
 
 def test_repair_messages_never_teach_the_json_form():

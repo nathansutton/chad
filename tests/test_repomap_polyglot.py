@@ -1,23 +1,14 @@
-"""Polyglot coverage for the tree-sitter substrate (tests/fixtures/polyglot).
+"""Polyglot coverage for the tree-sitter tags substrate (tests/fixtures/polyglot).
 
-The repo map claims language-agnostic symbol intelligence via the language pack's
-grammars, yet until this file every repo-map fixture was Python. Each fixture
-language carries the same three deliberate cases:
-
-  * a class method whose bare name collides with a free function elsewhere
-    (`Engine.process` vs `process`) — the qualified-path case,
-  * a cross-file reference through an import (`helper` defined in lib, called in
-    app) — the precision case,
-  * the same name defined in two files — the disambiguation case.
-
-First measurement (2026-07-29) found the pack's tags queries broken or missing for
-4 of 12 languages — typescript/tsx (no query at all), php (query names a node type
-the current grammar renamed), c (no reference captures; header prototypes tagged
-as definitions), cpp (out-of-class `Engine::process` invisible) — fixed by chad's
+The bash-route ambient levers (bash_read_skeleton's one-line symbol map and its
+definition pointer) claim language-agnostic extraction via the language pack's
+grammars. First measurement (2026-07-29) found the pack's tags queries broken or
+missing for 4 of 12 languages — typescript/tsx (no query at all), php (query
+names a node type the current grammar renamed), c (no reference captures), cpp
+(out-of-class `Engine::process` invisible) — fixed by chad's
 `repomap._TAGS_OVERRIDE`, which also adds bash outright (the pack ships no bash
-query; 89 of 91 terminal-bench-2.1 tasks contain shell). This test pins all 13
-languages so a language-pack bump that breaks a grammar's tags surfaces here, not
-in an agent run.
+query). This pins all 13 languages so a language-pack bump that breaks a
+grammar's tags surfaces here, not in an agent run.
 
 No model, no language server, no network; runs in the fast gate.
 """
@@ -72,71 +63,10 @@ def test_definitions_extracted(lang):
 
 
 @pytest.mark.parametrize("lang", sorted(LANGS))
-def test_find_and_view_symbol(lang):
-    helper, _process, run, _container, lib, app = LANGS[lang]
-    rm = _map_for(lang)
-    fs = rm.find_symbol(helper)
-    assert lib in fs, fs
-    vs = rm.view_symbol(run)
-    assert vs.startswith(f"{app}:"), vs
-    assert process_call_present(vs, lang), vs
-
-
-def process_call_present(view, lang):
-    """The viewed `run` body must contain the call into Engine's method — the span
-    is real code, not a header-only stub."""
-    needle = {"go": "e.Process(", "csharp": ".Process(", "c": "engine_process(",
-              "php": "->process(", "bash": "engine_process "}.get(lang, ".process(")
-    return needle in view
-
-
-@pytest.mark.parametrize("lang", sorted(LANGS))
-def test_cross_file_refs(lang):
-    """`helper` is defined in lib and called in app: find_refs must return the
-    cross-file hit (name-match honesty label is fine; missing the hit is not)."""
-    helper, _process, _run, _container, _lib, app = LANGS[lang]
-    rm = _map_for(lang)
-    fr = rm.find_refs(helper)
-    assert app in fr, fr
-
-
-@pytest.mark.parametrize("lang", sorted(LANGS))
-def test_definition_resolves_to_the_defining_file(lang):
-    """`definition(helper)` must land on lib, where helper is defined — resolved
-    from its use in app. No language server is installed in the fast gate, so this
-    exercises the tree-sitter fallback; either way the answer must name lib and
-    must state which precision it is (confidence honesty)."""
+def test_find_defs_resolves_the_helper(lang):
+    """_find_defs — the engine behind the ambient definition pointer — locates the
+    cross-file helper in every language."""
     helper, _process, _run, _container, lib, _app = LANGS[lang]
     rm = _map_for(lang)
-    out = rm.definition(helper)
-    assert lib in out, out
-    assert ("precise (language server" in out) or ("NAME-MATCH ONLY" in out), out
-
-
-@pytest.mark.parametrize("lang", sorted(LANGS))
-def test_definition_use_site_is_a_use_not_the_definition(lang):
-    """The site `definition` asks the language server about must be a USE of the
-    symbol. Asking at the definition is the bug this guards: go-to-definition
-    there answers with itself (or nothing), which would silently strand every
-    lookup on the name-match fallback."""
-    helper, _process, _run, _container, lib, app = LANGS[lang]
-    rm = _map_for(lang)
-    site = rm._use_site(helper)
-    assert site is not None, "no use site found for %s" % helper
-    rel, row, col = site
-    assert rel == app, site  # helper is *called* in app, *defined* in lib
-    with open(os.path.join(FIXTURES, lang, rel), errors="replace") as fh:
-        line = fh.read().splitlines()[row]
-    assert line[col:col + len(helper)] == helper, (line, col)
-    assert lib != rel
-
-
-@pytest.mark.parametrize("lang", sorted(LANGS))
-def test_same_name_two_files_disambiguates(lang):
-    """The colliding name is defined in two files; a bare view_symbol must return
-    the disambiguation listing naming both, not silently pick one."""
-    _helper, process, _run, _container, lib, app = LANGS[lang]
-    rm = _map_for(lang)
-    out = rm.view_symbol(process)
-    assert "pass path= to disambiguate" in out, out
-    assert lib in out and app in out, out
+    hits = rm._find_defs(helper)
+    assert any(d.rel == lib for d in hits), hits

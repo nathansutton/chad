@@ -159,34 +159,11 @@ def test_is_err_ignores_legitimate_output():
     check("bracketed non-error not flagged", _is_err("[replaced foo (3 lines)]") is False)
 
 
-def test_render_read_of_bracket_content_is_not_error():
-    # Snapshot: reading a file that starts with `[` and mentions 'error' downstream shows
-    # a line count (muted), NOT the red error line.
-    content = '[\n  {"status": "error"},\n  {"status": "ok"}\n]'
-    events = _emits("read", {}, content)
-    check("read snapshot is a line count", events == [("muted", "  ⎿ 4 lines")], repr(events))
-
-
 def test_render_real_error_uses_error_style():
     # Snapshot: a genuine error result emits a single 'error' event with the first line.
     events = _emits("read", {}, "[no such file: /x/y.py]")
     check("error snapshot uses error kind",
           events == [("error", "  ⎿ no such file: /x/y.py")], repr(events))
-
-
-def test_render_glob_no_matches_is_zero_files():
-    # "[no matches]" is one line of text but zero files — it used to render "1 file".
-    events = _emits("glob", {}, "[no matches]")
-    check("glob no-matches shows 0 files", events == [("muted", "  ⎿ 0 files")], repr(events))
-
-
-def test_render_grep_notice_lines_not_counted():
-    # The truncation notice contains a ":" but is not a match; only path:line: hits count.
-    result = ("./a.py:1: NEEDLE\n./a.py:2: NEEDLE\n"
-              "[results truncated: 2/500 lines — narrow the pattern or add a path]")
-    events = _emits("grep", {}, result)
-    check("grep summary excludes notices",
-          events == [("muted", "  ⎿ 2 matches in 1 file")], repr(events))
 
 
 if __name__ == "__main__":

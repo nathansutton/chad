@@ -72,13 +72,6 @@ def confirm_preview(name: str, args: dict, max_lines: int = 6) -> str:
     if name == "edit":
         return (f"{args.get('path','?')}\n  - {clip(args.get('old',''))}"
                 f"\n  + {clip(args.get('new',''))}")
-    if name in ("replace_symbol", "insert_symbol"):
-        body = args.get("new") or args.get("code") or ""
-        loc = args.get("name", "?") + (f" in {args['path']}" if args.get("path") else "")
-        return f"{loc}\n{head(body)}"
-    if name == "rename_symbol":
-        loc = f" in {args['path']}" if args.get("path") else ""
-        return f"{args.get('name','?')} → {args.get('new_name','?')}{loc}"
     if name.startswith("mcp__"):
         # An MCP tool can do anything (write files, hit an API, send a message); show
         # its full arguments so the approval is informed.
@@ -200,9 +193,7 @@ class _StreamView:
 # (so the spinner can show the right verb during a slow command); result() after.
 # ---------------------------------------------------------------------------
 
-_VERB = {"read": "Read", "edit": "Edit", "write": "Write", "bash": "Run",
-         "grep": "Search", "glob": "Find", "write_todos": "Plan",
-         "repo_map": "Mapping", "task": "Task"}
+_VERB = {"edit": "Edit", "write": "Write", "bash": "Run", "write_todos": "Plan"}
 
 
 def _disp_path(p) -> str:
@@ -279,34 +270,12 @@ def _emit_diff(emit, old: str, new: str, max_lines: int = 30, filename: str = ""
 
 def render_tool_start(emit, name: str, args: dict):
     """One-line header shown before the tool executes."""
-    if name == "read":
-        emit("tool", f"Read {_disp_path(args.get('path', ''))}")
-    elif name in ("edit", "write"):
+    if name in ("edit", "write"):
         emit("tool", f"{_VERB[name]} {_disp_path(args.get('path', ''))}")
     elif name == "bash":
         emit("tool", f"Run  {_oneline(args.get('command', ''))}")
-    elif name == "grep":
-        emit("tool", f"Search {_oneline(args.get('pattern', ''), 50)!r}")
-    elif name == "glob":
-        emit("tool", f"Find {_oneline(args.get('pattern', ''), 50)}")
     elif name == "write_todos":
         emit("tool", "Plan")
-    elif name == "task":
-        emit("tool", f"Task {_oneline(args.get('description', ''), 50)}")
-    elif name == "overview":
-        emit("tool", f"Overview {_disp_path(args.get('path', ''))}")
-    elif name == "view_symbol":
-        emit("tool", f"View {args.get('name', '')}")
-    elif name == "find_symbol":
-        emit("tool", f"Find {args.get('name', '')}")
-    elif name == "definition":
-        emit("tool", f"Def {args.get('name', '')}")
-    elif name == "find_refs":
-        emit("tool", f"Refs {args.get('name', '')}")
-    elif name in ("replace_symbol", "insert_symbol"):
-        emit("tool", f"Edit {args.get('name', '')}")
-    elif name == "rename_symbol":
-        emit("tool", f"Rename {args.get('name', '')} → {args.get('new_name', '')}")
     elif name.startswith("mcp__"):
         # mcp__<server>__<tool> -> "MCP server/tool {args…}" so a trace reads cleanly.
         bits = name[len("mcp__"):].split("__", 1)
@@ -319,44 +288,10 @@ def render_tool_start(emit, name: str, args: dict):
 def render_tool_result(emit, name: str, args: dict, result: str):
     """Compact summary shown after the tool returns."""
     result = str(result)
-    # Symbolic edits: result is "[summary]\n<unified diff>" on success.
-    if name in ("replace_symbol", "insert_symbol"):
-        if result.startswith(("[replaced", "[inserted")):
-            head, _, body = result.partition("\n")
-            emit("muted", "  ⎿ " + _firstline(head))
-            for d in body.split("\n")[:40]:
-                if d.startswith("+"):
-                    emit("add", "  + " + d[1:])
-                elif d.startswith("-"):
-                    emit("del", "  - " + d[1:])
-                elif d:
-                    emit("muted", "    " + d)
-        else:
-            emit("error", "  ⎿ " + _firstline(result))
-        return
-    if name == "rename_symbol":
-        emit("muted" if result.startswith("[renamed") else "error",
-             "  ⎿ " + _firstline(result))
-        return
     if _is_err(result):
         emit("error", "  ⎿ " + _firstline(result))
         return
-    if name == "read":
-        n = _nlines(result)
-        emit("muted", f"  ⎿ {n} line{'s' * (n != 1)}")
-    elif name == "view_symbol":
-        n = _nlines(result)
-        emit("muted", f"  ⎿ {n} line{'s' * (n != 1)}")
-    elif name == "overview":
-        n = _nlines(result)
-        emit("muted", f"  ⎿ {n} symbol{'s' * (n != 1)}")
-    elif name in ("find_symbol", "definition"):
-        n = _nlines(result)
-        emit("muted", f"  ⎿ {n} definition{'s' * (n != 1)}")
-    elif name == "find_refs":
-        n = _nlines(result)
-        emit("muted", f"  ⎿ {n} reference{'s' * (n != 1)}")
-    elif name == "edit":
+    if name == "edit":
         _emit_diff(emit, args.get("old", ""), args.get("new", ""),
                    filename=str(args.get("path", "")))
     elif name == "write":
@@ -365,30 +300,6 @@ def render_tool_result(emit, name: str, args: dict, result: str):
         _emit_diff(emit, "", content, max_lines=12, filename=str(args.get("path", "")))
     elif name == "bash":
         _indent_block(emit, result)
-    elif name == "task":
-        n = _nlines(result)
-        emit("muted", f"  ⎿ sub-agent returned {n} line{'s' * (n != 1)}")
-        _indent_block(emit, result, max_lines=4)
-    elif name == "grep":
-        # `[`-leading lines are notices ("[results truncated: …]"), not hits. Two
-        # result shapes exist: the flat `path:line: text` stream, and the per-file
-        # numbered rendering (`path:` header, then read-style numbered rows where a
-        # `*` marker distinguishes match rows from interleaved context lines).
-        rows = [l for l in result.splitlines()
-                if l and l != "--" and not l.startswith("[")]
-        headers = [l for l in rows if re.match(r"^\S.*:$", l)]
-        if headers:
-            starred = sum(1 for l in rows if re.match(r"^\s*\d+\* ", l))
-            numbered = sum(1 for l in rows if re.match(r"^\s*\d+[* ] ", l))
-            files, n = len(headers), (starred or numbered)
-        else:
-            lines = [l for l in rows if ":" in l]
-            files = len({l.split(":", 1)[0] for l in lines})
-            n = len(lines)
-        emit("muted", f"  ⎿ {n} match{'es' * (n != 1)} in {files} file{'s' * (files != 1)}")
-    elif name == "glob":
-        n = 0 if result == "[no matches]" else _nlines(result)
-        emit("muted", f"  ⎿ {n} file{'s' * (n != 1)}")
     elif name == "write_todos":
         for line in result.splitlines()[1:]:  # drop the "Plan updated:" header
             emit("muted", "  " + line.strip())

@@ -1,30 +1,20 @@
 """Ambient state for the result channel.
 
-Trace measurement showed the model routes ~83% of its searching through `bash` and
-calls the symbolic tools ~never, under a system prompt that already tells it not
-to — routing follows the model's trained prior, and steering text does not move
-it. The inversion implemented here: leave the model on the route it chose and
-make the harness's knowledge ambient IN that route — facts appended to results
-the model already reads, never a new tool, never an admonition, never a blocked
-command.
+Trace measurement showed the model routes its searching through `bash` under
+any tool surface — routing follows the model's trained prior, and steering text
+does not move it. The design here leans into that: the harness's knowledge is
+made ambient IN the bash route — facts appended to results the model already
+reads, never a new tool, never an admonition, never a blocked command.
 
-Five levers, each with its own trace-measured target. Default OFF under the
-1.10.0 contract, except where `levers.LEAN_DEFAULTS` re-arms the bash-route ones
-for an arm that has no dedicated read/grep tools to carry them:
+Each lever has its own trace-measured target (all default ON; see levers.py):
 
   env_manifest        session-start toolchain/package/search-toolbox inventory in
                       the system prompt tail. Target: the environment-probe class
                       (which/--version/pip list…), measured fail-enriched at
                       3.33/trial in fails vs 2.46 in passes, 37% failing.
-  session_ledger      one cumulative fact line — what changed, what was created,
-                      when something was last actually run — appended to landed
-                      mutation results and to done bounces. Target: the
-                      wrong-verify/confident-wrong-done class (the #1 measured
-                      fail bucket) read as a state-visibility gap, plus blind
-                      re-reads (21.8% of reads; fail 1.20 vs pass 0.86/trial).
   bash_read_skeleton  a one-line symbol map appended the first time a source
-                      file's content comes back through bash cat/sed/head or
-                      `read`, and a definition pointer when a bash grep for a
+                      file's content comes back through bash cat/sed/head,
+                      and a definition pointer when a bash grep for a
                       known symbol comes back empty. Target: blind re-reads and
                       the product story (structure ambient in the channel a
                       shell-native model actually uses).
@@ -38,17 +28,15 @@ for an arm that has no dedicated read/grep tools to carry them:
                       a measured run spent working out which failures pre-dated
                       its first edit.
 
-STATE is module-global and session-scoped, like tools._FILE_SEEN: one chad
-process is one session. `Agent.__init__` resets it for a fresh main agent;
-sub-agents never feed it (they are read-only and their transcript folds away).
-Bookkeeping runs even while the levers are OFF — the eval harness flips
-CHAD_ENABLE between tasks in-process, and a lever enabled mid-session must see
-true state, not state that started when it did. With every lever OFF the
-annotate path returns its input byte-identically.
+STATE is module-global and session-scoped: one chad process is one session.
+`Agent.__init__` resets it for a fresh session. Bookkeeping runs even while a
+lever is disabled — the eval harness flips CHAD_DISABLE between tasks
+in-process, and a lever enabled mid-session must see true state. With every
+lever disabled the annotate path returns its input byte-identically.
 
 The confabulation rule: every line states observable facts in
 past tense with its provenance ("last verifying run: …"), never an instruction
-and never a claim about correctness — a ledger line must not be quotable as
+and never a claim about correctness — an ambient line must not be quotable as
 verification the model didn't perform.
 """
 
@@ -80,20 +68,18 @@ _edited: dict[str, set] = {}     # rel path -> symbol names (empty set = file-le
 _wrote: list = []                # rel paths written whole (order kept, deduped)
 _last_run: dict | None = None    # {"call": int, "head": str, "exit": int}
 _baselines: dict = {}            # run key -> the run's outcome BEFORE any edit landed
-_last_ledger_key: str = ""       # dedup key of the last emitted ledger line
 _skeleton_shown: set = set()     # abs paths whose skeleton line already rode a result
 _manifest_cache: str | None = None
 
 
 def reset() -> None:
     """Fresh session (a new main Agent). Clears all ambient bookkeeping."""
-    global _calls, _last_run, _last_ledger_key, _manifest_cache
+    global _calls, _last_run, _manifest_cache
     _calls = 0
     _baselines.clear()
     _edited.clear()
     _wrote.clear()
     _last_run = None
-    _last_ledger_key = ""
     _skeleton_shown.clear()
     _manifest_cache = None
 
@@ -104,9 +90,7 @@ def reset() -> None:
 
 _ERROR_SENTINELS = ("[exit", "[timed out", "[interrupted", "[failed to launch")
 _EXIT_RE = re.compile(r"^\[exit (-?\d+)\]")
-_EDIT_TOOLS = ("edit", "replace_lines", "insert_lines")
-_SYMBOL_EDIT_PREFIX = {"replace_symbol": "[replaced", "insert_symbol": "[inserted",
-                       "rename_symbol": "[renamed"}
+_EDIT_TOOLS = ("edit",)
 
 
 def _rel(path: str) -> str:
@@ -166,10 +150,7 @@ def _run_key(bare: str) -> str:
 def _landed(name: str, result: str) -> bool:
     if name == "write":
         return result.startswith("[wrote")
-    if name in _EDIT_TOOLS:
-        return result.startswith("[edited")
-    prefix = _SYMBOL_EDIT_PREFIX.get(name)
-    return prefix is not None and result.startswith(prefix)
+    return name in _EDIT_TOOLS and result.startswith("[edited")
 
 
 def note_call(name: str, args: dict, result: str) -> None:
@@ -185,14 +166,9 @@ def note_call(name: str, args: dict, result: str) -> None:
                 _wrote.append(rel)
             _edited.pop(rel, None)  # a whole-file write supersedes prior edit facts
         else:
-            sym = str(args.get("name", "") or "")  # symbolic edits carry the symbol
             rel = _rel(path) if path else ""
-            if not rel and sym:
-                rel = "?"  # symbol edit resolved by name alone; file unknown here
             if rel:
                 _edited.setdefault(rel, set())
-                if sym:
-                    _edited[rel].add(sym)
         return
     if name == "bash":
         from . import guardrails
@@ -220,60 +196,6 @@ def note_call(name: str, args: dict, result: str) -> None:
             # baseline is never recalled against an `ava` failure.
             _baselines[key] = {"call": _calls, "exit": _last_run["exit"],
                                "summary": _summary_lines(result)}
-
-
-# ---------------------------------------------------------------------------
-# E2 — session ledger
-# ---------------------------------------------------------------------------
-
-def _ledger_body() -> tuple[str, str]:
-    """(line, dedup_key). The dedup key excludes the calls-ago counter, so an
-    unchanged state is elided even though the counter ticks."""
-    parts = []
-    if _edited:
-        ent = []
-        for rel, syms in list(_edited.items())[:6]:
-            shown = sorted(syms)[:2]
-            ent.append(rel + ("·" + ",".join(f"{s}()" for s in shown) if shown else ""))
-        if len(_edited) > 6:
-            ent.append(f"+{len(_edited) - 6} more")
-        parts.append("edited: " + ", ".join(ent))
-    if _wrote:
-        shown = _wrote[:4]
-        more = f" +{len(_wrote) - 4} more" if len(_wrote) > 4 else ""
-        parts.append("wrote: " + ", ".join(shown) + more)
-    if not parts:
-        return "", ""
-    if _last_run is None:
-        run = "no verifying run yet"
-        key_run = run
-    else:
-        ago = _calls - _last_run["call"]
-        status = "exit 0" if _last_run["exit"] == 0 else f"exit {_last_run['exit']}"
-        ago_txt = "this call" if ago == 0 else f"{ago} call{'s' if ago > 1 else ''} ago"
-        run = f"last verifying run: {ago_txt} ({_last_run['head']} → {status})"
-        key_run = f"run@{_last_run['call']}:{status}"
-    line = " · ".join(parts + [run])
-    if len(line) > _LEDGER_MAX:
-        line = line[: _LEDGER_MAX - 1] + "…"
-    return line, " · ".join(parts) + "|" + key_run
-
-
-def ledger_suffix(step: int | None = None, force: bool = False) -> str:
-    """The `[session]` fact line to append, or "". Emits only when the lever is
-    on and the state changed since the last emission (`force` bypasses the dedup
-    for done-time bounces, where restating current facts is the point)."""
-    global _last_ledger_key
-    if not levers.enabled("session_ledger"):
-        return ""
-    line, key = _ledger_body()
-    if not line:
-        return ""
-    if not force and key == _last_ledger_key:
-        return ""
-    _last_ledger_key = key
-    levers.fired("session_ledger", step=step)
-    return f"\n[session] {line}"
 
 
 # ---------------------------------------------------------------------------
@@ -375,14 +297,7 @@ def _skeleton_suffix(name: str, args: dict, result: str, step=None) -> str:
         return ""
     candidates: list = []
     zero_hit_ident = ""
-    if name == "read":
-        # Skip error sentinels and the big-file structure view (already a skeleton)
-        # and the paging lead (its nudge covers structure).
-        if not result.startswith("["):
-            p = str(args.get("path", "") or "")
-            if p and os.path.isfile(p):
-                candidates.append(p)
-    elif name == "bash":
+    if name == "bash":
         cmd = str(args.get("command", "") or "")
         if not result.startswith(("[timed out", "[interrupted", "[failed to launch")):
             candidates.extend(_opened_paths(cmd)[:2])
@@ -626,11 +541,8 @@ def annotate(name: str, args: dict, result: str, step: int | None = None) -> str
     the enabled levers owe it. With every lever OFF, returns `result` unchanged
     (byte-identical) — the bookkeeping still runs so a lever enabled mid-session
     sees true state."""
-    landed = _landed(name, result)
     note_call(name, args, result)
     suffix = ""
-    if landed:
-        suffix += ledger_suffix(step=step)
     suffix += _skeleton_suffix(name, args, result, step=step)
     suffix += _empty_suffix(name, args, result, step=step)
     suffix += _rg_replace_suffix(name, args, result, step=step)

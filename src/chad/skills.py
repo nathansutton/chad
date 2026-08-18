@@ -25,7 +25,7 @@ Agent / `/reset` starts so activations don't bleed across sessions.
 import os
 import re
 
-from . import config, levers
+from . import config
 from .diag import log, warn_footer
 from .ignore import IGNORE_DIRS
 
@@ -295,14 +295,9 @@ def has_skills() -> bool:
 # ---------------------------------------------------------------------------
 
 def _catalog_instructions() -> str:
-    """The behavioral header above the catalog. The reader it names has to be a tool the
-    current arm actually exposes: under CHAD_LEAN there is no `read`, and naming a tool
-    that isn't in the schema is the same staleness bug the workspace-map affordance
-    already fixes — the model either burns a call discovering it is gone or skips the
-    bundled resource entirely."""
-    reader = ("read those on demand from bash (`sed -n '1,120p' <file>`)"
-              if config.flag("CHAD_LEAN")
-              else "read those on demand with the `read` tool")
+    """The behavioral header above the catalog. The reader it names has to be a
+    tool the surface actually exposes — bash is the read route."""
+    reader = "read those on demand from bash (`sed -n '1,120p' <file>`)"
     return (
         "# Skills\n"
         "The following skills provide specialized instructions for specific tasks. Each "
@@ -320,31 +315,17 @@ def catalog_block(cwd: str = None) -> str:
     compact <available_skills> catalog, one `- name: description` line per skill.
     Returns "" when no skills are installed, so an empty block never confuses the model.
 
-    The catalog is the largest single block in the prompt — on a host with ~60 user
-    skills it measured 30k chars, 82% of the system prompt and 28% of a whole finished
-    task's context, which also swamps any prompt-size contrast an A/B arm is trying to
-    measure. Two thirds of the cut here is pure framing: the per-skill XML wrapper cost
-    more than the descriptions it wrapped, and `<location>` restated what `activate()`
-    already reports in its own header (skill directory + bundled-resource listing), so
-    dropping both loses no routing information. The descriptions themselves are left
-    intact — they ARE the trigger text the model matches a task against, and trimming
-    them would trade prompt size for worse skill selection. What remains after that cut
-    is the descriptions themselves, and on the same host they still measure 19k chars
-    across 62 skills — a median of 305 chars per row, so it is the distribution and not
-    a few outliers. `catalog_clip` (default OFF) is the arm for trimming them; the
-    contrast it has to win is skill SELECTION, not prompt size."""
+    The catalog framing is deliberately minimal: the per-skill XML wrapper this
+    replaced cost more than the descriptions it wrapped, and `<location>`
+    restated what `activate()` already reports. Descriptions are never trimmed —
+    they ARE the trigger text the model matches a task against, and clipping
+    them trades prompt size for worse skill selection."""
     reg = get_registry() if cwd is None else _Registry(cwd)
     if not reg.order:
         return ""
     lines = ["\n\n" + _catalog_instructions(), "<available_skills>"]
-    clipped = 0
     for name in reg.order:
-        full = _one_line(reg.by_name[name].description)
-        row = _clip_description(full)
-        clipped += row != full
-        lines.append(f"- {name}: {row}")
-    if clipped:
-        levers.fired("catalog_clip", rows=clipped, skills=len(reg.order))
+        lines.append(f"- {name}: {_one_line(reg.by_name[name].description)}")
     lines.append("</available_skills>")
     return "\n".join(lines)
 
@@ -352,31 +333,6 @@ def catalog_block(cwd: str = None) -> str:
 def _one_line(text: str) -> str:
     """Collapse whitespace so a multi-line description stays on one catalog line."""
     return " ".join(text.split())
-
-
-# Where one catalog row stops. Whole sentences only: a description is trigger text the
-# model matches a task against, and a row cut mid-clause can read as a different trigger
-# than the author wrote. The first sentence is always kept whatever its length (it is the
-# trigger in every description measured — median 56 chars), and later sentences are kept
-# while they fit; what a long row loses is the procedure/detail tail, which `activate()`
-# serves in full anyway. Measured over 62 installed skills: 19.0k chars → 9.8k, with 34
-# rows clipped and every one of them still a complete, well-formed sentence.
-CATALOG_ROW_CHARS = 260
-_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
-
-
-def _clip_description(text: str) -> str:
-    """`text` reduced to whole sentences within the row budget, or unchanged when the
-    lever is off or it already fits."""
-    if not levers.enabled("catalog_clip") or len(text) <= CATALOG_ROW_CHARS:
-        return text
-    parts = _SENTENCE_SPLIT.split(text)
-    out = parts[0]
-    for part in parts[1:]:
-        if len(out) + 1 + len(part) > CATALOG_ROW_CHARS:
-            return out + " …"
-        out += " " + part
-    return out
 
 
 def _list_resources(base_dir: str, skill_md: str):

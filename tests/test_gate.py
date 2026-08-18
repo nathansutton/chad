@@ -95,9 +95,9 @@ def _plan_gate(mode, name, args):
 def test_is_mutating_covers_every_mutator():
     """The gate's blocking arm keys off is_mutating; pin the set it screens so a tool that
     silently drops out of MUTATING (and thus past the plan-mode block) is caught here."""
-    for name in ("bash", "write", "edit", "replace_symbol", "insert_symbol", "rename_symbol"):
+    for name in ("bash", "write", "edit"):
         check(f"{name} is mutating", is_mutating(name) is True, name)
-    for name in ("read", "grep", "glob", "repo_map", "find_symbol", "done"):
+    for name in ("write_todos", "done", "activate_skill"):
         check(f"{name} is NOT mutating", is_mutating(name) is False, name)
 
 
@@ -112,8 +112,6 @@ def test_plan_mode_blocks_mutating_tools():
           _plan_gate("plan", "write", {"path": "src/chad/agent.py"}) == "blocked")
     check("plan: `..` escape write blocked",
           _plan_gate("plan", "write", {"path": "plans/../src/x.py"}) == "blocked")
-    check("plan: symbol edit blocked",
-          _plan_gate("plan", "replace_symbol", {"path": "plans/x.md"}) == "blocked")
 
     # Allowed in plan mode (the one escape hatch):
     check("plan: write under ./plans/ allowed",
@@ -175,7 +173,7 @@ def test_confirm_headless_block_sets_truthful_deny_reason(monkeypatch):
     """The headless guard block must hand the MODEL a truthful explanation via
     `_deny_reason` (the dispatch site substitutes it for '[denied by user]'): the bare
     denial reads as a human refusal, and the measured trace is a model re-phrasing the
-    same delete 30 times against it. Lever OFF restores the bare text (reason unset)."""
+    same delete 30 times against it."""
     monkeypatch.delenv("CHAD_NO_DESTRUCTIVE_GUARD", raising=False)
     monkeypatch.delenv("CHAD_DISABLE", raising=False)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
@@ -184,11 +182,6 @@ def test_confirm_headless_block_sets_truthful_deny_reason(monkeypatch):
     check("deny reason names the guard, not the user",
           agent._deny_reason is not None and "destructive-command guard" in agent._deny_reason,
           agent._deny_reason)
-    monkeypatch.setenv("CHAD_DISABLE", "scoped_destructive_guard")
-    agent2 = _mk_agent(mode="yolo")
-    check("lever OFF: still blocks", agent2._confirm("bash", {"command": _RM_HOME}) is False)
-    check("lever OFF: bare '[denied by user]' preserved (no reason set)",
-          agent2._deny_reason is None, agent2._deny_reason)
 
 
 def test_confirm_guard_opt_out(monkeypatch):
@@ -208,8 +201,7 @@ def test_auto_mode_approves_edits_without_prompting():
     consulted and _confirm returns True on its own."""
     calls = []
     agent = _mk_agent(mode="auto", confirm=lambda n, a: calls.append(n) or True)
-    for name in ("write", "edit", "replace_lines", "insert_lines",
-                 "replace_symbol", "insert_symbol", "rename_symbol"):
+    for name in ("write", "edit"):
         check(f"auto approves {name} silently",
               agent._confirm(name, {"path": "src/x.py"}) is True)
     check("no confirm channel consulted for edits", calls == [], calls)

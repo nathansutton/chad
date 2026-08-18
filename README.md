@@ -8,9 +8,10 @@
 > *Coding under supervision.*
 
 A single-user coding agent that runs **entirely locally on Apple Silicon** via
-[MLX](https://github.com/ml-explore/mlx). Claude-Code-style tool use (bash, read, write,
-edit, glob, grep), plan mode, and a full-screen TUI — driven by a local model on your
-laptop instead of a frontier model in a datacenter. No Docker, no API key, no model picker.
+[MLX](https://github.com/ml-explore/mlx). A deliberately lean, shell-first tool surface
+(bash, edit, write, a todo list, done), plan mode, and a full-screen TUI — driven by a
+local model on your laptop instead of a frontier model in a datacenter. No Docker, no
+API key, no model picker.
 
 ## Quickstart
 
@@ -142,9 +143,7 @@ re-downloads the model.
 
 **Development.** `uv sync` once, then `uv run pytest -q` — the fast unit gate loads **no
 model weights**, runs in seconds, and is what CI runs. Throughput on your own machine:
-`uv run chad-bench` (see [Throughput & performance](docs/benchmarks.md)). LSP-precise
-find-references / rename need no extra — chad fetches pyright via `uvx` on first use and
-falls back to tree-sitter when a language server can't start.
+`uv run chad-bench` (see [Throughput & performance](docs/benchmarks.md)).
 
 ## Interactive UX
 

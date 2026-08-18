@@ -34,13 +34,13 @@ def check(name, cond, detail=""):
 # --- Stage 1: lenient JSON repair --------------------------------------------
 def test_repair():
     cases = [
-        ('{"name": "read", "arguments": {"path": "a.py"}}', {"name": "read"}),  # clean
-        ('{"name": "read", "arguments": {"path": "a.py",}}', {"name": "read"}),  # trailing comma
+        ('{"name": "write", "arguments": {"path": "a.py", "content": "x"}}', {"name": "write"}),  # clean
+        ('{"name": "write", "arguments": {"path": "a.py",}}', {"name": "write"}),  # trailing comma
         ("{'name': 'read', 'arguments': {'path': 'a.py'}}", None),  # single quotes (not handled) -> bare-key path
-        ('{name: "read", arguments: {path: "a.py"}}', {"name": "read"}),  # bare keys
+        ('{name: "write", arguments: {path: "a.py"}}', {"name": "write"}),  # bare keys
         ('{"name": "done", "arguments": {"summary": "ok", "x": True}}', {"name": "done"}),  # py const
-        ('{"name": "grep", "arguments": {"pattern": "def foo"', None),  # truncated -> balanced
-        ('```json\n{"name": "glob", "arguments": {"pattern": "*.py"}}\n```', {"name": "glob"}),  # fenced
+        ('{"name": "bash", "arguments": {"command": "ls"', None),  # truncated -> balanced
+        ('```json\n{"name": "bash", "arguments": {"command": "ls"}}\n```', {"name": "bash"}),  # fenced
     ]
     for raw, expect in cases:
         got = repair_json(raw)
@@ -56,30 +56,21 @@ def test_repair():
 # --- Stages 2+3: coercion (valid-but-loose calls should SUCCEED) -------------
 def test_coercion():
     # integer-as-string -> int
-    a, e = coerce_and_validate("read", {"path": "a.py", "offset": "10"})
-    check("coerce offset str->int", not e and a["offset"] == 10, f"a={a} e={[str(x) for x in e]}")
-    # number-as-string for budget
-    a, e = coerce_and_validate("repo_map", {"budget": "2000"})
-    check("coerce budget str->int", not e and a["budget"] == 2000, f"a={a}")
+    a, e = coerce_and_validate("bash", {"command": "ls", "timeout": "10"})
+    check("coerce timeout str->int", not e and a["timeout"] == 10, f"a={a} e={[str(x) for x in e]}")
     # enum already valid
-    a, e = coerce_and_validate("insert_symbol", {"name": "foo", "code": "x=1", "where": "before"})
+    a, e = coerce_and_validate(
+        "write_todos", {"todos": [{"content": "x", "status": "pending"}]})
     check("enum valid passes", not e, f"e={[str(x) for x in e]}")
     # whole arguments double-stringified
-    a, e = coerce_and_validate("grep", '{"pattern": "def foo"}')
-    check("double-stringified args", not e and a.get("pattern") == "def foo", f"a={a} e={[str(x) for x in e]}")
+    a, e = coerce_and_validate("bash", '{"command": "ls"}')
+    check("double-stringified args", not e and a.get("command") == "ls",
+          f"a={a} e={[str(x) for x in e]}")
     # nested array field double-stringified (write_todos.todos as a JSON string)
     a, e = coerce_and_validate(
         "write_todos", {"todos": '[{"content": "x", "status": "pending"}]'})
     check("nested array un-stringified", not e and isinstance(a["todos"], list)
           and a["todos"][0]["status"] == "pending", f"a={a} e={[str(x) for x in e]}")
-    # lone scalar where array<string> wanted (focus="agent.py" not ["agent.py"]) -> wrap
-    a, e = coerce_and_validate("repo_map", {"focus": "src/chad/agent.py"})
-    check("scalar->one-element array", not e and a["focus"] == ["src/chad/agent.py"],
-          f"a={a} e={[str(x) for x in e]}")
-    # a real shape mismatch (object where array wanted) still REJECTS, not wrapped
-    a, e = coerce_and_validate("repo_map", {"focus": {"path": "agent.py"}})
-    check("object->array still rejects", any(x.path == "$focus" for x in e),
-          f"a={a} e={[str(x) for x in e]}")
 
 
 # --- Stages 2+3: validation (broken calls should REJECT precisely) ----------
@@ -94,7 +85,7 @@ def test_validation():
     check("bad enum reported", any("status" in x.path and "doing" in x.got for x in e),
           f"e={[str(x) for x in e]}")
     # uncoercible type (object where string wanted)
-    a, e = coerce_and_validate("read", {"path": {"nested": 1}})
+    a, e = coerce_and_validate("write", {"path": {"nested": 1}, "content": "x"})
     check("uncoercible type reported", any(x.path == "$path" for x in e),
           f"e={[str(x) for x in e]}")
     # unknown tool
@@ -132,12 +123,12 @@ def test_legacy_validate():
     check("legacy: unknown tool flagged",
           "unknown tool" in (legacy_validate("frobnicate", {}) or ""))
     check("legacy: non-dict args flagged",
-          "must be a JSON object" in (legacy_validate("read", "oops") or ""))
-    miss = legacy_validate("read", {}) or ""  # read requires `path`
+          "must be a JSON object" in (legacy_validate("write", "oops") or ""))
+    miss = legacy_validate("write", {}) or ""  # write requires `path`
     check("legacy: missing required arg flagged",
           "missing required argument" in miss and "path" in miss, f"msg={miss!r}")
     check("legacy: valid args pass (None)",
-          legacy_validate("read", {"path": "a.py"}) is None)
+          legacy_validate("write", {"path": "a.py", "content": "x"}) is None)
 
 
 # --- Dynamically-appended tools validate against the LIVE schema set ----------
@@ -175,46 +166,6 @@ def test_dynamic_tool_validates(tmp_path, monkeypatch):
         check("repair hint lists the live activate_skill", "activate_skill" in msg, msg)
     finally:
         skills.reset_session()
-
-
-# --- Batched replace_lines schema (improve 04) -------------------------------
-# The batch form takes edits=[{start, end, new}, …]. The schema must (a) accept a
-# well-formed batch and coerce loose item types, and (b) fail LOUDLY on a half-parsed
-# array — the whole point is that a garbled batch feeds the self-repair path rather than
-# silently applying the items that happened to parse.
-def test_replace_lines_batch_schema():
-    # top-level `start/end/new` are optional now (only `path` required) so the single
-    # form still validates and the batch form isn't forced to send them.
-    sch = _param_schema("replace_lines")
-    check("replace_lines requires only path", sch.get("required") == ["path"], sch)
-    check("replace_lines exposes edits array",
-          sch["properties"]["edits"]["type"] == "array", sch)
-
-    # a well-formed batch validates clean, coercing "2"->2 in an item
-    a, e = coerce_and_validate("replace_lines", {
-        "path": "a.py",
-        "edits": [{"start": 1, "end": "2", "new": "x"}]})
-    check("batch: valid batch accepted", e == [], [str(x) for x in e])
-    check("batch: item int coerced", a["edits"][0]["end"] == 2, a)
-
-    # the single form still validates against the same schema
-    _, e = coerce_and_validate("replace_lines",
-                               {"path": "a.py", "start": 1, "end": 1, "new": "x"})
-    check("batch: single form still valid", e == [], [str(x) for x in e])
-
-    # a garbled item (missing `new`) is flagged on that item's field, not silently kept
-    _, e = coerce_and_validate("replace_lines", {
-        "path": "a.py",
-        "edits": [{"start": 1, "end": 1, "new": "x"}, {"start": 2, "end": 2}]})
-    check("batch: missing item field reported",
-          any("new" in x.path and x.got == "missing" for x in e),
-          [str(x) for x in e])
-
-    # a JSON-encoded edits string (the nested-container failure mode) un-stringifies
-    a, e = coerce_and_validate("replace_lines", {
-        "path": "a.py", "edits": '[{"start": 1, "end": 1, "new": "x"}]'})
-    check("batch: edits JSON-string un-stringified", e == [] and isinstance(a["edits"], list),
-          (a, [str(x) for x in e]))
 
 
 def test_dynamic_tool_absent_without_skills(tmp_path, monkeypatch):

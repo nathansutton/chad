@@ -4,7 +4,7 @@
 # import name, and command name are independent. `uvx chad-code` runs the alias
 # script added under [project.scripts].
 name = "chad-code"
-version = "1.13.0"
+version = "2.0.0"
 description = "Local MLX-backed, Claude-Code-style coding agent (Apple Silicon, Ornith 35B/9B)"
 readme = "README.md"
 license = "MIT"
@@ -57,11 +57,6 @@ dependencies = [
     "prompt_toolkit>=3.0.43",
     "tree-sitter>=0.26.0",
     "tree-sitter-language-pack>=1.12.2",
-    # repomap's personalized PageRank. Native and battle-tested where the previous
-    # hand-rolled power iteration was ours to maintain; single self-contained Rust
-    # wheel, zero transitive deps. Benchmarked vs scipy/networkx/igraph on a real
-    # 421k-edge graph: identical top-50 ranking, 0.79s -> 0.04s.
-    "rustworkx>=0.15",
     # Single 2.x code path (the 1.x cap left with serena-agent, which hard-pinned mcp
     # and was the only thing keeping chad below 2). The 1->2 port was done deliberately,
     # not by a resolver: two of the renames (isError->is_error, readOnlyHint->

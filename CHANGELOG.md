@@ -2,6 +2,42 @@
 
 Notable, user-visible changes.
 
+## [2.0.0] — unreleased
+
+**The lean release.** chad 2.0.0 is the drastic simplification the 1.x measurement
+program earned: every lever pack, alternate tool dialect, and scaffolding layer was
+measured against the bare model + tool loop with pre-registered paired contrasts, and
+nothing beat it. What survives is the bare loop plus the eight bash-route levers that
+make the result channel honest — and those are now the default, all ON.
+
+- **One tool surface.** The model sees exactly `bash`, `edit`, `write`,
+  `write_todos`, and `done` (plus `activate_skill` and MCP tools where configured).
+  Removed wholesale: the dedicated `read`/`grep`/`glob` tools, the line-addressed
+  edit family (`replace_lines`/`insert_lines`), the tree-sitter symbolic tools
+  (`repo_map`/`overview`/`view_symbol`/`find_symbol`/`definition`/`find_refs`/
+  `hover`/`replace_symbol`/`insert_symbol`/`rename_symbol`), the LSP client, and the
+  `task` sub-agent system. The former `CHAD_LEAN` arm is simply what chad is now.
+- **Eight levers, all ON.** `env_manifest`, `bash_read_skeleton`,
+  `bash_empty_diagnose`, `bash_trim_keep_failures`, `verify_baseline`,
+  `bash_line_clip`, `edit_miss_diagnose`, `rg_replace_flag_note`. `CHAD_DISABLE=a,b`
+  (or `all`) switches them off for leave-one-out ablation; `CHAD_ENABLE` is gone.
+  The other ~48 registered levers of 1.x — none of which earned a positive
+  pre-registered contrast — were removed along with their machinery.
+- **Safety is no longer optional.** The macOS Seatbelt sandbox for yolo-mode bash,
+  shadow-git edit checkpoints (`/undo`, `/restore`), the scoped destructive-command
+  guard, and credential-shaped env filtering for bash children are all unconditional
+  now (escape hatches: `CHAD_NO_SEATBELT`, `CHAD_NO_ENV_GUARD`,
+  `CHAD_NO_DESTRUCTIVE_GUARD`; opt-in tier: `CHAD_PROTECT_GIT`).
+- **Syntax gate is warn-only.** A mutation that introduces a parse error lands and
+  carries the warning in the same tool result; the lever-gated reject/revert tiers
+  are gone.
+- **Removed A/B knobs**: `CHAD_ENABLE`, `CHAD_LEAN`, `CHAD_NO_SYMBOLS`,
+  `CHAD_NO_TASK`, `CHAD_HIDE_TOOLS`, `CHAD_PROFILE` (model profiles are gone; the
+  prompt is model-agnostic), `CHAD_OFFLOAD_DIR`, `CHAD_LSP_TIMEOUT`,
+  `CHAD_LSP_MAX_RSS_MB`. `CHAD_THINK_CEILING` now defaults to 0 (off).
+- **Dependency drop**: `rustworkx` (the repo-map PageRank is gone; tree-sitter tags
+  stay, powering the ambient skeleton/definition-pointer lever).
+
 ## [1.13.0] — 2026-08-10
 
 - **Per-step generation cap raised 8192 → 32768** (`CHAD_MAX_GEN_TOKENS`

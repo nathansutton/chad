@@ -113,11 +113,8 @@ def _confirm_title(name: str) -> str:
         return "run a terminal command"
     if name.startswith("mcp__"):
         return f"call the MCP tool {name[len('mcp__'):]}"
-    return {"write": "write a file", "edit": "edit a file",
-            "replace_lines": "replace lines in a file",
-            "insert_lines": "insert lines into a file",
-            "replace_symbol": "replace a symbol", "insert_symbol": "insert a symbol",
-            "rename_symbol": "rename a symbol"}.get(name, f"run {name}")
+    return {"write": "write a file",
+            "edit": "edit a file"}.get(name, f"run {name}")
 
 
 # Spinner frames + the gerund shown next to it, keyed off the latest activity.
@@ -1055,25 +1052,20 @@ class TUI:
             if self._busy:
                 self._emit("info", "busy — try again once the current turn finishes.")
                 return False
-            from . import checkpoint, levers
+            from . import checkpoint
             ws = os.getcwd()
             arg = text[len("/restore"):].strip() if text.startswith("/restore") else ""
             if text == "/restore" and not arg:
                 rows = checkpoint.snapshots(ws)
                 if not rows:
                     self._emit("info", "no checkpoints for this workspace yet — "
-                                       "snapshots are taken before file edits when the "
-                                       "edit_checkpoint lever is on (CHAD_ENABLE=edit_checkpoint)")
+                                       "snapshots are taken before file edits")
                 else:
                     for h, when, label in rows:
                         self._emit("info", f"  {h}  {when}  {label}")
                     self._emit("info", "restore one with /restore <hash>")
                 return False
             msg = checkpoint.restore(ws, arg or "HEAD")
-            # Restoring from an older session's snapshots is legal with the lever
-            # off, so only count the fire when this session's guard is actually on.
-            if msg.startswith("restored") and levers.enabled("edit_checkpoint"):
-                levers.fired("edit_checkpoint", restore=True)
             self._emit("info", msg)
             return False
         if text == "/resume" or text.startswith("/resume "):

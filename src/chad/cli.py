@@ -698,15 +698,15 @@ def _levers_parser():
         prog="chad levers",
         description="Print the harness lever registry as JSON and exit. The ablation "
                     "driver enumerates this instead of hardcoding lever names. All "
-                    "levers default OFF; CHAD_ENABLE=a,b (or 'all') turns levers on, "
-                    "CHAD_DISABLE=a,b subtracts from that.",
+                    "levers default ON; CHAD_DISABLE=a,b (or 'all') switches levers "
+                    "off for a leave-one-out arm.",
     )
 
 
 def _run_levers():
     """No _preflight and no model: an ablation driver enumerating levers should not need
     an Apple-Silicon box or a loadable model just to read the registry."""
-    print(json.dumps({"levers": levers.as_dict(), "groups": levers.groups(),
+    print(json.dumps({"levers": levers.as_dict(),
                       "active": levers.active()}, indent=2))
     return 0
 
@@ -739,8 +739,8 @@ def _main(argv=None):
     if args.levers:  # deprecated spelling of `chad levers`
         sys.exit(_run_levers())
 
-    # Fail fast on a typo'd CHAD_ENABLE/CHAD_DISABLE, not mid-run: an unrecognized lever
-    # means the harness would run bare while an ablation reports the delta as "no effect".
+    # Fail fast on a typo'd CHAD_DISABLE, not mid-run: an unrecognized lever
+    # means the harness would run unmodified while an ablation reports "no effect".
     try:
         levers.validate_env()
     except levers.UnknownLever as e:

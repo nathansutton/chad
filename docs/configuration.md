@@ -28,8 +28,7 @@ optionally bundling `scripts/`, `references/`, and `assets/`.
    *that one* skill's full instructions, wrapped in `<skill_content>`, with its bundled
    files listed.
 3. **Resources** — referenced `scripts/`/`references/`/`assets/` files are read on demand
-   against the skill's directory, with the `read` tool (or from `bash` in the lean tool
-   arm, which has no `read`).
+   against the skill's directory, from `bash` (`sed -n '1,120p' <file>`).
 
 Parsing is lenient (a name that doesn't match its directory, an over-long field, or an
 unquoted `colon: value` in YAML loads anyway, with a warning); only a missing description
@@ -142,7 +141,7 @@ refreshes the token as needed). Notes:
 **How they behave in the harness:**
 
 - **Namespaced** `mcp__<server>__<tool>`, so server tools can't collide with chad's
-  builtins (`bash`/`read`/…) or with each other.
+  builtins (`bash`/`edit`/…) or with each other.
 - **Same validation path** as builtins — each tool's `inputSchema` drives the typed-coerce
   + self-repair loop (`"3"`→`3`, missing-required detection), no schema duplication.
 - **Confirmation gate.** A tool the server marks `readOnlyHint` runs without a prompt;
@@ -344,8 +343,8 @@ Two things it does that a stock llama.cpp server can't, because both ends are ch
 advertises them in `/props` and the client feature-detects, so nothing changes when you
 point the same client at a real llama-server:
 
-- **cache quarantine** — a sub-agent's excursion is bracketed by a real engine
-  push/pop, so it no longer evicts the main transcript's prefix.
+- **cache quarantine** — a client can bracket an excursion with a real engine
+  push/pop, so it does not evict the main transcript's prefix.
 - **warm prefix** — the on-disk KV warm-start of the stable system+tools prefix, which a
   remote client can't do because the checkpoint lives on the server's disk.
 
@@ -373,7 +372,7 @@ rather than a silent no-op.
 
 ```bash
 CHAD_THINK_BUDGET=1500        uv run chad  # soft-cap each step's <think> at N tokens, then force-close + continue
-CHAD_THINK_CEILING=384        uv run chad  # force-close a runaway <think> but keep decoding the action in the SAME step (ON by default; 0 disables)
+CHAD_THINK_CEILING=384        uv run chad  # force-close a runaway <think> but keep decoding the action in the SAME step (off by default)
 CHAD_TURN_BUDGET_TOKENS=90000 uv run chad  # governor token budget (default 3× the context limit)
 CHAD_TURN_BUDGET_S=600        uv run chad  # wall-clock variant (seconds); off by default
 CHAD_AUTO_CONTINUE=2          uv run chad  # on a hard stop, relaunch a fresh turn seeded with the progress note, N times
@@ -403,14 +402,11 @@ CHAD_REVIEW_PASS=1            uv run chad  # if a one-shot finishes early and cl
 - **`CHAD_THINK_CEILING`** — the **close-and-continue** ceiling, and the one to reach for
   before `CHAD_THINK_BUDGET`. Where the think-cap force-closes `<think>` and *ends* the
   step (so the model re-derives its reasoning next step), this force-closes the runaway
-  block and **keeps decoding the action in the same step** — the reasoning so far stays in
-  context and nothing is re-derived. Unlike the think-cap it is **ON by default at 384
-  tokens** in the full arm, sized to bite the tail of a measured per-step think
-  distribution rather than the median. **OFF by default under `CHAD_LEAN`**, which exists
-  to measure the model without that kind of intervention. `0` disables it in either arm;
-  any positive value overrides. It is a constructor default rather than a lever, so it
-  does not appear in `chad levers` and `CHAD_DISABLE` cannot reach it — this env var is
-  the only switch. Steps it fires on are counted as *salvaged* in the session log.
+  block and **keeps decoding the action in the same step** — the reasoning so far stays
+  in context and nothing is re-derived. **Off by default**: force-closing `</think>`
+  mid-generation is the most invasive thing the harness can do to the token stream, and
+  the measured record says the bare loop doesn't need it. Steps it fires on are counted
+  as *salvaged* in the session log.
 - **`CHAD_TURN_BUDGET_TOKENS`** — the governor's cumulative-prefill budget per turn; defaults
   to 3× the context limit. Disable the governor entirely with `CHAD_NO_GOVERNOR=1` (below).
 - **`CHAD_TURN_BUDGET_S`** — a wall-clock (seconds) variant of the same governor; off by
@@ -423,51 +419,24 @@ CHAD_REVIEW_PASS=1            uv run chad  # if a one-shot finishes early and cl
 > executions as `[name, seconds]` pairs) — so a slow step can be attributed to prefill,
 > tokenization, compaction, or a tool without guessing. Leave it unset in normal use.
 
-### Harness levers & model profiles
+### Harness levers
 
-A harness change that ships hardcoded can only be measured by reverting it. Behavioral
-levers are therefore named and switchable, so a bundle of fixes can be attributed with
-leave-one-out ablation instead of a revert per fix. `chad levers` prints the registry
-(it loads no model). A name that isn't registered is a startup error, not a warning: a
-typo would otherwise run the bare harness and report the lever as having no effect.
-
-**All levers default OFF as of 1.10.0** — a default run is the bare model + tool loop.
-Every lever was born from a plausible failure narrative, but head-to-head measurement
-(the 2026-08 clean-slate arms) showed the bare loop matches the full lever stack on the
-benchmark that motivated it, at substantially lower token spend. So the burden of proof
-flipped: a lever ships ON only behind a measured, pre-registered positive contrast. The
-registry stays because it is the instrument that makes such contrasts one env var
-instead of a code revert.
-
-Each lever carries a `group` (the harness iteration that introduced it, so one bundle can
-be priced without paying for the others) and a `kind`:
-
-- **`behavior`** — the change adds a behavior; without it the agent is merely less helped.
-- **`regression-guard`** — the change fixes a once-demonstrated bug, and OFF restores
-  that bug's possibility (measured aggregate cost: none).
-
-`tests/test_lever_bite.py` asserts every registered lever actually changes behavior when
-toggled, so a "no measured effect" verdict from an ablation means the fix does nothing —
-not that its guard was misplaced.
+chad 2.0.0 ships **eight** result-channel levers, **all ON by default** — the survivors
+of a long measurement campaign in which nothing else beat the bare model + tool loop.
+Each one makes the `bash` route more honest or more informative (a trimmed test run
+keeps its failure rows; a grep that matched nothing says what it searched; a failed
+edit explains itself), and each keeps a name and a switch for exactly one reason:
+leave-one-out ablation. `chad levers` prints the registry (it loads no model). A name
+that isn't registered is a startup error, not a warning: a typo would otherwise run
+the unmodified harness and report the lever as having no effect.
 
 ```bash
-uv run chad levers                               # inventory: every lever + what's active
-CHAD_ENABLE=compact_notice uv run chad            # switch one behavior on
-CHAD_ENABLE=all uv run chad                       # the full pre-1.10 lever stack
-CHAD_ENABLE=all CHAD_DISABLE=plan_review uv run chad   # leave-one-out ablation arm
-CHAD_PROFILE=generic uv run chad                  # drop the Ornith-specific accommodations
-CHAD_OFFLOAD_DIR=/tmp/off uv run chad             # where compaction spills untrimmed text
+uv run chad levers                          # inventory: every lever + what's active
+CHAD_DISABLE=bash_line_clip uv run chad     # leave-one-out ablation arm
+CHAD_DISABLE=all uv run chad                # the bare model + tool loop
 ```
 
-- **`CHAD_ENABLE`** — comma-separated lever names to turn on (`all` = every lever).
-  All levers default **off**.
-- **`CHAD_DISABLE`** — comma-separated lever names subtracted from `CHAD_ENABLE`.
-- **`CHAD_PROFILE`** — `ornith` (default) or `generic`. A profile block is strictly
-  additive: the `<tool_call>` contract stays in the base prompt, so `generic` can still
-  call tools. Resolved from the model id when unset, so an `--backend llama` run against
-  a non-Ornith endpoint drops the accommodations automatically.
-- **`CHAD_OFFLOAD_DIR`** — where the `compact_offload` lever writes the untrimmed
-  transcript (default `~/.chad/offload`, capped at 32 MB, never inside the project).
+- **`CHAD_DISABLE`** — comma-separated lever names to switch off (`all` = every lever).
 
 ### Safety & A/B opt-outs
 
@@ -475,10 +444,6 @@ These flip behavior off rather than tune it. The two safety opt-outs **weaken** 
 defenses — leave them unset in normal use; they exist for measurement and edge cases.
 
 ```bash
-CHAD_NO_SYMBOLS=1            uv run chad  # A/B knob: hide the tree-sitter symbolic tools
-CHAD_NO_TASK=1              uv run chad  # A/B knob: hide the subagent/Task delegation tool
-CHAD_HIDE_TOOLS=a,b         uv run chad  # A/B knob: hide named builtin tools from the schema
-CHAD_LEAN=1                 uv run chad  # A/B knob: the five-tool, shell-first arm
 CHAD_NO_VALIDATE=1          uv run chad  # A/B knob: DISABLE arg coercion + schema validation
 CHAD_NO_GOVERNOR=1          uv run chad  # A/B knob: DISABLE the runaway-turn governor
 CHAD_NO_REPEAT_GUARD=1      uv run chad  # A/B knob: DISABLE the degenerate-repetition stop
@@ -488,43 +453,12 @@ CHAD_NO_SKILLS=1            uv run chad  # A/B knob: disable all Agent Skill dis
 CHAD_NO_FASTPATH=1          uv run chad  # A/B knob: disable the fused-projection decode fast path
 CHAD_NO_MOE_FUSED=1         uv run chad  # A/B knob: disable the fused MoE decode kernels (35B only)
 CHAD_NO_QSDPA_SGM=1         uv run chad  # A/B knob: disable the split-head qKV attention tier
-CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbelt (unsafe)
+CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash screen (unsafe)
+CHAD_NO_SEATBELT=1          uv run chad  # DISABLE the macOS Seatbelt sandbox for yolo bash (unsafe)
+CHAD_NO_ENV_GUARD=1         uv run chad  # let bash children inherit credential-shaped env vars
+CHAD_PROTECT_GIT=1          uv run chad  # also write-DENY .git inside the yolo sandbox
 ```
 
-- **`CHAD_NO_SYMBOLS`** — drops the tree-sitter symbolic code-intel tools from the toolset
-  (`tools.py`). A measurement knob used by the eval harness to A/B whether symbols help a
-  given model; the plain bash/read/grep tools still work.
-- **`CHAD_NO_TASK`** — hides the `task` tool, which delegates open-ended
-  exploration ("find where X happens") to a fresh **sub-agent** running in its own small,
-  isolated context on a quarantined KV cache (`engine.push_cache`/`pop_cache`) and returns
-  only a condensed answer — so the main transcript (and its prefill cost) stays small. The
-  sub-agent is read-only by default and cannot spawn further sub-agents (depth 1). This
-  knob is the A/B arm for measuring adoption/impact, and the escape hatch if a model
-  misuses it.
-- **`CHAD_HIDE_TOOLS`** — comma-separated builtin tool names removed from the schema the
-  model sees (dispatch is untouched). The per-dialect measurement knob: e.g.
-  `CHAD_HIDE_TOOLS=edit` forces the line-addressed edit family,
-  `CHAD_HIDE_TOOLS=replace_lines,insert_lines` forces exact-match `edit`. A name that
-  matches no builtin tool fails loud at the first render rather than silently measuring
-  the unmodified toolset. Tool descriptions that cross-reference each other are rewritten
-  to match whatever surface survives, so a dialect arm never advertises the dialect it
-  just removed.
-- **`CHAD_LEAN`** — the **shell-first arm**: the schema shrinks to `bash`, `edit`,
-  `write`, `write_todos`, `done` (plus `activate_skill` where skills are installed), and
-  the system prompt is replaced with one that teaches only those. The premise is an
-  ablation — everything hidden is a chad dialect the model must learn in-context, while
-  the unix toolbox and exact-match editing it already knows from pretraining. Reading,
-  searching and verifying all move into `bash` (`wc -l` first, ranged `sed -n`, `rg`),
-  and `edit` becomes the only editor, so batched and line-addressed edits are
-  unavailable in this arm. The close-and-continue **think ceiling is OFF** here (the full
-  arm defaults it to 384): force-closing `</think>` mid-generation is harness scaffolding,
-  and this arm exists to measure its absence — set `CHAD_THINK_CEILING` to re-arm it.
-  Because `read`/`grep` carry guarantees of their own, lean
-  starts with a small set of bash-route levers ON (`levers.LEAN_DEFAULTS` — see
-  [Harness levers](#harness-levers--model-profiles)); `CHAD_ENABLE`/`CHAD_DISABLE`
-  still add and subtract on top, so
-  leave-one-out stays a valid arm inside lean. Distinct from `CHAD_HIDE_TOOLS`, which
-  subtracts named tools but keeps the full system prompt.
 - **`CHAD_NO_VALIDATE`** — **disables** the typia-style lenient-parse → typed-validate →
   self-repair loop for tool-call arguments (`validate.py`), falling back to a strict
   `json.loads` plus a terse missing-required check. This *weakens* input handling (malformed
@@ -547,10 +481,22 @@ CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash seatbel
 - **`CHAD_NO_PREFIX_CACHE`** — a fairness/measurement knob that **drops** the persistent
   prefix KV cache (`engine.py`), forcing a full re-prefill every step. It exists to measure
   what the cache is worth and makes chad much slower — never set it in normal use.
-- **`CHAD_NO_DESTRUCTIVE_GUARD`** — **disables** the catastrophic-bash seatbelt
+- **`CHAD_NO_DESTRUCTIVE_GUARD`** — **disables** the catastrophic-bash screen
   (`guardrails.py`) even in `--yolo` mode. With it set, an injected `rm -rf ~`,
   `mkfs`, `dd of=/dev/…`, fork bomb, or `curl … | sh` is **not** screened before running.
-  It is a seatbelt, not a security boundary (a sandbox is) — recommend leaving it unset.
+  It is a screen, not a security boundary (the sandbox below is) — leave it unset.
+- **`CHAD_NO_SEATBELT`** — **disables** the macOS Seatbelt sandbox (`seatbelt.py`) that
+  yolo-mode bash commands run under by default: file writes confined to the workspace,
+  temp dirs, and caches; reads and network open. Only the spawned shell child is ever
+  sandboxed. Set this only when the sandbox itself breaks a legitimate workflow.
+- **`CHAD_NO_ENV_GUARD`** — bash children normally get a **filtered** copy of the
+  environment: variable names shaped like credentials (`…_TOKEN`, `…_SECRET`,
+  `…_API_KEY`, …) are dropped — name-pattern only, values never read. Set this for a
+  session whose commands legitimately need a credential (e.g. `gh`, deploy scripts).
+- **`CHAD_PROTECT_GIT`** — an opt-in tier on top of the yolo sandbox: the workspace's
+  `.git` (and a worktree's external gitdir) is write-DENIED, so an unreviewed command
+  cannot destroy project history. The cost is real — every `.git`-writing git command
+  (commit, add, checkout) EPERMs inside the sandbox — which is why it is opt-in.
 - **`CHAD_NO_SKILLS`** — turns off [Agent Skill](#agent-skills-agentskillsio) discovery
   entirely: no `# Skills` prompt section, no skill tool. Set it when a benchmark must not
   inherit your personal skills, or to A/B what skills are worth. Unlike the other
@@ -589,28 +535,20 @@ CHAD_DUMP_RENDER=/tmp/prompt.txt    uv run chad  # dump the fully-rendered promp
 CHAD_PREFILL_TRACE=/tmp/pf.jsonl    uv run chad  # per-step prefill/cache telemetry
 ```
 
-### Symbolic code intel (repo map & language server)
+### Tree-sitter tags (ambient structure)
 
-Defaults are tuned for a big repo on a memory-tight machine (measured on an 11k-file
-checkout); you rarely need to touch these.
+The `bash_read_skeleton` lever's one-line symbol maps and definition pointers come from
+a tree-sitter tags index. Defaults are tuned for a big repo on a memory-tight machine;
+you rarely need to touch this.
 
 ```bash
 CHAD_REPOMAP_WORKERS=4   uv run chad  # subprocess workers for a cold repo scan (1 = serial)
-CHAD_LSP_TIMEOUT=10      uv run chad  # per-request language-server timeout, seconds (default 5)
-CHAD_LSP_MAX_RSS_MB=2048 uv run chad  # recycle a language server past this process-tree RSS (default 1536)
 ```
 
 - **`CHAD_REPOMAP_WORKERS`** — how many `python -c` subprocess workers a cold whole-repo
   tag scan shards across (`repomap.py`; default: cores−2, capped at 8). Workers import
   only `chad.repomap` — never the MLX engine. Tags persist per repo under
   `~/.chad/cache/repomap/` (mtime-validated per file), so warm sessions skip the scan.
-- **`CHAD_LSP_TIMEOUT`** — deadline for each language-server request (`lsp.py`). On
-  timeout the caller falls back to the tree-sitter backend, which labels its results
-  NAME-MATCH ONLY rather than implying precision.
-- **`CHAD_LSP_MAX_RSS_MB`** — after each request the server's process tree is measured;
-  past this cap it is stopped and restarts fresh on the next request. Guards against an
-  analysis server (pyright hit 4 GB on hot symbols) starving the GPU allocator that holds
-  the model weights.
 
 ### Sessions
 

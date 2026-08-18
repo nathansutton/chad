@@ -129,38 +129,17 @@ def test_ws_only_edit_applies_verbatim():
           after == "def f():\n    a = 1\n    b = 2\n", repr(after))
 
 
-def test_indent_break_is_rejected_and_reverted():
-    """Prong 1: an edit that would newly introduce a Python IndentationError
-    (or TabError) to a CLEAN file is rejected and the file left untouched — so the model
-    re-sends the edit instead of looping on whitespace surgery to un-break a landed file."""
-    before = "def f():\n    a = 1\n    b = 2\n"
-
-    # over-indent mid-block -> IndentationError ("unexpected indent")
-    res, after = run(before, "    b = 2", "      b = 2")
-    check("indent-break rejected", res.startswith("[edit rejected"), res)
-    check("indent-break file untouched", after == before, repr(after))
-
-    # spaces -> tab in a space-indented block -> TabError (a subclass of IndentationError)
-    res, after = run(before, "    b = 2", "\tb = 2")
-    check("tab-break rejected", res.startswith("[edit rejected"), res)
-    check("tab-break file untouched", after == before, repr(after))
-
-
-def test_non_indent_break_rejected(monkeypatch):
-    """(supersedes the warn-only scope): a NON-indentation syntax
-    break (unclosed paren) is also REVERTED. Dogfooding measured what warn-only
-    costs a small model: ten ignored "no longer parses" warnings while stale line edits
-    compounded on a severed def signature, ending in LOOP ABORT with the file broken.
-    Multi-step changes that must pass through a broken state route through `write`
-    (still warn-only) or replace_symbol. Ablating `syntax_revert` restores warn-and-land."""
-    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+def test_syntax_break_lands_with_warning():
+    """A syntax-breaking edit lands (the model's edit is the model's edit) and the
+    warning rides the SAME result, so the very next step sees it."""
     res, after = run("x = 1\n", "x = 1", "x = (1")
-    check("non-indent break rejected", res.startswith("[edit rejected"), res)
-    check("file left unchanged", after == "x = 1\n", repr(after))
-    monkeypatch.setenv("CHAD_DISABLE", "syntax_revert")
-    res, after = run("x = 1\n", "x = 1", "x = (1")
-    check("ablated: break lands with warning",
+    check("break lands with warning",
           res.startswith("[edited") and "no longer parses" in res and "x = (1" in after, res)
+    # An over-indent mid-block warns the same way.
+    before = "def f():\n    a = 1\n    b = 2\n"
+    res, after = run(before, "    b = 2", "      b = 2")
+    check("indent break lands with warning",
+          res.startswith("[edited") and "no longer parses" in res, res)
 
 
 def test_already_broken_file_stays_editable():
@@ -246,37 +225,3 @@ if __name__ == "__main__":
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
 
-
-def test_typo_recovery_file_has_unicode_model_sends_ascii():
-    # File uses typographic punctuation, the model
-    # re-types it ASCII-fied. Rungs 1-3 miss; the typo-normalized rung must land.
-    before = 'MSG = "cache — warm start"\nprint(MSG)\n'
-    res, after = run(before, 'MSG = "cache - warm start"', 'MSG = "cache - hot start"')
-    check("typo(ascii old): edit landed", res.startswith("[edited"), res)
-    check("typo(ascii old): note names the rung", "typographic" in res, res)
-    check("typo(ascii old): new text is verbatim", 'MSG = "cache - hot start"' in after, after)
-    check("typo(ascii old): rest untouched", "print(MSG)" in after, after)
-
-
-def test_typo_recovery_model_sends_unicode_file_has_ascii():
-    # Opposite direction: the model quotes with curly punctuation, file is ASCII.
-    before = "note = 'it is fine...'\nx = 1\n"
-    res, after = run(before, "note = ‘it is fine…’", "note = 'all good...'")
-    check("typo(unicode old): edit landed", res.startswith("[edited"), res)
-    check("typo(unicode old): replacement present", "note = 'all good...'" in after, after)
-
-
-def test_typo_recovery_requires_unique_match():
-    # SAFETY: two lines that both match after folding must be rejected, file untouched.
-    before = 'a = "x — y"\nb = "x — y"\n'
-    res, after = run(before, '"x - y"', '"z"')
-    check("typo ambiguous: rejected", not res.startswith("[edited"), res)
-    check("typo ambiguous: file untouched", after == before, after)
-
-
-def test_typo_recovery_lever_off(monkeypatch):
-    monkeypatch.setenv("CHAD_DISABLE", "edit_typo_match")
-    before = 'MSG = "cache — warm start"\nprint(MSG)\n'
-    res, after = run(before, 'MSG = "cache - warm start"', 'MSG = "x"')
-    check("typo lever off: not found", "not found" in res, res)
-    check("typo lever off: file untouched", after == before, after)
