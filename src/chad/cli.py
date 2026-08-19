@@ -411,6 +411,39 @@ def _free_disk_gb(path):
         return None
 
 
+def _cached_weights_complete(model_id) -> bool:
+    """Whether the HF cache holds this repo's WEIGHTS, not merely its small files.
+
+    The cheap check ("is config.json cached?") is wrong in the one case that matters.
+    A download interrupted after the json/tokenizer blobs land — one ctrl-c on a first
+    run — leaves a snapshot that answers yes while holding no tensors at all, so the
+    guard returns, and the failure surfaces minutes later inside mlx_lm as a
+    FileNotFoundError naming an internal blob path. There is no way back from that
+    state except hand-deleting the cache. So verify what the loader will actually
+    read: every shard the index names, or a single-file/loose layout on disk.
+    """
+    from huggingface_hub import try_to_load_from_cache
+    cached = lambda f: isinstance(try_to_load_from_cache(model_id, f), str)  # noqa: E731
+    index = try_to_load_from_cache(model_id, "model.safetensors.index.json")
+    if isinstance(index, str):
+        try:
+            with open(index, encoding="utf-8") as f:
+                shards = set(json.load(f).get("weight_map", {}).values())
+        except (OSError, ValueError):
+            return False  # unreadable index: treat as incomplete, re-fetch resumes
+        return bool(shards) and all(cached(s) for s in shards)
+    if cached("model.safetensors"):
+        return True
+    # No index and no conventionally-named file: an unusual layout is not our business
+    # to second-guess, so accept any .safetensors already sitting in the snapshot (this
+    # is what mlx_lm globs for) rather than forcing a re-download of a working cache.
+    config_path = try_to_load_from_cache(model_id, "config.json")
+    if isinstance(config_path, str):
+        import glob
+        return bool(glob.glob(os.path.join(os.path.dirname(config_path), "*.safetensors")))
+    return False
+
+
 def _ensure_model(model_id):
     """If model_id is a HF repo id not yet in the local cache, confirm and download it
     into ~/.cache/huggingface (shared, resumable, paid once per machine). Local dirs
@@ -419,8 +452,8 @@ def _ensure_model(model_id):
     disk is the worst first-run outcome (devex review T2)."""
     if os.path.isdir(model_id):
         return  # a local path — nothing to fetch
-    from huggingface_hub import snapshot_download, try_to_load_from_cache
-    if isinstance(try_to_load_from_cache(model_id, "config.json"), str):
+    from huggingface_hub import snapshot_download
+    if _cached_weights_complete(model_id):
         return  # already in the HF cache
     need_gb = _model_download_gb(model_id)
     hf_home = os.environ.get("HF_HOME", "~/.cache/huggingface")
@@ -436,10 +469,18 @@ def _ensure_model(model_id):
             "         Or point CHAD_MODEL at a local model dir on another volume.\n")
         sys.exit(1)
     size = f"~{need_gb:.0f} GB"
+    # Say WHICH of the two situations this is. "Downloading again" on a machine the
+    # user believes already has the model reads as a bug unless the partial cache is
+    # named; only the completed blobs are re-used, so the second run is also shorter.
+    from huggingface_hub import try_to_load_from_cache
+    partial = isinstance(try_to_load_from_cache(model_id, "config.json"), str)
     sys.stderr.write(
-        f"\nchad needs the model '{model_id}' "
-        f"({size} — minutes on fast fiber, ~20 min on 100 Mbit; resumable).\n"
-        "It downloads once into ~/.cache/huggingface and is reused across projects.\n")
+        (f"\nchad: the cached copy of '{model_id}' is incomplete (an interrupted "
+         f"download left its metadata but not all of its weights).\nResuming — only "
+         f"the missing files are fetched, up to {size}.\n" if partial else
+         f"\nchad needs the model '{model_id}' "
+         f"({size} — minutes on fast fiber, ~20 min on 100 Mbit; resumable).\n"
+         "It downloads once into ~/.cache/huggingface and is reused across projects.\n"))
     if sys.stdin.isatty():
         ans = input("Download now? [Y/n] ").strip().lower()
         if ans and ans not in ("y", "yes"):

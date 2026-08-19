@@ -1,12 +1,12 @@
-"""chad's tool surface: bash, edit, write, search, write_todos, done.
+"""chad's tool surface: bash, edit, write, write_todos, done.
 
 The premise (measured, not aesthetic): the model already knows the unix toolbox
 and the exact-match editor dialect from pretraining, so the harness exposes only
 those and puts its knowledge into the RESULT channel (ambient.py) instead of
-into more tools. `search` is the one deliberate addition to that surface, and it
-earns its slot only by being a primitive the shell does not have: ranked
-retrieval from a plain-English question, where bash can only match text the
-model already knows how to spell. It never replaces `rg` — see `tool_search`.
+into more tools. A ranked-retrieval tool was built and measured against this
+surface on a paired navigation benchmark: it left success unchanged at 6/6, did
+not reach the answer any sooner (time-to-first-hit +1.1%), and cost 27.6% more
+tool-result context. Discovery stays in bash.
 
 Each tool has an OpenAI/Qwen-compatible JSON schema (exposed to the model via the
 chat template's `tools` argument) and a Python implementation.
@@ -749,36 +749,6 @@ def tool_write_todos(todos) -> str:
     return "Plan updated:\n" + "\n".join(lines)
 
 
-def _search():
-    """Lazy import of the search module — keeps the native tantivy binding (and the
-    first index open) off chad's startup path entirely."""
-    from . import search
-    return search
-
-
-def tool_search(query: str, path: str = None, limit: int = None) -> str:
-    """Ranked lexical retrieval over the repository: the "where should I look?" tool.
-
-    Complements bash rather than competing with it. `rg` answers "find this exact
-    string" and this answers "which files are about this?" — the question a model
-    otherwise has to approximate with several guessed regexes, paying a round trip
-    per miss. Everything degrades to a message rather than an exception: a search
-    that raises costs the agent the same turn a wrong regex would.
-    """
-    sr = _search()
-    if not sr.available():
-        return ("[search unavailable: the `tantivy` package is not installed]\n"
-                "Use bash with `rg`/`grep` instead.")
-    if not (query or "").strip():
-        return "[search: empty query] Pass a question or some words to search for."
-    try:
-        hits = sr.CodeSearchIndex.for_root(".").search(query, path=path,
-                                                       limit=limit or sr.DEFAULT_LIMIT)
-    except Exception as e:  # noqa: BLE001 — index/query failure must not end the turn
-        return f"[search failed: {e}]\nUse bash with `rg` for an exact search."
-    return sr.format_hits(hits, query)
-
-
 # Each entry takes (args, should_stop); long-running tools honor should_stop so a
 # ctrl-c interrupt can abort them mid-flight.
 DISPATCH = {
@@ -786,7 +756,6 @@ DISPATCH = {
     "bash": lambda a, ss=None: tool_bash(a["command"], a.get("timeout", 120), should_stop=ss),
     "write": lambda a, ss=None: tool_write(a["path"], a["content"]),
     "edit": lambda a, ss=None: tool_edit(a["path"], a["old"], a["new"]),
-    "search": lambda a, ss=None: tool_search(a["query"], a.get("path"), a.get("limit")),
     # Agent Skills (https://agentskills.io): load one skill's full instructions on
     # demand (tier-2 progressive disclosure). Registered in active_schemas() only when
     # skills are installed; the dispatch is harmless (a clear message) otherwise.
@@ -897,29 +866,6 @@ SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "search",
-            "description": "Search the repository for code relevant to a natural-language "
-                           "question. Returns ranked file locations with a few lines of "
-                           "context. Use this for discovery when you do not know where "
-                           "something lives; use bash/rg when you need exact or "
-                           "exhaustive matching.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string",
-                              "description": "What you are looking for, in plain words."},
-                    "path": {"type": "string",
-                             "description": "Optional directory to restrict the search to."},
-                    "limit": {"type": "integer",
-                              "description": "Max results (default 8)."},
-                },
-                "required": ["query"],
-            },
-        },
-    },
 ]
 
 def _activate_skill_schema(names):
@@ -946,16 +892,11 @@ def _activate_skill_schema(names):
 
 
 def active_schemas():
-    """The tool schemas to expose to the model right now: SCHEMAS (minus `search`
-    when CHAD_NO_SEARCH is set), plus the activate_skill tool when any Agent Skills
+    """The tool schemas to expose to the model right now: SCHEMAS, plus the
+    activate_skill tool when any Agent Skills
     are installed for the current project/user (omitted otherwise, so a skill-less
     project never sees a dead tool), plus any connected MCP server's tools."""
     schemas = SCHEMAS
-    # CHAD_NO_SEARCH removes the ranked-search tool from the surface entirely (schema
-    # included), so the paired benchmark's baseline arm pays none of its schema cost —
-    # a tool the model can still see is not a baseline.
-    if config.flag("CHAD_NO_SEARCH"):
-        schemas = [s for s in schemas if s["function"]["name"] != "search"]
     names = _skills().skill_names()
     if names:
         schemas = schemas + [_activate_skill_schema(names)]

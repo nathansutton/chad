@@ -159,47 +159,6 @@ inside the coroutine so a hung server can never wedge the agent. Wired into
 `tools.active_schemas`/`dispatch_for`/`is_mutating`, the validator (`validate.py`), and the
 agent loop (`agent.py`).
 
-## Repository search (the `search` tool)
-
-`search` is the one tool on the surface that isn't a shell command. It answers the
-question `rg` can't take: *"where is FHIR validation handled?"* — a plain-English query
-in, ranked `path:line` locations out, with a line of context either side. Under it is a
-BM25 index (Tantivy) over the repository's text.
-
-It needs no setup and has no daemon. The first `search` of a session reconciles the index
-against the filesystem (mtime + size) and then answers; subsequent searches in the same
-session skip that. Nothing is added to chad's startup path — the native binding isn't even
-imported until a search actually runs.
-
-**Where the index lives.** `~/.chad/cache/search/<hash-of-repo-path>/`, keyed by canonical
-path — deliberately *outside* the repository, so a derived artifact can never show up in
-your `git status`. It is a pure cache: delete it and the only cost is one rebuild.
-
-```bash
-CHAD_SEARCH_DIR=/path/to/cache uv run chad  # relocate the index root (default ~/.chad/cache/search)
-CHAD_NO_SEARCH=1               uv run chad  # remove the tool from the surface entirely
-```
-
-- **`CHAD_SEARCH_DIR`** — index root. Useful on a machine where `~` is small or synced, or
-  to keep a benchmark's indexes out of your interactive cache.
-- **`CHAD_NO_SEARCH`** — withholds the tool's **schema**, not just its availability, and
-  the system prompt drops its search guidance to match. That completeness is the point: a
-  baseline arm that can still see the tool in its schema isn't a baseline. Use it for
-  paired benchmarks, or if you want the 1.x-style bash-only surface back.
-
-**Design notes that affect what you see.** Content is indexed but not *stored*, so every
-snippet is re-read from the file at query time — a result can never disagree with what's
-on disk. Indexing is one document per file, walks the same exclusion set as the tree-sitter
-tag scan (`ignore.py`: VCS dirs, model weights, installed packages, caches), skips files
-above the shared size ceiling, and stops at 20,000 files. Results default to 8 and cap at
-20 — a search competes with `rg` output for the same context budget, so it stays small
-enough that one search beats two greps and a `cat`.
-
-**When it's unavailable.** `tantivy` is a native (pyo3) binding. It ships wheels for
-CPython 3.11–3.14 on macOS arm64/x86_64 and manylinux, so an ordinary install never needs a
-Rust toolchain — but it is import-guarded anyway. On a platform with no matching wheel the
-tool says it is unavailable and every other tool keeps working.
-
 ## Context window (agentic coding needs room)
 
 By default the harness uses the model's **full native window** instead of an arbitrary

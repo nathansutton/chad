@@ -57,13 +57,6 @@ dependencies = [
     "prompt_toolkit>=3.0.43",
     "tree-sitter>=0.26.0",
     "tree-sitter-language-pack>=1.12.2",
-    # Ranked lexical retrieval for the `search` tool (src/chad/search.py). tantivy-py
-    # is a native (maturin/pyo3) binding to the Rust library and ships wheels for
-    # cp311-cp314 on macOS arm64/x86_64 and manylinux aarch64/x86_64, so an ordinary
-    # install never needs a Rust toolchain. Import-guarded in search.py anyway: on a
-    # wheel-less platform the source build can fail, and the rest of the tool surface
-    # (bash/edit/write) must not go down with it.
-    "tantivy>=0.24,<0.27",
     # Single 2.x code path (the 1.x cap left with serena-agent, which hard-pinned mcp
     # and was the only thing keeping chad below 2). The 1->2 port was done deliberately,
     # not by a resolver: two of the renames (isError->is_error, readOnlyHint->

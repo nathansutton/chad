@@ -149,10 +149,9 @@ So where a trimmable model would lean on PLD and partial-prefix repair, chad lea
 append-only reuse + a warm on-disk base — and gets the responsive agentic loop anyway.
 Implementation lives in `engine.py` (`_trimmable`, `warm_prefix`, the prefix diff).
 
-## Why the tool surface is six tools
+## Why the tool surface is five tools
 
-chad 2.0.0 exposes exactly `bash`, `edit`, `write`, `search`, `write_todos`, and
-`done`. The
+chad 2.0.0 exposes exactly `bash`, `edit`, `write`, `write_todos`, and `done`. The
 1.x releases carried a much larger surface — dedicated `read`/`grep`/`glob`, a
 line-addressed edit family, a tree-sitter repo map, and an LSP-precise symbolic
 layer — and a registry of ~56 behavioral levers around it. All of it was measured
@@ -179,30 +178,24 @@ So the design leans into the route the model actually takes:
   near-misses (literal `\n` escapes; indentation drift) without ever risking a
   wrong edit — each recovery still requires a unique match.
 
-The one addition to that shell is the primitive a shell genuinely lacks:
+A sixth tool was built and measured, and did not survive it:
 
-- **`search` is not a better `grep`; it is a different question.** `rg` answers
-  "find this exact string" and is unbeatable at it. It cannot answer "where is FHIR
-  validation handled?" — for that the model has to guess several synonymous regexes,
-  and every guess that misses costs a round trip. `search` (`search.py`) takes the
-  question in plain words and returns ranked `path:line` locations with a line of
-  context either side, from a BM25 index over the repo. The two tools are pointed at
-  different failure modes, and the prompt says so: `search` for discovery, `bash`/`rg`
-  when the match must be exact or exhaustive.
+- **Ranked retrieval was the one primitive `bash` appeared to lack.** `rg` answers
+  "find this exact string" and is unbeatable at it; it cannot answer "where is FHIR
+  validation handled?" without the model guessing several synonymous regexes, paying
+  a round trip per miss. A BM25 index over the repo (Tantivy, one document per file)
+  answered that question well: on a 26-task navigation set its ranking reached
+  recall@20 26/26 and MRR 0.59, so the right file was essentially always retrieved.
 
-  The shape follows the same rule as the rest of the harness — *never let the harness
-  disagree with the disk*. One document per file (update semantics stay trivial,
-  document counts stay in the thousands); content indexed but **not stored**, so the
-  snippet you read was re-read from the file at query time and cannot be a stale copy;
-  the index outside the repository, under `~/.chad/cache/search/`, so it can never show
-  up in a diff; freshness reconciled lazily on the first search of a session, so there
-  is no watcher, no daemon, and nothing added to startup.
-
-  Naming it in the prompt was not enough on its own. A single bullet listing `search`
-  alongside the other tools lost to the three standing instructions around it — the
-  model kept opening with `rg` and the tool went unused on 3 of 4 navigation tasks. It
-  is written into the prompt as how a turn *starts* instead, because telling a model a
-  tool exists is not the same as telling it when the turn should reach for it.
+  It still lost its slot. On a paired agent benchmark — same model, same tasks, same
+  corpus, arms differing only in whether the tool existed — success was **6/6 in both
+  arms**, time to the first answer-bearing result moved **+1.1% (flat)**, and tool-result
+  context went **+27.6%**. Discovery calls fell on the median (4.0 → 2.5) but that was
+  carried by a single task; on three of six the model ran a search *and* the same greps
+  it would have run anyway, and on one it had the tool and never called it. Retrieval
+  quality was never the problem: the model reaches for the shell because that is what
+  its prior does, and a tool it half-adopts is pure context cost. The measurement
+  harness stays in `benchmarks/search/`; the tool does not.
 
 ## Architecture
 
@@ -213,8 +206,7 @@ src/chad/        importable package (uv installs it as the `chad` console script
   cli.py         argument parsing + the one entrypoint (chad.cli:main)
   agent.py       agentic loop + guardrails
   engine.py      MLX inference + persistent prefix cache
-  tools.py       the bash/edit/write/search toolset
-  search.py      BM25 repository index behind the `search` tool
+  tools.py       the bash/edit/write toolset
   tui.py         full-screen prompt_toolkit UI
   ...            prompt, render, ambient, repomap, validate, … (modular)
 tests/           pytest suites (uv run pytest)
@@ -223,7 +215,7 @@ tests/           pytest suites (uv run pytest)
 ```
 cli.py ──▶ agent.py (agentic loop + guardrails) ──▶ engine.py (MLX + persistent prefix cache)
                  │                                          │
-                 └─ tools.py (bash/edit/write/search) ──▶ search.py (BM25 index)
+                 └─ tools.py (bash/edit/write)
 ```
 
 - **engine.py** — loads the model once, keeps its KV cache alive across turns, and on every
@@ -234,12 +226,6 @@ cli.py ──▶ agent.py (agentic loop + guardrails) ──▶ engine.py (MLX +
   schemas), streams the turn, parses tool calls, runs them, feeds results back, loops
   until the model stops calling tools.
 - **tools.py** — the Claude-Code-style toolset with JSON schemas.
-- **search.py** — the BM25 index behind `search`: a per-repo Tantivy index under
-  `~/.chad/cache/search/`, reconciled against mtime+size on the first query of a
-  session. Import-guarded, like `repomap`'s tree-sitter — on a platform with no
-  matching wheel the tool reports itself unavailable and the rest of the surface
-  keeps working.
-
 ## What it borrows from the masters
 
 Small local models are flaky tool-callers, so the harness leans on hard-won ideas from

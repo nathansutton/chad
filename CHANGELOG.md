@@ -9,8 +9,8 @@ measurement program earned: every lever pack, alternate tool dialect, and scaffo
 was measured against the bare model + tool loop with pre-registered paired contrasts, and
 nothing beat it. What survives is the bare loop plus the eight bash-route levers that make
 the result channel honest — and those are now the default, all ON. Around that smaller
-harness the release changes the model chad runs, adds the one retrieval primitive `bash`
-genuinely cannot serve (`search`), and lands a substantially faster decoder.
+harness the release changes the model chad runs and lands a substantially faster
+decoder.
 
 **Two breaking changes to read before upgrading**: the default model is different (a fresh
 ~12 GB download; the old weights can be deleted), and chad no longer supports Macs below
@@ -18,7 +18,7 @@ genuinely cannot serve (`search`), and lands a substantially faster decoder.
 
 ### The purge
 
-- **One tool surface.** The model sees exactly `bash`, `edit`, `write`, `search`,
+- **One tool surface.** The model sees exactly `bash`, `edit`, `write`,
   `write_todos`, and `done` (plus `activate_skill` and MCP tools where configured).
   Removed wholesale: the dedicated `read`/`grep`/`glob` tools, the line-addressed
   edit family (`replace_lines`/`insert_lines`), the tree-sitter symbolic tools
@@ -46,28 +46,6 @@ genuinely cannot serve (`search`), and lands a substantially faster decoder.
   `CHAD_THINK_CEILING` now defaults to 0 (off).
 - **Dependency drop**: `rustworkx` (the repo-map PageRank is gone; tree-sitter tags
   stay, powering the ambient skeleton/definition-pointer lever).
-
-### New: `search`, ranked repository retrieval
-
-- **A sixth tool, on by default.** `bash`/`rg` answers "find this exact string"; it
-  cannot answer "where is FHIR validation handled?" without the model first guessing
-  several synonymous regexes, and every guess that misses costs a round trip.
-  `search` takes a plain-English query and returns ranked `path:line` locations with
-  a line of context either side. It is a BM25 index (Tantivy), one document per file,
-  content indexed but **not** stored — snippets are re-read from disk at query time,
-  so a result can never disagree with the file in front of you.
-- **The index is a pure derived cache** under `~/.chad/cache/search/<repo-hash>/`,
-  never inside the repository, so it can't appear in a diff; deleting it costs one
-  rebuild and nothing else. Freshness is mtime+size reconciliation run lazily on the
-  first search of a session — no watcher, no daemon, and no cost at chad startup.
-  `CHAD_SEARCH_DIR` relocates it.
-- **New dependency**: `tantivy>=0.24,<0.27` (a native pyo3 binding that ships wheels
-  for cp311–cp314 on macOS arm64/x86_64 and manylinux, so an ordinary install needs
-  no Rust toolchain). It is import-guarded regardless: on a wheel-less platform the
-  tool reports itself unavailable and the rest of the surface is untouched.
-- **`CHAD_NO_SEARCH=1`** withholds the tool's schema entirely — and the prompt drops
-  its search guidance to match, so the baseline arm of a paired benchmark pays none
-  of the tool's cost. A tool the model can still see is not a baseline.
 
 ### Breaking: one model, and it is a different one
 

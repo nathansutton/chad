@@ -7,7 +7,7 @@
 
 A single-user coding agent that runs **entirely locally on Apple Silicon** via
 [MLX](https://github.com/ml-explore/mlx). A deliberately lean, shell-first tool surface
-(bash, edit, write, ranked repo search, a todo list, done), plan mode, and a full-screen
+(bash, edit, write, a todo list, done), plan mode, and a full-screen
 TUI — driven by a local model on your laptop instead of a frontier model in a datacenter.
 No Docker, no API key, no model picker.
 

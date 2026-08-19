@@ -10,6 +10,7 @@ the current contract so a refactor can't drift it.
 Run: `uv run python tests/test_cli.py`
 """
 
+import json
 import os
 
 import pytest
@@ -173,6 +174,68 @@ def test_ensure_model_disk_preflight_unreadable(monkeypatch):
         cli._ensure_model(cli._HF_MODEL)
     # Exit came from the user's "n" at the prompt, not the disk preflight.
     check("unreadable disk does not block", e.value.code == 1, e.value.code)
+
+
+def test_cached_weights_complete(monkeypatch, tmp_path):
+    """The guard must read WEIGHTS, not metadata. An interrupted first download leaves
+    config.json + tokenizer in the snapshot and no tensors; treating that as a cache hit
+    is what sent the load into mlx_lm's `No safetensors found` with no way back."""
+    import huggingface_hub
+    snap = tmp_path / "snapshots" / "abc"
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    index = snap / "model.safetensors.index.json"
+
+    def fake_cache(repo, filename, **kw):
+        f = snap / filename
+        return str(f) if f.exists() else None
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", fake_cache)
+
+    # metadata only — the exact state a ctrl-c'd first run leaves behind
+    check("metadata alone is not complete",
+          cli._cached_weights_complete("repo/x") is False)
+
+    # sharded, index present but a shard still missing
+    index.write_text(json.dumps({"weight_map": {
+        "a": "model-00001-of-00002.safetensors", "b": "model-00002-of-00002.safetensors"}}))
+    (snap / "model-00001-of-00002.safetensors").write_text("x")
+    check("missing shard is not complete",
+          cli._cached_weights_complete("repo/x") is False)
+
+    (snap / "model-00002-of-00002.safetensors").write_text("x")
+    check("all shards present is complete",
+          cli._cached_weights_complete("repo/x") is True)
+
+    # a corrupt index must re-fetch rather than crash
+    index.write_text("{not json")
+    check("unreadable index is not complete",
+          cli._cached_weights_complete("repo/x") is False)
+
+    # single-file layout
+    index.unlink()
+    (snap / "model.safetensors").write_text("x")
+    check("single-file layout is complete",
+          cli._cached_weights_complete("repo/x") is True)
+
+
+def test_ensure_model_resumes_partial_cache(monkeypatch, capsys):
+    """A partial cache must NOT be reported as a fresh download: the message names the
+    interrupted download, so a re-fetch on a machine that 'already has' the model does
+    not read as a bug."""
+    import huggingface_hub
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    # config.json cached, no weights anywhere — the interrupted-download state.
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache",
+                        lambda repo, filename, **kw: "/c/config.json"
+                        if filename == "config.json" else None)
+    monkeypatch.setattr(cli, "_free_disk_gb", lambda path: 500.0)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    with pytest.raises(SystemExit):
+        cli._ensure_model("repo/x")
+    err = capsys.readouterr().err
+    check("names the incomplete cache", "incomplete" in err, err)
+    check("says it resumes", "Resuming" in err, err)
 
 
 def test_pick_model_prefers_local_dir(monkeypatch):
