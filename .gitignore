@@ -23,3 +23,6 @@ benchmarks/tb2/*.tsv
 benchmarks/tb2/models/
 # Harbor per-run log dirs (job configs + trial logs) — run artifacts, never published
 benchmarks/tb2/harbor_logs_*/
+
+# Search-tool selection measurement harness — stays local
+benchmarks/search/

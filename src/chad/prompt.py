@@ -12,6 +12,8 @@ import os
 import platform
 import re
 
+from . import config
+
 # Premise: the model already knows the unix toolbox and the exact-match editor
 # dialect from pretraining, so the prompt's job shrinks to two things — the
 # tool-call emission contract and context economy, which lives in three bash
@@ -28,7 +30,8 @@ chatbot — you act.
 - After each tool result comes back, decide the next action and emit the next <tool_call>. Keep going until the task is actually done, then call `done`.
 
 # Your tools
-- `bash` — your primary tool: locate, read, run, verify. You know the unix toolbox; use it directly.
+- `search` — ranked search of this repo from a plain-English question ("where are auth failures handled?"). Your normal FIRST move on any task that touches code you have not already read: it returns `file:line` locations, which you then read with bash.
+- `bash` — read, run, verify, and exact matching. You know the unix toolbox; use it directly.
 - `edit` — change an existing file by exact text replacement (`old` → `new`).
 - `write` — create a new file (whole content).
 - `write_todos` — record/update a short plan for any task with 2+ steps; call it first, keep statuses current.
@@ -36,10 +39,11 @@ chatbot — you act.
 
 # Plan first, then work the plan
 - For any task with 2+ steps, your FIRST call is `write_todos` laying out a short plan; then work it, marking each item `in_progress` before you start it and `completed` right after.
-- A typical turn is: write_todos → bash (locate, then read the region) → edit → bash (run the project's tests) → done. Do not skip straight to a final text answer.
+- A typical turn is: write_todos → search (locate) → bash (read the region) → edit → bash (run the project's tests) → done. Do not skip straight to a final text answer.
 
-# Working in bash (context is scarce — read SMALL)
-- Locate code with ripgrep: `rg -n 'pattern' src/` (add `-C 2` for context, `-l` for files only). Find files with `rg --files | rg name` or `ls`.
+# Finding and reading code (context is scarce — read SMALL)
+- Locate code with `search` first: ask it the question in plain words and it ranks the files that are about it. Then read the region it points at.
+- Reach for ripgrep when you already know the exact string, or need EVERY match: `rg -n 'pattern' src/` (add `-C 2` for context, `-l` for files only). Find files with `rg --files | rg name` or `ls`.
 - Orient in a file: `wc -l file` first, then read only the region you need: `sed -n '120,180p' file`. Only `cat -n` a file you know is short (under ~100 lines).
 - Never dump whole large files or flood output — long output is clipped and wastes your context. Narrow the path, use `head`, `rg -m`.
 - Run and verify with the project's real commands (its test runner, its build) straight from bash.
@@ -48,7 +52,7 @@ chatbot — you act.
 - Change existing files ONLY with the `edit` tool: `old` is the exact current text copied from what you just read — including its tabs/spaces — and `new` is the replacement. Include enough surrounding lines to make `old` unique in the file.
 - Do NOT modify existing files via `sed -i`, `awk -i`, `perl -i`, `echo >>`, or shell redirection — quoting and indentation get mangled. (Heredocs/redirection are fine for creating new scratch scripts.)
 - When refactoring a function, read the WHOLE function first, then replace its entire body in one `edit` (old = the full original function text). Do not prepend new lines while leaving the old body in place — that creates duplicate/dead code.
-- Whenever the user mentions a function, file, symbol, error, or "this code", your FIRST action is to locate it with bash and read it. Never answer from memory or assumption; never propose changes to code you haven't read.
+- Whenever the user mentions a function, file, symbol, error, or "this code", your FIRST action is to locate it — `search` when you don't know the exact string to grep for, `rg` when you do — and then read it. Never answer from memory or assumption; never propose changes to code you haven't read.
 - To change code, edit the real file. Do NOT paste a rewritten function into your chat reply and call it done — an answer that isn't applied to a file is not a real change.
 
 # Persistence
@@ -218,12 +222,73 @@ def _dynamic_context() -> list:
     return dynamic
 
 
+# The four places above that `search` changed. Held as named constants so the
+# ablation table below can revert them; `test_search.py` asserts each one is still
+# present in `_BASE_PROMPT`, so editing the prompt without updating these fails a test
+# instead of silently leaving the ablation arm half-reverted.
+_TOOLS_LINES = (
+    "- `search` — ranked search of this repo from a plain-English question "
+    "(\"where are auth failures handled?\"). Your normal FIRST move on any task that "
+    "touches code you have not already read: it returns `file:line` locations, which "
+    "you then read with bash.\n"
+    "- `bash` — read, run, verify, and exact matching. You know the unix toolbox; use "
+    "it directly.\n")
+_TURN_LINE = ("- A typical turn is: write_todos → search (locate) → bash (read the "
+              "region) → edit → bash (run the project's tests) → done. Do not skip "
+              "straight to a final text answer.\n")
+_LOCATE_LINES = (
+    "# Finding and reading code (context is scarce — read SMALL)\n"
+    "- Locate code with `search` first: ask it the question in plain words and it ranks "
+    "the files that are about it. Then read the region it points at.\n"
+    "- Reach for ripgrep when you already know the exact string, or need EVERY match: "
+    "`rg -n 'pattern' src/` (add `-C 2` for context, `-l` for files only). Find files "
+    "with `rg --files | rg name` or `ls`.\n")
+_FIRST_ACTION_LINE = (
+    "- Whenever the user mentions a function, file, symbol, error, or \"this code\", "
+    "your FIRST action is to locate it — `search` when you don't know the exact string "
+    "to grep for, `rg` when you do — and then read it. Never answer from memory or "
+    "assumption; never propose changes to code you haven't read.\n")
+
+
+# Reverting the prompt above to its pre-`search`, bash-first wording.
+#
+# `search` is written into the prompt as the default first move rather than bolted on
+# as an extra bullet, because a single bullet measurably lost to the three standing
+# instructions around it: the model kept opening with `rg` and the tool went unused on
+# 3 of 4 navigation tasks. Naming it once in a list it does not lead is not the same
+# as telling the model how a turn starts.
+#
+# CHAD_NO_SEARCH withholds the tool's schema, so under that flag the prompt must not
+# name it either — a prompt advertising a tool the model cannot call teaches
+# hallucinated calls. These pairs restore the earlier text EXACTLY, so the ablation arm
+# runs the previous harness rather than a half-edited one; `test_search.py` pins that.
+_NO_SEARCH_SUBS = (
+    (_TOOLS_LINES, "- `bash` — your primary tool: locate, read, run, verify. "
+                   "You know the unix toolbox; use it directly.\n"),
+    (_TURN_LINE, "- A typical turn is: write_todos → bash (locate, then read the "
+                 "region) → edit → bash (run the project's tests) → done. Do not skip "
+                 "straight to a final text answer.\n"),
+    (_LOCATE_LINES, "# Working in bash (context is scarce — read SMALL)\n"
+                    "- Locate code with ripgrep: `rg -n 'pattern' src/` (add `-C 2` for "
+                    "context, `-l` for files only). Find files with `rg --files | rg "
+                    "name` or `ls`.\n"),
+    (_FIRST_ACTION_LINE, "- Whenever the user mentions a function, file, symbol, error, "
+                         "or \"this code\", your FIRST action is to locate it with bash "
+                         "and read it. Never answer from memory or assumption; never "
+                         "propose changes to code you haven't read.\n"),
+)
+
+
 def build_system_prompt() -> str:
     # Cache-boundary trick (from the Claude Code teardown): everything above the
     # boundary is static behavioral text that stays identical across sessions, so the
     # prefix KV cache reuses it. Volatile per-session context (cwd, project docs) goes
     # below, where re-prefilling a few hundred tokens is cheap.
-    return (_BASE_PROMPT + _verify_baseline_block() + "\n".join(_dynamic_context()))
+    base = _BASE_PROMPT
+    if config.flag("CHAD_NO_SEARCH"):
+        for present, previous in _NO_SEARCH_SUBS:
+            base = base.replace(present, previous)
+    return (base + _verify_baseline_block() + "\n".join(_dynamic_context()))
 
 
 def _verify_baseline_block() -> str:
