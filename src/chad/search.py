@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import threading
 from dataclasses import dataclass
 
@@ -50,8 +51,46 @@ log = logging.getLogger("chad")
 # new entry is still added in exactly one place.
 _SKIP_NAMES = frozenset(IGNORE_DIRS + REPOMAP_EXTRA)
 
+# Tracked plus untracked-but-not-ignored: exactly the files a developer would call
+# "the repository". `--others` keeps a file the model just wrote searchable before
+# it is ever committed; `--exclude-standard` is what applies .gitignore.
+_GIT_LS = ("git", "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+_GIT_TIMEOUT = 10
+
+
+def _git_listing(root: str):
+    """Every path git considers part of `root`, or None when it is not a git worktree.
+
+    Asking git is the only honest way to honor .gitignore: negations, directory
+    scoping, .git/info/exclude and the user's global excludes all live in git, not
+    in a list of directory names. The difference is not marginal — a JS package
+    keeps its compiled output in a gitignored directory, and each source map there
+    embeds a second copy of a source file, so a name-list walk can spend most of the
+    index on build artifacts that then outrank the source they were built from.
+    """
+    try:
+        done = subprocess.run(_GIT_LS, cwd=root, capture_output=True,
+                              timeout=_GIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None                      # no git binary, or it hung
+    if done.returncode != 0:
+        return None                      # not a worktree
+    return [p for p in done.stdout.decode("utf-8", "replace").split("\0") if p]
+
+
+def _skipped(rel: str) -> bool:
+    """The name-based exclusions, applied to a git-listed path. Git has already
+    dropped everything .gitignore covers; this is the floor for the repository that
+    commits its dependencies or its model weights anyway."""
+    return any(part.startswith(".") or part in _SKIP_NAMES
+               for part in rel.split("/"))
+
+
 _MAX_FILES = 20000          # same ceiling repomap uses for a whole-repo walk
-_STATE_VERSION = 1          # bump when the schema or state shape changes
+_STATE_VERSION = 1          # bump when the state sidecar's shape changes
+_SCHEMA_VERSION = 1         # bump on any schema/tokenizer change: it keys the cache
+                            # directory, so an index built by an older chad is orphaned
+                            # rather than queried with the wrong tokenizer
 _CACHE_DIR = os.path.expanduser("~/.chad/cache/search")
 _WRITER_HEAP = 32_000_000   # 32MB is ample for file-sized documents; the 128MB
                             # default is real resident memory next to a loaded model
@@ -71,6 +110,35 @@ where what which who whom how why when is-it it its this that these those
 i we you they there here from by with as at into out up down about
 find show tell me my our your please can could should would
 """.split())
+
+# Satellite files answer a "where is X?" question with a file *about* X rather than
+# the one that does X: a test names every concept it exercises, a changelog names
+# every concept it ever touched, and both are long enough to match many terms at once.
+# They stay in the ranking (sometimes the test IS the answer) but must outscore the
+# implementation on merit rather than on vocabulary.
+_SATELLITE = (
+    (re.compile(r"(^|/)(tests?|spec|specs)/|(^|/)(test_|conftest\.)|_test\.[a-z]+$"), 0.45),
+    (re.compile(r"(^|/)(benchmarks?|evals?|examples?|fixtures?)/"), 0.45),
+    (re.compile(r"(^|/)CHANGELOG|(^|/)(docs?|documentation)/|\.(md|rst|txt)$"), 0.55),
+    # Repository boilerplate: prose that matches a surprising number of code questions
+    # ("whether", "any", "conditions") and answers none of them.
+    (re.compile(r"(^|/)(licen[cs]e|copying|notice|authors|contributing|"
+                r"code_of_conduct|security)(\.[a-z]+)?$", re.I), 0.35),
+)
+# ...unless the question is asking for one of them, in which case the demotion would
+# be answering a different question than the one that was typed.
+_ASKS_FOR_SATELLITE = re.compile(
+    r"\b(test|tests|testing|spec|specs|benchmark|benchmarks|changelog|"
+    r"doc|docs|documentation|readme|example|examples|fixture|fixtures)\b", re.I)
+
+
+def _path_prior(rel: str) -> float:
+    """Score multiplier for what kind of file this is, independent of the query."""
+    for pattern, weight in _SATELLITE:
+        if pattern.search(rel):
+            return weight
+    return 1.0
+
 
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9]{2,}")
@@ -191,7 +259,8 @@ class CodeSearchIndex:
         """Per-repository cache directory, keyed by canonical path. Outside the repo
         on purpose: the index is derived state and must never appear in a diff."""
         base = config.env_str("CHAD_SEARCH_DIR", _CACHE_DIR)
-        return os.path.join(base, hashlib.sha256(self.root.encode()).hexdigest()[:16])
+        key = f"{self.root}\0schema{_SCHEMA_VERSION}".encode()
+        return os.path.join(base, hashlib.sha256(key).hexdigest()[:16])
 
     def _index_dir(self) -> str:
         return os.path.join(self.cache_dir(), "index")
@@ -209,6 +278,8 @@ class CodeSearchIndex:
         sb.add_text_field("path", stored=True, tokenizer_name="raw")
         # ...and tokenized separately for ranking, so "authentication middleware" can
         # score auth/middleware.py on its path without the path polluting content stats.
+        # Left unstemmed deliberately: stemming these two was measured against the
+        # navigation task set and ranked slightly worse than `default`.
         sb.add_text_field("pathtext", stored=False, tokenizer_name="default")
         sb.add_text_field("filename", stored=False, tokenizer_name="default")
         sb.add_text_field("lang", stored=False, tokenizer_name="default")
@@ -274,10 +345,29 @@ class CodeSearchIndex:
     def _discover(self) -> dict:
         """relpath -> (mtime_ns, size) for every candidate file, cheaply.
 
-        Pruning happens in `os.walk`'s dirnames so an ignored tree is never entered,
-        and nothing is opened here — only `stat` — so the walk stays proportional to
-        the repository's shape rather than its bytes.
+        Nothing is opened here — only `stat` — so discovery stays proportional to the
+        repository's shape rather than its bytes. Git enumerates the files when it
+        can, so .gitignore is honored; the walk below is the fallback for a directory
+        that is not a worktree.
         """
+        listing = _git_listing(self.root)
+        if listing is None:
+            return self._discover_walk()
+        out = {}
+        for rel in listing:
+            if _skipped(rel):
+                continue
+            if not self._accept(os.path.join(self.root, rel), out, rel):
+                continue
+            if len(out) >= _MAX_FILES:
+                break
+        return out
+
+    def _discover_walk(self) -> dict:
+        """Discovery without git: prune by directory name in `os.walk`'s dirnames so
+        an ignored tree is never entered. Coarser than .gitignore — it cannot know
+        what this particular repository builds into — but it never has to guess at a
+        file's history to decide whether to read it."""
         out = {}
         for dirpath, dirnames, filenames in os.walk(self.root):
             dirnames[:] = [d for d in dirnames
@@ -286,16 +376,23 @@ class CodeSearchIndex:
                 if name.startswith("."):
                     continue
                 f = os.path.join(dirpath, name)
-                try:
-                    st = os.stat(f)
-                    if not os.path.isfile(f) or st.st_size > _MAX_FILE_BYTES:
-                        continue
-                except OSError:
-                    continue
-                out[os.path.relpath(f, self.root)] = (st.st_mtime_ns, st.st_size)
+                self._accept(f, out, os.path.relpath(f, self.root))
                 if len(out) >= _MAX_FILES:
                     return out
         return out
+
+    def _accept(self, path: str, out: dict, rel: str) -> bool:
+        """stat `path` and record it under `rel` if it is a plain file small enough to
+        index. Directories reach here as gitlinks (submodules) and as walk entries
+        that changed under us, so the isfile test is load-bearing, not defensive."""
+        try:
+            st = os.stat(path)
+            if not os.path.isfile(path) or st.st_size > _MAX_FILE_BYTES:
+                return False
+        except OSError:
+            return False
+        out[rel] = (st.st_mtime_ns, st.st_size)
+        return True
 
     def _read_text(self, rel: str):
         """The file's text, or None if it is binary/unreadable. Strict UTF-8 decoding
@@ -385,13 +482,16 @@ class CodeSearchIndex:
             # it is about, and BM25 already ranks the docs that match more of them higher.
             q = index.parse_query(" ".join(terms), default_field_names=list(self._FIELDS),
                                   field_boosts=dict(self._BOOSTS))
-            # Over-fetch when a path filter is set — filtering happens on the way out,
-            # so the cap has to be applied after, not before.
-            raw = searcher.search(q, limit=limit * 10 if path else limit).hits
+            # Over-fetch: both the path filter and the re-rank below happen on the way
+            # out, so the cap has to be applied after them, not before.
+            raw = searcher.search(q, limit=limit * 10).hits
 
         prefix = self._norm_prefix(path)
+        prior = (lambda rel: 1.0) if _ASKS_FOR_SATELLITE.search(query) else _path_prior
+        scored = sorted(((score * prior(searcher.doc(addr).get_first("path")), addr)
+                         for score, addr in raw), key=lambda t: -t[0])
         hits = []
-        for score, addr in raw:
+        for score, addr in scored:
             rel = searcher.doc(addr).get_first("path")
             if prefix and not (rel == prefix or rel.startswith(prefix + os.sep)):
                 continue

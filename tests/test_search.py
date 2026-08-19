@@ -17,6 +17,7 @@ Three invariants matter here:
 
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -161,6 +162,63 @@ def test_indexes_text_and_skips_excluded_trees():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_gitignore_is_honored():
+    """The exclusions in ignore.py are a name list; what a repository actually builds
+    into is only knowable from .gitignore. A JS package is the case that bites: the
+    compiled tree is gitignored, every source map in it embeds a second copy of a
+    source file, and those copies outrank the sources they were built from."""
+    files = dict(REPO)
+    files[".gitignore"] = "distribution/\n"
+    for rel in ("distribution/auth/middleware.js",
+                "distribution/auth/middleware.js.map",
+                "distribution/auth/middleware.d.ts"):
+        files[rel] = ('class AuthMiddleware { }\n'
+                      '// authenticate the inbound request principal\n')
+    d, cache = _seed(files)
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True, capture_output=True)
+        ix = sr.CodeSearchIndex(d)
+        ix.reconcile()
+        hits = _paths(ix.search("attach the authenticated principal to a request",
+                                limit=20))
+        check("build output is never indexed",
+              not any(h.startswith("distribution/") for h in hits), hits)
+        check("the source it was built from still ranks",
+              "src/auth/middleware.py" in hits, hits)
+        check(".gitignore itself is not indexed", ".gitignore" not in hits, hits)
+
+        # --others, not just --cached: nothing here is committed, and a file the model
+        # wrote this turn has to be searchable this turn.
+        with open(os.path.join(d, "src", "auth", "tokens.py"), "w") as f:
+            f.write("def mint_session_token(principal):\n    return sign(principal)\n")
+        fresh = _paths(ix.search("mint a session token", limit=20))
+        check("an uncommitted new file is searchable",
+              "src/auth/tokens.py" in fresh, fresh)
+    finally:
+        _teardown(cache)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_non_git_directory_falls_back_to_the_name_walk():
+    """No worktree, no .gitignore to read — the walk still has to produce an index.
+    It is coarser by construction, and that is the honest boundary of the fallback."""
+    files = dict(REPO)
+    files[".gitignore"] = "distribution/\n"
+    files["distribution/auth/middleware.js"] = "class AuthMiddleware { }\n"
+    d, cache = _seed(files)
+    try:
+        check("the temp repo really is not a worktree", sr._git_listing(d) is None)
+        ix = sr.CodeSearchIndex(d)
+        ix.reconcile()
+        hits = _paths(ix.search("AuthMiddleware", limit=20))
+        check("the walk indexes what git would have excluded",
+              "distribution/auth/middleware.js" in hits, hits)
+        check("the name list still applies", not any("node_modules" in h for h in hits))
+    finally:
+        _teardown(cache)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_index_lives_outside_the_repository():
     """The index is derived state: it must never show up in the working tree."""
     d, cache = _seed()
@@ -196,6 +254,41 @@ def test_natural_language_queries_rank_the_right_file():
         ):
             top = _paths(ix.search(query, limit=n))
             check(f"{query!r} -> {wanted} in top {n}", wanted in top, top)
+    finally:
+        _teardown(cache)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_implementation_outranks_the_files_that_describe_it():
+    """A test file names every concept it exercises and a changelog names every concept
+    it ever touched, so on vocabulary alone they beat the code that actually does the
+    work. Ranking has to prefer the implementation for a "where is X?" question."""
+    files = dict(REPO)
+    concept = ("session token issuance and refresh, the sliding expiry window, "
+               "and revoking a session on sign-out\n")
+    files["tests/test_sessions.py"] = "# " + concept * 6
+    files["CHANGELOG.md"] = "# 1.2.0\n- " + concept * 6
+    files["docs/sessions.md"] = "# Sessions\n" + concept * 6
+    files["license"] = "Permission is hereby granted, " + concept * 6
+    files["src/sessions.py"] = ("def issue(principal):\n"
+                                "    # " + concept +
+                                "    return sign(principal)\n")
+    d, cache = _seed(files)
+    try:
+        ix = sr.CodeSearchIndex(d)
+        ix.reconcile()
+        top = _paths(ix.search("where are session tokens issued and revoked", limit=6))
+        check("the implementation ranks first", top[0] == "src/sessions.py", top)
+        for satellite in ("tests/test_sessions.py", "CHANGELOG.md", "docs/sessions.md",
+                          "license"):
+            check(f"{satellite} is demoted, not removed",
+                  satellite not in top[:1], top)
+
+        # The demotion is about answering the question that was asked — when the
+        # question IS about tests, the tests have to come back.
+        asked = _paths(ix.search("which test covers issuing session tokens", limit=6))
+        check("asking for tests puts tests back on top",
+              asked[0].startswith("tests/"), asked)
     finally:
         _teardown(cache)
         shutil.rmtree(d, ignore_errors=True)
