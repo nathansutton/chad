@@ -26,3 +26,6 @@ benchmarks/tb2/harbor_logs_*/
 
 # Search-tool selection measurement harness — stays local
 benchmarks/search/
+
+# `chad prove` scorecard rows — written to the invoking directory, per run
+/results.json
