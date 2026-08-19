@@ -66,65 +66,70 @@ def test_pick_model_override(monkeypatch):
     # signal, and a shell that exports CHAD_MODEL globally must not pin every run.
     model, _ = cli._pick_model("/flag/model")
     check("--model beats CHAD_MODEL", model == "/flag/model", model)
-    # `--model auto` is the explicit spelling of "ignore the override, use RAM".
+    # `--model auto` is the explicit spelling of "ignore the override, use the default".
     monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    model, why = cli._pick_model("auto")
-    check("auto falls through to the RAM default", model == cli._HF_9B, model)
-
-
-def test_pick_model_aliases(monkeypatch):
-    """`--model 9b` / `--model 35b` are the discoverable spelling of the shipped pair —
-    the point of the flag is that choosing small-or-large needs no repo id."""
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)   # no local build -> HF repos
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 8.0)  # tiny box: alias must win
-    for spec, expect in (("9b", cli._HF_9B), ("35b", cli._HF_35B),
-                         ("9B", cli._HF_9B), ("35B", cli._HF_35B)):
-        model, why = cli._pick_model(spec)
-        check(f"--model {spec} -> shipped repo", model == expect, model)
-        check(f"--model {spec} reason says requested", "requested" in why, why)
-    # Anything not an alias is passed through untouched (HF repo id or local dir).
-    model, _ = cli._pick_model("mlx-community/Whatever-4bit")
-    check("unknown spec passes through", model == "mlx-community/Whatever-4bit", model)
-
-
-def test_pick_model_ram_thresholds(monkeypatch):
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    # No local dirs anywhere -> HF repo ids.
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-
-    # RAM below the big-box threshold -> 9B HF repo (the safe fallback).
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 16.0)
-    model, why = cli._pick_model()
-    check("low RAM -> 9B HF repo", model == cli._HF_9B, model)
-    check("low RAM reason mentions 9B", "9B" in why, why)
-
-    # A 24 GB Mac gets the 35B. It did NOT before the fused attention kernel and the
-    # 8-bit-from-the-start KV cache cut the per-token cost — the floor was 32 GB and a
-    # 24 GB box silently got the small model. This is the case the threshold exists for,
-    # so it is pinned rather than left to the 16/64 pair either side of it.
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 24.0)
-    model, why = cli._pick_model()
-    check("24 GB -> 35B HF repo", model == cli._HF_35B, model)
-
-    # RAM at/above the threshold -> 35B HF repo (the default).
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    model, why = cli._pick_model()
-    check("big RAM -> 35B HF repo", model == cli._HF_35B, model)
-    check("big RAM reason mentions 35B", "35B" in why, why)
+    model, why = cli._pick_model("auto")
+    check("auto falls through to the shipped default", model == cli._HF_MODEL, model)
 
-    # RAM unreadable (None) -> the SAFE smaller model, never a surprise 12 GB
-    # download on unknown hardware (devex review T3: the old fall-through to the
-    # 35B branch contradicted _detect_ram_gb's "safe (smaller) model" contract).
+
+def test_pick_model_no_size_shorthands(monkeypatch):
+    """2.0.0 retired the Ornith pair and with it `--model 35b` / `--model 9b`.
+
+    The shorthands must not silently resolve to anything: they are now ordinary specs,
+    passed through as literal HF repo ids. Pinned because the failure mode of a
+    half-removed alias table is that `--model 9b` quietly loads the *default* model and
+    the user never learns their flag stopped meaning anything.
+    """
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
+    for spec in ("9b", "35b", "27b", "mlx-community/Whatever-4bit"):
+        model, why = cli._pick_model(spec)
+        check(f"--model {spec} passes through literally", model == spec, model)
+        check(f"--model {spec} reason says requested", "requested" in why.lower(), why)
+
+
+def test_pick_model_one_model_every_box(monkeypatch):
+    """One model, whatever the RAM: there is no smaller tier to fall back to."""
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)   # no local build -> HF repo
+    for ram in (16.0, 24.0, 64.0, None):
+        monkeypatch.setattr(cli, "_detect_ram_gb", lambda ram=ram: ram)
+        model, why = cli._pick_model()
+        check(f"RAM {ram} -> the shipped repo", model == cli._HF_MODEL, model)
+        check(f"RAM {ram} reason is a default", "default" in why, why)
+
+
+def test_pick_model_small_box_warns(monkeypatch, capsys):
+    """Below the 24 GB target chad warns and proceeds — it advises, it does not gate.
+
+    Retiring the 9B removed the safe fallback, so this warning is the only thing
+    standing between a 16 GB Mac and a silently unusable context window.
+    """
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 16.0)
+    model, _ = cli._pick_model()
+    err = capsys.readouterr().err
+    check("small box still served", model == cli._HF_MODEL, model)
+    check("small box warns", "below the" in err, err)
+    check("warning names the RAM read", "16 GB" in err, err)
+
+    # RAM unreadable: same warning path, named as undetectable rather than a number.
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: None)
-    model, why = cli._pick_model()
-    check("unknown RAM -> safe 9B HF repo", model == cli._HF_9B, model)
-    check("unknown RAM reason says undetectable", "undetectable" in why, why)
+    cli._pick_model()
+    check("unknown RAM warns 'undetectable'", "undetectable" in capsys.readouterr().err)
+
+    # At/above the target: silent.
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 24.0)
+    cli._pick_model()
+    check("24 GB box does not warn", capsys.readouterr().err == "")
 
 
 def test_model_download_gb():
-    check("35B repo -> ~12 GB", cli._model_download_gb(cli._HF_35B) == 12.0)
-    check("9B repo -> ~5 GB", cli._model_download_gb(cli._HF_9B) == 5.0)
+    check("shipped repo -> ~12 GB", cli._model_download_gb(cli._HF_MODEL) == 12.0)
 
 
 def test_free_disk_gb():
@@ -145,11 +150,11 @@ def test_ensure_model_disk_preflight(monkeypatch, capsys):
                         lambda *a, **k: None)
     monkeypatch.setattr(cli, "_free_disk_gb", lambda path: 1.0)
     with pytest.raises(SystemExit) as e:
-        cli._ensure_model(cli._HF_9B)
+        cli._ensure_model(cli._HF_MODEL)
     check("preflight exits 1", e.value.code == 1, e.value.code)
     err = capsys.readouterr().err
     check("names the shortfall", "not enough free disk" in err, err)
-    check("names required space", "~5 GB" in err, err)
+    check("names required space", "~12 GB" in err, err)
     check("points at cache GC", "hf cache" in err, err)
 
 
@@ -165,88 +170,36 @@ def test_ensure_model_disk_preflight_unreadable(monkeypatch):
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda *a: "n")
     with pytest.raises(SystemExit) as e:
-        cli._ensure_model(cli._HF_9B)
+        cli._ensure_model(cli._HF_MODEL)
     # Exit came from the user's "n" at the prompt, not the disk preflight.
     check("unreadable disk does not block", e.value.code == 1, e.value.code)
 
 
 def test_pick_model_prefers_local_dir(monkeypatch):
+    # A dev clone that already built the weights uses them instead of re-downloading.
     monkeypatch.delenv("CHAD_MODEL", raising=False)
-
-    # Small box AND the locally-built 9B dir exists -> use the local path, not the repo.
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 16.0)
-    monkeypatch.setattr(os.path, "isdir", lambda p: p == cli._LOCAL_9B)
-    model, _ = cli._pick_model()
-    check("local 9B preferred over HF repo", model == cli._LOCAL_9B, model)
-
-    # Big box AND the locally-built 35B dir exists -> use the local path.
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    monkeypatch.setattr(os.path, "isdir", lambda p: p == cli._LOCAL_35B)
+    monkeypatch.setattr(os.path, "isdir", lambda p: p == cli._LOCAL_MODEL)
     model, _ = cli._pick_model()
-    check("local 35B preferred over HF repo", model == cli._LOCAL_35B, model)
+    check("local build preferred over HF repo", model == cli._LOCAL_MODEL, model)
+    # `--model auto` takes the same path (it means "the default", not "ignore local").
+    model, _ = cli._pick_model("auto")
+    check("auto also prefers the local build", model == cli._LOCAL_MODEL, model)
 
 
 def test_pick_model_flag_auto_ignores_env(monkeypatch):
-    # '--model auto' forces the RAM pick even when CHAD_MODEL is set: the env must NOT
-    # win. Big box + no local dirs -> the 35B default, not the env value.
+    # '--model auto' forces the default even when CHAD_MODEL is set: the env must NOT win.
     monkeypatch.setenv("CHAD_MODEL", "/env/repo")
     monkeypatch.setattr(os.path, "isdir", lambda p: False)
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
     model, why = cli._pick_model("auto")
-    check("--model auto ignores env, RAM-picks 35B", model == cli._HF_35B, model)
+    check("--model auto ignores env", model == cli._HF_MODEL, model)
     check("--model auto reason is a default", "default" in why, why)
 
 
-def test_pick_model_flag_9b_both_ram(monkeypatch, capsys):
-    # Forcing 9B yields 9B on a big box AND a small box, and NEVER warns (9B is always
-    # safe). No local dirs -> HF repo.
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    for ram in (16.0, 64.0):
-        monkeypatch.setattr(cli, "_detect_ram_gb", lambda ram=ram: ram)
-        model, why = cli._pick_model("9b")
-        check(f"--model 9b -> 9B at {ram} GB", model == cli._HF_9B, model)
-        check("--model 9b reason names source", "--model" in why, why)
-    check("forcing 9B never warns", capsys.readouterr().err == "")
-
-
-def test_pick_model_flag_35b_big_no_warn(monkeypatch, capsys):
-    # Forcing 35B on a big box is exactly what the RAM pick would do -> no warning.
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    model, why = cli._pick_model("35b")
-    check("--model 35b -> 35B HF repo", model == cli._HF_35B, model)
-    check("35B on big box does not warn", capsys.readouterr().err == "")
-
-
-def test_pick_model_flag_35b_small_warns(monkeypatch, capsys):
-    # Forcing 35B under the RAM threshold still honors the override BUT warns (2A): the
-    # harness advises, the caller decides.
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 16.0)
-    model, _ = cli._pick_model("35b")
-    check("--model 35b honored on small box", model == cli._HF_35B, model)
-    err = capsys.readouterr().err
-    check("small-box 35B warns", "35b forced" in err, err)
-    check("warning names the OOM risk", "OOM" in err, err)
-
-
-def test_pick_model_flag_35b_ram_none_warns(monkeypatch, capsys):
-    # RAM undetectable + forced 35B: warn (we can't vouch for the memory) and proceed.
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: None)
-    model, _ = cli._pick_model("35b")
-    check("--model 35b honored on unknown RAM", model == cli._HF_35B, model)
-    check("unknown-RAM 35B warns 'undetectable'",
-          "undetectable" in capsys.readouterr().err)
-
-
 def test_pick_model_flag_repo_passthrough(monkeypatch):
-    # A non-alias value is a literal repo id / local dir, passed through unchanged (the
-    # CLI twin of CHAD_MODEL). RAM is irrelevant.
+    # A spec is a literal repo id / local dir, passed through unchanged (the CLI twin of
+    # CHAD_MODEL). RAM is irrelevant.
     monkeypatch.delenv("CHAD_MODEL", raising=False)
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 8.0)
     model, why = cli._pick_model("/some/local/model")
@@ -260,18 +213,9 @@ def test_pick_model_flag_beats_env(monkeypatch):
     monkeypatch.setenv("CHAD_MODEL", "/env/repo")
     monkeypatch.setattr(os.path, "isdir", lambda p: False)
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    model, why = cli._pick_model("9b")
-    check("--model beats CHAD_MODEL", model == cli._HF_9B, model)
+    model, why = cli._pick_model("/flag/repo")
+    check("--model beats CHAD_MODEL", model == "/flag/repo", model)
     check("winner reason names --model", "--model" in why, why)
-
-
-def test_pick_model_flag_prefers_local_dir(monkeypatch):
-    # A forced size prefers the locally-built dir, same as the RAM path.
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    monkeypatch.setattr(os.path, "isdir", lambda p: p == cli._LOCAL_35B)
-    model, _ = cli._pick_model("35b")
-    check("forced 35B prefers local dir", model == cli._LOCAL_35B, model)
 
 
 def test_pick_model_default_equals_auto(monkeypatch):
@@ -457,7 +401,9 @@ if __name__ == "__main__":
     with pytest.MonkeyPatch.context() as mp:
         test_pick_model_override(mp)
     with pytest.MonkeyPatch.context() as mp:
-        test_pick_model_ram_thresholds(mp)
+        test_pick_model_one_model_every_box(mp)
+    with pytest.MonkeyPatch.context() as mp:
+        test_pick_model_no_size_shorthands(mp)
     with pytest.MonkeyPatch.context() as mp:
         test_pick_model_prefers_local_dir(mp)
     with pytest.MonkeyPatch.context() as mp:

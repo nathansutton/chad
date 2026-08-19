@@ -2,16 +2,14 @@
 
 [![tests](https://github.com/nathansutton/chad/actions/workflows/tests.yml/badge.svg)](https://github.com/nathansutton/chad/actions/workflows/tests.yml)
 
-<img src="docs/tbench-size-vs-score.png" width="840" alt="Terminal-Bench 2.1: accuracy vs. cost per run. Every verified entry is a proprietary frontier model in a datacenter, costing $130–$2,000 per run. chad + Ornith (a 35B MoE) clears 57% on an Apple Silicon laptop for the electricity — the only no-API-cost point on the board.">
-
 > Claude can do anything, for anyone, anywhere. chad does one thing. 🗿
 > *Coding under supervision.*
 
 A single-user coding agent that runs **entirely locally on Apple Silicon** via
 [MLX](https://github.com/ml-explore/mlx). A deliberately lean, shell-first tool surface
-(bash, edit, write, a todo list, done), plan mode, and a full-screen TUI — driven by a
-local model on your laptop instead of a frontier model in a datacenter. No Docker, no
-API key, no model picker.
+(bash, edit, write, ranked repo search, a todo list, done), plan mode, and a full-screen
+TUI — driven by a local model on your laptop instead of a frontier model in a datacenter.
+No Docker, no API key, no model picker.
 
 ## Quickstart
 
@@ -19,13 +17,16 @@ Apple Silicon Mac + [uv](https://docs.astral.sh/uv/). One command — no clone, 
 
 ```bash
 uvx chad-code          # runs chad anywhere — the command is still `chad`
-uvx chad-code prove    # 2-min offline smoke test: 4 tiny fix-it tasks, verified, timed 🗿
+uvx chad-code prove    # offline smoke test: 4 tiny fix-it tasks, verified, timed 🗿
 ```
 
-First run picks the right Ornith model for your RAM (9B under 24 GB, 35B at 24 GB+), asks,
-and downloads it once (~5 GB / ~13 GB, resumable) into the shared Hugging Face cache. While
-it downloads, `cd` into a project and think of a scoped first ask — *"fix the failing test
-in `tests/test_x.py`"* lands; *"improve my codebase"* flails.
+First run asks, then downloads the model once (~12 GB, resumable) into the shared Hugging
+Face cache. While it downloads, `cd` into a project and think of a scoped first ask —
+*"fix the failing test in `tests/test_x.py`"* lands; *"improve my codebase"* flails.
+
+> **chad targets 24 GB Apple Silicon and nothing smaller.** It runs below that and will
+> tell you it is doing so, but the model needs ~12 GB resident before a single token of
+> context, so a 16 GB Mac gets a window too small to work in.
 
 > The PyPI package is **`chad-code`**; bare `chad` is an unrelated squatted package. Other
 > ways in (PATH install, bleeding-edge `main`, dev clone) are in
@@ -40,32 +41,34 @@ instrument:
 |-----------------|-------------------------------------------------|---------------------------------|
 | **Range**       | every workflow, every person, incredible nuance | one job: code, on your machine  |
 | **Runs**        | anywhere — cloud, IDE, terminal, phone          | your mac. that's it.            |
-| **Brain**       | a frontier model in a datacenter                | Ornith model                    |
+| **Brain**       | a frontier model in a datacenter                | one 27B on your SSD             |
 | **Disposition** | understands what you *meant*                    | does what you *said*            |
 | **Harness**     | open-ended, anything you can imagine            | plan. execute. nothing else.    |
 | **When wrong**  | reasons a way out                               | already shipped                 |
 
-![chad fixing a failing test end to end — reason, read, edit, run pytest, confirm green, all on a local 35B](docs/demo.gif)
+![chad fixing a failing test end to end — reason, read, edit, run pytest, confirm green, all on a local model](docs/demo.gif)
 
-> Real session, unedited (the silent prefill is cut): a local 35B finds the cent that
+> Real session, unedited (the silent prefill is cut): a local model finds the cent that
 > floor division loses, fixes it, and verifies itself — then your own `pytest`, in your
 > own shell. Recorded with `--yolo` so nothing pauses for a keypress; the default mode
 > stops and asks before every edit and every command.
 
-## Frontier scores, laptop cost
+## Frontier capability, laptop cost
 
 The exam is [Terminal-Bench](https://www.tbench.ai/leaderboard), the standard benchmark for
-CLI coding agents. chad won't top it — every verified entry on Terminal-Bench 2.1 is a
+CLI coding agents, and chad won't top it — every verified entry on Terminal-Bench 2.1 is a
 frontier model in a datacenter, scoring 59–84%. The number worth looking at is what that
-capability **costs**: the paid field spends **$130–$2,000 in API fees per run**. chad +
-Ornith clears **57%** on an Apple Silicon laptop, for the electricity — no API, no tokens,
-no datacenter. On a laptop, *capability per dollar* is the axis you actually compete on, and
-chad is the only point on the board that runs there.
+capability **costs**: the paid field spends **$130–$2,000 in API fees per run**. chad spends
+electricity. On a laptop, *capability per dollar* is the axis you actually compete on.
 
-> **Provisional number** — `57%` (51/89, k=1, self-run, not yet leaderboard-verified). The
-> whole benchmark is **publicly reproducible from a Mac**: the exact Harbor adapter, the
-> runner, and the recipe live in [`benchmarks/tb2/`](benchmarks/tb2/README.md). Check it,
-> don't trust it.
+> **No scored claim ships with 2.0.0.** The 57% (51/89, k=1, self-run) that earlier releases
+> quoted was measured on **Ornith 35B**, which 2.0.0 retired as the default — so it is not a
+> number about what you get when you install chad today. It is kept, dated and labelled, in
+> [Throughput & performance](docs/benchmarks.md#historical-ornith-35b--9b).
+> The 2.0.0 default has not been scored on Terminal-Bench 2.1 yet, and this section will
+> stay claim-free until it has been. The whole benchmark is **publicly reproducible from a
+> Mac** — adapter, runner and recipe live in [`benchmarks/tb2/`](benchmarks/tb2/README.md).
+> Check it, don't trust it.
 
 ## The bet: at this end of the report card, the harness beats the model
 
@@ -119,22 +122,37 @@ uv sync --extra speech                        # from a clone
 `/speech` in the TUI prints whichever of those matches your install, so you never have
 to work it out from here.
 
-**The model.** chad picks one for you by RAM and downloads it once into the shared Hugging
-Face cache (`~/.cache/huggingface`, reused across every project). Override with
-`--model 9b` / `--model 35b`, or `--model <repo or local dir>` for anything else.
+**The model.** chad ships exactly one, downloaded once into the shared Hugging Face cache
+(`~/.cache/huggingface`, reused across every project). There is no picker and no size tier.
 
-| Your Mac | Model | Footprint |
+| Model | Quant | Footprint |
 |---|---|---|
-| **≥ 24 GB** | [Ornith-1.0-35B `UD-Q2_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX) — 35B MoE, 2-bit experts | ~13 GB resident (~16 GB with KV) |
-| **16 / 18 GB** | [Ornith-1.0-9B `UD-Q4_K_XL`](https://huggingface.co/nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX) — 4-bit AWQ | ~5 GB |
+| [Qwen3.8-27B `UD-Q3_K_XL-MTP`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX) | 3-bit group-64 body, 5-bit `lm_head`, bundled 4-bit MTP head | ~12 GB resident, 262k native context |
 
-The 35B's floor used to be 32 GB — its working set SIGKILLed a 24 GB Mac mid-turn. The
-fused attention kernel and the 8-bit-from-the-start KV cache it enables cut the per-token
-cache cost enough to give that headroom back, and the compaction trigger now sizes itself
-from the live Metal budget, so a tight box narrows its context window instead of dying.
-24 GB runs the 35B; 16/18 GB still get the 9B. If a 24 GB machine feels tight next to your
-other apps, `--model 9b` puts it back. Quant names follow
-[Unsloth's dynamic-quant convention](https://docs.unsloth.ai/) (`UD-…`).
+Qwen3.8-27B is **dense** (64 layers: 48 GatedDeltaNet + 16 full attention), so every
+parameter is on the critical path for every token and shrinking the model is the only
+decode lever there is. The bits go where measurement says they pay: `lm_head` is a second
+full 1.27B-param tensor (vocab 248,320, untied), and the calibrated builds of this
+checkpoint agree it is the tier worth protecting — while `embed_tokens`, a lookup table
+whose per-row error never compounds through a matmul, is the cheapest. Quant names follow
+[Unsloth's dynamic-quant convention](https://docs.unsloth.ai/) (`UD-…`); the quant itself
+is MLX group-64 affine, not a llama.cpp k-quant.
+
+It ships with the checkpoint's own trained **multi-token-prediction head**, which is what
+lets chad decode self-speculatively — draft with the head, verify in one batched forward,
+accept by exact rejection sampling, so greedy output stays token-identical to the
+unspeculated path.
+
+**24 GB is the floor.** The context window is sized from the live Metal budget, not a
+constant, so a tighter box narrows its window rather than dying — but ~12 GB of weights
+plus a ~4.3 GB prefill transient spend most of a 24 GB budget before the first cached
+token, which is why a 24 GB Mac lands near ~56k of the model's 262k window rather than the
+whole thing. The banner states what you actually got. Below 24 GB chad warns and proceeds;
+it does not gate you, but it cannot give you a usable window either.
+
+`--model <repo or local dir>` runs different weights through the same engine. It is
+unsupported — the harness is tuned to the shipped model — and 2.0.0 removed the old `35b` /
+`9b` shorthands along with the Ornith models they named.
 
 **Upgrading** — depends on how you installed: `uv tool upgrade chad-code`; `uvx --refresh
 chad-code`; or `git pull && uv sync` for a clone. What changed lands in
@@ -181,8 +199,8 @@ model weights**, runs in seconds, and is what CI runs. Throughput on your own ma
 | `--resume` | list recent sessions, pick one by number (interactive TTY only) |
 | `--plan` | start in read-only plan mode (investigate + propose, edits blocked) |
 | `--yolo` | auto-approve bash/write/edit (skip confirm prompts) |
-| `--no-think` | skip Ornith's `<think>` blocks — faster on well-scoped work |
-| `--model` | `35b`, `9b`, `auto`, or any HF repo id / local model dir |
+| `--no-think` | skip the model's `<think>` blocks — faster on well-scoped work |
+| `--model` | `auto` (the shipped default), or any HF repo id / local model dir |
 | `--repl` | plain line REPL instead of the TUI |
 
 Plus three subcommands, each with its own `--help`:
@@ -190,7 +208,7 @@ Plus three subcommands, each with its own `--help`:
 | Command | What it does |
 |---|---|
 | `chad serve` | serve this Mac's model to a container or the LAN ([Configuration](docs/configuration.md#serving-the-local-model-to-a-container-chad-serve)) |
-| `chad prove` | 2-minute offline smoke test: 4 tiny fix-it tasks, verified, timed |
+| `chad prove` | offline smoke test: 4 tiny fix-it tasks, verified, timed |
 | `chad levers` | print the harness lever registry as JSON (ablation driver) |
 
 A headless task (positional, or piped with no TTY) auto-approves mutating tools; the model
@@ -219,7 +237,7 @@ Both are covered in full in the [Configuration reference](docs/configuration.md)
 - **[Throughput & performance](docs/benchmarks.md)** — prefill / decode / warm-step numbers
   you can reproduce with `chad-bench`.
 - **[Terminal-Bench 2.1 reproduction](benchmarks/tb2/README.md)** — the exact Harbor adapter
-  and runner behind the chart; serve Ornith yourself and check the number.
+  and runner; serve a model yourself and check the number.
 - **[Configuration reference](docs/configuration.md)** — Agent Skills, MCP servers, the
   context window, every environment variable, and the safety opt-outs.
 - **[Troubleshooting](docs/troubleshooting.md)** — when a session rambles, loops, or slows:

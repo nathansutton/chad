@@ -22,7 +22,7 @@ output to the transcript, so a naive backend re-reads an ever-longer prompt *eve
 step*. That is O(n) work per step and O(n²) over a session.
 
 Concretely, on a 24 GB M4 Pro: by step 20 a real coding session is ~5,000 tokens of
-transcript, which Ornith prefills in ~6.8 s. Re-reading it every step is **~7 seconds of
+transcript, which the model prefills in ~6.8 s. Re-reading it every step is **~7 seconds of
 dead air before the model says anything — every step, and growing faster than linearly**,
 since the prefill *rate* also falls as the prompt lengthens (~730 tok/s at 5k, ~500 by
 32k). Over a 40-step task, prefill (not generation) is where the minutes vanish.
@@ -38,7 +38,7 @@ step N prompt:  [ system + tools | cwd · CLAUDE.md | turn 1 | … | turn N-1 | 
 ```
 
 Same session, ~30 new tokens per step instead of 5,000: **~0.1 s of prefill per step
-instead of ~15 s.** That gap is the entire reason a 35B model on a laptop can feel like
+instead of ~15 s.** That gap is the entire reason a 27B model on a laptop can feel like
 an agent instead of a batch job.
 
 ### Why prefill is *hard*, not just expensive
@@ -50,7 +50,7 @@ things fight that, and chad handles both:
   trimmed — which changes the prefix and would normally throw the whole cache away.
   chad compacts oldest-first and reclaims enough in a single pass that it won't
   re-trigger next step (see [Context window](configuration.md#context-window-agentic-coding-needs-room)).
-- **A non-trimmable cache.** Ornith is a hybrid SSM/attention model: its recurrent
+- **A non-trimmable cache.** The shipped model is a hybrid SSM/attention model: its recurrent
   layers carry state that *can't be rewound to an arbitrary earlier token*. The cache
   can only grow by append; any divergence forces a full rebuild. chad leans into that —
   it reuses by extension and keeps a disk-checkpointed copy of the stable system+tools
@@ -70,12 +70,12 @@ three reasons:
 1. **The harness is tuned to the model, and that tuning is the product.** chad's
    tool-call parsing (four dialects + repair), edit forgiveness cascade, think-budget
    defaults, loop/thrash guards, and the prefix-stable transcript engineering are all
-   fitted to how Ornith actually misbehaves. Point the same harness at an arbitrary
+   fitted to how the shipped model actually misbehaves. Point the same harness at an arbitrary
    model and every one of those calibrations is wrong in a different direction. A
    picker doesn't add choice; it silently swaps a tested system for an untested one.
 2. **The engine co-design doesn't survive substitution.** The persistent prefix KV
    cache diffs *token ids* against a live cache object — it owns the tokenizer, the
-   cache layout, and Ornith's hybrid SSM/attention non-trimmability trade
+   cache layout, and the model's hybrid SSM/attention non-trimmability trade
    ([above](#why-prefill-is-hard-not-just-expensive)). "Just let me pick a GGUF"
    means "run through a stateless server boundary instead," and the measured cost of
    that boundary is the whole moat (see
@@ -91,6 +91,13 @@ cache, you lose the tuning fit), and `--backend llama` runs the harness against 
 llama.cpp server as a measured ablation arm (you lose the on-disk warm-prefix checkpoint
 and cache-quarantine — the KV lives in the server — documented in-code).
 Opinionated defaults, real overrides. 🗿
+
+2.0.0 went *further* in this direction rather than softening it. The Ornith 35B/9B pair and
+the RAM-aware pick that chose between them are gone; chad ships one model, Qwen3.8-27B, on
+every machine. The `35b` / `9b` shorthands went with them — `--model` now takes a repo id or
+a directory and nothing else. The tier existed to serve Macs below 24 GB, and chad no longer
+claims to: 24 GB is the target and the floor. What used to be "one model per RAM tier" is
+now just one model, which is the same principle with one fewer branch.
 
 ## Trimmable vs. append-only: the cache trade chad lives with
 
@@ -114,13 +121,13 @@ That cheap rewind unlocks two things that matter on a laptop:
   trimmable cache keeps the common prefix and re-prefills only from the divergence point.
   Append-only can't: any divergence is a full rebuild.
 
-**Ornith is not trimmable.** It's a hybrid SSM/attention (`qwen3_5`) model, and its
+**The shipped model is not trimmable.** It's a hybrid SSM/attention (`qwen3_5`) model, and its
 recurrent layers carry a *fixed-size running state that is a function of the entire
 sequence so far*. There's no per-token row to drop, so there's nothing to rewind to;
 `cache_utils.can_trim_prompt_cache` reports false and `engine._trimmable` stays off. PLD is
 gated on that flag and falls back cleanly — it can never speed up the shipped model.
 
-That's not a pure loss — it's the *same* recurrent design that keeps Ornith's KV footprint
+That's not a pure loss — it's the *same* recurrent design that keeps the KV footprint
 flat (a fixed-size SSM state no matter how long the context grows; see the
 [Context window](configuration.md#context-window-agentic-coding-needs-room) table). chad trades
 trimmability for a memory profile that fits comfortably in 24 GB. The job, then, is to stay
@@ -142,9 +149,10 @@ So where a trimmable model would lean on PLD and partial-prefix repair, chad lea
 append-only reuse + a warm on-disk base — and gets the responsive agentic loop anyway.
 Implementation lives in `engine.py` (`_trimmable`, `warm_prefix`, the prefix diff).
 
-## Why the tool surface is five tools
+## Why the tool surface is six tools
 
-chad 2.0.0 exposes exactly `bash`, `edit`, `write`, `write_todos`, and `done`. The
+chad 2.0.0 exposes exactly `bash`, `edit`, `write`, `search`, `write_todos`, and
+`done`. The
 1.x releases carried a much larger surface — dedicated `read`/`grep`/`glob`, a
 line-addressed edit family, a tree-sitter repo map, and an LSP-precise symbolic
 layer — and a registry of ~56 behavioral levers around it. All of it was measured
@@ -171,6 +179,31 @@ So the design leans into the route the model actually takes:
   near-misses (literal `\n` escapes; indentation drift) without ever risking a
   wrong edit — each recovery still requires a unique match.
 
+The one addition to that shell is the primitive a shell genuinely lacks:
+
+- **`search` is not a better `grep`; it is a different question.** `rg` answers
+  "find this exact string" and is unbeatable at it. It cannot answer "where is FHIR
+  validation handled?" — for that the model has to guess several synonymous regexes,
+  and every guess that misses costs a round trip. `search` (`search.py`) takes the
+  question in plain words and returns ranked `path:line` locations with a line of
+  context either side, from a BM25 index over the repo. The two tools are pointed at
+  different failure modes, and the prompt says so: `search` for discovery, `bash`/`rg`
+  when the match must be exact or exhaustive.
+
+  The shape follows the same rule as the rest of the harness — *never let the harness
+  disagree with the disk*. One document per file (update semantics stay trivial,
+  document counts stay in the thousands); content indexed but **not stored**, so the
+  snippet you read was re-read from the file at query time and cannot be a stale copy;
+  the index outside the repository, under `~/.chad/cache/search/`, so it can never show
+  up in a diff; freshness reconciled lazily on the first search of a session, so there
+  is no watcher, no daemon, and nothing added to startup.
+
+  Naming it in the prompt was not enough on its own. A single bullet listing `search`
+  alongside the other tools lost to the three standing instructions around it — the
+  model kept opening with `rg` and the tool went unused on 3 of 4 navigation tasks. It
+  is written into the prompt as how a turn *starts* instead, because telling a model a
+  tool exists is not the same as telling it when the turn should reach for it.
+
 ## Architecture
 
 The code is a standard `src/` package; tests live in `tests/`:
@@ -180,7 +213,8 @@ src/chad/        importable package (uv installs it as the `chad` console script
   cli.py         argument parsing + the one entrypoint (chad.cli:main)
   agent.py       agentic loop + guardrails
   engine.py      MLX inference + persistent prefix cache
-  tools.py       the bash/edit/write toolset
+  tools.py       the bash/edit/write/search toolset
+  search.py      BM25 repository index behind the `search` tool
   tui.py         full-screen prompt_toolkit UI
   ...            prompt, render, ambient, repomap, validate, … (modular)
 tests/           pytest suites (uv run pytest)
@@ -189,10 +223,10 @@ tests/           pytest suites (uv run pytest)
 ```
 cli.py ──▶ agent.py (agentic loop + guardrails) ──▶ engine.py (MLX + persistent prefix cache)
                  │                                          │
-                 └─ tools.py (bash/edit/write)
+                 └─ tools.py (bash/edit/write/search) ──▶ search.py (BM25 index)
 ```
 
-- **engine.py** — loads Ornith once, keeps its KV cache alive across turns, and on every
+- **engine.py** — loads the model once, keeps its KV cache alive across turns, and on every
   turn diffs the new prompt against the cached token ids so it only prefills the appended
   tokens. That's why multi-step tool loops stay snappy: re-rendering the whole transcript   
   each step prefills ~20–50 new tokens while 5000+ are served from cache.  
@@ -200,6 +234,11 @@ cli.py ──▶ agent.py (agentic loop + guardrails) ──▶ engine.py (MLX +
   schemas), streams the turn, parses tool calls, runs them, feeds results back, loops
   until the model stops calling tools.
 - **tools.py** — the Claude-Code-style toolset with JSON schemas.
+- **search.py** — the BM25 index behind `search`: a per-repo Tantivy index under
+  `~/.chad/cache/search/`, reconciled against mtime+size on the first query of a
+  session. Import-guarded, like `repomap`'s tree-sitter — on a platform with no
+  matching wheel the tool reports itself unavailable and the rest of the surface
+  keeps working.
 
 ## What it borrows from the masters
 
@@ -248,7 +287,7 @@ existing agents:
 - **Anti-hallucination guardrail** — an *internal-only* Claude Code instruction:
   never claim a test passed / task is done when the output shows otherwise.
 - **Context compaction** — when the prompt nears the limit, reclaim space oldest-first:
-  strip stale `<think>` reasoning from older assistant turns (Ornith's blocks are large
+  strip stale `<think>` reasoning from older assistant turns (the blocks are large
   and rarely matter later), then head/tail-truncate the oldest large tool outputs,
   keeping recent turns verbatim (`CHAD_CTX_LIMIT`). This and verified append-only cache
   reuse are what keep long agentic sessions responsive.

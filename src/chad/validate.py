@@ -254,7 +254,7 @@ def _coerce_scalar(value: Any, typ: Optional[str]) -> Tuple[Any, bool]:
 def _walk(value: Any, schema: dict, path: str) -> Tuple[Any, List[Err]]:
     typ = schema.get("type")
     # Un-double-stringify: a container field whose value arrived as a JSON string
-    # (Qwen3/Ornith do this on nested fields — typia's signature failure mode).
+    # (Qwen3 does this on nested fields — typia's signature failure mode).
     if typ in ("object", "array") and isinstance(value, str):
         un = repair_json(value) if typ == "object" else _load_json(value)
         if un is not None:

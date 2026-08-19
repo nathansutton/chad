@@ -382,7 +382,6 @@ def test_destructive_bash_guard():
 
 
 def test_destructive_guard_scoped_rm():
-    import os
     # scoped_destructive_guard ON (default): a recursive delete of a DEEP absolute
     # path is a scoped delete, not a catastrophe — the measured false-positive class
     # (152 '[denied by user]' results across 26 container trials, every real path
@@ -796,18 +795,12 @@ if __name__ == "__main__":
     test_reject_escalation()
     test_reject_loop_signature_resets_on_change()
     test_bash_result_verifies()
-    test_bash_result_verifies_ignores_trivial_checks()
-    test_bash_result_verifies_requires_executing_command()
-    test_investigation_gate()
-    test_verification_matrix()
     test_edit_failed_to_land()
-    test_edit_loop_break()
     test_done_rejection()
     test_update_work_flags()
     test_loop_guard()
     test_loop_guard_resets_on_landed_edit()
     test_nudge_for_no_calls()
-    test_garble_invariant_nudges()
     test_is_readonly_bash()
     test_landing_nudge()
     test_extend_step_cap()
@@ -820,11 +813,7 @@ if __name__ == "__main__":
     test_turn_governor()
     test_governor_two_band_jump_credits_progress()
     test_progress_note()
-    test_wrapup_window_nudge()
-    test_hard_wrapup_margins()
     test_relaunch_budget()
-    test_turn_think_budget()
-    test_turn_think_budget_check()
     test_review_pass_should_fire()
     test_classify_sync_kind()
     print(f"\n{PASS} passed, {FAIL} failed")

@@ -15,7 +15,7 @@ telemetry number an estimate. `/completion` removes both:
    the server evaluates chad's exact rendered prompt, byte-for-byte, with no second
    chat template and no re-tokenization drift. The one prerequisite: the server's
    GGUF must share the tokenizer vocab with the HF tokenizer loaded here (true when
-   both were converted from the same base model — verified for Ornith).
+   both were converted from the same base model).
 2. REAL CACHE TELEMETRY — with `cache_prompt: true` the server reuses the longest
    common prefix of the previous evaluation, exactly like chad's own MLX prefix
    cache, and its final stream chunk reports real `timings` (`prompt_n` = tokens

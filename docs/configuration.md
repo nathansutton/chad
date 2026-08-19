@@ -159,13 +159,54 @@ inside the coroutine so a hung server can never wedge the agent. Wired into
 `tools.active_schemas`/`dispatch_for`/`is_mutating`, the validator (`validate.py`), and the
 agent loop (`agent.py`).
 
+## Repository search (the `search` tool)
+
+`search` is the one tool on the surface that isn't a shell command. It answers the
+question `rg` can't take: *"where is FHIR validation handled?"* — a plain-English query
+in, ranked `path:line` locations out, with a line of context either side. Under it is a
+BM25 index (Tantivy) over the repository's text.
+
+It needs no setup and has no daemon. The first `search` of a session reconciles the index
+against the filesystem (mtime + size) and then answers; subsequent searches in the same
+session skip that. Nothing is added to chad's startup path — the native binding isn't even
+imported until a search actually runs.
+
+**Where the index lives.** `~/.chad/cache/search/<hash-of-repo-path>/`, keyed by canonical
+path — deliberately *outside* the repository, so a derived artifact can never show up in
+your `git status`. It is a pure cache: delete it and the only cost is one rebuild.
+
+```bash
+CHAD_SEARCH_DIR=/path/to/cache uv run chad  # relocate the index root (default ~/.chad/cache/search)
+CHAD_NO_SEARCH=1               uv run chad  # remove the tool from the surface entirely
+```
+
+- **`CHAD_SEARCH_DIR`** — index root. Useful on a machine where `~` is small or synced, or
+  to keep a benchmark's indexes out of your interactive cache.
+- **`CHAD_NO_SEARCH`** — withholds the tool's **schema**, not just its availability, and
+  the system prompt drops its search guidance to match. That completeness is the point: a
+  baseline arm that can still see the tool in its schema isn't a baseline. Use it for
+  paired benchmarks, or if you want the 1.x-style bash-only surface back.
+
+**Design notes that affect what you see.** Content is indexed but not *stored*, so every
+snippet is re-read from the file at query time — a result can never disagree with what's
+on disk. Indexing is one document per file, walks the same exclusion set as the tree-sitter
+tag scan (`ignore.py`: VCS dirs, model weights, installed packages, caches), skips files
+above the shared size ceiling, and stops at 20,000 files. Results default to 8 and cap at
+20 — a search competes with `rg` output for the same context budget, so it stays small
+enough that one search beats two greps and a `cat`.
+
+**When it's unavailable.** `tantivy` is a native (pyo3) binding. It ships wheels for
+CPython 3.11–3.14 on macOS arm64/x86_64 and manylinux, so an ordinary install never needs a
+Rust toolchain — but it is import-guarded anyway. On a platform with no matching wheel the
+tool says it is unavailable and every other tool keeps working.
+
 ## Context window (agentic coding needs room)
 
 By default the harness uses the model's **full native window** instead of an arbitrary
 cap. `CHAD_MAX_CONTEXT` requests more and **YaRN-extends** a model past native when its
 config supports it, capped at the model's documented max — so `CHAD_MAX_CONTEXT=262144`
 resolves to "256k, or the model's max". KV cache grows lazily, so a large window costs
-nothing until tokens fill it — and on the shipped Ornith models the KV cache is
+nothing until tokens fill it — and on the shipped model the KV cache is
 **quantized to 8-bit by default** (half the fp16 footprint; `CHAD_KV_BITS=0`
 restores fp16).
 
@@ -179,18 +220,18 @@ eval bench keeps for research), where the KV cache grows linearly with context:
 | 128k (YaRN) | 4.8 GB | 2.4 GB |
 | 256k | 9.7 GB | 4.8 GB |
 
-Ornith — the model chad ships — is a **hybrid SSM/attention** model: its recurrent
-layers carry a *fixed-size* state no matter how long the context gets, so only its
-attention layers grow. Its real footprint is flatter than the table above and sits well
-inside 24 GB alongside the ~5 GB of weights. When the prompt nears the window, old
-verbose tool outputs are compacted.
+Qwen3.8-27B — the model chad ships — is a **hybrid SSM/attention** model: 48 of its 64
+layers are GatedDeltaNet and carry a *fixed-size* recurrent state no matter how long the
+context gets, so only the 16 full-attention layers grow. Its real footprint is much flatter
+than the table above (measured: 34,816 bytes per token). When the prompt nears the window,
+old verbose tool outputs are compacted.
 
 8-bit KV used to cost ~20-30% throughput (mlx_lm's quantized attention is
 unfused), which is why it was opt-in. chad now ships a fused quantized-KV
 decode kernel (installed automatically when the model's attention shape is
-covered — both shipped Ornith models are), making the quantized cache *faster*
-than fp16 at long context (35B @32k: 60.2 vs 55.8 tok/s) on top of the RAM
-halving, so it is the default. `CHAD_KV_BITS=0` restores the fp16 cache;
+covered — the shipped model is), making the quantized cache *faster*
+than fp16 at long context (measured on the retired 35B at 32k: 60.2 vs 55.8 tok/s) on top
+of the RAM halving, so it is the default. `CHAD_KV_BITS=0` restores the fp16 cache;
 `CHAD_NO_QSDPA=1` keeps the quantized cache but disables the fused kernel
 (debug only — that combination is the old slow path).
 
@@ -212,7 +253,7 @@ CHAD_CTX_SAFETY=0.95    uv run chad      # the single headroom lever: fraction o
 CHAD_CTX_SLOPE_FACTOR=1.5 uv run chad    # A/B knob: per-token cost multiplier for that auto-sizing
                                          # (default 1.0 — a token's marginal cost is its KV cost)
 CHAD_MODEL=/path/to/mlx-model uv run chad  # power-user escape hatch: run a different MLX model
-                                         # (also: --model 9b|35b|auto|<repo> — the CLI twin, wins over this)
+                                         # (also: --model auto|<repo> — the CLI twin, wins over this)
 CHAD_PREFILL_CHUNK=1024 uv run chad      # force a fixed prefill chunk (default: adaptive — MoE 2048
                                          # / dense 512, decaying to 256 as context+pressure grow)
 CHAD_NO_MEMORY_CLAMP=1  uv run chad      # A/B knob: skip the Metal allocator clamps installed at load
@@ -225,10 +266,10 @@ cost, then capped at the model's window. Three things are subtracted before the 
 the resident weights, a headroom band (`CHAD_CTX_SAFETY`), and the **prefill transient** —
 the attention scratch that is live at the same moment the cache is. That last one is fixed,
 not per-token: it climbs with context and then flattens once the adaptive chunker starts
-shrinking the chunk (measured on the 27B: 1.8 GB at 8k, 4.15 GB at 49k, flat thereafter),
-and past that point peak memory grows at exactly the KV rate. On a 24 GB Mac the 27B's
-12.3 GB of weights plus that 4.3 GB transient spend 87% of the budget before the first
-cached token, which is why it lands near ~56k rather than its 262k native window. It
+shrinking the chunk (measured: 1.8 GB at 8k, 4.15 GB at 49k, flat thereafter), and past
+that point peak memory grows at exactly the KV rate. On a 24 GB Mac the model's 12.3 GB of
+weights plus that 4.3 GB transient spend 87% of the budget before the first cached token,
+which is why it lands near ~56k rather than its 262k native window. It
 self-calibrates per machine: less RAM compacts sooner, more RAM runs nearer the full
 window. `CHAD_CTX_LIMIT` forces an
 exact threshold (used by tests); `CHAD_CTX_SAFETY` (default 0.975) is the single
@@ -242,10 +283,12 @@ tens of thousands of tokens once the weights and the KV cache are paid for — a
 native number is context the run can never spend. When the governor is what bound it,
 the banner says so: `84k of 262k context`.
 
-`--model` (or `CHAD_MODEL`) takes `35b`, `9b`, `auto`, or any Hugging Face repo id /
-local MLX model directory. The two shorthands are the supported choices; an arbitrary
-model dir is unsupported and mostly there for research — the harness is tuned for Ornith.
-The flag wins over `CHAD_MODEL`, so a globally exported var can't pin every run.
+`--model` (or `CHAD_MODEL`) takes `auto` — the shipped model — or any Hugging Face repo id
+/ local MLX model directory. There are no size shorthands: 2.0.0 retired the Ornith 35B/9B
+pair and the RAM-aware pick that chose between them, so `--model 9b` is now just a literal
+(and nonexistent) repo id rather than a silent alias. An arbitrary model dir is unsupported
+and mostly there for research — the harness is tuned to the shipped model. The flag wins
+over `CHAD_MODEL`, so a globally exported var can't pin every run.
 
 **Memory safety.** At load the engine wires the Metal working set and caps
 the allocator slightly below it (`mx.set_wired_limit`/`set_memory_limit`), so a
@@ -255,25 +298,45 @@ retries. `CHAD_NO_MEMORY_CLAMP=1` disables the clamps (A/B). The compaction thre
 additionally respects host-physical free memory (pressure from Docker or other apps
 that the Metal budget can't see) and is re-checked between turns.
 
-**Forcing a size (`--model`).** chad's default keys on *physical* RAM, so a 24 GB Mac
-with a lot already resident still gets the 35B (~14 GB peak) and can swap-thrash — close
-other apps, or force the size for the session. The `--model` flag is the ergonomic way:
+### The model
+
+chad ships exactly one: [`nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX`][model], a dense
+`qwen3_5` hybrid (64 layers — 48 GatedDeltaNet, 16 full attention) quantized to 3-bit
+group-64 with `lm_head` held at 5-bit. ~12 GB resident, 262k native context, and it carries
+the checkpoint's own trained MTP head as `mtp.safetensors` for
+[self-speculative decoding](#speculative-decoding--kernel-knobs).
+
+[model]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX
+
+**chad targets 24 GB Apple Silicon and nothing smaller.** There is no low-RAM fallback any
+more, because there is no second model. On a smaller box chad prints a one-line warning at
+startup and runs anyway — it advises, it does not gate — but ~12 GB of weights plus the
+~4.3 GB prefill transient leave almost nothing for a KV cache, so the window collapses
+toward its floor. Even at 24 GB the honest figure is roughly ~56k of the model's 262k
+window; the banner states what you actually got, and the
+[context window](#context-window-agentic-coding-needs-room) section explains the sizing.
+
+Where the bits went, since a 3-bit model invites the question. On a dense model every
+parameter is on the critical path for every token, so there is no expert redundancy to
+absorb quantization error and no free lunch — but shrinking the weights is also the only
+decode lever available. The recipe follows what the calibrated GGUF builds of this same
+checkpoint agree on: `lm_head` is a second full 1.27B-param tensor (vocab 248,320,
+`tie_word_embeddings` false) and is where protection is worth buying, while `embed_tokens`
+is a lookup table whose per-row error never compounds through a matmul and is the cheapest
+tier to cut. Holding both high, as a uniform "sensitive tier" would, spends ~0.78 GB on the
+tier the evidence says needs it least — and on a 24 GB box 1 GB of weights is about 16k
+tokens of context.
+
+To run different weights through the same engine:
 
 ```bash
-uv run chad --model 9b     # pin the small model (~5 GB) regardless of RAM
-uv run chad --model 35b    # force the big model; warns first if RAM looks too small
-uv run chad --model auto   # explicit RAM-aware pick (ignores CHAD_MODEL if it's set)
+uv run chad --model mlx-community/Some-Other-Model-4bit   # any HF repo id
+uv run chad --model /path/to/local/mlx-model              # or a local dir
+CHAD_MODEL=/path/to/local/mlx-model uv run chad           # env equivalent
 ```
 
-`--model` is the CLI twin of `CHAD_MODEL`: it also accepts any HF repo id / local dir,
-and it **wins over `CHAD_MODEL`** when both are set. Precedence is `--model` → `CHAD_MODEL`
-→ the RAM-aware default. Forcing `35b` under the RAM threshold is honored but prints a
-one-line OOM warning first — the harness advises, you decide. The env spelling still works
-and is handy for pinning across a whole shell session:
-
-```bash
-CHAD_MODEL=nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX uv run chad   # env equivalent of --model 9b
-```
+Precedence is `--model` → `CHAD_MODEL` → the shipped default. Both are honored without
+argument; nothing about the harness is tuned for them.
 
 ### Alternate backend (remote)
 
@@ -319,8 +382,11 @@ chad "…" --backend llama --base-url http://host.docker.internal:8081
 
 The engine knobs are the same ones a local `chad` reads, and they mean the same thing
 here — the server is the local product, so `CHAD_MAX_CONTEXT`, `CHAD_KV_BITS`,
-`CHAD_KV_CACHE_MAX_GB`, `CHAD_TEMP`, `CHAD_MIN_P` and `CHAD_TOP_P` all apply to the model
-it serves. A knob a request doesn't mention keeps the server's value; a request that sends
+`CHAD_KV_CACHE_MAX_GB` and the full sampler family (`CHAD_TEMP`, `CHAD_MIN_P`,
+`CHAD_TOP_P`, `CHAD_TOP_K`, `CHAD_PRESENCE_PENALTY`) all apply to the model it serves.
+(In 1.x the server read *none* of the sampler vars — a `chad serve` started with
+`CHAD_MIN_P` set ran without it and said nothing. They travel as one call now, so the
+server and a local run cannot drift apart one setting at a time.) A knob a request doesn't mention keeps the server's value; a request that sends
 one explicitly wins for that request only, so a client can A/B a sampler setting against a
 server without restarting it.
 
@@ -356,6 +422,42 @@ quantization is the whole point of the exercise), and on a laptop the agent's ow
 workload competes with decode — on a wall-clock-timed benchmark, a task can fail on time
 rather than on capability. Pilot a handful of tasks before trusting a full sweep.
 
+### Sampling & reasoning effort
+
+chad decodes **greedily by default** (temperature 0): reproducible, and the cheapest path
+through the engine. That default has one field-measured failure mode worth knowing — a
+stalled or garbled step replays itself byte-identically on every retry, and across
+"independent" benchmark reps. Unattended harnesses should set a temperature so a retry can
+take a different path.
+
+```bash
+CHAD_TEMP=0.7             uv run chad  # sampling temperature (default 0 = greedy)
+CHAD_MIN_P=0.05           uv run chad  # min-p tail trim (default 0 = off)
+CHAD_TOP_P=0.95           uv run chad  # nucleus sampling (default 0 = off)
+CHAD_TOP_K=20             uv run chad  # top-k tail trim (default 0 = off)
+CHAD_PRESENCE_PENALTY=0.5 uv run chad  # flat penalty on already-generated tokens (default 0)
+CHAD_REASONING_EFFORT=low uv run chad  # template-level reasoning budget, where supported
+```
+
+- **`CHAD_MIN_P` / `CHAD_TOP_P` / `CHAD_TOP_K`** — anti-confabulation knobs for a heavily
+  quantized model, all off by default. They trim the sub-noise-floor logit tail without
+  touching temperature, which is usually what you want when a small quant invents an API.
+- **`CHAD_PRESENCE_PENALTY`** — a flat score penalty on every already-emitted token.
+  Ships at **0.0** and is worth leaving there, even though model cards suggest up to 1.5:
+  those ranges are written for chat, and code is inherently repetitive — identifiers,
+  keywords and punctuation *must* be reused. Measured on one task at 1.5, the model spent
+  45 steps in pure exploration, landed zero edits, and emitted visibly corrupted tool
+  arguments. Treat it as a knob to probe, not a default to ship.
+- **`CHAD_REASONING_EFFORT`** — `xhigh` | `medium` | `low`, passed to the chat template as
+  a reasoning budget on checkpoints whose template accepts one (Qwen3.8). Unset, the
+  argument is not passed *at all*, so a template without the knob is unaffected. This is a
+  template-level request to the model, distinct from the harness-level
+  [think-cap](#turn-budgets--think-cap) below, which force-closes a `<think>` run the model
+  has already started.
+
+All five sampler settings are applied as one call, so every path that builds an engine —
+interactive, one-shot, and `chad serve` — honors the same set.
+
 ### Turn budgets & think-cap
 
 A runaway-turn **governor** ends a turn that burns a lot of prefill without landing and
@@ -377,6 +479,7 @@ CHAD_TURN_BUDGET_TOKENS=90000 uv run chad  # governor token budget (default 3× 
 CHAD_TURN_BUDGET_S=600        uv run chad  # wall-clock variant (seconds); off by default
 CHAD_AUTO_CONTINUE=2          uv run chad  # on a hard stop, relaunch a fresh turn seeded with the progress note, N times
 CHAD_REVIEW_PASS=1            uv run chad  # if a one-shot finishes early and clean, spend the slack verifying it
+CHAD_MAX_GEN_TOKENS=32768     uv run chad  # hard per-STEP generation cap (default 32768)
 ```
 
 - **`CHAD_THINK_BUDGET`** — soft-caps each step's `<think>` run at N tokens, force-closes it,
@@ -411,6 +514,11 @@ CHAD_REVIEW_PASS=1            uv run chad  # if a one-shot finishes early and cl
   to 3× the context limit. Disable the governor entirely with `CHAD_NO_GOVERNOR=1` (below).
 - **`CHAD_TURN_BUDGET_S`** — a wall-clock (seconds) variant of the same governor; off by
   default.
+- **`CHAD_MAX_GEN_TOKENS`** — the hard ceiling on a single *step's* generation, 32768 by
+  default. It is a backstop against non-repetitive runaway garble, not a reasoning lever:
+  a literal decode loop is the repeat guard's job. It was 8192 through 1.12; raising it
+  fixed a real loss class where a long chain of thought pinned the cap while still inside
+  `<think>`, ending the step as discarded reasoning with no action.
 
 > **`CHAD_PREFILL_TRACE=path.jsonl`** is a dev/instrumentation knob, **not** supported
 > config: it captures one JSON row per engine prefill to the given path for measurement
@@ -451,8 +559,6 @@ CHAD_NO_SYNTAX_GATE=1       uv run chad  # A/B knob: DISABLE the post-edit synta
 CHAD_NO_PREFIX_CACHE=1      uv run chad  # measurement knob: drop the persistent prefix KV cache
 CHAD_NO_SKILLS=1            uv run chad  # A/B knob: disable all Agent Skill discovery
 CHAD_NO_FASTPATH=1          uv run chad  # A/B knob: disable the fused-projection decode fast path
-CHAD_NO_MOE_FUSED=1         uv run chad  # A/B knob: disable the fused MoE decode kernels (35B only)
-CHAD_NO_QSDPA_SGM=1         uv run chad  # A/B knob: disable the split-head qKV attention tier
 CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash screen (unsafe)
 CHAD_NO_SEATBELT=1          uv run chad  # DISABLE the macOS Seatbelt sandbox for yolo bash (unsafe)
 CHAD_NO_ENV_GUARD=1         uv run chad  # let bash children inherit credential-shaped env vars
@@ -504,24 +610,88 @@ CHAD_PROTECT_GIT=1          uv run chad  # also write-DENY .git inside the yolo 
 - **`CHAD_NO_FASTPATH`** — disables the fused-projection + compiled decode step installed
   at load for the hybrid MoE checkpoint (`mlx_fastpath.py`). Pure speed, no behavior
   change, so this is an A/B and bisection knob rather than something to run with.
-- **`CHAD_NO_MOE_FUSED`** — disables the fused MoE decode kernels (`mlx_moe_fused.py`),
-  which run the 35B's per-token MoE block — routed experts, shared expert, routing
-  weights, and the residual add — as two Metal dispatches instead of many, worth 5–7%
-  decode throughput (70.7 → 74.3 tok/s at 8k context). Expert routing is bit-identical
-  to stock and the kernels engage only on the exact 35B geometry (the 9B and any
-  foreign model keep the stock graph), so this is another speed-only bisection knob.
-  They install through the fast path, so `CHAD_NO_FASTPATH=1` disables them too.
-- **`CHAD_NO_QSDPA_SGM`** — disables the split-head tier of the fused quantized-KV
-  attention kernel (`mlx_qsdpa.py`), falling back to the per-head kernel at every
-  sequence length. The tier only engages on the 35B (it needs 8 query heads per KV head;
-  the 9B's 4 keep the per-head path regardless), and it is bit-exact with the fallback —
-  another speed-only bisection knob. `CHAD_NO_QSDPA=1` is the bigger hammer: it disables
-  the fused kernel entirely.
-
 chad sets **no** `MLX_*` runtime variables, so there is nothing to opt out of:
 `MLX_METAL_FAST_SYNCH`, `MLX_MAX_OPS_PER_BUFFER` and `MLX_MAX_MB_PER_BUFFER` were each
-measured end-to-end on the 35B and every setting was *slower* than mlx's own defaults.
+measured end-to-end and every setting was *slower* than mlx's own defaults.
 Export them yourself if you want to experiment; mlx reads them directly.
+
+### Speculative decoding & kernel knobs
+
+Everything in this block is **speed only**. Each one is bit-exact (or, for the sampled
+paths, distribution-exact) with the path it replaces, so these are bisection and A/B
+knobs — not something to run with. If output changes when you flip one, that is a bug.
+
+```bash
+CHAD_NO_MTP=1             uv run chad  # disable MTP self-speculative decoding
+CHAD_MTP_ADAPTIVE=0       uv run chad  # fixed draft width instead of the adaptive schedule
+CHAD_MTP_DRAFT=2          uv run chad  # force a draft width (implies adaptive off)
+CHAD_MTP_MAX_DRAFT=6      uv run chad  # cap the adaptive schedule's width (max 8)
+CHAD_MTP_H=…              uv run chad  # seed the depth policy's cost model
+CHAD_NO_DRAFT_SHORTLIST=1 uv run chad  # full-vocab readout for the draft chain
+CHAD_USE_PLD=1            uv run chad  # OPT-IN: wide prompt-lookup decoding
+CHAD_NO_QSDPA_WIDE=1      uv run chad  # disable the S>1 tier of the fused attention kernel
+CHAD_NO_QSDPA_WIDE_SGM=1  uv run chad  # disable just its split-head variant
+CHAD_QMMS=1               uv run chad  # OPT-IN: fused small-batch quantized matmul
+CHAD_NO_QMMS=1            uv run chad  # hard-off for the above, even if something enables it
+CHAD_QSDPA_WIDE_SGM_RT=1  uv run chad  # force the RT-split wide kernel instead of the one-read form
+CHAD_MTP_PATH=/path.safetensors uv run chad  # explicit MTP head sidecar (default: found beside the weights)
+CHAD_NO_KERNEL_WARM=1     uv run chad  # skip warming verify-width attention kernels at load
+```
+
+- **`CHAD_NO_MTP`** — disables **MTP self-speculative decoding** (`mlx_mtp.py`), on by
+  default wherever it can engage. chad drafts several tokens with the checkpoint's own
+  trained multi-token-prediction head (loaded as a sidecar), verifies them in one batched
+  forward, and accepts by exact rejection sampling — so greedy output is *token-identical*
+  to the unspeculated path and sampled output keeps the model's true distribution at any
+  temperature. It engages only on checkpoints that ship a head — the shipped model does;
+  an arbitrary `--model` almost certainly does not. Measured on an M4 Pro at
+  temp 1.0: **1.38× on quote-heavy spans, 1.11× on novel code, 1.0× on free prose** — it
+  speeds up predictable text and costs nothing on unpredictable text.
+- **`CHAD_MTP_ADAPTIVE` / `CHAD_MTP_DRAFT` / `CHAD_MTP_MAX_DRAFT` / `CHAD_MTP_H`** — the
+  draft-depth schedule. By default a per-round cost model picks the depth from recent
+  acceptance and, on a full-accept streak, jumps onto the measured flat verify plateau
+  (an S≥10 verify costs about the same through S=32). Where acceptance is poor — temp-1
+  thinking, cold content — it collapses to depth 1–2 or a free skip, so a bad regime
+  degrades to fixed-width behavior rather than below it. `CHAD_MTP_ADAPTIVE=0` restores a
+  fixed width; `CHAD_MTP_DRAFT=N` forces one and implies adaptive off (an explicit width
+  is an order); the other two override the schedule's cap and its cost seed.
+- **`CHAD_NO_DRAFT_SHORTLIST`** — the greedy draft chain reads its next token from a 2-bit
+  shortlist rather than the full vocabulary, because that full-vocab `lm_head` read was
+  ~70% of the head-step cost. Draft-side only: a shortlist miss costs a rejected draft
+  token, never a wrong output token. This restores the full readout for bisection.
+- **`CHAD_USE_PLD`** — turns **wide prompt-lookup decoding** back on. It was the default
+  before 2.0.0 and is now opt-in, because PLD drafts from *context recurrence* and can
+  therefore only accelerate text that already appeared. On real agentic traces that is a
+  minority of what this agent generates: ~62–66% of generated tokens are `<think>`, and
+  reasoning prose replays at only ~2.3%. Whole-session contribution measured at **+2.2%**
+  of generated tokens. It does not compose with MTP — one generate loop each — so on a
+  self-speculating checkpoint MTP is strictly the better of the two, and this flag is how
+  you measure the other arm.
+- **`CHAD_NO_QSDPA_WIDE` / `CHAD_NO_QSDPA_WIDE_SGM`** — disable the multi-token (S>1) tier
+  of the fused quantized-KV attention kernel (`mlx_qsdpa.py`), which serves speculative
+  verification and prefill. Without it those steps fall back to dequantizing the whole
+  cache, which the wide path beats by 1.4–1.8× at 32k+. Bit-exact with that fallback.
+  (`CHAD_QSDPA_WIDE_KERNEL=1` forces the single-kernel variant instead of the split-head
+  one — a kernel-selection knob for measurement.) The bigger hammers are still
+  `CHAD_NO_QSDPA`, in [Safety & A/B opt-outs](#safety--ab-opt-outs), which disables the
+  fused kernel entirely.
+- **`CHAD_QMMS`** — opt **in** to a fused small-batch quantized matmul (`mlx_qmm_s.py`).
+  Bit-exact with the stock op, but measured only ~par at S 2–4 and *behind* at S 6–8 on
+  mlx 0.32 (stock `qmm_t` already part-amortizes, and the current lane structure is
+  register-bound at high S). It ships OFF and exists as the scaffold a sparse-decode
+  kernel builds on — flip it on only to experiment. `CHAD_NO_QMMS=1` forces it off.
+- **`CHAD_QSDPA_WIDE_SGM_RT`** — the wide tier has two forms. The default is *one-read*
+  (K/V bytes touched once, all row tiles resident); this forces the *RT-split* form (one
+  8-row tile per threadgroup, K/V read once per tile), which is what runs anyway at S>4.
+  Both are exact; the knob exists to A/B them at a given width.
+- **`CHAD_MTP_PATH`** — an explicit path to the MTP head's `.safetensors` sidecar. Unset,
+  the loader looks beside the weights (the shipped model bundles it as `mtp.safetensors`).
+  Useful when building a head yourself with `python -m chad.mlx_mtp`.
+- **`CHAD_NO_KERNEL_WARM`** — the attention kernel is templated on its verify width, so a
+  width that has never run means a Metal compile lands on the critical path of a real
+  step. Load warms exactly the widths *this* configuration can produce (MTP verifies at
+  one width; wide-PLD at any of 9–32), rather than the union of everything. Opting out
+  moves those compiles into your first few steps.
 
 ### Dev & instrumentation
 
@@ -533,7 +703,13 @@ CHAD_TRAJECTORY_JSON=/tmp/traj.json uv run chad  # record an ATIF trajectory (pu
 CHAD_SPILL_DIR=/tmp/spill           uv run chad  # where large tool outputs spill to disk
 CHAD_DUMP_RENDER=/tmp/prompt.txt    uv run chad  # dump the fully-rendered prompt each step
 CHAD_PREFILL_TRACE=/tmp/pf.jsonl    uv run chad  # per-step prefill/cache telemetry
+CHAD_CHECKPOINT_DIR=/tmp/ckpt       uv run chad  # relocate the shadow-git edit checkpoints
 ```
+
+- **`CHAD_CHECKPOINT_DIR`** — where the shadow-git repositories backing `/undo` and
+  `/restore` live (default `~/.chad/checkpoints`, keyed per workspace). It exists so a test
+  or eval suite never writes real home state. Note this is *not* `~/.chad/history`, which is
+  the TUI's prompt-history file.
 
 ### Tree-sitter tags (ambient structure)
 
@@ -549,6 +725,30 @@ CHAD_REPOMAP_WORKERS=4   uv run chad  # subprocess workers for a cold repo scan 
   tag scan shards across (`repomap.py`; default: cores−2, capped at 8). Workers import
   only `chad.repomap` — never the MLX engine. Tags persist per repo under
   `~/.chad/cache/repomap/` (mtime-validated per file), so warm sessions skip the scan.
+
+### Voice mode (`/speech`)
+
+Voice mode is all on-device: [Parakeet-on-MLX](https://github.com/ml-explore/mlx) (vendored)
+transcribes your mic, macOS `say` speaks the replies. It needs the `speech` extra — see
+[Installing](../README.md#installing--upgrading) — and nothing leaves the machine.
+
+```bash
+CHAD_VOICE="Daniel"        uv run chad  # macOS `say` voice (default: the system voice)
+CHAD_SPEECH_RATE=200       uv run chad  # `say` rate in words/minute (default: the system rate)
+CHAD_STT_QUANT=4           uv run chad  # ASR weight quantization: 8 (default), 4, or none
+CHAD_STT_MODEL=<hf-repo>   uv run chad  # override the ASR checkpoint
+CHAD_SPEECH_WORDS=/path.json uv run chad # personal word table (default ~/.chad/speech_words.json)
+```
+
+- **`CHAD_VOICE`** — an installed macOS voice name. An unknown name is refused at startup
+  with a did-you-mean rather than silently falling back; `say -v '?'` lists what you have.
+- **`CHAD_STT_QUANT`** — `8` by default. `4` halves the ASR weights again but is **opt-in**:
+  clean-audio testing can't rule out degradation on a noisy mic. `none` keeps full precision.
+- **`CHAD_STT_MODEL`** — defaults to `mlx-community/parakeet-tdt-0.6b-v3`. Anything else is
+  unsupported; the vendored decoder is written to this model's output contract.
+- **`CHAD_SPEECH_WORDS`** — the JSON word table that teaches the transcriber your jargon
+  (project names, library names). Relocating it is mostly useful for keeping a benchmark
+  from inheriting your personal vocabulary.
 
 ### Sessions
 

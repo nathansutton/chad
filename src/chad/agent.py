@@ -43,7 +43,6 @@ from .render import (
 )
 from .toolcall_parse import parse_tool_calls, strip_think
 from .tools import IGNORE_DIRS, TERMINAL, _under_plans, active_schemas, dispatch_for, is_mutating
-
 from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_repair
 
 # Validation (VALIDATE knob, legacy_validate baseline) lives in validate.py, the
@@ -197,7 +196,7 @@ def close_unclosed_think(text: str, thinking: bool) -> str:
     emits its own `</think>`. A turn truncated at the token cap can stop BEFORE that
     close. The template then renders the stored (unclosed) content as an EMPTY think
     block + trailing content — which diverges from the cache at the very first content
-    token. On Ornith's non-trimmable cache that single divergence forces a FULL
+    token. On this non-trimmable cache that single divergence forces a FULL
     re-prefill of the whole transcript next step (measured: tens of thousands of tokens
     at large context). Appending the missing `</think>` keeps the cached tokens a strict
     prefix of the re-render, so only a couple of tokens prefill instead. No-op when
@@ -213,7 +212,7 @@ def split_inline_reasoning(m: dict) -> dict:
 
     chad stores a generated turn verbatim in `content`, reasoning inline, because that
     is the exact byte stream the model emitted (and so the stored turn re-renders into a
-    prefix of the live KV cache). Ornith's template reconstructs the split itself: when
+    prefix of the live KV cache). The model's template reconstructs the split itself: when
     `reasoning_content` is absent it recovers the reasoning by splitting `content` on
     `</think>`. Qwen3.8's stock template DROPPED that recovery branch — it reads
     `reasoning_content` and nothing else, so an inline-think turn renders as an EMPTY
@@ -372,7 +371,7 @@ class Agent:
         mcp.reset_session()
         ambient.reset()
         self.mode = mode or ("yolo" if yolo else "normal")
-        self.thinking = thinking  # Ornith is a reasoning model; toggles <think> blocks
+        self.thinking = thinking  # a reasoning model; toggles <think> blocks
         # Steps per WINDOW, not a hard kill: a window that landed+verified a change
         # earns an extension (see guardrails.extend_step_cap; absolute ceiling 4x).
         self.max_steps = max_steps
@@ -590,7 +589,7 @@ class Agent:
           entirely (a non-thinking template). NOT safe: splitting would silently drop the
           model's reasoning from the transcript. Off.
         * split render == unsplit render    -> the template already recovers inline
-          `</think>` on its own (Ornith). Nothing to fix; off, so Ornith's rendered
+          `</think>` on its own. Nothing to fix; off, so the rendered
           prompt stays byte-identical to before this change.
         * otherwise                         -> the template reads `reasoning_content` but
           does not recover inline think (Qwen3.8). On.
@@ -623,7 +622,7 @@ class Agent:
             thinking = self.thinking
         # Lift inline reasoning into `reasoning_content` when the template needs it, so
         # the re-render is a prefix extension of the KV cache instead of diverging at the
-        # first generated token. Off (and byte-identical to before) on Ornith.
+        # first generated token. Off (and byte-identical to before) on the shipped model.
         messages = self.messages
         if self._reasoning_split_supported():
             messages = [split_inline_reasoning(m) for m in messages]
@@ -889,7 +888,7 @@ class Agent:
             # before the next generation (this point sits at the top of the iteration
             # so the retry/nudge `continue` paths above also pass through it). It rides
             # the same synthetic tool-role path as the guardrail nudges, a template
-            # shape proven not to confuse Ornith; and it is a pure append, so the warm
+            # shape proven not to confuse the model; and it is a pure append, so the warm
             # KV prefix stays valid and the steer prefills only itself — vs an
             # interrupt's lost work + big re-prefill on the non-trimmable cache.
             if self._drain_steering is not None:
@@ -1002,7 +1001,7 @@ class Agent:
             if gen_count[0] % 16:  # flush the final (un-throttled) count for the ↓ readout
                 self._emit("gen", str(gen_count[0]))
             # The generation ran to the token cap: the turn was cut off, not finished.
-            # A truncated assistant turn is NOT a final answer (and on Ornith's
+            # A truncated assistant turn is NOT a final answer (and on this
             # non-trimmable cache its decoded text won't re-tokenize identically, so it
             # also forces the next-step re-prefill). Tracked so the no-call branch can
             # tell "truncated mid-thought" apart from "deliberately answered."

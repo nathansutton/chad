@@ -7,7 +7,7 @@
 #
 # Two moments are the demo; keep both:
 #   * the banner — the session states what it is: version, model, context, cwd. The
-#     model name is the whole pitch (a 35B on this laptop, not an API).
+#     model name is the whole pitch (a 27B on this laptop, not an API).
 #   * the unbroken run — read, reason, edit, verify, with the work visible as it lands.
 #
 # The session runs `--yolo` deliberately: in the default (normal) mode every edit and
@@ -22,15 +22,17 @@
 # timed. Overshoot: a few dull frames of a finished transcript. Undershoot: `/exit` typed
 # into a running turn. When in doubt, lengthen — never shorten.
 #
-# Sleep values below are measured on the 35B (Q2_K_XL, warm weights): load ~10s, first
-# tool ~24s after the ask, edit ~32s, pytest ~33s, a second pytest ~38s (chad re-verifies
-# once on its own), done ~40s. Re-measure after a model or prompt change by running the
-# same ask headless with timestamped output.
+# STALE AS OF 2.0.0 — RE-MEASURE BEFORE RECORDING. The sleep values below were measured
+# on the retired Ornith 35B (Q2_K_XL, warm weights): load ~10s, first tool ~24s after the
+# ask, edit ~32s, pytest ~33s, a second pytest ~38s (chad re-verifies once on its own),
+# done ~40s. 2.0.0 changed the model to a dense 27B with a different decode profile and a
+# think-heavy generation mix, so these offsets are not transferable — re-measure by running
+# the same ask headless with timestamped output, then update every Sleep below. Recording
+# against these numbers will type `/exit` into a running turn.
 #
-# Rehearsal (mechanics only, no 13 GB load):
-#   CHAD_MODEL=nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX vhs docs/demo.tape
-# The 9B is ~3x slower to the first gate, so it overruns these sleeps — rehearse the
-# wiring with it, but never ship a GIF recorded from it.
+# There is no smaller rehearsal model any more (2.0.0 retired the 9B), so rehearse the
+# mechanics against whatever local MLX model you have via CHAD_MODEL — but never ship a
+# GIF recorded from anything but the shipped default.
 
 Output docs/demo.gif
 

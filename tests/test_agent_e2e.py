@@ -19,9 +19,8 @@ Mirrors the fake-engine style of test_completion_engine.py; hermetic via `tmp_pa
 
 import json
 
-from chad import guardrails
 from chad.agent import Agent
-from chad.base_engine import BaseEngine, GenStats, think_ceiling_hit
+from chad.base_engine import BaseEngine, GenStats
 
 
 class _FakeTok:

@@ -169,9 +169,6 @@ def test_render_real_error_uses_error_style():
 if __name__ == "__main__":
     test_is_err_flags_real_diagnostics()
     test_is_err_ignores_legitimate_output()
-    test_render_read_of_bracket_content_is_not_error()
     test_render_real_error_uses_error_style()
-    test_render_glob_no_matches_is_zero_files()
-    test_render_grep_notice_lines_not_counted()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

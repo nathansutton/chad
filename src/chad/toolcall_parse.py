@@ -4,7 +4,7 @@
 single most format-fragile surface in the project. Local models are inconsistent
 about tool-call formatting (lesson from prior art like opencode): some emit JSON
 inside <tool_call> tags, some emit ```json fences, some emit a bare JSON object,
-and some (Qwen3 / Ornith / GLM thinking models) emit an XML function-call dialect:
+and some (Qwen3 / GLM thinking models) emit an XML function-call dialect:
 <function=name><parameter=key>value</parameter></function>. Parse them all,
 de-duplicated.
 
@@ -38,7 +38,7 @@ _INT_PARAMS = {"offset", "limit", "timeout"}
 _TEXT_PARAMS = {"old", "new", "content", "code", "command"}
 _FRAME_RE = re.compile(r"\A[ \t]*\r?\n|\r?\n[ \t]*\Z")
 # Hybrid dialect: a JSON-style `{"name": "bash"` opener followed by XML-style
-# `<parameter=…>…</parameter>` blocks — NOT the `<function=name>` form. Quantized Ornith
+# `<parameter=…>…</parameter>` blocks — NOT the `<function=name>` form. Quantized models
 # emits this constantly under temp-1.0 sampling (30 occurrences in a single run), most
 # often as `<tool_call>{"name": "bash" <parameter=command>…</parameter></function>`.
 # Neither the JSON path (the `{…}` never closes, so brace-matching yields nothing) nor the
@@ -94,9 +94,10 @@ def _parse_params(body: str) -> dict:
     """Parse `<parameter=key>value</parameter>` blocks out of `body` into an args dict,
     with the same int-coercion as the XML dialect. Shared by the `<function=…>` and the
     hybrid `{"name":…}`+`<parameter>` parsers."""
-    args = {}
+    args: dict[str, object] = {}
     for pm in _XML_PARAM_RE.finditer(body):
         key = pm.group(1).strip()
+        val: object
         if key in _TEXT_PARAMS and "\n" in pm.group(2):
             # Multi-line text value: the first line's indentation is content. A
             # single-line value keeps the legacy full strip — models emit inline

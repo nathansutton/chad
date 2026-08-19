@@ -123,7 +123,5 @@ if __name__ == "__main__":
     test_plain_text_never_policed()
     test_tree_sitter_delta()
     test_opt_out()
-    test_symbol_edit()
-    test_indent_reject_names_enclosing_symbol()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

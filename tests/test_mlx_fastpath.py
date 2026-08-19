@@ -1,12 +1,16 @@
 """mlx_fastpath: the decode fast-path must be a pure re-plumbing of the same
-computation. These tests build a tiny synthetic qwen3_5_moe hybrid (2 layers:
-one GDN + one attention, 8 experts top-2, 4-bit) — no downloaded weights — and
-assert that installing the fast-path changes neither greedy token choices nor
+computation. These tests build a tiny synthetic qwen3_5 DENSE hybrid (2 layers:
+one GDN + one attention, quantized swiglu MLP, 4-bit) — no downloaded weights —
+and assert that installing the fast-path changes neither greedy token choices nor
 (beyond fp-rounding noise) the logits, on both the compiled S==1 decode path
 and the stock-graph S>1 prefill path that shares the fused weights.
 
 The class-level patches must also leave a NON-installed model of the same
-classes behaving stock (foreign-instance fallback guards)."""
+classes behaving stock (foreign-instance fallback guards).
+
+A MoE config is still built here, but only to pin that it is now REFUSED: 2.0.0
+removed the sparse-MoE path with the Ornith 35B, and install() must decline such
+a model silently rather than half-apply the dense transforms to it."""
 
 import os
 import sys
@@ -85,32 +89,15 @@ def greedy(model, prompt_ids, n=6):
 PROMPT = [3, 141, 59, 26, 53, 58, 97, 93, 23, 84, 62, 64, 33, 83, 27, 95]
 
 
-def test_fastpath_greedy_equivalence():
+def test_moe_model_is_refused():
+    """The sparse-MoE path went away with the Ornith 35B. A MoE checkpoint must be
+    declined outright — a silent no-op leaving the model stock — rather than fall
+    through into the dense transforms, which would mangle its expert weights."""
     model = build_tiny()
-    ref_ids, ref_pre, ref_steps = greedy(model, PROMPT)
+    ref_ids, ref_pre, _ = greedy(model, PROMPT)
 
-    assert mlx_fastpath.install(model) is True
-    got_ids, got_pre, got_steps = greedy(model, PROMPT)
-
-    # prefill (S>1, stock graph + fused weights): row-math is unchanged, but
-    # matmul tiling may round differently — allow only tiny drift.
-    pre_err = float(mx.abs(ref_pre - got_pre).max())
-    assert pre_err < 5e-2, f"prefill logits drifted {pre_err}"
-    # decode: token choices must match exactly; logits within rounding noise.
-    assert got_ids == ref_ids
-    worst = max(float(mx.abs(a - b).max()) for a, b in zip(ref_steps, got_steps))
-    assert worst < 5e-2, f"decode logits drifted {worst}"
-
-
-def test_foreign_instance_falls_back_to_stock():
-    """After install() patched the classes, a second NON-installed model of the
-    same classes must still produce its own stock outputs (hasattr guards)."""
-    patched = build_tiny()
-    virgin = build_tiny()  # same seed -> same weights
-    ref_ids, ref_pre, _ = greedy(virgin, PROMPT)
-
-    assert mlx_fastpath.install(patched) is True
-    got_ids, got_pre, _ = greedy(virgin, PROMPT)  # virgin NOT installed
+    assert mlx_fastpath.install(model) is False
+    got_ids, got_pre, _ = greedy(model, PROMPT)
     assert got_ids == ref_ids
     assert float(mx.abs(ref_pre - got_pre).max()) == 0.0
 

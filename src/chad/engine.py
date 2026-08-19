@@ -11,10 +11,10 @@ Two decode-speed levers were investigated (see the README's throughput section):
 
 1. **Prompt-lookup decoding (PLD)** — draft-model-free speculative decoding, gated on a
    *trimmable* cache (`engine._trimmable`) and temp==0. It is provably greedy-identical
-   and helps trimmable models on quote-heavy work, but Ornith's hybrid SSM/attention
+   and helps trimmable models on quote-heavy work, but the shipped hybrid SSM/attention
    cache is non-trimmable, so PLD falls back cleanly and does not speed up the shipped
    model. (`prompt_lookup_draft` + `_generate_prompt_lookup`.)
-2. **Thinking budget** — `--no-think` drops Ornith's `<think>` overhead; the most
+2. **Thinking budget** — `--no-think` drops the model's `<think>` overhead; the most
    effective real speedup for time-to-done, since decode is bandwidth-bound (~47 tok/s).
 
 chad is single-model by construction: there is no second "draft" model anywhere in the
@@ -153,6 +153,7 @@ def peek_kv_footprint(model_id: str) -> tuple:
     try:
         import glob
         import json
+
         from . import mlx_qsdpa
         path = _local_path(model_id)
         cfg_path = os.path.join(path, "config.json")
@@ -448,7 +449,7 @@ class Engine:
     # row against the tokens preceding it).
     presence_penalty: float = 0.0
     # KV cache quantization. None = AUTO: 8-bit when the fused decode kernel
-    # (mlx_qsdpa) covers the model's attention shape — both shipped Ornith
+    # (mlx_qsdpa) covers the model's attention shape — the shipped
     # models qualify — else off. 0 forces off; an explicit bit width forces on
     # (an uncovered shape then decodes via mlx_lm's slow unfused path). The
     # cache is quantized FROM THE START (follow-on): prefill runs
@@ -460,7 +461,7 @@ class Engine:
     prompt_lookup: bool = True      # n-gram prompt-lookup speculative decoding (no draft model)
     pld_num_draft: int = 10         # tokens to draft per forward via n-gram lookup
     pld_ngram: int = 3              # max suffix length to match for drafting
-    # PLD on a hybrid (qwen3_5/Ornith) cache is correct (bit-exact) but OFF by default:
+    # PLD on a hybrid (qwen3_5) cache is correct (bit-exact) but OFF by default:
     # the eval suite measured it ~2x SLOWER on realistic agentic generation. A recurrent
     # model can't rewind to mid-forward, so every partial/total draft rejection costs an
     # extra re-feed forward; on novel-text-heavy work (low n-gram acceptance) that's ~2
@@ -613,7 +614,7 @@ class Engine:
         documented extended max), so long agentic-coding sessions fit real context.
         """
         cfg = self._read_config(repo)
-        # VL checkpoints (e.g. Ornith/qwen3_5) nest the text model's real window
+        # VL checkpoints (e.g. qwen3_5) nest the text model's real window
         # under `text_config`; the top level omits max_position_embeddings, so a
         # naive read silently falls back to 32768 and triggers needless compaction
         # (= a full re-prefill on this non-trimmable cache) at ~8x too small a
@@ -800,8 +801,11 @@ class Engine:
             from . import mlx_qsdpa
             # Scales/norms carry the model's compute dtype; quantized weights
             # are uint32, so take the first float parameter rather than guess.
-            dt = next((p.dtype for _, p in tree_flatten(self.model.parameters())
-                       if p.dtype in (mx.float16, mx.bfloat16)), None)
+            # tree_flatten yields (path, array) pairs; the stub types it loosely
+            # enough that mypy reads the element as a str.
+            dt = next((p.dtype for _, p in tree_flatten(  # type: ignore[misc]
+                self.model.parameters())
+                if p.dtype in (mx.float16, mx.bfloat16)), None)
             if dt is None:
                 return
             t0 = time.time()
@@ -894,7 +898,7 @@ class Engine:
                 for c in self._cache
             ]
         self._cached_ids = []
-        # Hybrid SSM/attention models (e.g. Ornith/qwen3_5) keep recurrent state
+        # Hybrid SSM/attention models (e.g. qwen3_5) keep recurrent state
         # that cannot be rewound, so their cache is not trimmable. KV-trim tricks
         # (prompt-lookup decoding, partial prefix reuse) only work when it is.
         self._set_cache_flags()
@@ -929,7 +933,7 @@ class Engine:
         )
 
     # -- on-disk KV checkpoints -------------------------------------------
-    # Ornith's hybrid SSM cache is NOT trimmable, so we can never partially reuse
+    # The hybrid SSM cache is NOT trimmable, so we can never partially reuse
     # a divergent prefix in RAM. But a STABLE prefix — the system prompt + tool
     # schemas, byte-identical every session (~3.2k tokens) — is pure dead-weight
     # prefill on every cold start and `/reset`. Persisting the cache avoids that by
@@ -1432,7 +1436,7 @@ class Engine:
 
         # Prompt-lookup decoding path: needs greedy decoding (exact),
         # an unquantized cache, and a trimmable cache (cheap rollback). A qwen3_5-style
-        # hybrid (Ornith) CAN also roll back, via recurrent-snapshot + KV-trim + re-feed
+        # hybrid CAN also roll back, via recurrent-snapshot + KV-trim + re-feed
         # (self._pld_hybrid), but the re-feed makes it ~2x slower on realistic agentic
         # generation, so it's behind enable_pld_hybrid (opt-in, off by default). PLD
         # shines on trimmable models doing edit-heavy work that re-quotes read files.
@@ -1476,7 +1480,7 @@ class Engine:
                 stats.prompt_tokens = 1
                 stats.cached_tokens = common
             else:
-                # Non-trimmable hybrid (e.g. Ornith): we cannot pop a single token off
+                # Non-trimmable hybrid: we cannot pop a single token off
                 # the recurrent state, so trimming is invalid and re-feeding would
                 # duplicate the last token in the cache. This degenerate case is rare,
                 # so take the safe path: rebuild from scratch and full re-prefill.

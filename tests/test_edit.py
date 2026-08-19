@@ -215,7 +215,6 @@ if __name__ == "__main__":
     test_edit()
     test_ws_recovery_prefers_file_indentation()
     test_ws_only_edit_applies_verbatim()
-    test_indent_break_is_rejected_and_reverted()
     test_already_broken_file_stays_editable()
     test_failed_edit_shows_visible_whitespace()
     test_ws_recovery_inserted_line_takes_neighbor_indent()

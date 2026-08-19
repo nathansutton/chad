@@ -13,7 +13,7 @@ import subprocess
 
 import pytest
 
-from chad import config, levers, seatbelt, tools
+from chad import config, seatbelt, tools
 
 
 @pytest.fixture(autouse=True)

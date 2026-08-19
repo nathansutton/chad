@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """chad — a local, MLX-backed, Claude-Code-style coding agent.
 
-One model (Ornith — 35B on most Macs, 9B on small), one entrypoint, run with uv:
+One model (Qwen3.8-27B, 3-bit, with its MTP head), one entrypoint, run with uv:
 
     uv run chad                                # interactive full-screen TUI
     uv run chad "fix the bug in greet.py"      # one-shot, headless
     uv run chad -c                             # resume this directory's conversation
-    uv run chad --model 9b                     # force the small model
+    uv run chad --model <repo|dir>             # run different weights (unsupported)
 
 Plus three subcommands, each with its own `--help`: `chad serve`, `chad prove`,
 `chad levers`.
@@ -35,44 +35,31 @@ from .engine import Engine
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
-# The shipped models, on Hugging Face. Naming follows Unsloth's dynamic-quant
-# convention so the quant scheme is recognizable (UD = Unsloth Dynamic; Q2_K_XL =
-# 2-bit experts with a high-bit backbone/router), plus an -MLX suffix for format
-# discoverability. The quant itself is MLX group-64 affine, not llama.cpp Q2_K
+# The shipped model, on Hugging Face. Naming follows Unsloth's dynamic-quant
+# convention so the quant scheme is recognizable (UD = Unsloth Dynamic; Q3_K_XL =
+# a 3-bit body with extra bits where they pay), plus an -MLX suffix for format
+# discoverability and -MTP because the trained multi-token-prediction head ships
+# with the weights. The quant itself is MLX group-64 affine, not llama.cpp Q3_K
 # k-quants — the model card says so; the tag is for recognition, not bit-for-bit
 # equivalence.
-_HF_35B = "nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX"   # default: 35B MoE, ~13.4 GB resident
-_HF_9B = "nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX"     # low-RAM fallback, ~5 GB resident
-# Qwen3.8-27B (dense qwen3_5 hybrid, text-only 4-bit conversion). Opt-in via
-# `--model 27b` while the wall-clock A/B against the 35B is pending; it is NOT
-# in the RAM-aware default pick. ~16 GB resident is tighter than the 35B on a
-# 24 GB box — the live safe_ctx wall is what makes it survivable there.
-# Our own conversion rather than mlx-community's: same language weights
-# bit-for-bit, minus the 0.86 GB BF16 vision tower that mlx-lm's qwen3_5
-# discards at load anyway, plus the quantized MTP head as `mtp.safetensors`
-# so mlx_mtp finds it with no build step (candidate 2 in _sidecar_candidates).
-# Net 14.3 GB vs 15.0 GB — smaller AND self-speculating. Measured on an M4 Pro
-# at temp 1.0: 1.38x decode on quote-heavy spans, 1.11x on novel code, 1.0x on
-# free prose; greedy output is token-identical to the non-MTP path.
-_HF_27B = "nathansutton/Qwen3.8-27B-4bit-MTP-MLX"
+#
+# Qwen3.8-27B is `qwen3_5` — DENSE (64 layers: 48 GatedDeltaNet + 16 full attention),
+# so every parameter is on the critical path for every token and shrinking the model
+# is the only decode lever there is. The recipe (`q3_e3h5`) is 3-bit group-64
+# throughout, except lm_head at 5-bit: with vocab_size 248,320 and tie_word_embeddings
+# false, the head is a second full 1.27B-param tensor, and the calibrated GGUF builds
+# of this same checkpoint are unanimous that it is the tier worth protecting while
+# embed_tokens — a lookup table, whose per-row error never compounds through a matmul
+# — is the cheapest. ~12.1 GB resident.
+_HF_MODEL = "nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX"
 # A dev clone that already built the weights locally should use them rather than
-# re-download — prefer these dirs when present.
-_LOCAL_35B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-35B-dyn2-q2_down3")
-_LOCAL_9B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-9B-4bit-awq")
-_LOCAL_27B = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-4bit")
-# The 35B (2-bit experts, 3-bit expert down-projections, 6-bit backbone) is ~13.4 GB
-# resident + KV + runtime, and the KV grows across a long agentic turn. That used to
-# SIGKILL mid-turn on a 24 GB Mac, where the Metal wired limit (~2/3 RAM ≈ 16 GB) minus
-# the OS leaves little headroom — so the floor sat at 32 GB. The fused attention kernel
-# (mlx_qsdpa) plus the 8-bit-from-the-start KV cache it enables cut the per-token cache
-# cost enough to give that headroom back, and `ram_aware_ctx_limit` now sizes the
-# compaction trigger from the live Metal budget rather than a blind constant, so a
-# tight box self-limits its window instead of dying. 24 GB gets the 35B; 16 GB and
-# below still fall back to the 9B.
-_BIG_RAM_GB = 23.5
-# `--model` shorthands. Anything else is passed through as an HF repo id or local dir.
-_MODEL_ALIASES = {"35b": (_LOCAL_35B, _HF_35B), "9b": (_LOCAL_9B, _HF_9B),
-                  "27b": (_LOCAL_27B, _HF_27B)}
+# re-download — prefer this dir when present.
+_LOCAL_MODEL = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-q3_e3h5")
+# chad targets 24 GB Apple Silicon and nothing smaller. Below this the model still
+# loads, but the context governor has almost nothing left to spend after ~12.1 GB of
+# weights and the ~4.3 GB prefill transient, so the window collapses toward its floor.
+# We warn and proceed rather than refuse: the harness advises, the caller decides.
+_MIN_RAM_GB = 23.5
 
 
 # These are the STRICT siblings of config.env_int/env_float: a non-numeric value raises
@@ -377,54 +364,35 @@ def _resolve(local, repo):
 def _pick_model(spec=None):
     """Resolve the model id and a human label for *why* it was chosen.
 
-    Order: explicit `--model` (`spec`) → CHAD_MODEL → RAM-aware default (35B unless the
-    box is small). A resolved shorthand prefers a locally-built models/ dir over the HF
-    repo when one exists; an arbitrary spec is passed through untouched.
+    Order: explicit `--model` (`spec`) → CHAD_MODEL → the shipped default. There are no
+    size shorthands any more — chad ships exactly one model (2.0.0 retired the Ornith
+    35B/9B pair and the RAM-aware pick that chose between them). `auto` still means "the
+    default"; anything else is passed through untouched as an HF repo id or local dir.
 
-    Forcing `35b` where the RAM check would not have chosen it (small or undetectable
-    RAM) is honored, but warns on stderr first: chad advises, the caller decides.
+    A box below the 24 GB target is warned about once, on stderr, and then served
+    anyway: chad advises, the caller decides.
     """
     # Name the winning source in the reason: it is only ever ambiguous when both the
     # flag and the env var are set, which is exactly when the user needs to be told.
     source = "--model" if spec is not None else "CHAD_MODEL"
     spec = spec or config.env_str("CHAD_MODEL")
     if spec and spec.strip().lower() != "auto":
-        key = spec.strip().lower()
-        alias = _MODEL_ALIASES.get(key)
-        if not alias:
-            return spec, f"explicitly requested ({source} override)"
-        local, repo = alias
-        if key == "35b":
-            ram = _detect_ram_gb()
-            if ram is None or ram < _BIG_RAM_GB:
-                got = "undetectable" if ram is None else f"{ram:.0f} GB"
-                sys.stderr.write(
-                    f"chad: 35b forced via {source} (RAM {got} < ~{_BIG_RAM_GB:.0f} GB "
-                    f"recommended); the 35B needs ~16 GB resident with its KV cache and "
-                    f"may OOM or thrash here. Proceeding as asked.\n")
-        return _resolve(local, repo), f"{key} (requested via {source})"
+        return spec, f"explicitly requested ({source} override)"
     ram = _detect_ram_gb()
-    if ram is None:
-        # RAM unreadable -> the safe (smaller) model: a wrong 9B costs capability, a
-        # wrong 35B costs a 12 GB download and possibly an OOM'd first session.
-        local, repo = _LOCAL_9B, _HF_9B
-        why = "9B (RAM undetectable — choosing the safe smaller model; " \
-              "set CHAD_MODEL or --model to override)"
-    elif ram < _BIG_RAM_GB:
-        local, repo = _LOCAL_9B, _HF_9B
-        why = f"9B (default; {ram:.0f} GB RAM < {_BIG_RAM_GB:.0f} GB, 35B would be tight)"
-    else:
-        local, repo = _LOCAL_35B, _HF_35B
-        why = "35B (default)"
-    return _resolve(local, repo), why
+    if ram is None or ram < _MIN_RAM_GB:
+        got = "undetectable" if ram is None else f"{ram:.0f} GB"
+        sys.stderr.write(
+            f"chad: RAM {got}, below the ~{_MIN_RAM_GB:.0f} GB chad is built for. The "
+            f"model needs ~12 GB resident plus its KV cache, so expect a small context "
+            f"window and possible thrashing. Proceeding.\n")
+    return _resolve(_LOCAL_MODEL, _HF_MODEL), "default"
 
 
 def _model_download_gb(model_id):
-    """Approximate download size in GiB for the shipped models (for the disk preflight
-    and the confirm prompt — display honesty, not accounting)."""
-    if "27B" in model_id:
-        return 17.0
-    return 12.0 if "35B" in model_id else 5.0
+    """Approximate download size in GiB for the shipped model (for the disk preflight
+    and the confirm prompt — display honesty, not accounting). An arbitrary `--model`
+    is unknowable ahead of the resolve, so it gets the same figure."""
+    return 12.0
 
 
 def _free_disk_gb(path):
@@ -509,7 +477,8 @@ def _fail_model_load(model_id, err):
     else:
         sys.stderr.write(
             "  fix:   a partial/corrupt download or not enough free RAM. Re-run (the HF\n"
-            f"         download resumes), or try the smaller model: CHAD_MODEL={_HF_9B}\n")
+            "         download resumes). chad needs ~12 GB resident for weights alone,\n"
+            "         so close other memory-hungry apps before retrying.\n")
     sys.exit(1)
 
 
@@ -590,17 +559,18 @@ _resolved_base_url = None
 
 def _add_model_arg(ap):
     """`--model`, shared by the agent and `chad serve` — both load a local model and both
-    need the same escape hatch from the RAM-aware default."""
+    need the same escape hatch from the shipped default."""
     ap.add_argument("--model", default=None,
-                    help="which model to load: '35b' (big, default on most Macs), '9b' "
-                         "(small, low-RAM), 'auto' (choose by RAM), or any Hugging Face "
-                         "repo id / local model dir. Also CHAD_MODEL.")
+                    help="which model to load: 'auto' (the shipped default) or any "
+                         "Hugging Face repo id / local model dir. Anything but 'auto' "
+                         "is unsupported — the harness is tuned to the shipped model. "
+                         "Also CHAD_MODEL.")
 
 
 def _agent_parser():
     ap = argparse.ArgumentParser(
         prog="chad",
-        description="Local MLX-backed coding agent (Ornith). Run with `uv run chad`.",
+        description="Local MLX-backed coding agent. Run with `uv run chad`.",
         epilog="subcommands (each takes --help): chad serve · chad prove · chad levers. "
                "Long-session and unattended-run knobs live in CHAD_* env vars — "
                "see README \"Advanced\".",
@@ -685,7 +655,7 @@ def _serve_parser():
 def _prove_parser():
     ap = argparse.ArgumentParser(
         prog="chad prove",
-        description="Run the bundled end-to-end smoke test against the pinned 9B model: "
+        description="Run the bundled end-to-end smoke test against the shipped model: "
                     "downloads it if needed, drives a real task, and reports what worked.",
     )
     ap.add_argument("--backend", choices=("mlx", "llama"), default="mlx",
@@ -756,16 +726,15 @@ def _main(argv=None):
     # TASK deadline is left), not just per-turn enforcement.
     turn_budget_s = config.env_float("CHAD_TURN_BUDGET_S")
     task = args.task or args.prompt_flag
-    # Ornith. --model / CHAD_MODEL, else the RAM-aware default; local-dir-preferred,
-    # HF fallback.
+    # --model / CHAD_MODEL, else the shipped default; local-dir-preferred, HF fallback.
     model_id, why = _pick_model(args.model)
 
     # Advanced, rarely-touched knobs live in env vars to keep the CLI sane:
     #   CHAD_MAX_CONTEXT       YaRN-extend the window (e.g. 131072 for 128k)
     #   CHAD_CTX_LIMIT         prompt-token budget before old tool outputs compact
     #   CHAD_KV_BITS           KV cache quantization; default AUTO (8-bit where the
-    #                          fused kernel covers the model — both shipped Ornith
-    #                          models). 0 forces the fp16 cache.
+    #                          fused kernel covers the model, as it does the shipped
+    #                          one). 0 forces the fp16 cache.
     #   CHAD_KV_CACHE_MAX_GB   cap the on-disk KV cache (LRU-evict above it); 0 = unlimited
     # Unattended-run governor (harness-only; the matching flags are hidden):
     #   CHAD_THINK_CEILING  CHAD_TURN_BUDGET_TOKENS  CHAD_TURN_BUDGET_S

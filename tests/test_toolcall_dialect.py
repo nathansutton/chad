@@ -23,8 +23,6 @@ asymmetry — but nothing chad writes may contradict the template.
 
 import re
 
-import pytest
-
 from chad import guardrails, prompt, validate
 
 # A JSON-dialect tool call: a `{"name": …}` object as the body of a call. Matching the

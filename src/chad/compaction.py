@@ -48,7 +48,7 @@ _OVERLIMIT_REARM = 2048
 
 def compact_if_needed(messages, render, emit, ctx_limit, prompt_ids, state=None):
     """Context compaction for long agentic sessions. On a non-trimmable cache
-    (Ornith) any prefix change forces a full re-prefill, so compaction is
+    any prefix change forces a full re-prefill, so compaction is
     expensive — we must reclaim enough in ONE pass that it won't re-trigger next
     step (otherwise: full re-prefill every step). We therefore reclaim down to a
     target well below the limit, escalating until we get there:

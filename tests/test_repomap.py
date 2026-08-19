@@ -147,15 +147,8 @@ def test_parallel_extract(tmp_path=None):
 
 
 if __name__ == "__main__":
-    test_repomap()
-    test_repo_map_edge_aggregation()
-    test_rank_files()
     test_disk_cache()
     test_parallel_extract()
-    test_aggregate_memoization()
-    test_disambig_budget_and_cache()
-    test_definition_precise_and_fallback()
-    test_definition_is_wired_into_the_toolset()
     print(f"\n{passed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)
 

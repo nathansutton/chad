@@ -26,7 +26,6 @@ Build one from an original-checkpoint shard holding the `mtp.*` tensors:
   uv run python -m chad.mlx_mtp <shard.safetensors> --model <model_dir>
 """
 
-import math
 import os
 from typing import Any, Optional
 

@@ -2,15 +2,23 @@
 
 Notable, user-visible changes.
 
-## [2.0.0] — unreleased
+## [2.0.0] — 2026-08-18
 
-**The lean release.** chad 2.0.0 is the drastic simplification the 1.x measurement
-program earned: every lever pack, alternate tool dialect, and scaffolding layer was
-measured against the bare model + tool loop with pre-registered paired contrasts, and
-nothing beat it. What survives is the bare loop plus the eight bash-route levers that
-make the result channel honest — and those are now the default, all ON.
+**The lean release, and a new brain.** chad 2.0.0 is the drastic simplification the 1.x
+measurement program earned: every lever pack, alternate tool dialect, and scaffolding layer
+was measured against the bare model + tool loop with pre-registered paired contrasts, and
+nothing beat it. What survives is the bare loop plus the eight bash-route levers that make
+the result channel honest — and those are now the default, all ON. Around that smaller
+harness the release changes the model chad runs, adds the one retrieval primitive `bash`
+genuinely cannot serve (`search`), and lands a substantially faster decoder.
 
-- **One tool surface.** The model sees exactly `bash`, `edit`, `write`,
+**Two breaking changes to read before upgrading**: the default model is different (a fresh
+~12 GB download; the old weights can be deleted), and chad no longer supports Macs below
+24 GB.
+
+### The purge
+
+- **One tool surface.** The model sees exactly `bash`, `edit`, `write`, `search`,
   `write_todos`, and `done` (plus `activate_skill` and MCP tools where configured).
   Removed wholesale: the dedicated `read`/`grep`/`glob` tools, the line-addressed
   edit family (`replace_lines`/`insert_lines`), the tree-sitter symbolic tools
@@ -34,9 +42,152 @@ make the result channel honest — and those are now the default, all ON.
 - **Removed A/B knobs**: `CHAD_ENABLE`, `CHAD_LEAN`, `CHAD_NO_SYMBOLS`,
   `CHAD_NO_TASK`, `CHAD_HIDE_TOOLS`, `CHAD_PROFILE` (model profiles are gone; the
   prompt is model-agnostic), `CHAD_OFFLOAD_DIR`, `CHAD_LSP_TIMEOUT`,
-  `CHAD_LSP_MAX_RSS_MB`. `CHAD_THINK_CEILING` now defaults to 0 (off).
+  `CHAD_LSP_INIT_TIMEOUT`, `CHAD_LSP_DIAG_TIMEOUT`, `CHAD_LSP_MAX_RSS_MB`.
+  `CHAD_THINK_CEILING` now defaults to 0 (off).
 - **Dependency drop**: `rustworkx` (the repo-map PageRank is gone; tree-sitter tags
   stay, powering the ambient skeleton/definition-pointer lever).
+
+### New: `search`, ranked repository retrieval
+
+- **A sixth tool, on by default.** `bash`/`rg` answers "find this exact string"; it
+  cannot answer "where is FHIR validation handled?" without the model first guessing
+  several synonymous regexes, and every guess that misses costs a round trip.
+  `search` takes a plain-English query and returns ranked `path:line` locations with
+  a line of context either side. It is a BM25 index (Tantivy), one document per file,
+  content indexed but **not** stored — snippets are re-read from disk at query time,
+  so a result can never disagree with the file in front of you.
+- **The index is a pure derived cache** under `~/.chad/cache/search/<repo-hash>/`,
+  never inside the repository, so it can't appear in a diff; deleting it costs one
+  rebuild and nothing else. Freshness is mtime+size reconciliation run lazily on the
+  first search of a session — no watcher, no daemon, and no cost at chad startup.
+  `CHAD_SEARCH_DIR` relocates it.
+- **New dependency**: `tantivy>=0.24,<0.27` (a native pyo3 binding that ships wheels
+  for cp311–cp314 on macOS arm64/x86_64 and manylinux, so an ordinary install needs
+  no Rust toolchain). It is import-guarded regardless: on a wheel-less platform the
+  tool reports itself unavailable and the rest of the surface is untouched.
+- **`CHAD_NO_SEARCH=1`** withholds the tool's schema entirely — and the prompt drops
+  its search guidance to match, so the baseline arm of a paired benchmark pays none
+  of the tool's cost. A tool the model can still see is not a baseline.
+
+### Breaking: one model, and it is a different one
+
+- **The default model is now [`Qwen3.8-27B UD-Q3_K_XL-MTP`][model]**, a dense `qwen3_5`
+  hybrid (64 layers: 48 GatedDeltaNet + 16 full attention) quantized to 3-bit group-64
+  with `lm_head` held at 5-bit. ~12 GB resident, 262k native context. **This is a fresh
+  download on first run after upgrading**, and the Ornith weights in your Hugging Face
+  cache can be deleted once you are happy (`hf cache` will find them).
+- **The Ornith 35B/9B pair is retired**, and with it the RAM-aware pick that chose between
+  them and the `--model 35b` / `--model 9b` / `--model 27b` shorthands. `--model` now takes
+  `auto` or a repo id / local dir, nothing else — a stale `--model 9b` in a script is now a
+  literal (nonexistent) repo id rather than a silent alias, which is deliberate: a
+  half-removed alias table would quietly load the default and never tell you.
+- **Breaking: 24 GB is the floor.** There is no smaller model to fall back to, so a Mac
+  below the target gets a one-line warning at startup and runs anyway — chad advises, it
+  does not gate — but ~12 GB of weights plus the ~4.3 GB prefill transient leave too little
+  for a usable KV cache. Even at 24 GB the honest window is ~56k of the model's 262k; the
+  banner has always stated what you actually got.
+- **Why these bits.** On a dense model every parameter is on the critical path for every
+  token: no expert redundancy to absorb quantization error, and shrinking the weights is
+  the only decode lever there is. The recipe follows what the calibrated GGUF builds of
+  this checkpoint agree on — `lm_head` is a second full 1.27B-param tensor (vocab 248,320,
+  untied) and is where protection pays, while `embed_tokens` is a lookup table whose
+  per-row error never compounds through a matmul and is the cheapest tier to cut. Holding
+  both high, as a uniform "sensitive tier" would, spends ~0.78 GB on the tier that needs it
+  least — and on a 24 GB box 1 GB of weights is ~16k tokens of context.
+- **It ships its trained MTP head** as `mtp.safetensors` alongside the weights, which is
+  what the new self-speculative decoder drafts with (below). The conversion is ours rather
+  than mlx-community's: identical language weights, minus the 0.86 GB BF16 vision tower
+  that mlx-lm's loader discards at load anyway, plus that head.
+- **`chad prove` now runs the shipped model** instead of pinning a smaller stand-in. It
+  answers "does what I am about to run work on this machine", which a stand-in cannot, and
+  it costs no extra download since these are the weights chad was going to fetch anyway.
+- **No benchmark claim ships with this release.** The 57% Terminal-Bench 2.1 result quoted
+  by 1.x was measured on Ornith 35B and says nothing about the new default, so it has moved
+  out of the README into [`docs/benchmarks.md`](docs/benchmarks.md), dated and labelled
+  historical. The new default has not been scored yet; per the standing rule, that number
+  will flip in its own dedicated commit when the run lands.
+
+[model]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX
+
+### Decode speed
+
+- **MTP self-speculative decoding** (`mlx_mtp.py`, default ON where a head exists).
+  Drafts with the checkpoint's own trained multi-token-prediction head loaded as a
+  sidecar, verifies in one batched forward, and applies exact rejection sampling — so
+  greedy output stays token-identical to the non-speculative path and sampled output
+  keeps the model's true distribution at any temperature. The shipped model bundles a
+  head, so this is on by default; a checkpoint without one is unaffected.
+  Measured on an M4 Pro at temp 1.0: 1.38× on quote-heavy spans, 1.11× on novel code,
+  1.0× on free prose. `CHAD_NO_MTP=1` disables it.
+- **Adaptive draft depth.** Rather than a fixed draft width, a per-round cost model
+  picks the depth from recent acceptance, and a full-accept streak qualifies a jump
+  onto the measured flat verify-cost plateau (S≥10 verifies cost about the same
+  through S=32). Low-acceptance regimes — temp-1 thinking, cold content — collapse to
+  depth 1–2 or a free skip, so the schedule degrades to fixed-k behavior rather than
+  below it. `CHAD_MTP_ADAPTIVE=0` restores fixed width; `CHAD_MTP_DRAFT` forces one
+  (and implies adaptive off); `CHAD_MTP_MAX_DRAFT` / `CHAD_MTP_H` override the cap
+  and the cost seed.
+- **An S>1 tier for the fused quantized-KV attention kernel** (`mlx_qsdpa.py`).
+  Speculative verification and prefill both dispatch multi-token attention steps,
+  which previously fell back to dequantizing the whole cache; the new wide path is
+  1.4–1.8× that fallback at 32k+. Bit-exact with the path it replaces.
+  `CHAD_NO_QSDPA_WIDE` / `CHAD_NO_QSDPA_WIDE_SGM` disable the tiers,
+  `CHAD_QSDPA_WIDE_KERNEL` forces the single-kernel variant.
+- **Verify-width kernel warming.** The attention kernel is templated on the verify
+  width, so a width that has never run is a Metal compile on the critical path of a
+  real step. Load now warms exactly the widths *this* configuration can produce, not
+  the union of everything. `CHAD_NO_KERNEL_WARM=1` opts out.
+- **Wide prompt-lookup decoding is now opt-in** (`CHAD_USE_PLD=1`), not default.
+  PLD drafts from context recurrence, so it can only accelerate text that already
+  appeared — and on real agentic traces that is a minority of what this agent
+  generates (~62–66% of generated tokens are `<think>`, and reasoning prose replays
+  at ~2.3%). Whole-session contribution measured at +2.2% of generated tokens. It
+  does not compose with MTP (one generate loop each), so on a checkpoint that
+  self-speculates, MTP is the better of the two.
+- **CATS sparse decode removed.** It never beat the alternatives on the hybrid and
+  could not run alongside speculation.
+- **`CHAD_QMMS=1`** exposes a fused small-batch quantized matmul (`mlx_qmm_s.py`),
+  bit-exact with the stock op but measured only ~par at S 2–4 and behind at S 6–8 on
+  mlx 0.32. It ships OFF, as the scaffold a future sparse-decode kernel builds on.
+- **`CHAD_NO_DRAFT_SHORTLIST=1`** disables the 2-bit shortlist readout used by the
+  greedy draft chain (draft-side only, never load-bearing — the chained drafts'
+  full-vocab `lm_head` read was ~70% of the head-step cost).
+- **Dead kernels removed with the model they served.** Two decode paths could only ever
+  engage on the retired Ornith 35B, so they went with it rather than lingering as knobs
+  that do nothing:
+  - `mlx_moe_fused.py` (the fused sparse-MoE decode kernels) and the MoE branch of
+    `mlx_fastpath.py`. The shipped model is dense; `install()` now declines a MoE
+    checkpoint outright instead of half-applying the dense transforms to it. **Removed
+    knob: `CHAD_NO_MOE_FUSED`.**
+  - The S=1 `simdgroup_matrix` attention tier in `mlx_qsdpa.py`, which needed exactly 8
+    query heads per KV head to fill its fixed 8×8 score tile. The shipped model is GQA-6
+    and could never dispatch it. **Removed knob: `CHAD_NO_QSDPA_SGM`.** Its *wide* (S>1)
+    sibling carries the retile idea forward on virtual rows and has no such constraint —
+    that one is live and is what speculative verification runs on.
+
+### Context, sampling, and other changes
+
+- **Breaking: `CHAD_CTX_RESERVE_GB` is replaced by `CHAD_CTX_SAFETY`.** The headroom
+  lever is now a *fraction* of the live Metal budget the auto-sizing may spend
+  (default 0.975) rather than an absolute gigabyte reserve, which is what lets the
+  same setting mean the same thing on a 16 GB and a 64 GB machine. The compaction
+  threshold now also subtracts the **prefill transient** — the attention scratch live
+  at the same moment as the cache — which is fixed rather than per-token (measured on
+  the 27B: 1.8 GB at 8k, 4.15 GB at 49k, flat thereafter). `CHAD_CTX_LIMIT` still
+  forces an exact threshold.
+- **New sampler knobs**: `CHAD_TOP_K` (quant-tail trim, off by default) and
+  `CHAD_PRESENCE_PENALTY` (0.0 by default and worth leaving there — code is
+  inherently repetitive, and measured at 1.5 the model produced 45 steps of pure
+  exploration, zero edits, and visibly corrupted tool arguments). All five sampler
+  settings now travel as one call, so `chad serve` honors them too — previously a
+  server started with `CHAD_MIN_P` ran without it and said nothing.
+- **New: `CHAD_REASONING_EFFORT`** (`xhigh` | `medium` | `low`) sets the
+  template-level reasoning budget on checkpoints whose chat template accepts one.
+  Unset, the argument is not passed at all, so templates without the knob are
+  unaffected.
+- **Tab-indented files edit correctly.** The `edit` tool's indentation-drift recovery
+  mis-indented a majority of edits in tab-indented sources; over the dogfood corpus
+  that path went from 33% to 100% correct.
 
 ## [1.13.0] — 2026-08-10
 

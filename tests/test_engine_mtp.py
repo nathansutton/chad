@@ -8,9 +8,10 @@ full-rollback arm (restore recurrent + trim KV + re-feed + drafter-cache trim)
 on every step; a zeroed model makes drafter and verifier agree trivially, so
 it exercises the full-accept arm and the drafter catch-up bookkeeping.
 
-These run on the tiny synthetic qwen3_5 hybrid from the PLD suite —
-unquantized, so exact argmax comparisons are meaningful (see that module's
-docstring for why quantized grids make greedy ties ambiguous)."""
+These run on the tiny synthetic qwen3_5 DENSE hybrid from the fastpath suite —
+the shipped model's geometry — unquantized, so exact argmax comparisons are
+meaningful (see that module's docstring for why quantized grids make greedy ties
+ambiguous)."""
 
 import os
 import sys
@@ -26,7 +27,7 @@ from mlx_lm.models import cache as cache_utils  # noqa: E402
 
 from chad import mlx_mtp  # noqa: E402
 from chad.engine import Engine  # noqa: E402
-from test_mlx_fastpath import TINY_CFG  # noqa: E402
+from test_mlx_fastpath import TINY_DENSE_CFG  # noqa: E402
 
 PROMPT = [5, 9, 11, 22, 33, 44, 55, 66, 77, 88, 101, 102, 7]
 N_TOKENS = 40
@@ -38,7 +39,7 @@ def _build_tiny(seed=0, zero=False):
     from mlx.utils import tree_map
     from mlx_lm.models.qwen3_5 import Model, ModelArgs
 
-    cfg = copy.deepcopy(TINY_CFG)
+    cfg = copy.deepcopy(TINY_DENSE_CFG)
     cfg["text_config"]["head_dim"] = 64
     mx.random.seed(seed)
     model = Model(ModelArgs.from_dict(cfg))

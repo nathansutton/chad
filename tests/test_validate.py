@@ -192,6 +192,5 @@ if __name__ == "__main__":
     test_validation()
     test_render()
     test_legacy_validate()
-    test_replace_lines_batch_schema()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

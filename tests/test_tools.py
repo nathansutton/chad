@@ -1,20 +1,18 @@
 """Characterization battery for the filesystem tools in `tools.py`:
-`tool_edit` (uniqueness/no-corruption truth table), `tool_grep`, `tool_glob`,
-`tool_write`. Pure filesystem in a temp dir — no model load.
+`tool_edit` (uniqueness/no-corruption truth table) and `tool_write`. Pure filesystem
+in a temp dir — no model load.
 
 The KEY invariant: `tool_edit` rewrites the file ONLY on a genuinely-unique match and
 leaves it BYTE-FOR-BYTE untouched in every reject/ambiguous case. `test_edit.py` already
 covers the recovery cascade (literal \\n, indent drift, ws-flexible ambiguity); this file
-focuses on the plan's grep/glob/write tables plus the core edit truth table.
+focuses on the write table plus the core edit truth table.
 
 Run: `.venv/bin/python test_tools.py`
 """
 
-import glob as _glob
 import os
 import sys
 import tempfile
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

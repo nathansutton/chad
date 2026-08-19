@@ -23,9 +23,7 @@ Agent / `/reset` starts so activations don't bleed across sessions.
 """
 
 import os
-import re
 
-from . import config
 from .diag import log, warn_footer
 from .ignore import IGNORE_DIRS
 

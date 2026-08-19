@@ -36,8 +36,7 @@ install() routes eligible calls here from BOTH call surfaces:
 S=1 decode and large-S prefill are untouched.
 """
 
-import os
-from typing import Any, Optional
+from typing import Any
 
 from . import config
 from .diag import log
@@ -239,7 +238,7 @@ def install() -> bool:
             nn.QuantizedLinear.__call__ = call  # type: ignore[method-assign]
 
         from . import mlx_fastpath
-        mlx_fastpath.QMM = qmm
+        mlx_fastpath.QMM = qmm  # type: ignore[assignment]  # module default is None
         log.info("qmm_s installed: fused small-batch quantized matmul "
                  "(verify forwards S 2..%d)", _MAX_S)
         return True
