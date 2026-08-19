@@ -141,7 +141,7 @@ def _patch_dense_mlp_call() -> None:
     def fused_call(self, x):
         if not hasattr(self, "_fused_w"):
             return stock_call(self, x)
-        gu = _qmm(
+        gu = mx.quantized_matmul(
             x, self._fused_w, scales=self._fused_s, biases=self._fused_b,
             transpose=True, group_size=self._fused_gs, bits=self._fused_bits)
         g, u = mx.split(gu, 2, axis=-1)
@@ -190,17 +190,6 @@ def _concat_gdn_in_projs(model) -> None:
 # by engine._generate_mtp; always None during prefill and normal decode.
 GDN_COLLECTOR = None
 
-# Quantized-matmul indirection for the fused-concat call sites below. Stock
-# mx.quantized_matmul until mlx_qmm_s.install() swaps in its small-batch
-# dispatcher (same signature); S=1 decode and prefill route back to the stock
-# op inside the dispatcher, so this hook only changes verify-shaped calls.
-QMM = None
-
-
-def _qmm(x, w, **kw):
-    import mlx.core as mx
-    return (QMM or mx.quantized_matmul)(x, w, **kw)
-
 
 def _patch_gdn_call() -> None:
     """Stock-graph GDN forward using the fused in_proj (used for S>1; the S==1
@@ -217,7 +206,7 @@ def _patch_gdn_call() -> None:
         if not hasattr(self, "_fused_w"):
             return stock_call(self, inputs, mask=mask, cache=cache)
         B, S, _ = inputs.shape
-        big = _qmm(
+        big = mx.quantized_matmul(
             inputs, self._fused_w, scales=self._fused_s, biases=self._fused_b,
             transpose=True, group_size=self._fused_gs, bits=self._fused_bits)
         qkv, z, b, a = mx.split(
@@ -320,12 +309,10 @@ def _install_layer_fastpath(model) -> None:
             else:
                 r = self.self_attn(self.input_layernorm(x), mask, cache)
                 return self._mlp_fast(x + r)
-        # NOTE (plan 138): a compiled S=2..4 verify step was built and
-        # measured HERE — round time did not move (dispatch was not the
-        # verify cost), and the compiled bodies bypass the QMM hook that
-        # mlx_qmm_s routes small-S weight matmuls through, which IS the
-        # verify cost under production memory residency. So S>1 stays on the
-        # stock graph, where every projection reaches the hook.
+        # A compiled S=2..4 verify step was built and measured HERE, and
+        # round time did not move: dispatch is not what a verify forward
+        # costs. S>1 therefore stays on the stock graph — the simpler of two
+        # equal-speed options.
         return stock_layer_call(self, x, mask=mask, cache=cache)
 
     layer_call._chad_fastpath = True  # type: ignore[attr-defined]

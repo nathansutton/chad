@@ -245,9 +245,11 @@ the banner says so: `84k of 262k context`.
 `--model` (or `CHAD_MODEL`) takes `auto` — the shipped model — or any Hugging Face repo id
 / local MLX model directory. There are no size shorthands: 2.0.0 retired the Ornith 35B/9B
 pair and the RAM-aware pick that chose between them, so `--model 9b` is now just a literal
-(and nonexistent) repo id rather than a silent alias. An arbitrary model dir is unsupported
-and mostly there for research — the harness is tuned to the shipped model. The flag wins
-over `CHAD_MODEL`, so a globally exported var can't pin every run.
+(and nonexistent) repo id rather than a silent alias. Pointing it at other weights is
+supported and kept on purpose — one shipped model is a default, not a restriction — but the
+harness is *tuned* to the shipped model, so the realistic cost is throughput, not
+correctness. The flag wins over `CHAD_MODEL`, so a globally exported var can't pin every
+run.
 
 **Memory safety.** At load the engine wires the Metal working set and caps
 the allocator slightly below it (`mx.set_wired_limit`/`set_memory_limit`), so a
@@ -590,8 +592,6 @@ CHAD_NO_DRAFT_SHORTLIST=1 uv run chad  # full-vocab readout for the draft chain
 CHAD_USE_PLD=1            uv run chad  # OPT-IN: wide prompt-lookup decoding
 CHAD_NO_QSDPA_WIDE=1      uv run chad  # disable the S>1 tier of the fused attention kernel
 CHAD_NO_QSDPA_WIDE_SGM=1  uv run chad  # disable just its split-head variant
-CHAD_QMMS=1               uv run chad  # OPT-IN: fused small-batch quantized matmul
-CHAD_NO_QMMS=1            uv run chad  # hard-off for the above, even if something enables it
 CHAD_QSDPA_WIDE_SGM_RT=1  uv run chad  # force the RT-split wide kernel instead of the one-read form
 CHAD_MTP_PATH=/path.safetensors uv run chad  # explicit MTP head sidecar (default: found beside the weights)
 CHAD_NO_KERNEL_WARM=1     uv run chad  # skip warming verify-width attention kernels at load
@@ -634,11 +634,6 @@ CHAD_NO_KERNEL_WARM=1     uv run chad  # skip warming verify-width attention ker
   one — a kernel-selection knob for measurement.) The bigger hammers are still
   `CHAD_NO_QSDPA`, in [Safety & A/B opt-outs](#safety--ab-opt-outs), which disables the
   fused kernel entirely.
-- **`CHAD_QMMS`** — opt **in** to a fused small-batch quantized matmul (`mlx_qmm_s.py`).
-  Bit-exact with the stock op, but measured only ~par at S 2–4 and *behind* at S 6–8 on
-  mlx 0.32 (stock `qmm_t` already part-amortizes, and the current lane structure is
-  register-bound at high S). It ships OFF and exists as the scaffold a sparse-decode
-  kernel builds on — flip it on only to experiment. `CHAD_NO_QMMS=1` forces it off.
 - **`CHAD_QSDPA_WIDE_SGM_RT`** — the wide tier has two forms. The default is *one-read*
   (K/V bytes touched once, all row tiles resident); this forces the *RT-split* form (one
   8-row tile per threadgroup, K/V read once per tile), which is what runs anyway at S>4.

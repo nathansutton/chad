@@ -1,11 +1,10 @@
-"""Fused quantized-KV decode attention (roadmap item 1).
+"""Fused quantized-KV decode attention.
 
 mlx_lm's quantized-KV attention (`kv_bits=8`) is manually unfused — two
 `quantized_matmul`s around a materialized softmax — and measured 2.3-2.6x
 SLOWER than fused fp16 attention despite reading half the bytes (measured
 53->38 tok/s @32k). That made cache quantization a pure loss, so chad ships
-with it off and the governor's ctx_limit pays full fp16 KV rates (~20.5
-KB/token on the 35B).
+with it off and the governor's ctx_limit pays full fp16 KV rates.
 
 This module JIT-compiles (mx.fast.metal_kernel — no wheel rebuild) a fused
 online-softmax scan over the 8-bit group-64 affine QuantizedKVCache layout.
@@ -35,7 +34,9 @@ kernel streaming at 331 GB/s, at the measured roofline, with 68% of its runtime
 in the math. The cost was GQA reuse through threadgroup memory (~8 KB/position
 against ~500 B/position of device traffic), not the fetch.
 
-Measured on the target shape (q 16h x 256d, kv 2h, GQA-8, bf16, M4 Pro):
+Measured when the kernel was built, on what was then the shipped shape
+(q 16h x 256d, kv 2h, GQA-8, bf16, M4 Pro) — the ratios are the reason this
+exists, not a claim about the current model:
 vs stock fused fp16 sdpa_vector: 1.17x @8k, 1.31x @32k, 1.36x @98k faster —
 while reading a 1.88x smaller cache (~10.9 KB/token). vs the mlx_lm unfused
 quantized path it replaces: 2.7x @8k, 3.4x @32k, 5.4x @98k. Numerics:
@@ -45,11 +46,11 @@ kernels.
 
 `install()` patches the QuantizedKVCache branch of
 `mlx_lm.models.base.scaled_dot_product_attention` to use the fused kernels
-for S==1 decode steps on exactly this shape (D=256, GQA=8, bits=8, gs=64,
-no/causal mask), reading the cache's FULL padded buffers with a runtime
-valid-length — the sliced views the stock path uses would force a
-contiguity copy per call. Everything else falls through to stock. Opt out:
-CHAD_NO_QSDPA=1.
+for S==1 decode steps on the shapes `covers()` accepts (D=256, GQA 4/6/8 —
+the shipped model is GQA-6 — bits=8, gs=64, no/causal mask), reading the
+cache's FULL padded buffers with a runtime valid-length — the sliced views
+the stock path uses would force a contiguity copy per call. Everything else
+falls through to stock. Opt out: CHAD_NO_QSDPA=1.
 
 Scope note: chad's engine still gates kv_bits OFF the rewind/interruptible-
 prefill paths (engine.py), so this kernel lands ahead of that glue; it also
@@ -895,13 +896,14 @@ _P1_SGM_WIDE1R_SRC = """
 
 # Below this many valid positions the retile's extra barriers and its wider
 # partials slab (VB = blocks * NPG) cost more than the reuse it saves, and the
-# per-head kernel wins. Measured crossover on the 35B shape, interleaved arms:
+# per-head kernel wins. Crossover measured on the gqa-8 shape, interleaved arms:
 # n=1024 0.95x, 2048 1.04x, 4096 1.12x, 8192 1.18x, 16384 1.22x, 98304 1.30x.
 _SGM_MIN_N = 2048
 
-_GQAS = (4, 6, 8)   # 35B is 16q/2kv (gqa 8); 9B is 16q/4kv (gqa 4);
-                    # Qwen3.8-27B is 24q/4kv (gqa 6) — per-head kernel only,
-                    # the simdgroup retile needs 8 q-head rows per score tile
+# The shipped model is 24q/4kv (gqa 6). 4 and 8 stay covered because `--model`
+# is a real escape hatch: they cost nothing but a template instantiation, and
+# without them another checkpoint silently loses quantized KV entirely.
+_GQAS = (4, 6, 8)
 _D = 256
 
 

@@ -15,24 +15,40 @@
 # timer, which cost ~35s of the runtime sitting on panels waiting to be dismissed. The
 # approval UX is real and worth showing — but a GIF is the wrong place to show waiting.
 #
-# WHY EVERY BEAT BELOW IS A FIXED SLEEP AND NOT `Wait+Screen /…/`:
+# WHY THE PRIMING RUN BELOW EXISTS — READ BEFORE "SIMPLIFYING" IT AWAY:
+# chad checkpoints the stable system+tools KV prefix to disk and reloads it on the next
+# session in the same project (engine.warm_prefix). The checkpoint key covers the whole
+# system prompt, cwd and repo map included, so a FRESH mktemp dir can only ever miss.
+# Measured on the shipped 27B, this exact fixture and ask:
+#
+#              cold (fresh dir, miss)   warm (checkpoint hit)
+#   first tool         75.6s                    5.5s
+#   whole turn        ~103s                    31.4s
+#
+# Recording straight into a fresh dir therefore records chad's WORST case — a ~7.4k-token
+# prefix prefill no returning user ever pays again — and the old tape hid it behind a
+# 17s `Hide` block, which is the misleading half of both options. So: prime the checkpoint
+# off camera, then record the warm run every user actually gets after their first session.
+# The turn is then short enough to show unbroken, with no hidden cut at all.
+#
+# The priming run is headless, which is safe because the stable prefix is the same in both
+# modes: `build_system_prompt()` takes no headless/TUI/yolo argument, so the checkpoint a
+# headless run writes is the one the TUI run reads. It must run AFTER the fixture files
+# exist (the repo map is part of the key) and it costs one extra model load per recording.
+#
+# WHY EVERY TURN BEAT IS A FIXED SLEEP AND NOT `Wait+Screen /…/`:
 # vhs's screen matcher polls fine for shell output, but it stops seeing the screen once
 # chad's TUI starts a turn (measured: two runs, both frozen at the same line, both burned
 # the full WaitTimeout while the thing they waited for sat on screen). So the turn is
 # timed. Overshoot: a few dull frames of a finished transcript. Undershoot: `/exit` typed
 # into a running turn. When in doubt, lengthen — never shorten.
 #
-# STALE AS OF 2.0.0 — RE-MEASURE BEFORE RECORDING. The sleep values below were measured
-# on the retired Ornith 35B (Q2_K_XL, warm weights): load ~10s, first tool ~24s after the
-# ask, edit ~32s, pytest ~33s, a second pytest ~38s (chad re-verifies once on its own),
-# done ~40s. 2.0.0 changed the model to a dense 27B with a different decode profile and a
-# think-heavy generation mix, so these offsets are not transferable — re-measure by running
-# the same ask headless with timestamped output, then update every Sleep below. Recording
-# against these numbers will type `/exit` into a running turn.
+# Offsets below were measured on the shipped Qwen3.8-27B, warm, M4 Pro (24 GB): ready 4.1s,
+# first tool +5.5s, edit +23.1s, verify +27.0s, turn done +31.4s. Re-measure if the model
+# or the ask changes — run the same ask headless with timestamped output and read them off.
 #
-# There is no smaller rehearsal model any more (2.0.0 retired the 9B), so rehearse the
-# mechanics against whatever local MLX model you have via CHAD_MODEL — but never ship a
-# GIF recorded from anything but the shipped default.
+# Sampling is not deterministic: a take where the model fumbles (invents a path, re-reads,
+# wanders) is a bad demo, not a bad tape. Watch the frames; if it wandered, run it again.
 
 Output docs/demo.gif
 
@@ -42,7 +58,7 @@ Set Width 1200
 Set Height 640
 Set Padding 12
 Set TypingSpeed 40ms
-Set WaitTimeout 2m
+Set WaitTimeout 4m
 
 # --- fixture: a tiny project with one failing test (off camera) -----------------
 # `chad` is bound to THIS working tree, not whatever is installed globally — the GIF
@@ -64,6 +80,16 @@ Type `printf 'def split_evenly(total_cents, n):\n    """Split a bill n ways. Eve
 Enter
 Type `printf 'from budget import split_evenly\n\n\ndef test_no_cent_is_lost():\n    shares = split_evenly(100, 3)\n    assert sum(shares) == 100\n    assert shares == [34, 33, 33]\n\n\ndef test_even_split_is_even():\n    assert split_evenly(90, 3) == [30, 30, 30]\n' > test_budget.py`
 Enter
+
+# --- prime the on-disk warm prefix (off camera; see the header) -------------------
+# One headless turn writes the checkpoint the recorded session reads back. The ask is
+# deliberately trivial and edits nothing; the fixture is rewritten afterwards regardless,
+# so a fumbled priming turn cannot leak into the take.
+Type `chad --yolo "run the bash command 'true' and then stop" >/dev/null 2>&1`
+Enter
+Sleep 150s
+Type `printf 'def split_evenly(total_cents, n):\n    """Split a bill n ways. Every cent has to land somewhere."""\n    return [total_cents // n] * n\n' > budget.py`
+Enter
 Type "clear"
 Enter
 Show
@@ -82,23 +108,18 @@ Wait+Screen /type ahead/
 Sleep 1.5s
 
 # Type the ask WHILE the weights load — the type-ahead queue is a real feature, and it
-# means the 10-second load costs you nothing.
+# means the load costs you nothing.
 Type "the first test fails — fix split_evenly in budget.py so no cent is lost, then run pytest -q once to verify"
 Sleep 1s
 Enter
 
-# The first ~17s of a turn is a silent prefill: a spinner and ↑0 ↓0, nothing to watch.
-# Cut THAT, not the streaming that follows — the reasoning and the Read lines are the
-# interesting part, and the first take made exactly this mistake in reverse.
-Hide
-Sleep 17s
-Show
-
-# --- the run: reads, reasons, edits, verifies, re-verifies -------------------------
-# ~25s of turn is left after the cut above. The extra margin is deliberate: overshooting
-# leaves the finished transcript on screen (which the viewer wants to read anyway),
-# undershooting types `/exit` into a running turn.
-Sleep 32s
+# --- the run: warm start, then reads, reasons, edits, verifies --------------------
+# Nothing is hidden here. The turn opens with chad's own "[warm start: N prefix tokens
+# from disk cache]" line, which is the sentence that explains why the rest is quick, then
+# runs ~31s to done. The margin below is deliberate: overshooting leaves the finished
+# transcript on screen (which the viewer wants to read anyway), undershooting types
+# `/exit` into a running turn.
+Sleep 42s
 
 # --- green, on a laptop, on local weights ----------------------------------------
 Type "/exit"

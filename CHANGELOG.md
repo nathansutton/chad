@@ -2,7 +2,7 @@
 
 Notable, user-visible changes.
 
-## [2.0.0] — 2026-08-18
+## [2.0.0] — 2026-08-19
 
 **The lean release, and a new brain.** chad 2.0.0 is the drastic simplification the 1.x
 measurement program earned: every lever pack, alternate tool dialect, and scaffolding layer
@@ -124,15 +124,12 @@ decoder.
   self-speculates, MTP is the better of the two.
 - **CATS sparse decode removed.** It never beat the alternatives on the hybrid and
   could not run alongside speculation.
-- **`CHAD_QMMS=1`** exposes a fused small-batch quantized matmul (`mlx_qmm_s.py`),
-  bit-exact with the stock op but measured only ~par at S 2–4 and behind at S 6–8 on
-  mlx 0.32. It ships OFF, as the scaffold a future sparse-decode kernel builds on.
 - **`CHAD_NO_DRAFT_SHORTLIST=1`** disables the 2-bit shortlist readout used by the
   greedy draft chain (draft-side only, never load-bearing — the chained drafts'
   full-vocab `lm_head` read was ~70% of the head-step cost).
-- **Dead kernels removed with the model they served.** Two decode paths could only ever
-  engage on the retired Ornith 35B, so they went with it rather than lingering as knobs
-  that do nothing:
+- **Dead kernels removed.** Three custom decode paths earned their keep on a model or an
+  mlx version chad no longer ships against. Rather than linger as knobs that do nothing,
+  they are gone:
   - `mlx_moe_fused.py` (the fused sparse-MoE decode kernels) and the MoE branch of
     `mlx_fastpath.py`. The shipped model is dense; `install()` now declines a MoE
     checkpoint outright instead of half-applying the dense transforms to it. **Removed
@@ -142,6 +139,13 @@ decoder.
     and could never dispatch it. **Removed knob: `CHAD_NO_QSDPA_SGM`.** Its *wide* (S>1)
     sibling carries the retile idea forward on virtual rows and has no such constraint —
     that one is live and is what speculative verification runs on.
+  - `mlx_qmm_s.py`, the fused small-batch quantized matmul, and the `QMM` indirection
+    in `mlx_fastpath.py` that existed only to host it. Re-measured against the stock op
+    at bf16 — the dtype the model actually runs, and the one an earlier fp16-only
+    measurement got wrong — on real verify shapes with cold weights, it is 1.01× at
+    S=3 (the shipped speculation width) and 0.71× at S=6: par at best, slower where it
+    matters. A kernel that ships OFF because it loses to the op it replaces is dead
+    code, not scaffolding. **Removed knobs: `CHAD_QMMS`, `CHAD_NO_QMMS`.**
 
 ### Context, sampling, and other changes
 
@@ -166,6 +170,18 @@ decoder.
 - **Tab-indented files edit correctly.** The `edit` tool's indentation-drift recovery
   mis-indented a majority of edits in tab-indented sources; over the dogfood corpus
   that path went from 33% to 100% correct.
+- **The cross-session warm start is now documented, with numbers.** Nothing changed in
+  the feature — chad has always checkpointed the stable system+tools KV prefix to disk
+  and reloaded it on the next session in the same project — but it was described only in
+  passing, as a `chad serve` footnote, and never measured. On the shipped model it is
+  worth 75.6 s → 5.5 s to the first tool call and ~103 s → 31.4 s on the whole turn.
+  See [Throughput & performance](docs/benchmarks.md).
+- **The demo GIF records the warm path.** `docs/demo.tape` built its fixture in a fresh
+  `mktemp` directory, which can only ever miss the warm-prefix checkpoint, so the demo
+  was recording chad's worst case and then hiding the resulting minute-long prefill
+  behind a timed cut. The tape now primes the checkpoint off camera and records the
+  session every user gets after their first — short enough to show unbroken, with no
+  hidden cut inside the turn.
 
 ## [1.13.0] — 2026-08-10
 

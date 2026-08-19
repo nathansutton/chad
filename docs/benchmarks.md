@@ -68,6 +68,27 @@ model change. Why the cache is *append-only* (and why that's the right trade for
 SSM/attention model) is in
 [the cache trade](design.md#trimmable-vs-append-only-the-cache-trade-chad-lives-with).
 
+## The second session in a project starts warm
+
+The ~0.2 s figure above is the *within*-session win. Across sessions there is a second one,
+and it is larger: chad checkpoints the stable system+tools KV prefix to disk
+(`engine.warm_prefix`) and reloads it when you next start in the same project, so the
+~7.4k-token system prefix is prefilled **once, ever** rather than once per session.
+
+Measured on the shipped 27B (M4 Pro, 24 GB), one fixture and one ask, cold vs. warm:
+
+| | cold (first session in a project) | warm (checkpoint hit) |
+|---|---|---|
+| ask → first tool call | 75.6 s | **5.5 s** |
+| whole turn | ~103 s | **31.4 s** |
+
+The cold column is a real cost and worth stating plainly: the first turn in a *new* project
+spends over a minute reading a system prompt before it does anything you asked for. It is
+also a cost you pay once — the checkpoint is keyed on the whole system prompt, cwd and repo
+map included, so it survives restarts and is invalidated exactly when the prompt it caches
+actually changes. The session banner's `[warm start: N prefix tokens from disk cache]` line
+is chad telling you which of these two turns you are about to have.
+
 ## Why decode sits where it does
 
 The intuitive answer is "memory bandwidth" — each token streams the resident weights through

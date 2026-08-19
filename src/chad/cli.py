@@ -6,7 +6,7 @@ One model (Qwen3.8-27B, 3-bit, with its MTP head), one entrypoint, run with uv:
     uv run chad                                # interactive full-screen TUI
     uv run chad "fix the bug in greet.py"      # one-shot, headless
     uv run chad -c                             # resume this directory's conversation
-    uv run chad --model <repo|dir>             # run different weights (unsupported)
+    uv run chad --model <repo|dir>             # run different weights
 
 Plus three subcommands, each with its own `--help`: `chad serve`, `chad prove`,
 `chad levers`.
@@ -603,8 +603,9 @@ def _add_model_arg(ap):
     need the same escape hatch from the shipped default."""
     ap.add_argument("--model", default=None,
                     help="which model to load: 'auto' (the shipped default) or any "
-                         "Hugging Face repo id / local model dir. Anything but 'auto' "
-                         "is unsupported — the harness is tuned to the shipped model. "
+                         "Hugging Face repo id / local model dir. Other weights run "
+                         "through the same engine; the tuning is fitted to the shipped "
+                         "model, so expect to lose speed, not correctness. "
                          "Also CHAD_MODEL.")
 
 

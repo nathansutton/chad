@@ -571,10 +571,11 @@ class Engine:
     _model_path: str = field(init=False, default="")  # resolved weights dir
     _warm_prefix_ids: Any = field(init=False, default=None)
     kv_bytes_per_token: float = field(init=False, default=0.0)  # measured at load (036)
-    # Model-shape facts read from config at load, for the adaptive prefill chunk
-    #MoE prefill amortizes routing with bigger chunks (+14%
-    # measured 512→2048 on the 35B) while the dense 9B is compute-flat, and the
-    # unfused head_dim-256 attention's transient scales with heads*chunk*kv_len.
+    # Model-shape facts read from config at load, for the adaptive prefill chunk.
+    # MoE prefill amortizes routing with bigger chunks (+14% measured 512→2048 on
+    # a 35B MoE) while a dense model is compute-flat; the unfused head_dim-256
+    # attention's transient scales with heads*chunk*kv_len. The shipped model is
+    # dense — the MoE arm is here for `--model`.
     _is_moe: bool = field(init=False, default=False)
     _mtp_head: Any = field(init=False, default=None)
     _mtp_draft_readout: Any = field(init=False, default=None)
@@ -677,14 +678,6 @@ class Engine:
         # only; inert unless a QuantizedKVCache is actually in play.
         from . import mlx_qsdpa
         qsdpa_ok = mlx_qsdpa.install()
-        # Fused small-batch quantized matmul (opt-in): bit-exact vs the stock
-        # op but measured only ~par at S 2-4 and behind at S 6-8 on mlx 0.32
-        # (stock qmm_t already part-amortizes; the v1 lane structure is
-        # register-bound at high S). Kept as the scaffold the sparse-decode
-        # kernel builds on; flip on with CHAD_QMMS=1 to experiment.
-        if config.flag("CHAD_QMMS"):
-            from . import mlx_qmm_s
-            mlx_qmm_s.install()
         # MTP head sidecar (Qwen3.8-class): pure speed feature, None on any miss.
         if not config.flag("CHAD_NO_MTP"):
             from . import mlx_mtp
@@ -722,7 +715,8 @@ class Engine:
         attention head count (sizes the unfused-SDPA transient) and whether the
         model is a MoE (bigger chunks amortize expert routing) — plus the kv-head
         count and head_dim the kv-quantization auto-gate needs. Best-effort —
-        the defaults are the shipped 9B/35B shapes."""
+        a model whose config withholds a field falls back to a conservative
+        default rather than failing the load."""
         try:
             cfg = self._read_config(path)
             tc = cfg.get("text_config", cfg)
@@ -1262,10 +1256,12 @@ class Engine:
         """Prefill chunk size for the next chunk, given `kv_len` tokens already
         resident. Two measured facts drive this:
 
-        - The 35B MoE gains +14% prefill throughput from 512→2048 chunks (routing
-          amortization); the dense 9B is compute-bound flat across chunk sizes, so
-          bigger chunks buy it nothing and only add transient memory.
-        - Both models run head_dim-256 attention, which falls off MLX's fused-SDPA
+        - A MoE gains +14% prefill throughput from 512→2048 chunks (routing
+          amortization, measured on a 35B MoE); a dense model is compute-bound flat
+          across chunk sizes, so bigger chunks buy it nothing and only add transient
+          memory. The shipped model is dense, so 512 is the shipped path and the
+          MoE arm serves `--model`.
+        - head_dim-256 attention falls off MLX's fused-SDPA
           path: each chunk materializes an fp32 (heads, chunk, kv_len) score tensor
           per attention layer, so the transient grows with chunk*kv_len — big chunks
           at long context are the prefill-OOM signature.

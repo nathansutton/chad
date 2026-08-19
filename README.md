@@ -150,9 +150,12 @@ token, which is why a 24 GB Mac lands near ~56k of the model's 262k window rathe
 whole thing. The banner states what you actually got. Below 24 GB chad warns and proceeds;
 it does not gate you, but it cannot give you a usable window either.
 
-`--model <repo or local dir>` runs different weights through the same engine. It is
-unsupported — the harness is tuned to the shipped model — and 2.0.0 removed the old `35b` /
-`9b` shorthands along with the Ornith models they named.
+`--model <repo or local dir>` runs different weights through the same engine, and stays a
+first-class escape hatch: shipping one model is a default, not a cage. What you give up is
+fit, not function — the speculation width, kernel dispatch, and context governor are tuned
+to the shipped model, so other weights are slower rather than broken. 2.0.0 removed the
+`35b` / `9b` shorthands along with the Ornith models they named; the flag itself takes a
+repo id or a directory.
 
 **Upgrading** — depends on how you installed: `uv tool upgrade chad-code`; `uvx --refresh
 chad-code`; or `git pull && uv sync` for a clone. What changed lands in
@@ -234,8 +237,9 @@ Both are covered in full in the [Configuration reference](docs/configuration.md)
 
 - **[Design & internals](docs/design.md)** — why prefill is the bill, the persistent prefix
   cache, the trimmable/append-only trade, and the ideas borrowed from other agents.
-- **[Throughput & performance](docs/benchmarks.md)** — prefill / decode / warm-step numbers
-  you can reproduce with `chad-bench`.
+- **[Throughput & performance](docs/benchmarks.md)** — prefill / decode / warm-step
+  numbers you can reproduce with `chad-bench`, and what the cross-session warm start is
+  worth (75.6 s → 5.5 s to the first tool call).
 - **[Terminal-Bench 2.1 reproduction](benchmarks/tb2/README.md)** — the exact Harbor adapter
   and runner; serve a model yourself and check the number.
 - **[Configuration reference](docs/configuration.md)** — Agent Skills, MCP servers, the
