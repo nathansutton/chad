@@ -4,6 +4,29 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+### DFlash2 block drafter
+
+Decoding on the shipped model now speculates with a **DFlash2 block drafter** instead of the
+checkpoint's MTP head. The drafter (`incoai/Qwen3.8-27B-DFlash2`, 1.9B, fetched once on
+first run with the same consent prompt as the model, quantized to a ~1.1 GB sidecar) reads
+the main model's residual stream at five tapped layers and proposes a whole block of tokens
+in **one** forward; the MTP head had to chain one step per token and its acceptance decayed
+past depth 3. Verification, rollback and the exact-acceptance rule are unchanged — both
+drafters now run on one shared speculative loop (`Engine._generate_spec`) — so greedy output
+is token-identical to plain decoding and sampled output keeps the true distribution.
+
+- Measured on an M4 Pro, shipped 3-bit quant, one load, same prompts, 384-token decodes:
+  greedy serial 17.7 → MTP 26.5 → **DFlash2 28.1 tok/s** (1.59×); at the thinking sampling
+  preset MTP 25.3 → **27.3**; at the non-thinking preset 23.7 → **28.4** (a 3-bit g64 quant
+  of the shipped model). On the shipped `UD-Q3_K_XL-MTP` weights at the thinking preset:
+  MTP 24.4 → **29.3**, every prompt won, code included (24.4 → 29.3).
+- `CHAD_NO_DFLASH=1` restores the MTP path; `CHAD_DFLASH_DRAFT=N` sets the verified width
+  (default 4 of the block's 7); `CHAD_DFLASH_ADAPTIVE=1` opts into a per-round width
+  schedule (measured worse at the thinking preset, so off); `CHAD_DFLASH_PATH` / `CHAD_DFLASH_REPO`
+  point at other drafter weights. `python -m chad.mlx_dflash <dir>` builds a sidecar.
+- Memory: +1.1 GB resident for the drafter (its context cache is a 2048-row ring, ~40 MB);
+  on a 24 GB box that is ~30k tokens of context ceiling.
+
 ### A clip is a loan, not a deletion
 
 chad truncates tool output in three places — bash's own head/tail budget, the per-result

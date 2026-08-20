@@ -138,10 +138,11 @@ whose per-row error never compounds through a matmul, is the cheapest. Quant nam
 [Unsloth's dynamic-quant convention](https://docs.unsloth.ai/) (`UD-…`); the quant itself
 is MLX group-64 affine, not a llama.cpp k-quant.
 
-It ships with the checkpoint's own trained **multi-token-prediction head**, which is what
-lets chad decode self-speculatively — draft with the head, verify in one batched forward,
-accept by exact rejection sampling, so greedy output stays token-identical to the
-unspeculated path.
+It decodes speculatively: a small **DFlash2 block drafter** (fetched once, ~1.1 GB
+resident) proposes several tokens per forward from the main model's own hidden states, the
+main model verifies them in one batched forward, and exact rejection sampling keeps greedy
+output token-identical to the unspeculated path. The checkpoint's own trained
+**multi-token-prediction head** is bundled as the fallback drafter.
 
 **24 GB is the floor.** The context window is sized from the live Metal budget, not a
 constant, so a tighter box narrows its window rather than dying — but ~12 GB of weights

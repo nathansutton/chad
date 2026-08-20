@@ -445,6 +445,14 @@ def _cached_weights_complete(model_id) -> bool:
 
 
 def _ensure_model(model_id):
+    """First-run consent + download for the model weights, then the same contract
+    for the model's speculative drafter (`_ensure_drafter`). Every entrypoint that
+    loads a model (cli, serve, bench, prove) goes through here."""
+    _ensure_model_weights(model_id)
+    _ensure_drafter(model_id)
+
+
+def _ensure_model_weights(model_id):
     """If model_id is a HF repo id not yet in the local cache, confirm and download it
     into ~/.cache/huggingface (shared, resumable, paid once per machine). Local dirs
     and already-cached repos return immediately. Headless (no TTY) auto-downloads.
@@ -505,6 +513,56 @@ def _ensure_model(model_id):
             "  fix:   check your connection; if the repo is gated, run `hf auth login`.\n"
             "         Or point CHAD_MODEL at a local model dir you've already built.\n")
         sys.exit(1)
+
+
+def _ensure_drafter(model_id):
+    """First-run consent + download for the model's DFlash2 block drafter
+    (mlx_dflash.py): a separate ~3.8 GB bf16 checkpoint, quantized to a ~1.1 GB
+    sidecar at load. Pure speed: declining (or any failure) just runs this
+    session without it, via CHAD_NO_DFLASH. Models with no registered drafter,
+    already-built sidecars and a cached checkpoint return immediately; headless
+    (no TTY) auto-downloads like the model."""
+    if os.environ.get("CHAD_NO_DFLASH"):
+        return
+    try:
+        from . import mlx_dflash
+        from .engine import _local_path
+        model_dir = _local_path(model_id)
+        repo = mlx_dflash.repo_for_model_dir(model_dir)
+        if not repo or mlx_dflash.sidecar_ready(repo):
+            return
+        if _cached_weights_complete(repo):
+            return  # Engine.load quantizes it from the HF cache (no network)
+        from huggingface_hub import snapshot_download
+        need_gb = 3.8
+        hf_home = os.environ.get("HF_HOME", "~/.cache/huggingface")
+        free_gb = _free_disk_gb(hf_home)
+        if free_gb is not None and free_gb < need_gb + 2.0:
+            sys.stderr.write(
+                f"\nchad: skipping the DFlash2 drafter download ({free_gb:.1f} GB free at "
+                f"{hf_home}, needs ~{need_gb:.0f} GB + 2 GB headroom); decoding without "
+                "it this session.\n")
+            os.environ["CHAD_NO_DFLASH"] = "1"
+            return
+        sys.stderr.write(
+            f"\nchad also uses a speculative-decoding drafter for this model: '{repo}' "
+            f"(~{need_gb:.1f} GB, one-time, resumable; quantized locally to ~1.1 GB).\n"
+            "It makes decoding substantially faster and never changes what the model "
+            "says.\n")
+        if sys.stdin.isatty():
+            ans = input("Download it now? [Y/n] ").strip().lower()
+            if ans and ans not in ("y", "yes"):
+                sys.stderr.write("Skipping — decoding without the drafter this session "
+                                 "(CHAD_NO_DFLASH=1 silences this prompt).\n")
+                os.environ["CHAD_NO_DFLASH"] = "1"
+                return
+        else:
+            sys.stderr.write("[headless: downloading automatically]\n")
+        snapshot_download(repo, allow_patterns=["config.json", "*.safetensors"])
+    except Exception as e:  # noqa: BLE001 — a drafter is never worth failing a launch
+        sys.stderr.write(f"\nchad: DFlash2 drafter unavailable ({type(e).__name__}: {e}); "
+                         "decoding without it this session.\n")
+        os.environ["CHAD_NO_DFLASH"] = "1"
 
 
 def _fail_model_load(model_id, err):

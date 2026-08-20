@@ -687,6 +687,11 @@ are chasing a behaviour change:
   quality moves.
 
 ```bash
+CHAD_NO_DFLASH=1          uv run chad  # disable the DFlash2 block drafter (MTP head takes over)
+CHAD_DFLASH_DRAFT=4       uv run chad  # verified width per round (1..7; default 4)
+CHAD_DFLASH_ADAPTIVE=1    uv run chad  # OPT-IN: schedule the width per round from acceptance
+CHAD_DFLASH_PATH=/dir     uv run chad  # explicit drafter checkpoint or built sidecar dir
+CHAD_DFLASH_REPO=org/name uv run chad  # a different drafter repo for the loaded model
 CHAD_NO_MTP=1             uv run chad  # disable MTP self-speculative decoding
 CHAD_MTP_ADAPTIVE=0       uv run chad  # fixed draft width instead of the adaptive schedule
 CHAD_MTP_DRAFT=2          uv run chad  # force a draft width (implies adaptive off)
@@ -701,8 +706,32 @@ CHAD_MTP_PATH=/path.safetensors uv run chad  # explicit MTP head sidecar (defaul
 CHAD_NO_KERNEL_WARM=1     uv run chad  # skip warming verify-width attention kernels at load
 ```
 
-- **`CHAD_NO_MTP`** — disables **MTP self-speculative decoding** (`mlx_mtp.py`), on by
-  default wherever it can engage. chad drafts several tokens with the checkpoint's own
+- **`CHAD_NO_DFLASH`** — disables the **DFlash2 block drafter** (`mlx_dflash.py`), the
+  default speculative path on the shipped model. A separate 1.9B drafter
+  ([`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2),
+  fetched once on first run with your consent and quantized to a ~1.1 GB sidecar under
+  `~/.cache/chad/dflash/`) reads the main model's residual stream at five layers and
+  proposes a whole block of tokens in **one** forward — where the MTP head must chain one
+  step per token and its acceptance decays past depth 3. Verification, rollback and the
+  exact-acceptance rule are the same as MTP's, so greedy output is token-identical to the
+  unspeculated path and sampled output keeps the true distribution. Measured on an M4 Pro
+  with the shipped 3-bit quant, 384-token greedy decodes: serial 17.7 → MTP head 26.5 → **DFlash2 28.1 tok/s**, and at the
+  thinking sampling preset (temp 1.0, top_p 0.95, top_k 20) MTP 25.3 → **27.3**; on code the
+  two tie. With this set,
+  or when the drafter is not available, the MTP head runs instead.
+- **`CHAD_DFLASH_DRAFT`** — how many of the block's 7 proposals are verified per round
+  (default 4). Verify cost on this box rises ~25 ms per row through
+  width 8, so the full block pays only on very predictable text; the default is the
+  measured optimum across prose and code. `CHAD_DFLASH_ADAPTIVE=1` opts into a per-round
+  width schedule (the MTP cost model with the block drafter's flat draft cost); measured
+  it under-drafts at the thinking preset (24.2 vs 27.3 tok/s), so it stays an A/B arm.
+- **`CHAD_DFLASH_PATH` / `CHAD_DFLASH_REPO`** — point the loader at a local drafter
+  checkpoint (an HF-layout dir, quantized on first use) or an already-built sidecar dir,
+  or name a different drafter repo for the loaded model. `python -m chad.mlx_dflash <dir>`
+  builds a sidecar by hand.
+- **`CHAD_NO_MTP`** — disables **MTP self-speculative decoding** (`mlx_mtp.py`), the
+  fallback speculative path (and the default on a checkpoint that ships a head but has
+  no registered block drafter). chad drafts several tokens with the checkpoint's own
   trained multi-token-prediction head (loaded as a sidecar), verifies them in one batched
   forward, and accepts by exact rejection sampling — so greedy output is *token-identical*
   to the unspeculated path and sampled output keeps the model's true distribution at any

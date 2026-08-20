@@ -21,6 +21,7 @@ chad is single-model by construction: there is no second "draft" model anywhere 
 engine. PLD gets speculative decoding's accept/rollback benefit from the context itself.
 """
 
+import contextlib
 import hashlib
 import os
 import time
@@ -550,6 +551,32 @@ class Engine:
     # (point-mass proposal) — the better mode only near-greedy. Both preserve
     # the output distribution exactly.
     mtp_sample_drafts: bool = True
+    # DFlash2 block drafter (mlx_dflash.py): an external 1.9B drafter that
+    # proposes a whole block in ONE forward, conditioned on the target's
+    # residual stream at five tapped layers, with the same verify/rollback/
+    # exact-accept machinery as MTP. Engages when a drafter is registered for
+    # the loaded target (Qwen3.8-27B class) and loads; takes precedence over
+    # the MTP head. CHAD_NO_DFLASH disables, CHAD_DFLASH_DRAFT sets the
+    # verified width (1..block_size-1). Width 4 by measurement (M4 Pro, the
+    # shipped 3-bit quant, 10 prompts x 384 tokens, medians): greedy serial
+    # 17.7 -> MTP 26.5 -> DFlash2 28.1 tok/s; at the thinking preset (temp 1.0
+    # / top_p 0.95 / top_k 20) MTP 25.3 -> 27.3; at the non-thinking preset
+    # MTP 23.7 -> 28.4. Acceptance sits near width+1 tokens per round on
+    # prose, so the verify ladder (~33 ms per extra row here) sets the width:
+    # 3 and 5 both measured ~1.5 tok/s below 4, the full block 7 only ties it
+    # on the hottest prose and loses on code.
+    dflash: bool = True
+    dflash_num_draft: int = 4
+    # Per-round verified-width schedule (mlx_dflash.block_policy): the block
+    # is drafted whole either way; this picks how many of its proposals to
+    # verify from recent acceptance and a seeded verify ladder. OFF by
+    # measurement: at the thinking preset it under-drafted (24.2 vs the
+    # fixed width's 27.3 — its seed ladder prices the first extra row too
+    # cheaply against the stock S>1 graph, so medium acceptance collapses it
+    # to skips); it only matched fixed width where acceptance was high.
+    # CHAD_DFLASH_ADAPTIVE=1 opts in; CHAD_DFLASH_DRAFT=N forces a width
+    # (implies adaptive off).
+    dflash_adaptive: bool = False
     cache_dir: Optional[str] = None # on-disk KV checkpoints; None disables
     kv_cache_max_bytes: int = 8 * 1024**3  # LRU-evict the on-disk KV cache above this; 0 disables
 
@@ -579,6 +606,7 @@ class Engine:
     _is_moe: bool = field(init=False, default=False)
     _mtp_head: Any = field(init=False, default=None)
     _mtp_draft_readout: Any = field(init=False, default=None)
+    _dflash: Any = field(init=False, default=None)
     _n_attn_heads: int = field(init=False, default=16)
     _n_kv_heads: int = field(init=False, default=0)
     _head_dim: int = field(init=False, default=0)
@@ -691,6 +719,20 @@ class Engine:
                 self._mtp_draft_readout = mlx_mtp.build_draft_readout(
                     self.model, path)
             self._resolve_mtp_knobs()
+        # DFlash2 block drafter: pure speed feature, None on any miss.
+        if self.dflash and not config.flag("CHAD_NO_DFLASH"):
+            from . import mlx_dflash
+            self._dflash = mlx_dflash.load_drafter(self.model, path)
+            if self._dflash is not None:
+                av = config.env_str("CHAD_DFLASH_ADAPTIVE")
+                if av is not None and av != "":
+                    self.dflash_adaptive = av.strip().lower() not in ("0", "false")
+                nd = config.env_int("CHAD_DFLASH_DRAFT", 0)
+                if nd:
+                    self.dflash_num_draft = nd
+                    self.dflash_adaptive = False    # an explicit width is an order
+                self.dflash_num_draft = max(1, min(
+                    self.dflash_num_draft, self._dflash.config.block_size - 1))
         self._resolve_kv_bits(qsdpa_ok)
         self._warm_verify_widths()
         self._install_memory_clamp()
@@ -801,6 +843,11 @@ class Engine:
                               if 0 < d <= self.mtp_max_draft)
             else:
                 widths.add(self.mtp_num_draft + 1)
+        if getattr(self, "_dflash", None) is not None:
+            if self.dflash_adaptive:
+                widths.update(range(2, self.dflash_num_draft + 2))
+            else:
+                widths.add(self.dflash_num_draft + 1)
         if (config.flag("CHAD_USE_PLD") and self.prompt_lookup and self.pld_wide
                 and self.pld_wide_draft >= self.pld_wide_min_draft):
             # _wide_verify feeds [pending] + draft, and the draft runs from
@@ -1332,7 +1379,7 @@ class Engine:
                 setattr(c, k, list(v) if isinstance(v, list) else v)
 
     def _prefill(self, ids: list, should_stop=None, chunk: Optional[int] = None,
-                 on_progress=None) -> int:
+                 on_progress=None, on_chunk=None) -> int:
         """Feed token ids through the model into the live cache in chunks, checking
         should_stop between chunks. Returns the count actually fed (< len(ids) when
         interrupted). This is what makes a large re-prefill abortable: MLX runs one
@@ -1349,7 +1396,12 @@ class Engine:
         so far (monotonic, ending at `total` on a clean pass) so a caller can show a
         live progress %. It is **only** called when not None — the hot loop is
         byte-identical to a no-callback run, which matters because this feeds the
-        non-trimmable cache."""
+        non-trimmable cache.
+
+        on_chunk(), if given, fires after each chunk has been fed and evaluated
+        (never for a chunk that OOMed and is being retried) — the hook a
+        speculative drafter uses to absorb the target's tapped hidden states
+        chunk by chunk instead of holding the whole prompt's."""
         mc = self._cache
         n = len(ids)
         if chunk is None:
@@ -1378,6 +1430,8 @@ class Engine:
                             "chunk=%d", i, n, kv_base + i, oom_cap)
                 continue
             i += step
+            if on_chunk:
+                on_chunk()
             if on_progress:
                 on_progress(i, n)
         return i
@@ -1453,6 +1507,14 @@ class Engine:
         # and tolerates the quantized KV cache: rollback is offset-trim + rewrite,
         # the same mechanism _take_rewind_snapshot documents as safe on a
         # quantized-from-the-start cache.
+        # DFlash2 block drafter first (measured faster than the MTP chain on the
+        # shipped model), the MTP head as the fallback — same verify loop.
+        if (getattr(self, "_dflash", None) is not None
+                and (self._trimmable or self._pld_hybrid)):
+            return self._generate_spec("dflash", prompt_ids, max_tokens,
+                                       on_token, stop_texts, should_stop,
+                                       on_prefill, on_prefill_progress,
+                                       stop_condition, think_ceiling)
         if (self._mtp_head is not None
                 and (self._trimmable or self._pld_hybrid)):
             return self._generate_mtp(prompt_ids, max_tokens, on_token,
@@ -2237,30 +2299,49 @@ class Engine:
                       should_stop=None, on_prefill=None,
                       on_prefill_progress=None, stop_condition=None,
                       think_ceiling=None):
-        """Self-speculative decoding with the checkpoint's own MTP head.
+        """Self-speculative decoding with the checkpoint's own MTP head —
+        the MTP drafter on the shared speculative loop (`_generate_spec`)."""
+        return self._generate_spec("mtp", prompt_ids, max_tokens, on_token,
+                                   stop_texts, should_stop, on_prefill,
+                                   on_prefill_progress, stop_condition,
+                                   think_ceiling)
 
-        Per step: draft `mtp_num_draft` tokens by chaining the 1-layer head
-        (each chained step feeds the head's own output hidden back — the
-        serving-engine reference behavior), verify them in ONE batched main
-        forward, and accept via exact speculative (rejection) sampling, so the
+    def _generate_spec(self, kind, prompt_ids, max_tokens, on_token, stop_texts,
+                       should_stop=None, on_prefill=None,
+                       on_prefill_progress=None, stop_condition=None,
+                       think_ceiling=None):
+        """Speculative decoding: draft k tokens, verify them in ONE batched main
+        forward, accept via exact speculative (rejection) sampling, so the
         output distribution is identical to plain decoding at the same
         temp/top_p/min_p — greedy included (temp 0 reduces to argmax-match).
+
+        `kind` picks the drafter (see _MTPDrafter / _DFlashDrafter): how the
+        k proposals are produced and what per-turn drafter state is kept are
+        the only things that differ; verify, accept, rollback, commit and the
+        think-ceiling salvage are shared.
+
+        - "mtp": chain the checkpoint's 1-layer MTP head k times (each chained
+          step feeds the head's own output hidden back — the serving-engine
+          reference behavior).
+        - "dflash": one forward of the DFlash2 block drafter proposes all k
+          (mlx_dflash), conditioned on the target's tapped residual stream.
 
         Cache contracts:
         - Main cache rollback on rejection is the PLD-hybrid primitive
           (recurrent snapshot/restore + KV offset-trim + re-feed), which also
           holds on the quantized-from-the-start cache: trim moves the offset
           and the re-feed rewrites rows above it before they are ever read.
-        - The MTP head is attention-only, so its private KVCache trims
-          natively. It is rebuilt fresh each turn and fed only REAL
-          (main-model hidden, committed token) pairs after each verify —
-          drafting's speculative entries are always trimmed. RoPE is relative
-          under attention, so the turn-local (zero-based) drafter context is
-          sound; it only costs the head cross-turn context, which affects
-          acceptance rate, never correctness.
+        - Drafter caches hold only COMMITTED positions. The MTP head is
+          attention-only, so its private KVCache trims natively; it is rebuilt
+          fresh each turn and fed only REAL (main-model hidden, committed
+          token) pairs after each verify — drafting's speculative entries are
+          always trimmed. The DFlash drafter never caches its block at all:
+          its context cache is fed the verify forward's tapped hiddens of the
+          committed tokens. RoPE is relative under attention, so the
+          turn-local (zero-based) drafter context is sound; it only costs the
+          drafter cross-turn context, which affects acceptance rate, never
+          correctness.
         """
-        from mlx_lm.models.base import create_attention_mask
-
         from . import mlx_fastpath
 
         common = self._sync_to(prompt_ids)
@@ -2271,7 +2352,6 @@ class Engine:
 
         mc = self._cache
         eos = self._eos_ids()
-        head = self._mtp_head
         lm = self.model.language_model
         embed = lm.model.embed_tokens
 
@@ -2283,9 +2363,15 @@ class Engine:
         hybrid = self._pld_hybrid and not self._trimmable
         t0 = time.time()
 
+        drafter = (_DFlashDrafter(self, embed, _logits) if kind == "dflash"
+                   else _MTPDrafter(self, embed, _logits))
+        drafter.start_turn()
+
         def _prefill_head():
-            fed = self._prefill(suffix[:-1], should_stop,
-                                on_progress=on_prefill_progress)
+            with drafter.tapped():
+                fed = self._prefill(suffix[:-1], should_stop,
+                                    on_progress=on_prefill_progress,
+                                    on_chunk=drafter.on_prefill_chunk)
             if fed < len(suffix) - 1:  # interrupted mid-prefill
                 self._cached_ids = list(prompt_ids[: common + fed])
                 stats.prefill_s = time.time() - t0
@@ -2313,80 +2399,32 @@ class Engine:
                 return "", stats
             y_val = suffix[-1]
 
-        mtp_cache = head.make_cache()
-        # Fresh per-turn policy state: acceptance statistics are a property of
-        # the current prompt/content, not of the session.
-        from .mlx_mtp import DepthPolicy
-        policy = (DepthPolicy(self.mtp_max_draft, self.mtp_h, self.mtp_costs)
-                  if self.mtp_adaptive else None)
-        key = mx.random.key(int.from_bytes(os.urandom(4), "little"))
+        policy = drafter.policy
+        rng = _Rng(mx.random.key(int.from_bytes(os.urandom(4), "little")))
         first_token_at = None
         out_ids = []
         fed_ids = list(prompt_ids[:-1])
         detok = self.tok.detokenizer
         detok.reset()
-        # Hidden (post-final-norm, (1,1,H)) of the LAST FED position — the
-        # head's `previous hidden` input. None until the first verify forward,
-        # so the first step drafts k=0 (a plain decode step that seeds it).
-        h_last = None
-
-        def _mtp_feed(tokens, h_prev, hid_seq):
-            """Write real (hidden, next-token) pairs into the drafter cache:
-            (h_prev, tokens[0]), (hid_seq[:,0], tokens[1]), ... Cheap: one
-            1-layer forward of S=len(tokens)."""
-            e = embed(mx.array([tokens], dtype=mx.uint32))
-            s = len(tokens)
-            hs = h_prev if s == 1 else mx.concatenate(
-                [h_prev, hid_seq[:, : s - 1]], axis=1)
-            m = create_attention_mask(e, mtp_cache) if s > 1 else None
-            head(e, hs, cache=mtp_cache, mask=m)
 
         while len(out_ids) < max_tokens:
             if should_stop and should_stop():
                 break
             round_t0 = time.time()
-            if h_last is None:
-                k = 0
-            elif policy is not None:
-                k = policy.depth()
-            else:
-                k = self.mtp_num_draft
+            k = drafter.depth()
             # Never draft past the token budget: the tail of the window is a
             # plain (or shallower) step, not a wasted deep round.
             k = min(k, max(0, max_tokens - len(out_ids) - 1))
 
-            # -- draft: chain the head k times ------------------------------
-            # The chain stays LAZY: each drafted token feeds the next step's
-            # embedding as an mx array, and one eval at the end fetches all k
-            # ids — one host sync instead of k.
+            # -- draft -------------------------------------------------------
+            # Proposals stay LAZY: d_arrs are k scalar arrays and one eval
+            # after the verify fetches them with the accept — one host sync.
+            # q_rows, when the proposal was SAMPLED, is one dense proposal
+            # distribution per draft (the q of rejection sampling); empty for
+            # argmax proposals, which accept as a point mass.
             draft, q_rows, d_arrs = [], [], []
             if k:
-                # Greedy proposals can take the shortlist readout (2-bit
-                # lm_head shadow + exact top-32 rerank — mlx_mtp.DraftReadout)
-                # instead of the full-vocab read. Sampled proposals need the
-                # whole distribution, so they keep the full readout.
-                sampled = self.temp > 0 and self.mtp_sample_drafts
-                readout = None if sampled else \
-                    getattr(self, "_mtp_draft_readout", None)
-                e = embed(mx.array([[y_val]], dtype=mx.uint32))
-                hin = h_last
-                for _ in range(k):
-                    hout = head(e, hin, cache=mtp_cache)
-                    if sampled:
-                        scaled = self._spec_scaled(_logits(hout)[0, -1])
-                        key, sub = mx.random.split(key)
-                        d = mx.random.categorical(scaled, key=sub)
-                        q_rows.append(mx.softmax(scaled, axis=-1))
-                    elif readout is not None:
-                        d = readout.argmax_token(hout)
-                    else:
-                        # argmax proposal — also correct at temp>0 (point-mass
-                        # q; see mtp_sample_drafts). argmax of raw logits ==
-                        # argmax after temp/top_p/min_p, which never drop the max.
-                        d = mx.argmax(_logits(hout)[0, -1])
-                    d_arrs.append(d)
-                    e = embed(d.reshape(1, 1))
-                    hin = hout
+                d_arrs, q_rows = drafter.propose(k, y_val, rng)
                 if self.presence_penalty and self.temp > 0:
                     # seen_rows (below) needs the draft ids on the host BEFORE
                     # the verify graph is built. Everyone else reads them after
@@ -2412,10 +2450,12 @@ class Engine:
                  if k else mx.array([y_val], dtype=mx.uint32))
             try:
                 mlx_fastpath.GDN_COLLECTOR = coll
-                hid = lm.model(y[None], cache=mc)
+                with drafter.tapped():
+                    hid = lm.model(y[None], cache=mc)
                 logits = _logits(hid)[0]
             finally:
                 mlx_fastpath.GDN_COLLECTOR = None
+            fused = drafter.collect()
             if self.temp > 0:
                 # Row j of the verify predicts the token AFTER draft[:j], so its
                 # presence history is the committed history plus exactly those
@@ -2440,9 +2480,8 @@ class Engine:
                     # token; the host then just indexes with n_acc.
                     dr = y[1:]                 # the k draft ids, still lazy
                     p_sel = mx.take_along_axis(p[:k], dr[:, None], axis=-1)[:, 0]
-                    key, sub = mx.random.split(key)
-                    u = mx.random.uniform(shape=(k,), key=sub)
-                    if self.mtp_sample_drafts:
+                    u = mx.random.uniform(shape=(k,), key=rng.split())
+                    if q_rows:
                         q = mx.stack(q_rows)
                         q_sel = mx.take_along_axis(q, dr[:, None],
                                                    axis=-1)[:, 0]
@@ -2451,21 +2490,20 @@ class Engine:
                         ok = u <= p_sel      # point-mass q: accept w.p. p(d)
                     cand = []
                     for j in range(k):
-                        if self.mtp_sample_drafts:
+                        if q_rows:
                             resid = mx.maximum(p[j] - q_rows[j], 0.0)
                         else:
                             # residual of a point mass: p with the draft
                             # token's mass removed
                             resid = mx.where(
                                 mx.arange(p.shape[-1]) == dr[j], 0.0, p[j])
-                        key, sub = mx.random.split(key)
+                        sub = rng.split()
                         cand.append(mx.where(
                             resid.sum() > 0,
                             mx.random.categorical(mx.log(resid + 1e-30),
                                                   key=sub),
                             mx.random.categorical(scaled[j], key=sub)))
-                    key, sub = mx.random.split(key)
-                    cand.append(mx.random.categorical(scaled[k], key=sub))
+                    cand.append(mx.random.categorical(scaled[k], key=rng.split()))
                     mx.eval(ok, cand, d_arrs)   # the round's ONE host sync
                     if not draft:
                         draft = [int(x) for x in d_arrs]
@@ -2474,8 +2512,7 @@ class Engine:
                         n_acc += 1
                     next_tok = int(cand[n_acc])
                 else:
-                    key, sub = mx.random.split(key)
-                    nt = mx.random.categorical(scaled[0], key=sub)
+                    nt = mx.random.categorical(scaled[0], key=rng.split())
                     mx.eval(nt)
                     next_tok = int(nt)
             else:
@@ -2557,16 +2594,12 @@ class Engine:
                 else:
                     cache_utils.trim_prompt_cache(mc, k - n_acc)
 
-            # -- reconcile the drafter cache --------------------------------
-            # Drop ALL k speculative entries, then feed the real pairs for the
-            # tokens that actually landed ([y_val] + accepted drafts) using the
-            # verify forward's hiddens — bit-identical to what a re-feed would
-            # compute, per the PLD-hybrid rollback evidence.
-            if k:
-                cache_utils.trim_prompt_cache([mtp_cache], k)
-            if h_last is not None:
-                _mtp_feed([y_val] + draft[:n_acc], h_last, hid)
-            h_last = hid[:, n_acc : n_acc + 1]
+            # -- reconcile the drafter --------------------------------------
+            # Whatever the drafter keeps about committed positions is updated
+            # from the verify forward's own hiddens for [y_val] + the accepted
+            # drafts — bit-identical to what a re-feed would compute, per the
+            # PLD-hybrid rollback evidence. Speculative entries never survive.
+            drafter.reconcile(k, n_acc, y_val, draft, hid, fused)
 
             fed_ids.append(y_val)
             fed_ids.extend(draft[:n_acc])
@@ -2605,18 +2638,17 @@ class Engine:
                 close_ids = list(self.tok.encode(THINK_CLOSE,
                                                  add_special_tokens=False))
                 y2 = mx.array([y_val] + close_ids, dtype=mx.uint32)
-                hid2 = lm.model(y2[None], cache=mc)
+                with drafter.tapped():
+                    hid2 = lm.model(y2[None], cache=mc)
+                fused2 = drafter.collect()
                 logits2 = _logits(hid2)[0, -1]
                 if self.temp > 0:
-                    key, sub = mx.random.split(key)
                     nt = mx.random.categorical(self._spec_scaled(logits2),
-                                               key=sub)
+                                               key=rng.split())
                 else:
                     nt = mx.argmax(logits2)
                 mx.eval(nt)
-                if h_last is not None:
-                    _mtp_feed([y_val] + close_ids, h_last, hid2)
-                h_last = hid2[:, -1:]
+                drafter.after_inject(y_val, close_ids, hid2, fused2)
                 fed_ids.append(y_val)
                 fed_ids.extend(close_ids)
                 for tid in close_ids:
@@ -2652,3 +2684,217 @@ class Engine:
         mx.clear_cache()
         return detok.text, stats
 
+
+class _Rng:
+    """Threaded mlx PRNG key for the speculative loop: every draw forks a
+    fresh subkey, so a round's draft sampling, acceptance uniforms and
+    residual resamples never share randomness."""
+
+    def __init__(self, key):
+        self.key = key
+
+    def split(self):
+        self.key, sub = mx.random.split(self.key)
+        return sub
+
+    def uniform(self, n: int):
+        return mx.random.uniform(shape=(n,), key=self.split())
+
+
+class _MTPDrafter:
+    """Drafter strategy for Engine._generate_spec: the checkpoint's own 1-layer
+    MTP head (mlx_mtp), chained k times per round.
+
+    Per-turn state: the head's private KVCache (attention-only, natively
+    trimmable) and `h_last`, the main model's post-final-norm hidden of the
+    LAST FED position — the head's `previous hidden` input. None until the
+    first verify forward, so the first round drafts k=0 (a plain step that
+    seeds it)."""
+
+    on_prefill_chunk = None          # MTP needs nothing from the prefill
+
+    def __init__(self, eng, embed, logits_fn):
+        self.eng = eng
+        self.head = eng._mtp_head
+        self.embed = embed
+        self.logits = logits_fn
+        self.policy = None
+        self.cache = None
+        self.h_last = None
+
+    @staticmethod
+    def tapped():
+        return contextlib.nullcontext()
+
+    def start_turn(self):
+        from .mlx_mtp import DepthPolicy
+        eng = self.eng
+        self.cache = self.head.make_cache()
+        self.h_last = None
+        # Fresh per-turn policy state: acceptance statistics are a property
+        # of the current prompt/content, not of the session.
+        self.policy = (DepthPolicy(eng.mtp_max_draft, eng.mtp_h, eng.mtp_costs)
+                       if eng.mtp_adaptive else None)
+
+    def depth(self) -> int:
+        if self.h_last is None:
+            return 0
+        if self.policy is not None:
+            return self.policy.depth()
+        return self.eng.mtp_num_draft
+
+    @staticmethod
+    def collect():
+        return None
+
+    def propose(self, k, y_val, rng):
+        """Chain the head k times. The chain stays LAZY: each drafted token
+        feeds the next step's embedding as an mx array; the caller's one eval
+        after the verify fetches all k ids."""
+        eng = self.eng
+        # Greedy proposals can take the shortlist readout (2-bit lm_head
+        # shadow + exact top-32 rerank — mlx_mtp.DraftReadout) instead of
+        # the full-vocab read. Sampled proposals need the whole
+        # distribution, so they keep the full readout.
+        sampled = eng.temp > 0 and eng.mtp_sample_drafts
+        readout = None if sampled else getattr(eng, "_mtp_draft_readout", None)
+        e = self.embed(mx.array([[y_val]], dtype=mx.uint32))
+        hin = self.h_last
+        d_arrs, q_rows = [], []
+        for _ in range(k):
+            hout = self.head(e, hin, cache=self.cache)
+            if sampled:
+                scaled = eng._spec_scaled(self.logits(hout)[0, -1])
+                d = mx.random.categorical(scaled, key=rng.split())
+                q_rows.append(mx.softmax(scaled, axis=-1))
+            elif readout is not None:
+                d = readout.argmax_token(hout)
+            else:
+                # argmax proposal — also correct at temp>0 (point-mass q;
+                # see mtp_sample_drafts). argmax of raw logits == argmax
+                # after temp/top_p/min_p, which never drop the max.
+                d = mx.argmax(self.logits(hout)[0, -1])
+            d_arrs.append(d)
+            e = self.embed(d.reshape(1, 1))
+            hin = hout
+        return d_arrs, q_rows
+
+    def _feed(self, tokens, hid_seq):
+        """Write real (hidden, next-token) pairs into the drafter cache:
+        (h_last, tokens[0]), (hid_seq[:,0], tokens[1]), ... Cheap: one
+        1-layer forward of S=len(tokens)."""
+        from mlx_lm.models.base import create_attention_mask
+        e = self.embed(mx.array([tokens], dtype=mx.uint32))
+        s = len(tokens)
+        hs = self.h_last if s == 1 else mx.concatenate(
+            [self.h_last, hid_seq[:, : s - 1]], axis=1)
+        m = create_attention_mask(e, self.cache) if s > 1 else None
+        self.head(e, hs, cache=self.cache, mask=m)
+
+    def reconcile(self, k, n_acc, y_val, draft, hid, fused):
+        # Drop ALL k speculative entries, then feed the real pairs for the
+        # tokens that actually landed ([y_val] + accepted drafts).
+        if k:
+            cache_utils.trim_prompt_cache([self.cache], k)
+        if self.h_last is not None:
+            self._feed([y_val] + draft[:n_acc], hid)
+        self.h_last = hid[:, n_acc : n_acc + 1]
+
+    def after_inject(self, y_val, close_ids, hid2, fused2):
+        if self.h_last is not None:
+            self._feed([y_val] + close_ids, hid2)
+        self.h_last = hid2[:, -1:]
+
+
+class _DFlashDrafter:
+    """Drafter strategy for Engine._generate_spec: the DFlash2 block drafter
+    (mlx_dflash). One drafter forward proposes all k tokens.
+
+    Per-turn state: the drafter's context KV cache (one row per COMMITTED
+    target position this turn, injected from the target's tapped residual
+    stream) and `pending`, the fused tapped hiddens of positions the target
+    has fed but the drafter has not yet absorbed — appended at the start of
+    the next draft. The block itself is never cached, so there is nothing to
+    trim on rejection. Turn-local positions start at 0 (RoPE is relative);
+    the prefill streams its chunks in through on_prefill_chunk so no more
+    than one chunk's fused rows are ever held."""
+
+    def __init__(self, eng, embed, logits_fn):
+        from . import mlx_dflash
+        self.eng = eng
+        self.m = eng._dflash
+        cfg = self.m.config
+        self.cap = max(1, min(int(getattr(eng, "dflash_num_draft", 4)),
+                              cfg.block_size - 1))
+        # Fresh per-turn schedule state: acceptance statistics are a property
+        # of the current prompt/content, not of the session.
+        self.policy = (mlx_dflash.block_policy(self.cap)
+                       if getattr(eng, "dflash_adaptive", False) else None)
+        self._ids = list(cfg.target_layer_ids)
+        self._mask = int(cfg.mask_token_id)
+        self._vocab = int(eng.model.language_model.args.vocab_size)
+        self._tap: dict = {}
+        self.cache = None
+        self.pending = None
+
+    @contextlib.contextmanager
+    def tapped(self):
+        from . import mlx_dflash
+        prev = mlx_dflash.TAP
+        mlx_dflash.TAP = self._tap
+        try:
+            yield
+        finally:
+            mlx_dflash.TAP = prev
+
+    def start_turn(self):
+        self.cache = self.m.make_cache()
+        self.pending = None
+        self._tap.clear()
+
+    def depth(self) -> int:
+        if self.policy is not None:
+            return self.policy.depth()
+        return self.cap
+
+    def collect(self):
+        """The fused tapped hiddens [1, S, taps*H] of the forward just run."""
+        fused = mx.concatenate([self._tap[i] for i in self._ids], axis=-1)
+        self._tap.clear()
+        return fused
+
+    def on_prefill_chunk(self):
+        # Absorb the PREVIOUS chunk into the drafter cache and hold this one:
+        # the last prefilled chunk is then the first draft's pending context.
+        fused = self.collect()
+        if self.pending is not None:
+            self.m.append_ctx(self.m.project_ctx(self.pending), self.cache)
+        self.pending = fused
+
+    def propose(self, k, y_val, rng):
+        cfg = self.m.config
+        block = mx.array([[y_val] + [self._mask] * (cfg.block_size - 1)],
+                         dtype=mx.uint32)
+        if self.eng.temp > 0:
+            ids, cand, q = self.m.select_block(
+                block, self.pending, self.cache, cap=k, anchor_id=y_val,
+                uniforms=rng.uniform(k), temperature=self.eng.temp)
+            # The selector's q lives on K candidates per slot; scatter it
+            # dense so the shared accept reads it like any proposal.
+            dense = mx.put_along_axis(mx.zeros((k, self._vocab)), cand, q, axis=1)
+            q_rows = [dense[j] for j in range(k)]
+        else:
+            ids = self.m.select_block(block, self.pending, self.cache,
+                                      cap=k, anchor_id=y_val)[0]
+            q_rows = []
+        self.pending = None                 # appended inside select_block
+        return [ids[j] for j in range(k)], q_rows
+
+    def reconcile(self, k, n_acc, y_val, draft, hid, fused):
+        rows = fused[:, : n_acc + 1]        # [y_val] + accepted drafts
+        self.pending = (rows if self.pending is None
+                        else mx.concatenate([self.pending, rows], axis=1))
+
+    def after_inject(self, y_val, close_ids, hid2, fused2):
+        self.pending = (fused2 if self.pending is None
+                        else mx.concatenate([self.pending, fused2], axis=1))
