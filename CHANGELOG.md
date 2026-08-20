@@ -27,6 +27,16 @@ is token-identical to plain decoding and sampled output keeps the true distribut
 - Memory: +1.1 GB resident for the drafter (its context cache is a 2048-row ring, ~40 MB);
   on a 24 GB box that is ~30k tokens of context ceiling.
 
+### Small-M matmul kernel for speculative verify
+
+Verifying a draft of k tokens is a k+1-row forward, and stock `quantized_matmul` priced
+every extra row at ~33 ms on the shipped model — the ladder that pinned the block drafter's
+width at 4. `mlx_qmm_mma.py` brings in avlp12's `qmm_mma4` MMA kernel (via mlx-dspark, MIT),
+which dequantizes each weight group once for all rows, with a width-generic unpack so the
+3-bit body and the 5-bit `lm_head` qualify alongside 4/8-bit weights. A load-time probe
+races it against the stock kernel per weight shape and per width on the running machine,
+keeps only the winners (cached), and everything else stays stock. QMM_CHANGELOG.
+
 ### A clip is a loan, not a deletion
 
 chad truncates tool output in three places — bash's own head/tail budget, the per-result

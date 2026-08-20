@@ -704,6 +704,8 @@ CHAD_NO_QSDPA_WIDE_SGM=1  uv run chad  # disable just its split-head variant
 CHAD_QSDPA_WIDE_SGM_RT=1  uv run chad  # force the RT-split wide kernel instead of the one-read form
 CHAD_MTP_PATH=/path.safetensors uv run chad  # explicit MTP head sidecar (default: found beside the weights)
 CHAD_NO_KERNEL_WARM=1     uv run chad  # skip warming verify-width attention kernels at load
+CHAD_NO_QMM_MMA=1         uv run chad  # stock quantized_matmul at every verify width
+CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on this machine
 ```
 
 - **`CHAD_NO_DFLASH`** — disables the **DFlash2 block drafter** (`mlx_dflash.py`), the
@@ -783,6 +785,20 @@ CHAD_NO_KERNEL_WARM=1     uv run chad  # skip warming verify-width attention ker
 - **`CHAD_MTP_PATH`** — an explicit path to the MTP head's `.safetensors` sidecar. Unset,
   the loader looks beside the weights (the shipped model bundles it as `mtp.safetensors`).
   Useful when building a head yourself with `python -m chad.mlx_mtp`.
+- **`CHAD_NO_QMM_MMA` / `CHAD_QMM_MMA_RECAL`** — the **small-M quantized matmul kernel**
+  (`mlx_qmm_mma.py`) that serves speculative verification. Stock `quantized_matmul` is at
+  roofline for one row and tiles well from ~13 rows, but in between — verify width = draft
+  width + 1 — its cost grows almost linearly in rows, because the GEMV path re-reads the
+  weights per row (~33 ms per extra row on the shipped model). The MMA kernel (avlp12's
+  `qmm_mma4` via mlx-dspark, MIT; with a width-generic unpack so the 3-bit body and 5-bit
+  `lm_head` qualify) dequantizes each weight group once for all rows, so widths 6–8 cost
+  about what width 5 does. At load chad probes every eligible weight shape on *this*
+  chip × mlx version — numerics against the stock kernel, then a dependent-chain race at
+  each width — and routes only the (shape, width) pairs that won; the verdict is cached
+  under `~/.cache/chad/qmm_mma/`. Same exactness class as the attention-kernel knobs
+  above: within rounding of the stock kernel, not bit-identical to it. Measured:
+  QMM_MEASURED. `CHAD_NO_QMM_MMA=1` is the A/B arm; `CHAD_QMM_MMA_RECAL=1` re-probes
+  (after an mlx upgrade, say).
 - **`CHAD_NO_KERNEL_WARM`** — the attention kernel is templated on its verify width, so a
   width that has never run means a Metal compile lands on the critical path of a real
   step. Load warms exactly the widths *this* configuration can dispatch — the ones the

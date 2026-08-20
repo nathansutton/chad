@@ -35,7 +35,7 @@ no-op (stock behavior). Opt out with CHAD_NO_FASTPATH=1.
 
 from typing import Any
 
-from . import config
+from . import config, mlx_qmm_mma
 from .diag import log
 
 
@@ -141,9 +141,10 @@ def _patch_dense_mlp_call() -> None:
     def fused_call(self, x):
         if not hasattr(self, "_fused_w"):
             return stock_call(self, x)
-        gu = mx.quantized_matmul(
-            x, self._fused_w, scales=self._fused_s, biases=self._fused_b,
-            transpose=True, group_size=self._fused_gs, bits=self._fused_bits)
+        # mlx_qmm_mma.qmm: the small-M MMA kernel on verified (shape, width)
+        # pairs — speculative verify widths — stock quantized_matmul otherwise.
+        gu = mlx_qmm_mma.qmm(x, self._fused_w, self._fused_s, self._fused_b,
+                             self._fused_gs, self._fused_bits)
         g, u = mx.split(gu, 2, axis=-1)
         return self.down_proj(swiglu(g, u))
 
@@ -206,9 +207,8 @@ def _patch_gdn_call() -> None:
         if not hasattr(self, "_fused_w"):
             return stock_call(self, inputs, mask=mask, cache=cache)
         B, S, _ = inputs.shape
-        big = mx.quantized_matmul(
-            inputs, self._fused_w, scales=self._fused_s, biases=self._fused_b,
-            transpose=True, group_size=self._fused_gs, bits=self._fused_bits)
+        big = mlx_qmm_mma.qmm(inputs, self._fused_w, self._fused_s, self._fused_b,
+                              self._fused_gs, self._fused_bits)
         qkv, z, b, a = mx.split(
             big, [self.conv_dim, self.conv_dim + self.value_dim,
                   self.conv_dim + self.value_dim + self.num_v_heads], axis=-1)

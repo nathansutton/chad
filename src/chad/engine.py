@@ -733,6 +733,10 @@ class Engine:
                     self.dflash_adaptive = False    # an explicit width is an order
                 self.dflash_num_draft = max(1, min(
                     self.dflash_num_draft, self._dflash.config.block_size - 1))
+        # Small-M MMA quantized matmul for the speculative verify widths
+        # (mlx_qmm_mma): probed per shape on this chip, cached; stock elsewhere.
+        from . import mlx_qmm_mma
+        mlx_qmm_mma.install(self.model, self._dflash, self._mtp_head)
         self._resolve_kv_bits(qsdpa_ok)
         self._warm_verify_widths()
         self._install_memory_clamp()
