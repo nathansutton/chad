@@ -16,7 +16,7 @@ owns its inference loop instead of talking to a server.
 reason 2.0.0 is *smaller* than 1.x. A registry of ~56 behavioral levers and a much larger
 bespoke tool surface were measured against a bare model-plus-shell loop, repeatedly, and did
 not beat it.
-What shipped instead is five tools, eight result-channel behaviors, and a shell the model
+What shipped instead is five tools, ten result-channel behaviors, and a shell the model
 learned in pretraining ([below](#why-the-tool-surface-is-five-tools)).
 
 They meet in the same place: every tool you add and every lever you teach is prompt tokens
@@ -184,11 +184,12 @@ So the design leans into the route the model actually takes:
   had to be taught in-context, which costs prompt tokens and which the model then
   mostly declined to use.
 - **The harness's knowledge lives in the result channel, not in more tools**
-  (`ambient.py`). Eight levers — all ON, each ablatable via `CHAD_DISABLE` — make
+  (`ambient.py`). Ten levers — all ON, each ablatable via `CHAD_DISABLE` — make
   the bash route more honest and more informative: a first read of a source file
   carries a one-line symbol map, an empty grep explains which pipeline stage came up
   empty, a trimmed test run keeps its failure rows verbatim, a failed edit shows the
-  first character where the sent text diverges from the file.
+  first character where the sent text diverges from the file, and anything the
+  harness trims hands back a path to the full body instead of destroying it.
 - **One editor, exact-match.** `edit` (old → new, unique match) is the editing
   dialect every model knows. It recovers mechanically from the two dominant
   near-misses (literal `\n` escapes; indentation drift) without ever risking a
@@ -226,7 +227,8 @@ src/chad/        importable package (uv installs it as the `chad` console script
   agent.py       agentic loop + guardrails
   engine.py      MLX inference + persistent prefix cache
   tools.py       the five-tool surface + JSON schemas
-  ambient.py     the eight result-channel levers
+  ambient.py     the result-channel levers
+  spill.py       the disk half of every truncation (a clip is a loan, not a deletion)
   tui.py         full-screen prompt_toolkit UI
   ...            prompt, render, repomap, validate, compaction, skills, mcp, … (modular)
 tests/           pytest suites (uv run pytest)

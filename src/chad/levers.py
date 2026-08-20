@@ -1,7 +1,7 @@
-"""The eight bash-route levers chad ships, each individually disableable.
+"""The bash-route levers chad ships, each individually disableable.
 
 chad 2.0.0 is the lean harness: one tool surface (bash / edit / write /
-write_todos / done) and the eight result-channel behaviors below, all ON by
+write_todos / done) and the result-channel behaviors below, all ON by
 default. Everything else the 1.x lever registry carried was measured against the
 bare loop and never beat it (the 2026-08 clean-slate arms and the pack campaign
 that followed: every pack inside the two-bare-arm null band), so it was removed
@@ -65,6 +65,14 @@ LEVERS: dict[str, Lever] = {
         "A failed edit explains itself: whether the change looks ALREADY "
         "applied, or the first line/column where the sent text diverges from "
         "the file — instead of a bare 'old string not found'."),
+    "trim_spill": Lever(
+        "When compaction head/tail-trims an older tool result, the full "
+        "original goes to a spill file and the collapse marker names the path "
+        "— the one lossy path in the harness becomes a loan, not a deletion."),
+    "result_spill": Lever(
+        "When the per-result backstop cap clips a tool result, the full body "
+        "goes to a spill file and the notice names the path, so the model can "
+        "grep for what was dropped instead of re-running the call."),
     "rg_replace_flag_note": Lever(
         "One line naming what an `rg -r` result actually is (rewritten output, "
         "not the file's text) — `-rn` is `--replace n`, not grep's recursive "

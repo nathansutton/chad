@@ -254,20 +254,61 @@ def test_plan_prefix():
 
 
 def test_clip_tool_result():
-    """No single tool result should blow up the next turn's prefill: oversized output is
-    truncated with a note (keeping the head); small output passes through untouched."""
+    """No single tool result should blow up the next turn's prefill: oversized output
+    is bounded head+tail, the full body goes to a spill file, and the notice names it
+    so the dropped bytes cost a `grep` rather than a repeat of the call. Small output
+    passes through untouched."""
+    from chad import spill
     from chad.agent import _MAX_TOOL_RESULT_CHARS, _clip_tool_result
     small = "x" * 100
     check("small tool result passes through unchanged", _clip_tool_result(small) == small)
-    big = "y" * (_MAX_TOOL_RESULT_CHARS + 5000)
+    big = "HEAD-MARK" + "y" * (_MAX_TOOL_RESULT_CHARS + 5000) + "TAIL-MARK"
     clipped = _clip_tool_result(big)
     check("oversized tool result is bounded + annotated",
-          len(clipped) < len(big) and "truncated" in clipped, f"len={len(clipped)}")
-    check("clip keeps the head", clipped.startswith("y" * 1000))
+          len(clipped) < len(big) and "chars omitted" in clipped, f"len={len(clipped)}")
+    check("clip keeps the head", clipped.startswith("HEAD-MARK"))
+    # The head-only clip this replaced dropped the end of every long result — which on
+    # an MCP error or a verbose command echo is the sentence that says what went wrong.
+    check("clip keeps the tail", clipped.endswith("TAIL-MARK"), clipped[-80:])
+    path = spill.path_in(clipped)
+    check("clip names a live spill file", path is not None, clipped[:400])
+    with open(path) as f:
+        check("spill holds the complete body", f.read() == big)
     tight = _clip_tool_result(big, cap=2000)
     check("explicit cap clips harder than the default",
-          tight.startswith("y" * 2000) and not tight.startswith("y" * 2001)
-          and "truncated" in tight)
+          len(tight) < len(clipped) and tight.startswith("HEAD-MARK")
+          and tight.endswith("TAIL-MARK"), f"len={len(tight)}")
+
+
+def test_clip_tool_result_reuses_an_existing_spill():
+    """A body that has ALREADY been spilled (an oversized bash result, capped once by
+    bash's own head/tail and again by the backstop) re-points at its file instead of
+    writing the same bytes twice."""
+    from chad import spill
+    from chad.agent import _MAX_TOOL_RESULT_CHARS, _clip_tool_result
+    path = spill.write("the original body", "bash")
+    body = ("z" * (_MAX_TOOL_RESULT_CHARS // 2)
+            + f"\n[… FULL output saved to {path}; grep/sed that file …]\n"
+            + "z" * _MAX_TOOL_RESULT_CHARS)
+    before = sorted(os.listdir(spill.session_dir()))
+    clipped = _clip_tool_result(body)
+    check("re-clip points at the existing spill", spill.path_in(clipped) == path,
+          clipped[:400])
+    check("re-clip writes no second file",
+          sorted(os.listdir(spill.session_dir())) == before,
+          os.listdir(spill.session_dir()))
+
+
+def test_clip_tool_result_lever_off(monkeypatch):
+    """CHAD_DISABLE=result_spill drops the pointer but keeps the bound — the clip is a
+    correctness backstop, only the loan half is a lever."""
+    from chad.agent import _MAX_TOOL_RESULT_CHARS, _clip_tool_result
+    monkeypatch.setenv("CHAD_DISABLE", "result_spill")
+    clipped = _clip_tool_result("q" * (_MAX_TOOL_RESULT_CHARS + 5000))
+    check("lever off: still bounded", len(clipped) < _MAX_TOOL_RESULT_CHARS + 1000,
+          f"len={len(clipped)}")
+    check("lever off: no pointer, guidance instead",
+          "saved to" not in clipped and "narrow the query" in clipped, clipped[:400])
 
 
 def test_step_tool_cap():
@@ -299,6 +340,7 @@ if __name__ == "__main__":
     test_non_utf8_project_docs_dont_crash()
     test_plan_prefix()
     test_clip_tool_result()
+    test_clip_tool_result_reuses_an_existing_spill()
     test_step_tool_cap()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

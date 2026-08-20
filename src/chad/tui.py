@@ -209,6 +209,7 @@ SLASH_COMMANDS = [
     ("/mcp trust", "trust this project's .mcp.json servers"),
     ("/mcp login", "authenticate an MCP server (OAuth)"),
     ("/compact", "reclaim context now"),
+    ("/ctx", "where the context window is going, in tokens"),
     ("/undo", "revert files to the last edit checkpoint"),
     ("/restore", "list edit checkpoints; /restore <hash> reverts to one"),
     ("/resume", "list recent sessions; /resume <n> forks one"),
@@ -1046,7 +1047,7 @@ class TUI:
         # commands that reset/compact/reslot the KV cache would crash. Typing a task is
         # fine — it just queues (type-ahead). Everything else waits for the model.
         if not self._model_ready.is_set() and (
-                text.startswith(("/reset", "/clear", "/compact", "/resume", "/accept"))):
+                text.startswith(("/reset", "/clear", "/compact", "/ctx", "/resume", "/accept"))):
             self._emit("info", "still loading the model — try that once it's ready.")
             return False
         if text in ("/reset", "/clear"):
@@ -1071,6 +1072,20 @@ class TUI:
                 b, a = self.agent.compact_now()
                 self._emit("info", f"compacted context: {b:,}→{a:,} tokens"
                                    + (" (already lean)" if a >= b else ""))
+            return False
+        if text == "/ctx":
+            # Read-only and tokenizer-only, so unlike /compact it needs no busy
+            # guard — it never mutates the transcript the worker thread is rendering.
+            # Allowed mid-turn on purpose: "why is this session compacting already?"
+            # is asked while the session is compacting. A concurrent append can make
+            # the render inconsistent, which is what the except below is for.
+            from .agent import format_ctx_breakdown
+            try:
+                for ln in format_ctx_breakdown(self.agent.ctx_breakdown()):
+                    self._emit("info", "  " + ln)
+            except Exception as e:  # noqa: BLE001 - a gauge must not kill the session
+                self._emit("info", f"  [context breakdown unavailable: "
+                                   f"{type(e).__name__}: {e}]")
             return False
         if text == "/undo" or text == "/restore" or text.startswith("/restore "):
             # Checkout mutates workspace files: refuse mid-turn for the same reason
@@ -1136,7 +1151,7 @@ class TUI:
             self._emit("info", "shift-tab: cycle mode (normal/auto-accept edits/yolo/plan) "
                                "· esc/ctrl-c: "
                                "interrupt · /init /skills /mcp /mcp trust /mcp login <server> "
-                               "/resume /reset /clear /compact /undo /restore /model /mode /speech /accept /exit "
+                               "/resume /reset /clear /compact /ctx /undo /restore /model /mode /speech /accept /exit "
                                "· /<skill> runs an installed skill (/skills lists them) "
                                "· !cmd shell · @path "
                                "attach · type while busy to steer the running turn "

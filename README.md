@@ -181,7 +181,9 @@ model weights**, runs in seconds, and is what CI runs. Throughput on your own ma
   **↑prefilled / ↓generated** token counts (with an advancing **%** on an unavoidable full
   re-prefill, so it's never silent).
 - **slash commands** — `/init`, `/skills`, `/<skill>`, `/mcp`, `/accept`, `/resume`,
-  `/compact`, `/model`, `/mode`, `/help`, `/exit`, and the two that undo the agent:
+  `/compact`, `/ctx` (where the window is going, split into system prompt, tool schemas,
+  think residue and tool results), `/model`, `/mode`, `/help`, `/exit`, and the two that
+  undo the agent:
   **`/undo`** reverts your files to the last edit checkpoint and **`/restore`** lists the
   checkpoints so you can revert to any of them. Same set in the `--repl` line interface.
 - **`@file` / `@dir` mentions** and **`!command` shell passthrough** — pull a file into

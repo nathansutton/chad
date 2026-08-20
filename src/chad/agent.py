@@ -21,8 +21,10 @@ from . import (
     compaction,
     config,
     guardrails,
+    levers,
     seatbelt,
     session,
+    spill,
     syntaxgate,
 )
 from .base_engine import BaseEngine
@@ -319,16 +321,90 @@ def _step_tool_cap(spent: int) -> int:
                min(_MAX_TOOL_RESULT_CHARS, _STEP_TOOL_BUDGET_CHARS - spent))
 
 
+# Split of the backstop cap between head and tail, tail-biased for the same reason
+# bash's is: a head-only clip of a long MCP error or a verbose command echo keeps the
+# preamble and drops the sentence that says what went wrong.
+_CLIP_HEAD_FRAC = 0.4
+
+
 def _clip_tool_result(result: str, cap: int = _MAX_TOOL_RESULT_CHARS) -> str:
     """Bound a tool result's size so no single call blows up the next turn's prefill.
-    Keeps the head (usually the most relevant) and notes how to fetch the rest."""
+
+    Keeps a head and a tail, and hands back an executable pointer to the full body:
+    the dropped bytes go to a spill file the model can grep, so a clip costs a
+    `grep` rather than a repeat of the call. A result that already carries a spill
+    pointer (an oversized bash body, capped once by bash and again here) re-points at
+    its existing file instead of writing the same bytes twice."""
     if not isinstance(result, str) or len(result) <= cap:
         return result
     omitted = len(result) - cap
-    return (result[:cap]
-            + f"\n[… {omitted} chars truncated to keep the turn responsive — narrow the "
-            f"query (rg a pattern, sed -n a range), or re-run this call by itself, "
-            f"to pull just what you need.]")
+    head = int(cap * _CLIP_HEAD_FRAC)
+    tail = cap - head
+    path = None
+    if levers.enabled("result_spill"):
+        path = spill.path_in(result) or spill.write(result, "result")
+    if path:
+        levers.fired("result_spill", chars=omitted)
+        where = (f"full output saved to {path}; grep/sed that file instead of "
+                 f"re-running this call")
+    else:
+        where = ("narrow the query (rg a pattern, sed -n a range), or re-run this "
+                 "call by itself, to pull just what you need")
+    return (result[:head]
+            + f"\n[… {omitted} chars omitted to keep the turn responsive — {where}. "
+            f"The TAIL below is usually the outcome …]\n"
+            + result[-tail:])
+
+
+# Sentinel for _stable_prefix_ids: "render with whatever schemas are active", which
+# `None` cannot mean — None is the legitimate request for a prefix with NO tools.
+_ACTIVE_SCHEMAS = object()
+
+_THINK_SPAN = re.compile(r"<think>(.*?)</think>", re.S)
+
+
+def _ctx_spans(messages, count) -> tuple[int, int, int]:
+    """(think residue, all tool results, trailing tool results) in tokens.
+
+    Pure over a message list and a token-counting callable so the split can be tested
+    without a model. Trailing = the run of tool messages at the end of the transcript,
+    i.e. what the last step just appended — the part a user can shrink by narrowing
+    the next call rather than by starting over."""
+    think = tools_all = 0
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content") or ""
+        if role == "assistant":
+            think += sum(count(seg) for seg in _THINK_SPAN.findall(content))
+        elif role == "tool":
+            tools_all += count(content)
+    recent = 0
+    for m in reversed(messages):
+        if m.get("role") != "tool":
+            break
+        recent += count(m.get("content") or "")
+    return think, tools_all, recent
+
+
+def format_ctx_breakdown(bd: dict) -> list[str]:
+    """`ctx_breakdown` as display lines. The nested rows are a decomposition of
+    `history`, not additions to it, so they are indented under it and the total is
+    the only number that has to add up."""
+    def row(label, n, indent=0, of=None):
+        pct = f"  {100 * n / of:4.1f}%" if of else ""
+        return f"{' ' * indent + label:<24}{n:>8,}{pct}"
+    total = max(1, bd["total"])
+    lines = [row("context total", bd["total"]) + f"   (compact at {bd['limit']:,})",
+             row("system prompt", bd["system"], 2, total),
+             row("tool schemas", bd["schemas"], 2, total),
+             row("history", bd["history"], 2, total),
+             row("· think residue", bd["think"], 4, total),
+             row("· tool results", bd["tools"], 4, total),
+             row("· chat + template", bd["chat"], 4, total)]
+    if bd["tools_recent"]:
+        lines.append(row("last step's results", bd["tools_recent"], 2, total))
+    return lines
+
 
 # Canned task behind the /init slash command (Claude-Code parity): scaffold a CLAUDE.md
 # the way `claude /init` does. Runs through the normal agentic loop (orient → read the
@@ -548,16 +624,45 @@ class Agent:
                   if m.get("role") == "assistant" and "</think>" in m["content"]][:-2]:
             c = self.messages[i]["content"]
             self.messages[i]["content"] = c.split("</think>", 1)[1].lstrip("\n")
-        # A compaction notice is guidance, not output: head/tail-clipping one would leave
-        # the model a mangled instruction, and it must not consume one of the four spared
-        # slots either. Same exemption the skill messages get in compact_if_needed.
+        # Already-collapsed results are skipped — re-trimming a trimmed body reclaims
+        # almost nothing and would strand the spill pointer compaction wrote into it.
         idxs = [i for i, m in enumerate(self.messages)
-                if m.get("role") == "tool" and self._COLLAPSED not in m["content"]
-                and compaction._NOTICE_TAG not in m["content"]]
+                if m.get("role") == "tool" and self._COLLAPSED not in m["content"]]
         for i in idxs[:max(0, len(idxs) - 4)]:  # keep the last 4 tool outputs verbatim
             if len(self.messages[i]["content"]) > 400:
                 self.messages[i]["content"] = self._headtail(self.messages[i]["content"])
         return before, len(self._render())
+
+    def ctx_breakdown(self) -> dict:
+        """Where the window actually went, in tokens of the model's own tokenizer.
+
+        `context N` answers "how full" and nothing else, so a session that compacts
+        early is a mystery: an eager MCP server's schemas, a 40k skill body and a
+        transcript of think blocks all read the same on the gauge. This splits the
+        rendered prompt into the parts a user can act on — drop a server, stop
+        loading a skill, start a fresh session — using the tokenizer chad already
+        runs, at zero cost when the command is not invoked.
+
+        The static parts are exact (two prefix renders, differenced); `chat` is the
+        remainder, so template scaffolding lands there rather than being attributed
+        to content that did not produce it."""
+        total = len(self._render())
+        prefix = len(self._stable_prefix_ids())
+        system = len(self._stable_prefix_ids(tools=None))
+        think, tools_all, tools_recent = _ctx_spans(self.messages,
+                                                    lambda t: token_len(self.engine, t))
+        history = max(0, total - prefix)
+        return {
+            "total": total,
+            "limit": self.ctx_limit,
+            "system": system,
+            "schemas": max(0, prefix - system),
+            "history": history,
+            "think": think,
+            "tools": tools_all,
+            "tools_recent": tools_recent,
+            "chat": max(0, history - think - tools_all),
+        }
 
     def _active_schemas(self):
         """The tool schemas to expose this agent (builtins + skills + MCP)."""
@@ -648,17 +753,22 @@ class Agent:
                 pass
         return ids
 
-    def _stable_prefix_ids(self):
+    def _stable_prefix_ids(self, tools=_ACTIVE_SCHEMAS):
         """The byte-identical head of every session: system prompt + tool schemas,
         up to (but not including) the first user turn. Computed by diffing two
         first-turn renders with different user text — their common token prefix is
         exactly the system+tools block. This is what warm_prefix checkpoints to disk
         so a cold start skips re-prefilling it (the template can't render a system
-        message alone — it raises 'No user query found' — hence the diff trick)."""
+        message alone — it raises 'No user query found' — hence the diff trick).
+
+        `tools=None` prices the same prefix with the schema block removed; the
+        difference between the two is what the tool definitions actually cost, which
+        is the one number the context gauge cannot get any other way."""
+        schemas = self._active_schemas() if tools is _ACTIVE_SCHEMAS else tools
         sysm = self.messages[0]
         def render1(u):
             return self._template_ids(self.engine.tok.apply_chat_template(
-                [sysm, {"role": "user", "content": u}], tools=self._active_schemas(),
+                [sysm, {"role": "user", "content": u}], tools=schemas,
                 add_generation_prompt=True, enable_thinking=self.thinking))
         a, b = render1("a"), render1("the quick brown fox jumps")
         n = 0
@@ -1501,18 +1611,24 @@ class Agent:
                 "resume, or re-scope the ask smaller (docs/troubleshooting.md)]")
 
 
-def skill_token_cost(engine, text: str) -> int:
-    """What loading this skill actually costs, in tokens of the model's own tokenizer.
-
-    Reported at the point of load because the number is the whole decision: a gstack
-    skill body can run past 40k tokens, which is most of the usable window on a 24 GB
-    box, and a user who types `/name` deserves to see that happen rather than discover
-    it as an unexplained compaction three turns later. Falls back to a chars/4 estimate
-    if the engine has no usable tokenizer."""
+def token_len(engine, text: str) -> int:
+    """`text` in tokens of the model's own tokenizer, with a chars/4 fallback if the
+    engine has no usable one. The fallback exists for cosmetic call sites only — a
+    number on screen must never break the command that printed it."""
     try:
         return len(engine.tok.encode(text, add_special_tokens=False))
     except Exception:  # noqa: BLE001 - a cosmetic number must never break the command
         return len(text) // 4
+
+
+def skill_token_cost(engine, text: str) -> int:
+    """What loading this skill actually costs, in tokens.
+
+    Reported at the point of load because the number is the whole decision: a gstack
+    skill body can run past 40k tokens, which is most of the usable window on a 24 GB
+    box, and a user who types `/name` deserves to see that happen rather than discover
+    it as an unexplained compaction three turns later."""
+    return token_len(engine, text)
 
 
 def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = None,

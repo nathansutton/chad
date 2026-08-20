@@ -2,6 +2,43 @@
 
 Notable, user-visible changes.
 
+## [Unreleased]
+
+### A clip is a loan, not a deletion
+
+chad truncates tool output in three places — bash's own head/tail budget, the per-result
+backstop cap, and compaction's aging passes. Only the first one used to keep the bytes it
+dropped. Measured over the banked session archive: of the results compaction trimmed,
+**7.6% were later re-fetched with a byte-identical call** (17 of 225, across 7 sessions) —
+a dead turn plus a full re-prefill each, on a box where a turn is 30–60 s. The clips that
+already carried a pointer were re-run **0** times.
+
+- **Compaction's trims now carry an executable pointer** (`trim_spill`). Before a tool
+  result is head/tail-trimmed, the full original goes to a spill file and the trimmed
+  message names it, so the omitted middle costs a `grep` instead of a repeat of the call.
+- **The per-result backstop cap joins the same contract** (`result_spill`), and now keeps
+  a **tail** as well as a head — a head-only clip of a long error kept the preamble and
+  dropped the sentence that said what went wrong.
+- **One spill store, one budget.** `spill.py` holds the file/permission/retention
+  discipline all three call sites share: per-process session dirs, per-kind file counts, a
+  dir-wide byte cap, 0600, and a 7-day sweep of dirs orphaned by dead processes. A body
+  that is already spilled re-points at its file rather than being written twice.
+
+### Fixed
+
+- **`/compact` raised `AttributeError`** the moment a session had an untrimmed tool
+  result: the manual reclaim path filtered on a module constant that no module defines.
+  It had no test, which is how it shipped; it has one now.
+
+### Added
+
+- **`/ctx`** — where the context window actually went, in tokens of the model's own
+  tokenizer: system prompt, tool schemas, history, and inside history the think residue,
+  the tool results, and the last step's results. `context N` says how full the window is
+  and nothing about why; a 40k skill body, an eager MCP server's schemas and a transcript
+  of think blocks all read identically on the bare gauge. Read-only and model-free, so it
+  works mid-turn — which is when the question gets asked.
+
 ## [2.0.0] — 2026-08-19
 
 **The lean release, and a new brain.** chad 2.0.0 is the drastic simplification the 1.x

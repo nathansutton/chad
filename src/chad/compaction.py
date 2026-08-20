@@ -7,23 +7,49 @@ self._emit, self.ctx_limit, prompt_ids)`; the `compact_now` (/compact) path reus
 `_headtail`/`_COLLAPSED` via the Agent aliases.
 
 Every pass marks what it trimmed with `_COLLAPSED`, in-band, so a clipped
-result never reads as complete.
+result never reads as complete — and the full original goes to a spill file whose
+path rides in the same message, so the marker is a pointer and not just an apology.
 """
 
 import logging
 
-from . import skills
+from . import levers, skills, spill
 
 log = logging.getLogger("chad")
 
 _COLLAPSED = "[…earlier output trimmed to save context…]"
+
+
+def _pointer(original: str) -> str:
+    """The trailing line that makes a trim recoverable: `\n[… full output saved to
+    <path> …]`, or "" if there is nowhere to point.
+
+    Compaction is the one path in the harness that used to destroy bytes outright —
+    bash has spilled its omitted middle since it shipped, but a result the compactor
+    head/tail-trimmed was simply gone, and the model's only route back was to issue
+    the identical call again (measured over the banked archive: 7.6% of trimmed
+    results, each costing a dead turn plus a full re-prefill). A result that already
+    carries a spill pointer reuses it rather than writing the same body twice."""
+    if not levers.enabled("trim_spill"):
+        return ""
+    path = spill.path_in(original) or spill.write(original, "compact")
+    if not path:
+        return ""
+    levers.fired("trim_spill", chars=len(original))
+    return (f"\n[… full output saved to {path} — grep/sed that file instead of "
+            f"re-running the call that produced it …]")
+
 
 def _headtail(text: str, head: int = 12, tail: int = 8, max_chars: int = 8000) -> str:
     """Keep the first/last few lines of a long output; drop the middle. The
     head and tail carry the most signal (what a command was / how it ended),
     and this preserves far more than a bare stub while still reclaiming space.
     A char cap also clips pathological single-line blobs (minified files etc.)
-    that have too few newlines for line-based trimming to help."""
+    that have too few newlines for line-based trimming to help.
+
+    Whatever is dropped goes to a spill file first and the trimmed text names it, so
+    the middle is a `grep` away rather than a re-run away."""
+    original = text
     lines = text.splitlines()
     if len(lines) > head + tail + 3:
         text = "\n".join(
@@ -33,7 +59,9 @@ def _headtail(text: str, head: int = 12, tail: int = 8, max_chars: int = 8000) -
     if len(text) > max_chars:
         keep = max_chars // 2
         text = text[:keep] + f"\n  {_COLLAPSED}\n" + text[-keep:]
-    return text
+    if text is original:  # nothing dropped — no loan to record
+        return text
+    return text + _pointer(original)
 
 
 # When compaction cannot get under ctx_limit (the protected floor — system prompt +

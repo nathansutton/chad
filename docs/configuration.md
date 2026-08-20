@@ -562,7 +562,7 @@ CHAD_MAX_GEN_TOKENS=32768     uv run chad  # hard per-STEP generation cap (defau
 
 ### Harness levers
 
-chad 2.0.0 ships **eight** result-channel levers, **all ON by default** — the survivors
+chad 2.0.0 ships **ten** result-channel levers, **all ON by default** — the survivors
 of a long measurement campaign in which nothing else beat the bare model + tool loop.
 Each one makes the `bash` route more honest or more informative (a trimmed test run
 keeps its failure rows; a grep that matched nothing says what it searched; a failed
@@ -586,6 +586,8 @@ CHAD_DISABLE=all uv run chad                # the bare model + tool loop
 | `verify_baseline` | the pre-edit outcome of the project's test command, recalled on a failing post-edit run |
 | `bash_line_clip` | per-line cap so one minified line can't spend the whole output budget; the full text goes to a spill file |
 | `edit_miss_diagnose` | a failed edit says whether the change looks *already applied*, or the first line/column where the sent text diverges |
+| `trim_spill` | when compaction head/tail-trims an older tool result, the full original goes to a spill file and the trimmed message names the path |
+| `result_spill` | when the per-result backstop cap clips a result, the full body goes to a spill file and the notice names the path |
 | `rg_replace_flag_note` | one line naming what an `rg -r` result actually is — `-rn` is `--replace n`, not grep's recursive flag |
 
 - **`CHAD_DISABLE`** — comma-separated lever names to switch off (`all` = every lever).
@@ -765,7 +767,7 @@ between releases.
 
 ```bash
 CHAD_TRAJECTORY_JSON=/tmp/traj.json uv run chad  # record an ATIF trajectory (pure observer)
-CHAD_SPILL_DIR=/tmp/spill           uv run chad  # where large tool outputs spill to disk
+CHAD_SPILL_DIR=/tmp/spill           uv run chad  # where truncated tool output spills to disk
 CHAD_DUMP_RENDER=/tmp/prompt.txt    uv run chad  # dump the fully-rendered prompt each step
 CHAD_PREFILL_TRACE=/tmp/pf.jsonl    uv run chad  # per-step prefill/cache telemetry
 CHAD_CHECKPOINT_DIR=/tmp/ckpt       uv run chad  # relocate the shadow-git edit checkpoints

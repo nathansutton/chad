@@ -1,6 +1,6 @@
 """Tests for the lever registry (levers.py).
 
-chad 2.0.0 ships eight bash-route levers, all default ON; `CHAD_DISABLE` exists
+chad 2.0.0 ships ten bash-route levers, all default ON; `CHAD_DISABLE` exists
 so a leave-one-out ablation can switch one off without editing the tree.
 
 The registry's most important property is that it FAILS LOUD on a typo. A
@@ -17,6 +17,7 @@ LEAN_SET = {
     "env_manifest", "bash_read_skeleton", "bash_empty_diagnose",
     "bash_trim_keep_failures", "verify_baseline", "bash_line_clip",
     "edit_miss_diagnose", "rg_replace_flag_note",
+    "trim_spill", "result_spill",
 }
 
 

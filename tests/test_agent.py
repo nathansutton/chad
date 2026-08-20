@@ -200,3 +200,56 @@ if __name__ == "__main__":
     test_reasoning_split_probe_classifies_templates()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
+
+
+# --- /ctx: where the window actually went -------------------------------------
+
+def test_ctx_spans_splits_a_transcript():
+    """`context N` says how full the window is and nothing about why. The split is
+    what a user can act on — a 40k skill body, an eager MCP server's schemas and a
+    transcript of think blocks all read identically on the bare gauge."""
+    from chad.agent import _ctx_spans
+    msgs = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "<think>" + "t" * 40 + "</think>answer"},
+        {"role": "tool", "name": "bash", "content": "o" * 100},
+        {"role": "assistant", "content": "no thinking here"},
+        {"role": "tool", "name": "bash", "content": "r" * 30},
+        {"role": "tool", "name": "bash", "content": "r" * 20},
+    ]
+    think, tools, recent = _ctx_spans(msgs, len)   # 1 char == 1 "token"
+    check("think residue counts only <think> spans", think == 40, think)
+    check("tool results count every tool message", tools == 150, tools)
+    check("trailing run is the last step's results only", recent == 50, recent)
+
+    # No trailing tool run (the transcript ends on an assistant turn) -> 0, not "all".
+    _, _, none_recent = _ctx_spans(msgs[:-2], len)
+    check("no trailing tool run reports 0", none_recent == 0, none_recent)
+    # An unterminated <think> is not a span: half a block must not be priced as one.
+    open_think, _, _ = _ctx_spans([{"role": "assistant", "content": "<think>abc"}], len)
+    check("unterminated think block counts 0", open_think == 0, open_think)
+
+
+def test_ctx_breakdown_adds_up():
+    """The parts must reconcile to the total — `chat` is the remainder on purpose, so
+    template scaffolding lands there instead of being attributed to content that did
+    not produce it."""
+    from chad.agent import Agent, format_ctx_breakdown
+    from test_agent_e2e import ScriptedEngine
+    agent = Agent(ScriptedEngine(["done"]), mode="yolo", thinking=False)
+    agent.messages += [
+        {"role": "user", "content": "do a thing"},
+        {"role": "assistant", "content": "<think>" + "t" * 400 + "</think>ok"},
+        {"role": "tool", "name": "bash", "content": "o" * 800},
+    ]
+    bd = agent.ctx_breakdown()
+    check("system + schemas + history == total",
+          bd["system"] + bd["schemas"] + bd["history"] == bd["total"], bd)
+    check("history decomposes exactly",
+          bd["think"] + bd["tools"] + bd["chat"] == bd["history"], bd)
+    check("every part is non-negative", all(v >= 0 for v in bd.values()), bd)
+    check("the limit shown is the compaction trigger", bd["limit"] == agent.ctx_limit, bd)
+    lines = format_ctx_breakdown(bd)
+    check("formats one line per part", len(lines) >= 7, lines)
+    check("names the compaction trigger", f"{bd['limit']:,}" in lines[0], lines[0])

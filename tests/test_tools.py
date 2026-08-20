@@ -267,7 +267,7 @@ def test_bash_spill():
         stale = os.path.join(d, "99999999")
         os.makedirs(stale)
         os.utime(stale, (0, 0))
-        tools._SPILL_SWEPT = False
+        tools.spill._SWEPT = False
         tools._bash_headtail("s" * (tools.BASH_MAX_CHARS + 1))
         check("spill: stale session swept", not os.path.exists(stale))
 
