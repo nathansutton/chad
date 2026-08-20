@@ -7,7 +7,7 @@ out by hand from the live docstring (longest match wins, ties broken by recency,
 what followed). Contexts are kept tiny so a reviewer can re-derive each one.
 
 Tier 2 (model-gated, self-skipping): loads a small *trimmable, draft-less* model
-(Qwen2.5-Coder-0.5B-Instruct-4bit — NOT Ornith, which is non-trimmable so PLD never
+(Qwen2.5-Coder-0.5B-Instruct-4bit — NOT the shipped hybrid, which is non-trimmable so PLD never
 engages) and asserts PLD produces output byte-identical to plain greedy decoding. The
 engine returns decoded text (not raw ids), so equivalence is asserted on the full
 decoded output string — the user-observable signal a corruption bug would break — plus a
@@ -64,8 +64,9 @@ def _is_quantized(model_dir):
     logit grid produces exact argmax ties (top1==top2) where the winner is decided by
     sub-ULP FP noise from how tokens are batched into forward passes — so even two
     legitimate greedy decodes of the same model can disagree at a tie. (Verified 2026-06:
-    the strict test below passes on bf16 Ornith-9B and on quantized trimmable Qwen, but
-    'fails' on 4-bit AWQ Ornith purely at margin-0.0 ties — not a rollback bug.) So when
+    the strict test below passed on the bf16 dense model of the day and on quantized
+    trimmable Qwen, but 'failed' on a 4-bit AWQ hybrid purely at margin-0.0 ties — not a
+    rollback bug.) So when
     the env var points at quantized weights we SKIP rather than fail spuriously; the
     corruption guard stays strict for the bf16 run where it is meaningful."""
     import json
@@ -339,14 +340,14 @@ def test_wide_gate_demands_the_full_ngram():
 
 # === Tier 2: PLD == plain-greedy equivalence (model-gated, self-skipping) =====
 
-# A small dense Qwen2.5-Coder is trimmable; Ornith is not (so PLD never engages).
+# A small dense Qwen2.5-Coder is trimmable; the qwen3_5 hybrid is not (PLD never engages).
 TIER2_MODEL = "mlx-community/Qwen2.5-Coder-0.5B-Instruct-4bit"
 
 
 def _build_engine(model_id=TIER2_MODEL, enable_pld_hybrid=False):
     """Load a small draft-less PLD engine, or return None to SKIP.
 
-    `enable_pld_hybrid` opts into the hybrid (qwen3_5/Ornith) recurrent-snapshot
+    `enable_pld_hybrid` opts into the hybrid (qwen3_5) recurrent-snapshot
     rollback path (off by default; see Engine.enable_pld_hybrid).
     """
     try:
@@ -424,7 +425,7 @@ def test_pld_equals_greedy():
 
 # === Tier 2-hybrid: hybrid-PLD == plain-greedy equivalence (real hybrid weights, self-skipping) ===
 # The trimmable PLD path above is pinned bit-exact. This is its analogue for the
-# HIGHEST-corruption-risk code in the repo: the hybrid (qwen3_5/Ornith) recurrent-
+# HIGHEST-corruption-risk code in the repo: the hybrid (qwen3_5) recurrent-
 # snapshot rollback (engine.py: _snap_recurrent -> _restore_recurrent -> _trim_kv ->
 # re-feed the accepted prefix). On a rejected speculative draft that sequence must land
 # the recurrent DeltaNet state and the attention KV at EXACTLY y_val+draft[:n_acc]; one
@@ -432,11 +433,10 @@ def test_pld_equals_greedy():
 #
 # A hybrid (non-trimmable) model is required to exercise this; CI runners are weightless,
 # so the test reads the model dir from CHAD_TEST_HYBRID_MODEL and self-skips when unset.
-# It must NOT hardcode a path (the local Ornith weights live in the private workshop, not
-# the public repo). The bit-equality guard requires UNQUANTIZED (bf16) weights — on a
+# It must NOT hardcode a path (bf16 hybrid weights are not something the repo ships). The bit-equality guard requires UNQUANTIZED (bf16) weights — on a
 # quantized hybrid model the coarse logit grid yields exact argmax ties that bit-equality
 # can't survive, so the test self-skips on quantized dirs (see _is_quantized). To run it:
-#   CHAD_TEST_HYBRID_MODEL=<path-to-bf16-ornith-dir> uv run pytest \
+#   CHAD_TEST_HYBRID_MODEL=<path-to-a-bf16-qwen3_5-dir> uv run pytest \
 #       tests/test_engine.py::test_pld_hybrid_equals_greedy -q
 
 def test_pld_hybrid_equals_greedy():
@@ -450,7 +450,8 @@ def test_pld_hybrid_equals_greedy():
                     "CHAD_TEST_HYBRID_MODEL unset (no hybrid weights in test env)")
     # Quantized weights make bit-exact greedy equivalence undefined (margin-0.0 argmax
     # ties decided by FP batching noise — see _is_quantized). Point this at the bf16
-    # source weights (e.g. a local bf16 Ornith-1.0-9B checkout) to exercise the guard.
+    # source weights (an unquantized qwen3_5 checkout) to exercise the guard. The shipped
+    # 27B is 3-bit, so pointing this at it lands here rather than running.
     if _is_quantized(model_id):
         return skip("pld_hybrid_equals_greedy",
                     f"{model_id} is quantized; bit-equality is undefined under "
@@ -693,7 +694,7 @@ def test_push_pop_bit_exact():
     if os.environ.get("CHAD_FAST_TESTS"):
         return skip("push_pop_bit_exact", "CHAD_FAST_TESTS set (fast gate)")
     # push/pop is model-agnostic (RAM-tuple stash + optional disk spill); the trimmable
-    # default is the CI path. A run on the real hybrid (bf16 Ornith) is also wanted,
+    # default is the CI path. A run on a real bf16 hybrid is also wanted,
     # so CHAD_TEST_HYBRID_MODEL — when set — points THIS test at those weights.
     model_id = os.environ.get("CHAD_TEST_HYBRID_MODEL", TIER2_MODEL)
     eng = _build_engine(model_id=model_id)

@@ -3,8 +3,10 @@
 mlx_lm's quantized-KV attention (`kv_bits=8`) is manually unfused — two
 `quantized_matmul`s around a materialized softmax — and measured 2.3-2.6x
 SLOWER than fused fp16 attention despite reading half the bytes (measured
-53->38 tok/s @32k). That made cache quantization a pure loss, so chad ships
-with it off and the governor's ctx_limit pays full fp16 KV rates.
+53->38 tok/s @32k). That made cache quantization a pure loss, so chad shipped
+it off and the governor's ctx_limit paid full fp16 KV rates. With the kernels
+below it is the DEFAULT (see Engine._resolve_kv_bits): a win on decode time and
+on the context the governor can afford, rather than a trade between them.
 
 This module JIT-compiles (mx.fast.metal_kernel — no wheel rebuild) a fused
 online-softmax scan over the 8-bit group-64 affine QuantizedKVCache layout.
@@ -45,16 +47,21 @@ max |err| vs a dequantize->fp32 reference is at output-dtype rounding level
 kernels.
 
 `install()` patches the QuantizedKVCache branch of
-`mlx_lm.models.base.scaled_dot_product_attention` to use the fused kernels
-for S==1 decode steps on the shapes `covers()` accepts (D=256, GQA 4/6/8 —
-the shipped model is GQA-6 — bits=8, gs=64, no/causal mask), reading the
-cache's FULL padded buffers with a runtime valid-length — the sliced views
-the stock path uses would force a contiguity copy per call. Everything else
-falls through to stock. Opt out: CHAD_NO_QSDPA=1.
+`mlx_lm.models.base.scaled_dot_product_attention` to use the fused kernels on
+the shapes `covers()` accepts (D=256, GQA 4/6/8 — the shipped model is GQA-6 —
+bits=8, gs=64, no/causal mask): S==1 decode steps, and verify steps up to
+`_wide_s_max`. It reads the cache's FULL padded buffers with a runtime
+valid-length — the sliced views the stock path uses would force a contiguity
+copy per call. Wider steps (deep speculation, prefill chunks) take the same
+patch's other branch, which dequantizes that layer's K/V and runs stock fused
+attention; past `_wide_s_max` that is measured the faster of the two.
+Everything else falls through to stock. Opt out: CHAD_NO_QSDPA=1.
 
-Scope note: chad's engine still gates kv_bits OFF the rewind/interruptible-
-prefill paths (engine.py), so this kernel lands ahead of that glue; it also
-serves `chad --serve` setups exposing the in-process engine with --kv-bits.
+Scope note: the engine builds the cache quantized from the start, so these
+kernels serve normal decode, MTP verification and prefill alike. The one path
+that still requires an fp16 cache is opt-in wide prompt-lookup decoding
+(CHAD_USE_PLD). This also serves `chad serve` setups exposing the in-process
+engine with --kv-bits.
 """
 
 from typing import Any
@@ -956,13 +963,59 @@ def _kernel_wide():
     return _p1_wide
 
 
-def _wide_s_max(gqa: int) -> int:
-    """Largest S the wide kernel supports at this GQA: bounded by the 32 KB
-    threadgroup allocation (K/V double buffers + the GQA*S staged q rows)."""
-    ch = max(8 // gqa, 1) * gqa
-    budget = 32768 - 4 * ch * _D * 2          # K/V: 2 buffers x CH x D x half, x2 arrays
-    s = budget // (gqa * _D * 2)
-    return max(0, min(6, s))
+# Largest verify width still worth routing through this kernel instead of the
+# dequantize-whole-cache fallback in install()'s S>1 branch. Measured on the
+# shipped 27B (one model load, interleaved arms, real verify forwards, PyPI mlx
+# 0.32.0) as the round-time gain from taking the fused path at that width:
+#
+#     S      8k ctx    20k ctx    40k ctx
+#      3      +0.1%      +0.1%      +0.0%   <- control: fused on both arms
+#      6      -0.0%      +0.4%      +0.5%   <- control
+#     10      +8.6%     +19.8%     +36.4%
+#     12      +7.8%     +18.5%     +33.5%
+#     16      +6.3%     +14.3%     +25.7%
+#     24      +2.2%      +6.8%     +12.3%
+#     32      -0.6%      -0.7%      -1.7%
+#
+# The fused path wins by more the longer the context, because the fallback
+# dequantizes the whole cache once per attention layer while this kernel reads
+# it packed. It crosses over just under S=32, where the fp32 partials slab
+# (B, HQ, S, VB, D) that pass 1 writes and pass 2 reads back outgrows the
+# dequant it saves — so 32 stays on the fallback, and the cap lands exactly on
+# the DepthPolicy candidate below it. A width above the cap is not refused, it
+# just takes the other path.
+_WIDE_S_CAP = 24
+
+# The same crossover for the PER-ROW schedule, which serves S>1 when the SGM
+# retile is unavailable (n < _SGM_MIN_N, or CHAD_NO_QSDPA_WIDE_SGM for
+# bisection). It replays the S==1 kernel S times, so its cost is linear in S
+# where the fallback's is flat, and it crosses over sooner (gqa 6, per-row vs
+# fallback): S=6 2.30x/3.08x, S=10 1.52x/1.92x, S=16 1.01x/1.23x, S=24
+# 0.73x/0.86x at 8k/32k. 16 is the last width that is never a loss.
+_PER_ROW_S_CAP = 16
+
+
+def _wide_s_max(gqa: int, n: int = _SGM_MIN_N) -> int:
+    """Largest S `_eligible` admits to the fused wide path at this GQA and
+    context length — i.e. the cap of whichever schedule `qsdpa` will dispatch.
+
+    The DEFAULT S>1 schedules have no S-dependent threadgroup allocation: the
+    SGM retile (S>=3, n>=_SGM_MIN_N) stages one 8-row tile per threadgroup and
+    rides the row-tile count in grid.y, and the per-row fallback below it just
+    dispatches the S==1 kernel S times. Only `_kernel_wide` — reachable solely
+    via CHAD_QSDPA_WIDE_KERNEL — stages GQA*S q rows in threadgroup memory, so
+    only it needs the 32 KB budget bound. Applying that bound to every path
+    capped the default schedule at 6 and quietly dropped every DepthPolicy
+    plateau width (S=10..32) onto the dequantize fallback, while
+    Engine._warm_verify_widths went on compiling variants for them.
+    """
+    if config.flag("CHAD_QSDPA_WIDE_KERNEL"):
+        ch = max(8 // gqa, 1) * gqa
+        budget = 32768 - 4 * ch * _D * 2      # K/V: 2 buffers x CH x D x half, x2 arrays
+        return max(0, min(6, budget // (gqa * _D * 2)))
+    if n < _SGM_MIN_N or config.flag("CHAD_NO_QSDPA_WIDE_SGM"):
+        return _PER_ROW_S_CAP
+    return _WIDE_S_CAP
 
 
 _p1_sgm_wide_1r = None
@@ -1003,9 +1056,39 @@ def _kernel_sgm_wide():
     return _p1_sgm_wide
 
 
-def _pick_blocks(n: int, gqa: int = 8) -> int:
+def _sgm_wide_ok(n: int, S: int) -> bool:
+    """Whether the S>1 simdgroup retile serves this shape. Single source of the
+    predicate: `qsdpa` branches on it and `_pick_blocks` has to agree with the
+    branch it is sizing."""
+    return (S >= 3 and n >= _SGM_MIN_N
+            and not config.flag("CHAD_NO_QSDPA_WIDE_SGM")
+            and not config.flag("CHAD_QSDPA_WIDE_KERNEL"))
+
+
+def _uses_rt_split(n: int, S: int) -> bool:
+    """...and specifically its RT-split form rather than the one-read form."""
+    return _sgm_wide_ok(n, S) and (S > 4 or config.flag("CHAD_QSDPA_WIDE_SGM_RT"))
+
+
+def _pick_blocks(n: int, gqa: int = 8, S: int = 1) -> int:
     """Split factor for the 2-pass scan. Pass 2 combines `blocks` partials per
     head, so this must stay a multiple of its BN=32.
+
+    The RT-split wide kernel takes a flat 32; every other schedule takes the
+    context table below. That split is not about S as such — it is about which
+    kernel runs. RT-split hands pass 2 `blocks * 2` entries per head, so its
+    fp32 partials slab, (B, HQ, S, VB, D), is twice as deep per block as any
+    other schedule's *and* S times as tall, while the grid already carries S
+    times the work and has no occupancy left to buy. Sweeping the boundary
+    (gqa 6, b32 gain over b64) puts the crossover exactly on the kernel change
+    at S=5, in both contexts:
+
+        S           1      2      3      4  |    5      6      8     10     24
+        n=16384  -1.8%  -5.7%  -1.6%  +0.2% | +6.1%  +5.3%  +5.1%  +6.0%  +5.7%
+        n=32768  -4.7%  -3.2%  -4.0%  -2.3% | +3.0%  +1.1%  +2.3%  +2.0%  +2.5%
+
+    S<=4 is the one-read form (or, at S=2, the per-row replay of the S==1
+    kernel), and those want the same wide split single-token decode wants.
 
     Deliberately NOT mlx's sdpa_vector_2pass table, which this kernel used to
     inherit. That table is tuned for an fp16 cache, which reads twice the bytes
@@ -1022,11 +1105,10 @@ def _pick_blocks(n: int, gqa: int = 8) -> int:
 
     Fewer than 32 is not available (pass 2's BN), and the isolated curve is
     monotone up to it — but the isolated curve is not the decision criterion
-    (see the module maxim), and end-to-end the answer moved when the retile
-    landed: the flat 32 above was tuned against the PER-HEAD kernel, while at
-    gqa 8, n >= _SGM_MIN_N the kernel is now the simdgroup retile, whose pass-1
-    partials are cheaper per block. Measured end-to-end on the real models (one
-    load, interleaved arms, median-of-4 paired rounds, spread clearing 1.000):
+    (see the module maxim), and end-to-end the answer moved once the S==1
+    simdgroup retile landed for gqa 8, whose pass-1 partials were cheaper per
+    block. Measured end-to-end on the retired models (one load, interleaved
+    arms, median-of-4 paired rounds, spread clearing 1.000):
 
         gqa 8 (35B): 64 is 1.006x+-0.002 @16k, 1.015x+-0.001 @32k; 1.000 @8k;
                      128 is 0.995 @16k — worse than 64 everywhere it was tried.
@@ -1035,7 +1117,17 @@ def _pick_blocks(n: int, gqa: int = 8) -> int:
     Both tiers widen at n >= 16384: the largest measured-neutral point is 16000
     and the wins start at the next measured context, so the boundary sits just
     above the neutral evidence.
+
+    The gqa-8 half of that evidence is now historical — its retile went with the
+    35B, so every S==1 dispatch is the per-head kernel again — but the shipped
+    gqa 6 lands in the same branch, and re-measuring it there says the widening
+    is still the right call or a tie (S==1, ms): 16384 b32 0.447 / b64 0.439;
+    32768 b32 0.758 / b64 0.729 / b128 0.701; 49152 b32 1.036 / b64 1.000.
+    64 is best-or-tied at two of three and 4% off b128 at one, which is inside
+    the spread that decided the original table — not enough to churn on.
     """
+    if _uses_rt_split(n, S):
+        return 32
     if n >= 16384:
         return 128 if gqa == 4 else 64
     return 32
@@ -1055,7 +1147,7 @@ def qsdpa(q: Any, k_quant: tuple, v_quant: tuple, scale: float, n: int) -> Any:
     B, HQ, S, D = q.shape
     HKV, NP = kw.shape[1], kw.shape[2]
     gqa = HQ // HKV
-    blocks = _pick_blocks(n, gqa)
+    blocks = _pick_blocks(n, gqa, S)
     scale_arr = mx.array([scale], dtype=mx.float32)
     _, p2 = _kernels()
 
@@ -1068,9 +1160,7 @@ def qsdpa(q: Any, k_quant: tuple, v_quant: tuple, scale: float, n: int) -> Any:
 
     params = mx.array([n, NP, blocks], dtype=mx.int32)
     if S > 1:
-        if (n >= _SGM_MIN_N and S >= 3
-                and not config.flag("CHAD_NO_QSDPA_WIDE_SGM")
-                and not config.flag("CHAD_QSDPA_WIDE_KERNEL")):
+        if _sgm_wide_ok(n, S):
             # S==2 stays per-row: measured 1.36 vs 1.99 ms at 32k — two
             # row-tiles' barrier traffic isn't paid back by one KV read
             # at only 12 live rows.
@@ -1080,10 +1170,11 @@ def qsdpa(q: Any, k_quant: tuple, v_quant: tuple, scale: float, n: int) -> Any:
             # bytes touched once; all row tiles resident, O[RT*4] at SL=32);
             # CHAD_QSDPA_WIDE_SGM_RT forces the RT-split form (one 8-row
             # tile per threadgroup, K/V read once per tile) kept for A/B.
-            if S > 4 or config.flag("CHAD_QSDPA_WIDE_SGM_RT"):
+            if _uses_rt_split(n, S):
                 # one-read tops out at S=4: RT=5 needs O[20] accumulator
                 # tiles, past the measured register cliff (numerics break,
-                # not just speed) — S 5..6 takes the RT-split form instead
+                # not just speed) — S>=5 takes the RT-split form instead.
+                # `blocks` is already narrowed for this form (_pick_blocks).
                 rt = (gqa * S + 7) // 8
                 vb2 = blocks * 2
                 partials, sums, maxs = _kernel_sgm_wide()(
@@ -1168,8 +1259,11 @@ def qsdpa(q: Any, k_quant: tuple, v_quant: tuple, scale: float, n: int) -> Any:
 
 def _eligible(q: Any, cache: Any, mask: Any) -> bool:
     """True iff this call is a validated decode shape: S==1 (plain decode) or
-    S in 2.._wide_s_max (the MTP/PLD verify forward — wide kernel), D==256,
+    S in 2.._wide_s_max(gqa, offset) (the MTP/PLD verify forward), D==256,
     GQA in _GQAS, 8-bit group-64 quantized cache, no restricting mask.
+
+    A width past that cap is not an error — `install()` sends it to the
+    dequantize-and-fuse branch, which is the faster of the two up there.
 
     S>1 additionally requires mask == "causal": the wide kernel implements
     causality as a per-row valid length, which is only correct for the
@@ -1189,7 +1283,7 @@ def _eligible(q: Any, cache: Any, mask: Any) -> bool:
         if kw_probe is None or kw_probe.shape[1] == 0 or q.shape[1] % kw_probe.shape[1]:
             return False
         gqa = q.shape[1] // kw_probe.shape[1]
-        if not (2 <= S <= _wide_s_max(gqa)) or cache.offset < S:
+        if not (2 <= S <= _wide_s_max(gqa, cache.offset)) or cache.offset < S:
             return False
         if config.flag("CHAD_NO_QSDPA_WIDE"):
             return False
@@ -1394,13 +1488,14 @@ def install() -> bool:
                 except Exception as e:  # noqa: BLE001 — perf path: never break decode
                     log.warning("qsdpa fused kernel failed (%s); stock path", e)
             elif queries.ndim == 4 and queries.shape[2] > 1:
-                # Prefill (S>1) over a quantized cache: dequantize this
-                # layer's K/V and run the FUSED fp16/bf16 kernel (steel at
-                # hd-256 via the patched wheel) instead of mlx_lm's unfused
+                # Too wide for the fused path (prefill chunks, and verify
+                # widths past _wide_s_max): dequantize this layer's K/V and
+                # run mx.fast SDPA instead of mlx_lm's unfused
                 # qmm+softmax+qmm — which materializes an (H, S, N) score
                 # slab (~2 GB at chunk 2048 x 32k ctx) and is several times
-                # slower. The dequantized transient is N*D*4 bytes per
-                # kv-head (~67 MB at 32k), freed at chunk end.
+                # slower. The dequantized transient is N*D*2 bytes per kv-head
+                # per array (~67 MB at 32k), freed at chunk end. Cost is flat
+                # in S, which is why it wins above the cap and loses below it.
                 try:
                     import mlx.core as mx
                     kd = mx.dequantize(*keys, group_size=cache.group_size,

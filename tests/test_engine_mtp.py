@@ -275,3 +275,49 @@ def test_sampled_path_stays_consistent():
     # resident (same contract as PLD), so residency is bounded, not exact.
     lo = len(PROMPT) + len(got) - 1
     assert lo <= len(eng._cached_ids) <= lo + eng.mtp_num_draft
+
+
+def test_mtp_knob_clamp_never_lands_below_the_default(monkeypatch):
+    """CHAD_MTP_MAX_DRAFT lowers the schedule's depth cap. It must clamp to the
+    policy's own ceiling, not to some smaller leftover: clamping to 8 (as this
+    did before the plateau candidates existed) meant asking for 16 delivered 8
+    — below the default of 31, and below every deep candidate — so the knob
+    silently made decode slower than not setting it at all."""
+    from chad.mlx_mtp import DepthPolicy
+
+    default = Engine.__dataclass_fields__["mtp_max_draft"].default
+    assert default == DepthPolicy.MAX_DEPTH
+
+    def _resolved(value):
+        eng = object.__new__(Engine)
+        eng.mtp_max_draft = default
+        eng.mtp_adaptive = True
+        eng.mtp_num_draft = 2
+        eng.mtp_h = 0.065
+        monkeypatch.setenv("CHAD_MTP_MAX_DRAFT", str(value))
+        eng._resolve_mtp_knobs()
+        return eng.mtp_max_draft
+
+    for asked in (1, 4, 6, 8, 12, 16, 24, 31):
+        got = _resolved(asked)
+        assert got == asked, f"asked {asked}, got {got}"
+    # Over the ceiling saturates at it rather than at some other number.
+    assert _resolved(99) == DepthPolicy.MAX_DEPTH
+    # Every candidate the schedule can pick stays reachable at the default.
+    monkeypatch.delenv("CHAD_MTP_MAX_DRAFT")
+    assert max(DepthPolicy.CANDIDATES) <= default
+
+
+def test_mtp_knob_explicit_width_disables_adaptive(monkeypatch):
+    """CHAD_MTP_DRAFT is an order, not a hint — it pins the width and turns the
+    schedule off, whatever CHAD_MTP_ADAPTIVE said."""
+    eng = object.__new__(Engine)
+    eng.mtp_max_draft = 31
+    eng.mtp_adaptive = True
+    eng.mtp_num_draft = 2
+    eng.mtp_h = 0.065
+    monkeypatch.setenv("CHAD_MTP_ADAPTIVE", "1")
+    monkeypatch.setenv("CHAD_MTP_DRAFT", "3")
+    eng._resolve_mtp_knobs()
+    assert eng.mtp_num_draft == 3
+    assert eng.mtp_adaptive is False

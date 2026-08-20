@@ -178,3 +178,51 @@ def test_warm_prefix_roundtrip_and_mode_isolation(tiny, tmp_path):
     status, _ = fp16.warm_prefix(ids)
     assert status == "miss"  # different key: never cross-loads the kv8 file
     assert cache_utils.QuantizedKVCache not in {type(c) for c in fp16._cache}
+
+
+def test_warm_verify_widths_only_warms_dispatchable_widths(monkeypatch):
+    """Warming is for widths templated on S — the ones the fused kernel
+    dispatches. Wider verify steps take the dequantize-and-fuse branch, which
+    is one stock kernel at any width and has nothing to compile, so warming
+    them built variants no step could reach. (Before the cap fix this was the
+    tell: chad paid the Metal compile for exactly the widths _eligible refused.)
+    """
+    from chad import mlx_qsdpa
+    from chad.mlx_mtp import DepthPolicy
+
+    seen = {}
+
+    def _fake_warm(widths, hq, hkv, dtype, n=None):
+        seen["widths"] = sorted(widths)
+        return len(seen["widths"])
+
+    monkeypatch.setattr(mlx_qsdpa, "warm_widths", _fake_warm)
+
+    eng = object.__new__(Engine)
+    eng.kv_bits = 8
+    eng._mtp_head = object()
+    eng.mtp_adaptive = True
+    eng.mtp_max_draft = DepthPolicy.MAX_DEPTH
+    eng.mtp_num_draft = 2
+    eng._n_attn_heads, eng._n_kv_heads = 24, 4       # the shipped gqa-6 shape
+    eng.prompt_lookup = False
+    eng.pld_wide = False
+    eng.pld_wide_draft = 0
+    eng.pld_wide_min_draft = 0
+    eng.model = _StubParams()
+
+    eng._warm_verify_widths()
+
+    cap = mlx_qsdpa._wide_s_max(6)
+    assert seen["widths"], "nothing warmed"
+    assert max(seen["widths"]) <= cap
+    # the plateau widths under the cap are warmed, the one above it is not
+    assert 10 in seen["widths"] and 24 in seen["widths"]
+    assert 32 not in seen["widths"]
+
+
+class _StubParams:
+    """Just enough model surface for _warm_verify_widths to read a dtype."""
+
+    def parameters(self):
+        return {"w": mx.zeros((2, 2), dtype=mx.bfloat16)}

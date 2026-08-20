@@ -672,20 +672,15 @@ def test_reject_escalation():
           generic)
     check("escalation forbids fabricating output",
           "Do NOT invent" in generic or "not invent" in generic.lower(), generic)
-    # activate_skill gets the extra anti-confabulation clause — the trace's failure mode.
-    sk = reject_escalation("activate_skill")
-    check("skill escalation says skill NOT loaded", "NOT loaded" in sk, sk)
-    check("skill escalation forbids proceeding from memory",
-          "from memory" in sk or "fabricate" in sk, sk)
 
 
 def test_reject_loop_signature_resets_on_change():
     # The rejection loop breaker keys on (name, args): a *different* attempt at the same
     # tool must reset the counter (it's a new try, not a repeat), while an identical
     # re-emit matches.
-    a = loop_signature([("activate_skill", {"name": "widgets"})])
-    b = loop_signature([("activate_skill", {"name": "widgets"})])
-    c = loop_signature([("activate_skill", {"name": "gadgets"})])
+    a = loop_signature([("edit", {"path": "a.py", "old": "x", "new": "y"})])
+    b = loop_signature([("edit", {"path": "a.py", "old": "x", "new": "y"})])
+    c = loop_signature([("edit", {"path": "a.py", "old": "x", "new": "z"})])
     check("identical rejected call -> same sig", a == b, (a, b))
     check("changed arg -> different sig (counter resets)", a != c, (a, c))
 

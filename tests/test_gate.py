@@ -97,7 +97,7 @@ def test_is_mutating_covers_every_mutator():
     silently drops out of MUTATING (and thus past the plan-mode block) is caught here."""
     for name in ("bash", "write", "edit"):
         check(f"{name} is mutating", is_mutating(name) is True, name)
-    for name in ("write_todos", "done", "activate_skill"):
+    for name in ("write_todos", "done"):
         check(f"{name} is NOT mutating", is_mutating(name) is False, name)
 
 

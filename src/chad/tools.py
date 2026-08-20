@@ -756,17 +756,8 @@ DISPATCH = {
     "bash": lambda a, ss=None: tool_bash(a["command"], a.get("timeout", 120), should_stop=ss),
     "write": lambda a, ss=None: tool_write(a["path"], a["content"]),
     "edit": lambda a, ss=None: tool_edit(a["path"], a["old"], a["new"]),
-    # Agent Skills (https://agentskills.io): load one skill's full instructions on
-    # demand (tier-2 progressive disclosure). Registered in active_schemas() only when
-    # skills are installed; the dispatch is harmless (a clear message) otherwise.
-    "activate_skill": lambda a, ss=None: _skills().activate(a["name"]),
 }
 
-
-def _skills():
-    """Lazy import of the skills module (avoids a circular import at module load)."""
-    from . import skills
-    return skills
 
 # Tools that mutate state -> CLI asks for confirmation unless --yolo.
 MUTATING = {"bash", "write", "edit"}
@@ -868,38 +859,15 @@ SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
-def _activate_skill_schema(names):
-    """The activate_skill tool schema, with `name` constrained to the set of installed
-    skill names so the model can't hallucinate one that doesn't exist (spec guidance)."""
-    return {
-        "type": "function",
-        "function": {
-            "name": "activate_skill",
-            "description": "Load the full instructions for one of the available skills "
-                           "(listed under '# Skills' in the system prompt) before doing a "
-                           "task that matches its description. Returns the skill's "
-                           "step-by-step instructions and the files it bundles.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "enum": names,
-                             "description": "Exact name of the skill to activate."},
-                },
-                "required": ["name"],
-            },
-        },
-    }
-
 
 def active_schemas():
-    """The tool schemas to expose to the model right now: SCHEMAS, plus the
-    activate_skill tool when any Agent Skills
-    are installed for the current project/user (omitted otherwise, so a skill-less
-    project never sees a dead tool), plus any connected MCP server's tools."""
+    """The tool schemas to expose to the model right now: SCHEMAS plus any connected MCP
+    server's tools.
+
+    Agent Skills add nothing here. They are invoked by the user typing `/name`, which
+    submits the skill body as a user turn — so there is no skill-selection tool for the
+    model, and no per-skill cost in the prompt (see skills.slash_commands)."""
     schemas = SCHEMAS
-    names = _skills().skill_names()
-    if names:
-        schemas = schemas + [_activate_skill_schema(names)]
     # Tools from connected MCP servers (mcp__<server>__<tool>), if any are configured.
     # Empty list when none, so a server-less project never sees an extra tool.
     mcp_schemas = _mcp().schemas()

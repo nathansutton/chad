@@ -204,7 +204,7 @@ def _todo_panel_rows(todos, max_items: int = 8):
 SLASH_COMMANDS = [
     ("/help", "commands & keybindings"),
     ("/init", "analyze the project, write CLAUDE.md"),
-    ("/skills", "list available Agent Skills"),
+    ("/skills", "list installed Agent Skills (run one with /<name>)"),
     ("/mcp", "MCP server status"),
     ("/mcp trust", "trust this project's .mcp.json servers"),
     ("/mcp login", "authenticate an MCP server (OAuth)"),
@@ -223,13 +223,31 @@ SLASH_COMMANDS = [
 ]
 
 
+def _skills_mod():
+    """Lazy import of the skills module (keeps TUI import cost off the startup path)."""
+    from . import skills
+    return skills
+
+
 def slash_matches(text: str):
     """`[(cmd, desc)]` whose command starts with the typed line. Only fires for a
     single-line input that starts with `/`; once the text runs past a known command
-    (an arg is being typed, e.g. `/mcp login foo`) nothing matches, so completion stops."""
+    (an arg is being typed, e.g. `/mcp login foo`) nothing matches, so completion stops.
+
+    Installed Agent Skills are appended as `/name` rows. This menu is chad's ONLY skill
+    discovery surface — nothing about skills reaches the model until the user picks one
+    — so the descriptions have to be here, where they cost nothing, rather than in the
+    system prompt, where all of them together cost 60% of it."""
     if "\n" in text or not text.startswith("/"):
         return []
-    return [(c, d) for (c, d) in SLASH_COMMANDS if c.startswith(text)]
+    try:
+        skill_rows = _skills_mod().slash_commands()
+    except Exception:  # noqa: BLE001 - a broken skills dir must not kill completion
+        skill_rows = []
+    # Builtins first and they win a tie: a skill named `model` must never shadow /model.
+    builtin = {c for c, _ in SLASH_COMMANDS}
+    rows = SLASH_COMMANDS + [r for r in skill_rows if r[0] not in builtin]
+    return [(c, d) for (c, d) in rows if c.startswith(text)]
 
 
 def at_path_token(text_before_cursor: str) -> Optional[str]:
@@ -1007,6 +1025,14 @@ class TUI:
 
     # -- input handling --------------------------------------------------
 
+    def _skill_cost(self, text: str) -> int:
+        """Tokens a loaded skill will occupy, reported in the confirmation line. A
+        gstack skill body can exceed 40k tokens — most of the usable window on this
+        hardware — so the cost is shown when it is paid, not inferred later from an
+        unexplained compaction."""
+        from .agent import skill_token_cost
+        return skill_token_cost(self.engine, text)
+
     def _on_accept(self, buff):
         text = buff.text.strip()
         if not text:
@@ -1110,11 +1136,25 @@ class TUI:
             self._emit("info", "shift-tab: cycle mode (normal/auto-accept edits/yolo/plan) "
                                "· esc/ctrl-c: "
                                "interrupt · /init /skills /mcp /mcp trust /mcp login <server> "
-                               "/resume /reset /clear /compact /undo /restore /model /mode /speech /accept /exit · !cmd shell · @path "
+                               "/resume /reset /clear /compact /undo /restore /model /mode /speech /accept /exit "
+                               "· /<skill> runs an installed skill (/skills lists them) "
+                               "· !cmd shell · @path "
                                "attach · type while busy to steer the running turn "
                                "(applies after the current step) · plan ready: type to "
                                "steer, ctrl-g to accept")
             return False
+        # `/<skill>` — the user picked an Agent Skill. Rewrite the line into the skill's
+        # instructions and fall through to the normal message path: a skill is guidance
+        # for one task, so it rides as a user turn that compaction can reclaim, not as
+        # a tool result or a permanent system-prompt block. Everything after the command
+        # (`/investigate the flaky test`) carries through as the concrete ask.
+        echo = text
+        hit = _skills_mod().is_skill_command(text)
+        if hit:
+            name, task = hit
+            text = _skills_mod().load(name, task)
+            self._emit("info", f"loaded skill {name} "
+                               f"({self._skill_cost(text):,} tokens)")
         # A typed message while a governor budget note is pending = continue fresh:
         # clear context and relaunch, seeding the note + the user's steer.
         if self._pending_budget_note and not self._busy:
@@ -1125,7 +1165,7 @@ class TUI:
             seed = f"{text}\n\n[{note}]"
             self._queue.append(seed)
             self._emit("info", "context cleared · continuing with the progress note")
-            self._emit("user", text)
+            self._emit("user", echo)
             self._wake.set()
             return False
         # A typed message while a plan is pending = steer: continue the plan-mode
@@ -1138,11 +1178,11 @@ class TUI:
         # to the model); esc/ctrl-c remain the hard stop.
         if self._busy and not text.startswith("!"):
             self._steer_queue.append(text)
-            self._emit("user", text + "   (steering — applies after current step)")
+            self._emit("user", echo + "   (steering — applies after current step)")
             return False
         # enqueue the message; echo it (note when it's queued behind running work)
         self._queue.append(text)
-        self._emit("user", text + ("   (queued)" if self._busy else ""))
+        self._emit("user", echo + ("   (queued)" if self._busy else ""))
         self._wake.set()
         return False
 

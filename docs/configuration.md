@@ -18,24 +18,36 @@ optionally bundling `scripts/`, `references/`, and `assets/`.
 | Project | `./.agents/skills/`, `./.claude/skills/` (relative to the working dir) |
 | User    | `~/.agents/skills/`, `~/.claude/skills/` |
 
-**Progressive disclosure** keeps context small (the point, on a local model):
+**You choose the skill, not the model.** Every installed skill is a slash command:
 
-1. **Catalog** — at startup, only every skill's `name` + `description` go into the system
-   prompt as an `<available_skills>` block, one `- name: description` line each (~40-80
-   tokens). `/skills` prints it.
-2. **Activation** — when a task matches, the model calls the `activate_skill` tool (its
-   `name` argument is enum-constrained to real skills, so it can't invent one). That loads
-   *that one* skill's full instructions, wrapped in `<skill_content>`, with its bundled
-   files listed.
+1. **Dispatch** — type `/` and the completion menu lists every skill by name and
+   description, alongside chad's builtins. `/skills` prints the same list with any
+   discovery warnings. None of this reaches the model, so it costs nothing in context.
+2. **Load** — `/ship` submits that one skill's instructions as your turn, wrapped in
+   `<skill>` with its directory and bundled files listed. Anything you type after the
+   command is the task: `/investigate the flaky truncation test`.
 3. **Resources** — referenced `scripts/`/`references/`/`assets/` files are read on demand
    against the skill's directory, from `bash` (`sed -n '1,120p' <file>`).
 
+This is a deliberate divergence from the spec's tier-1 disclosure, where a catalog of
+every skill's description rides in the system prompt for the model to select from. That
+catalog measured **4,751 tokens against 62 installed skills — 60% of chad's entire system
+prompt**, paid on every turn of every session, so a small model could guess at a choice
+you can make instantly from a menu. Dropping it took the system prompt from 7,975 tokens
+to 2,824. On a 24 GB box whose usable window is ~50k, that is 10% of the window back.
+
+The cost you *do* still pay is the skill body itself, and it can be large — a big
+Claude Code skill runs past 40k tokens, most of the window. chad prints the exact token
+count when you load one (`loaded skill ship (41,238 tokens)`) so the bill arrives when
+you incur it, rather than as an unexplained compaction three turns later.
+
 Parsing is lenient (a name that doesn't match its directory, an over-long field, or an
 unquoted `colon: value` in YAML loads anyway, with a warning); only a missing description
-or unparseable YAML is skipped. Activated instructions are exempt from context compaction
-— durable guidance is never silently truncated — and re-activating a loaded skill is a
-no-op. Implementation: `src/chad/skills.py` (discovery/parse/activate), with the catalog in
-`prompt.py`, the tool in `tools.py`, and the compaction guard in `compaction.py`.
+or unparseable YAML is skipped. A loaded skill's turn is exempt from context compaction —
+you asked for that guidance by name, and nothing would reload it — and re-running the same
+command notes that it is already loaded instead of sending a second copy. Implementation:
+`src/chad/skills.py` (discovery/parse/dispatch/load), with the menu in `tui.py` and the
+compaction guard in `compaction.py`.
 
 ## MCP servers (modelcontextprotocol.io)
 
@@ -518,7 +530,7 @@ CHAD_NO_GOVERNOR=1          uv run chad  # A/B knob: DISABLE the runaway-turn go
 CHAD_NO_REPEAT_GUARD=1      uv run chad  # A/B knob: DISABLE the degenerate-repetition stop
 CHAD_NO_SYNTAX_GATE=1       uv run chad  # A/B knob: DISABLE the post-edit syntax gate
 CHAD_NO_PREFIX_CACHE=1      uv run chad  # measurement knob: drop the persistent prefix KV cache
-CHAD_NO_SKILLS=1            uv run chad  # A/B knob: disable all Agent Skill discovery
+CHAD_NO_SKILLS=1            uv run chad  # disable Agent Skill discovery (no /<skill>)
 CHAD_NO_FASTPATH=1          uv run chad  # A/B knob: disable the fused-projection decode fast path
 CHAD_NO_DESTRUCTIVE_GUARD=1 uv run chad  # DISABLE the catastrophic-bash screen (unsafe)
 CHAD_NO_SEATBELT=1          uv run chad  # DISABLE the macOS Seatbelt sandbox for yolo bash (unsafe)
@@ -565,9 +577,10 @@ CHAD_PROTECT_GIT=1          uv run chad  # also write-DENY .git inside the yolo 
   cannot destroy project history. The cost is real — every `.git`-writing git command
   (commit, add, checkout) EPERMs inside the sandbox — which is why it is opt-in.
 - **`CHAD_NO_SKILLS`** — turns off [Agent Skill](#agent-skills-agentskillsio) discovery
-  entirely: no `# Skills` prompt section, no skill tool. Set it when a benchmark must not
-  inherit your personal skills, or to A/B what skills are worth. Unlike the other
-  `CHAD_NO_*` vars this one wants a real truthy value (`1`/`true`/`yes`/`on`).
+  entirely, so no `/<skill>` command resolves. Skills no longer touch the system prompt,
+  so this is no longer needed to keep your personal skills out of a benchmark; set it
+  when you want them unreachable from chad at all. Unlike the other `CHAD_NO_*` vars this
+  one wants a real truthy value (`1`/`true`/`yes`/`on`).
 - **`CHAD_NO_FASTPATH`** — disables the fused-projection + compiled decode step installed
   at load for the hybrid MoE checkpoint (`mlx_fastpath.py`). Pure speed, no behavior
   change, so this is an A/B and bisection knob rather than something to run with.
@@ -578,15 +591,30 @@ Export them yourself if you want to experiment; mlx reads them directly.
 
 ### Speculative decoding & kernel knobs
 
-Everything in this block is **speed only**. Each one is bit-exact (or, for the sampled
-paths, distribution-exact) with the path it replaces, so these are bisection and A/B
-knobs — not something to run with. If output changes when you flip one, that is a bug.
+Everything in this block is **speed only** — bisection and A/B knobs, not something to
+run with. Two different kinds of exactness live here, and the difference matters when you
+are chasing a behaviour change:
+
+- **The speculation knobs are exact.** `CHAD_NO_MTP` and the draft-schedule settings
+  change *which* tokens get proposed, never which get emitted: greedy decoding is
+  token-identical with and without speculation (checked on the shipped model), and the
+  sampled path keeps the model's true distribution at any temperature. If flipping one of
+  these changes output, that is a bug.
+- **The kernel knobs are exact to rounding, not bit-identical.** `CHAD_NO_QSDPA*` swap one
+  attention kernel for another; each is within output-dtype rounding of an fp32 reference
+  (the acceptance class MLX holds its own fused kernels to), but they are not bit-identical
+  to *each other*. A greedy near-tie can therefore land on a different token and
+  autoregression will amplify it into different prose. Measured: flipping
+  `CHAD_NO_QSDPA_WIDE` on a 150-token greedy generation produced equally valid but
+  differently worded output. That is expected, not a bug — so bisect a *behaviour* change
+  with the speculation knobs, and read a kernel-knob output diff as noise unless the
+  quality moves.
 
 ```bash
 CHAD_NO_MTP=1             uv run chad  # disable MTP self-speculative decoding
 CHAD_MTP_ADAPTIVE=0       uv run chad  # fixed draft width instead of the adaptive schedule
 CHAD_MTP_DRAFT=2          uv run chad  # force a draft width (implies adaptive off)
-CHAD_MTP_MAX_DRAFT=6      uv run chad  # cap the adaptive schedule's width (max 8)
+CHAD_MTP_MAX_DRAFT=6      uv run chad  # cap the adaptive schedule's depth (default 31)
 CHAD_MTP_H=…              uv run chad  # seed the depth policy's cost model
 CHAD_NO_DRAFT_SHORTLIST=1 uv run chad  # full-vocab readout for the draft chain
 CHAD_USE_PLD=1            uv run chad  # OPT-IN: wide prompt-lookup decoding
@@ -613,7 +641,9 @@ CHAD_NO_KERNEL_WARM=1     uv run chad  # skip warming verify-width attention ker
   thinking, cold content — it collapses to depth 1–2 or a free skip, so a bad regime
   degrades to fixed-width behavior rather than below it. `CHAD_MTP_ADAPTIVE=0` restores a
   fixed width; `CHAD_MTP_DRAFT=N` forces one and implies adaptive off (an explicit width
-  is an order); the other two override the schedule's cap and its cost seed.
+  is an order); `CHAD_MTP_MAX_DRAFT=N` lowers the schedule's depth cap from its default of
+  31 — set it below 9 and the plateau candidates are unreachable, which is the point when
+  you are bisecting one — and `CHAD_MTP_H` seeds the cost model.
 - **`CHAD_NO_DRAFT_SHORTLIST`** — the greedy draft chain reads its next token from a 2-bit
   shortlist rather than the full vocabulary, because that full-vocab `lm_head` read was
   ~70% of the head-step cost. Draft-side only: a shortlist miss costs a rejected draft
@@ -628,8 +658,15 @@ CHAD_NO_KERNEL_WARM=1     uv run chad  # skip warming verify-width attention ker
   you measure the other arm.
 - **`CHAD_NO_QSDPA_WIDE` / `CHAD_NO_QSDPA_WIDE_SGM`** — disable the multi-token (S>1) tier
   of the fused quantized-KV attention kernel (`mlx_qsdpa.py`), which serves speculative
-  verification and prefill. Without it those steps fall back to dequantizing the whole
-  cache, which the wide path beats by 1.4–1.8× at 32k+. Bit-exact with that fallback.
+  verification. Without it those steps fall back to dequantizing the whole cache once per
+  attention layer, which the wide path beats by 8% at 8k context and 30% at 38k on the
+  widths the adaptive schedule actually jumps to. Same numerics class as that
+  fallback — both within output-dtype rounding of an fp32 reference — but see the
+  note above: not bit-identical to it.
+  (`CHAD_NO_QSDPA_WIDE_SGM` also lowers the width at which chad switches to that fallback,
+  because the schedule left behind replays the S=1 kernel per row and so crosses over
+  sooner.) Prefill chunks are far wider than any verify step and always take the
+  fallback — flat in width, it is the faster of the two up there.
   (`CHAD_QSDPA_WIDE_KERNEL=1` forces the single-kernel variant instead of the split-head
   one — a kernel-selection knob for measurement.) The bigger hammers are still
   `CHAD_NO_QSDPA`, in [Safety & A/B opt-outs](#safety--ab-opt-outs), which disables the
@@ -643,9 +680,9 @@ CHAD_NO_KERNEL_WARM=1     uv run chad  # skip warming verify-width attention ker
   Useful when building a head yourself with `python -m chad.mlx_mtp`.
 - **`CHAD_NO_KERNEL_WARM`** — the attention kernel is templated on its verify width, so a
   width that has never run means a Metal compile lands on the critical path of a real
-  step. Load warms exactly the widths *this* configuration can produce (MTP verifies at
-  one width; wide-PLD at any of 9–32), rather than the union of everything. Opting out
-  moves those compiles into your first few steps.
+  step. Load warms exactly the widths *this* configuration can dispatch — the ones the
+  draft schedule can pick, intersected with the ones the fused kernel serves — rather than
+  the union of everything. Opting out moves those compiles into your first few steps.
 
 ### Dev & instrumentation
 

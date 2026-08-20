@@ -162,25 +162,51 @@ def test_discover_ignores_non_skill_dirs(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Disclosure (catalog) + registry
+# Dispatch (slash menu) + registry
 # ---------------------------------------------------------------------------
 
-def test_catalog_block_empty_when_no_skills(tmp_path):
-    assert skills.catalog_block(str(tmp_path)) == ""
-
-
-def test_catalog_block_lists_skills(tmp_path):
+def test_no_skill_text_reaches_the_system_prompt(tmp_path, monkeypatch):
+    """The load-bearing guarantee of the slash-command design: however many skills are
+    installed, the system prompt does not grow by one token."""
+    from chad import prompt as prompt_mod
     cwd = tmp_path / "proj"
     _write_skill(str(cwd / ".agents" / "skills"), "alpha",
                  description="Do alpha things. Use for alpha.")
-    block = skills.catalog_block(str(cwd))
-    assert "<available_skills>" in block
-    assert "- alpha: Do alpha things. Use for alpha." in block
-    assert "activate_skill" in block  # behavioral instruction present
-    # No per-skill location: `activate()` reports the skill directory and its bundled
-    # resources itself, and on a host with ~60 skills the framing this drops was a
-    # third of the largest block in the system prompt.
-    assert "/SKILL.md" not in block
+    monkeypatch.chdir(cwd)
+    skills.reset_session()
+    built = prompt_mod.build_system_prompt()
+    assert "alpha" not in built
+    assert "Do alpha things" not in built
+    assert "activate_skill" not in built
+
+
+def test_slash_commands_lists_skills(tmp_path, monkeypatch):
+    cwd = tmp_path / "proj"
+    _write_skill(str(cwd / ".agents" / "skills"), "alpha",
+                 description="Do alpha things. Use for alpha.")
+    monkeypatch.chdir(cwd)
+    skills.reset_session()
+    assert skills.slash_commands() == [("/alpha", "Do alpha things. Use for alpha.")]
+
+
+def test_slash_commands_empty_when_no_skills(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    skills.reset_session()
+    assert skills.slash_commands() == []
+
+
+def test_is_skill_command_parses_name_and_task(tmp_path, monkeypatch):
+    cwd = tmp_path / "proj"
+    _write_skill(str(cwd / ".agents" / "skills"), "alpha")
+    monkeypatch.chdir(cwd)
+    skills.reset_session()
+    assert skills.is_skill_command("/alpha") == ("alpha", "")
+    assert skills.is_skill_command("/alpha fix the flaky test") == (
+        "alpha", "fix the flaky test")
+    assert skills.is_skill_command("/alphabet") is None   # exact leading token only
+    assert skills.is_skill_command("/model") is None      # a builtin is never a skill
+    assert skills.is_skill_command("alpha") is None       # needs the leading slash
+    assert skills.is_skill_command("/alpha\nmore") is None  # single-line only
 
 
 def test_registry_cached_and_rebuilt_on_cwd_change(tmp_path, monkeypatch):
@@ -201,7 +227,7 @@ def test_registry_cached_and_rebuilt_on_cwd_change(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Activation (tier 2)
+# Loading (the skill body as a user turn)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -212,61 +238,57 @@ def _in_project(tmp_path, monkeypatch):
     return cwd
 
 
-def test_activate_returns_wrapped_body_and_resources(_in_project):
+def test_load_returns_wrapped_body_and_resources(_in_project):
     d = _write_skill(str(_in_project / ".agents" / "skills"), "pdf",
                      body="# PDF\nDo the steps.")
     os.makedirs(os.path.join(d, "scripts"), exist_ok=True)
     with open(os.path.join(d, "scripts", "extract.py"), "w") as f:
         f.write("print('hi')")
-    out = skills.activate("pdf")
-    assert out.startswith('<skill_content name="pdf">')
+    out = skills.load("pdf")
+    assert out.startswith('<skill name="pdf">')
     assert "Do the steps." in out
     assert "name:" not in out  # frontmatter stripped
     assert "Skill directory:" in out
     assert "scripts/extract.py" in out
-    assert "</skill_content>" in out
+    assert "</skill>" in out
 
 
-def test_activate_dedupes(_in_project):
+def test_load_appends_the_users_task(_in_project):
     _write_skill(str(_in_project / ".agents" / "skills"), "pdf")
-    first = skills.activate("pdf")
-    assert first.startswith("<skill_content")
-    second = skills.activate("pdf")
-    assert "already active" in second
+    out = skills.load("pdf", "fix the flaky test")
+    assert out.rstrip().endswith("fix the flaky test")
 
 
-def test_activate_unknown_name(_in_project):
+def test_load_dedupes(_in_project):
     _write_skill(str(_in_project / ".agents" / "skills"), "pdf")
-    out = skills.activate("nope")
+    first = skills.load("pdf")
+    assert first.startswith("<skill ")
+    second = skills.load("pdf", "and now this")
+    assert "loaded earlier in this conversation" in second
+    assert "<skill " not in second          # the body is not sent twice
+    assert second.endswith("and now this")  # but the new task still gets through
+
+
+def test_load_unknown_name(_in_project):
+    _write_skill(str(_in_project / ".agents" / "skills"), "pdf")
+    out = skills.load("nope")
     assert "no skill named" in out
     assert "pdf" in out  # lists what's available
 
 
 # ---------------------------------------------------------------------------
-# Tool registration
+# Tool surface
 # ---------------------------------------------------------------------------
 
-def test_activate_skill_tool_registered_only_with_skills(_in_project):
-    # No skills yet -> tool absent.
-    names = [s["function"]["name"] for s in tools.active_schemas()]
-    assert "activate_skill" not in names
-    # Add one and rebuild registry.
+def test_skills_add_no_tool_to_the_model(_in_project):
+    """Installing skills must not change the tool surface: selection is the user's."""
+    before = [s["function"]["name"] for s in tools.active_schemas()]
     _write_skill(str(_in_project / ".agents" / "skills"), "pdf")
     skills.reset_session()
-    schemas = tools.active_schemas()
-    sk = next(s for s in schemas if s["function"]["name"] == "activate_skill")
-    enum = sk["function"]["parameters"]["properties"]["name"]["enum"]
-    assert enum == ["pdf"]  # constrained to real names
-
-
-def test_activate_skill_dispatch(_in_project):
-    _write_skill(str(_in_project / ".agents" / "skills"), "pdf", body="# PDF\nbody-text")
-    out = tools.DISPATCH["activate_skill"]({"name": "pdf"})
-    assert "body-text" in out
-
-
-def test_activate_skill_not_mutating():
-    assert "activate_skill" not in tools.MUTATING
+    after = [s["function"]["name"] for s in tools.active_schemas()]
+    assert before == after
+    assert "activate_skill" not in after
+    assert "activate_skill" not in tools.DISPATCH
 
 
 # ---------------------------------------------------------------------------
@@ -275,20 +297,19 @@ def test_activate_skill_not_mutating():
 
 def test_skill_message_detected():
     assert skills.is_skill_message(
-        {"role": "tool", "name": "activate_skill", "content": "<skill_content name=\"x\">..."})
-    assert skills.is_skill_message(
-        {"role": "tool", "name": "read", "content": "<skill_content name=\"x\">leaked"})
+        {"role": "user", "content": '<skill name="x">...'})
     assert not skills.is_skill_message({"role": "tool", "name": "read", "content": "hi"})
     assert not skills.is_skill_message({"role": "user", "content": "hi"})
+    assert not skills.is_skill_message({"role": "user"})  # content may be absent
 
 
 def test_compaction_does_not_truncate_skill_content():
     big = "INSTRUCTIONS LINE\n" * 500
-    skill_content = '<skill_content name="x">\n' + big + "</skill_content>"
+    skill_content = '<skill name="x">\n' + big + "</skill>"
     messages = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "do a thing"},
-        {"role": "tool", "name": "activate_skill", "content": skill_content},
+        {"role": "user", "content": skill_content},
         {"role": "tool", "name": "bash", "content": "noise\n" * 2000},
         {"role": "user", "content": "now the active task"},
         {"role": "tool", "name": "bash", "content": "recent\n" * 2000},

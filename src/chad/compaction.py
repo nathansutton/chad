@@ -79,11 +79,11 @@ def compact_if_needed(messages, render, emit, ctx_limit, prompt_ids, state=None)
         return len(render())
 
     def trunc_tools(keep_recent, head, tail, max_chars):
-        # Activated skill instructions are durable behavioral guidance — exempt them
-        # from truncation (silently shrinking them degrades the agent with no error).
+        # Only tool results are truncated here; a loaded skill now rides as a USER turn
+        # (skills.load), so it is out of this pass's reach by construction and needs no
+        # exemption. Pass 3 is where it has to be protected from deletion.
         idxs = [i for i, m in enumerate(messages)
-                if m.get("role") == "tool" and _COLLAPSED not in m["content"]
-                and not skills.is_skill_message(m)]
+                if m.get("role") == "tool" and _COLLAPSED not in m["content"]]
         stop = len(idxs) - keep_recent if keep_recent else len(idxs)
         for i in idxs[:stop]:
             if len(messages[i]["content"]) > 400:
@@ -120,8 +120,9 @@ def compact_if_needed(messages, render, emit, ctx_limit, prompt_ids, state=None)
         lu = _last_user_idx()
         ceil = max(1, len(messages) - KEEP_RECENT)
         # Oldest deletable indices: after the system prompt, before the recent window,
-        # never the active user query, and never an activated skill message (durable
-        # guidance is kept verbatim). Collect up to BATCH of them in one scan so we
+        # never the active user query, and never a loaded skill's turn (the user asked
+        # for that guidance by name; dropping it degrades the agent with no error, and
+        # nothing would reload it). Collect up to BATCH of them in one scan so we
         # re-tokenize (cur_len) once per batch instead of once per deletion — render()
         # tokenizes the whole transcript, so per-message re-checks made pass 3 O(N²).
         victims = [i for i in range(1, ceil)

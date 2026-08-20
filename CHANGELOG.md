@@ -16,10 +16,32 @@ decoder.
 ~12 GB download; the old weights can be deleted), and chad no longer supports Macs below
 24 GB.
 
+### Skills are slash commands now
+
+- **The skill catalog is out of the system prompt.** Agent Skills used to ride in every
+  prompt as an `<available_skills>` catalog so the model could select one, and be loaded
+  through an `activate_skill` tool. Both are gone. Every installed skill is now a slash
+  command: type `/` to see them all in the completion menu, `/ship` to run one,
+  `/investigate the flaky test` to run one against a specific ask.
+- **The measurement:** against 62 installed skills the catalog cost **4,751 tokens** and
+  the tool's enum another 294 — together 65% of the entire system prompt, on every turn of
+  every session. The system prompt went **7,975 → 2,824 tokens**. On a 24 GB Mac, where
+  the usable window is ~50k, that is 10% of the window handed back, and it no longer grows
+  with the number of skills you have installed.
+- **A loaded skill is a user turn**, not a tool result and not a prompt block — scoped to
+  the task, reclaimable by compaction once it is done (though still protected while the
+  task is live: you asked for that guidance by name).
+- **The load prints its price.** `loaded skill ship (41,238 tokens)` — big skills are big,
+  and on this hardware you should see that when you spend it, not infer it later from a
+  surprise compaction.
+- This is a deliberate divergence from the Agent Skills spec's tier-1 disclosure. chad
+  reads the same `SKILL.md` format from the same directories; it just declines to spend
+  60% of a small model's prompt letting it guess at a choice you can make from a menu.
+
 ### The purge
 
 - **One tool surface.** The model sees exactly `bash`, `edit`, `write`,
-  `write_todos`, and `done` (plus `activate_skill` and MCP tools where configured).
+  `write_todos`, and `done` (plus MCP tools where configured).
   Removed wholesale: the dedicated `read`/`grep`/`glob` tools, the line-addressed
   edit family (`replace_lines`/`insert_lines`), the tree-sitter symbolic tools
   (`repo_map`/`overview`/`view_symbol`/`find_symbol`/`definition`/`find_refs`/
@@ -103,18 +125,31 @@ decoder.
   through S=32). Low-acceptance regimes — temp-1 thinking, cold content — collapse to
   depth 1–2 or a free skip, so the schedule degrades to fixed-k behavior rather than
   below it. `CHAD_MTP_ADAPTIVE=0` restores fixed width; `CHAD_MTP_DRAFT` forces one
-  (and implies adaptive off); `CHAD_MTP_MAX_DRAFT` / `CHAD_MTP_H` override the cap
-  and the cost seed.
+  (and implies adaptive off); `CHAD_MTP_MAX_DRAFT` lowers the depth cap from its
+  default of 31 and `CHAD_MTP_H` seeds the cost model.
 - **An S>1 tier for the fused quantized-KV attention kernel** (`mlx_qsdpa.py`).
-  Speculative verification and prefill both dispatch multi-token attention steps,
-  which previously fell back to dequantizing the whole cache; the new wide path is
-  1.4–1.8× that fallback at 32k+. Bit-exact with the path it replaces.
+  Speculative verification dispatches multi-token attention steps, which otherwise
+  fall back to dequantizing the whole cache once per attention layer. The fused
+  wide path now serves every verify width the draft schedule can pick, up to 24;
+  above that the fallback keeps them, because its cost is flat in width while the
+  fused kernel's partials slab is not, so the two cross over just under 32.
+  Measured on the shipped model as verify-round time (one load, interleaved arms,
+  real forwards): **+8.6% at 8k, +19.8% at 20k, +36.4% at 40k** for a width-10
+  round — the first rung of the plateau, and the one the schedule reaches most —
+  tapering to +2.2/+6.8/+12.3% at width 24. The gain grows with context because
+  the fallback re-reads the whole cache and this kernel reads it packed. Widths
+  the fused path never serves are unchanged within ±0.5%. Numerics stay at
+  output-dtype rounding level against an fp32 reference, the same acceptance class
+  as the fallback — though, like any two kernels for the same math, not bit-identical
+  to it, so flipping the knob can move a greedy near-tie.
   `CHAD_NO_QSDPA_WIDE` / `CHAD_NO_QSDPA_WIDE_SGM` disable the tiers,
   `CHAD_QSDPA_WIDE_KERNEL` forces the single-kernel variant.
 - **Verify-width kernel warming.** The attention kernel is templated on the verify
   width, so a width that has never run is a Metal compile on the critical path of a
-  real step. Load now warms exactly the widths *this* configuration can produce, not
-  the union of everything. `CHAD_NO_KERNEL_WARM=1` opts out.
+  real step. Load now warms exactly the widths *this* configuration can dispatch —
+  the ones the draft schedule can pick, intersected with the ones the fused kernel
+  serves rather than the dequantize fallback — not the union of everything.
+  `CHAD_NO_KERNEL_WARM=1` opts out.
 - **Wide prompt-lookup decoding is now opt-in** (`CHAD_USE_PLD=1`), not default.
   PLD drafts from context recurrence, so it can only accelerate text that already
   appeared — and on real agentic traces that is a minority of what this agent

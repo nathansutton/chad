@@ -209,12 +209,10 @@ def _dynamic_context() -> list:
             if doc:
                 dynamic.append(f"\n# Project instructions ({fname})\n{doc}")
             break
-    # Agent Skills catalog (tier-1 disclosure): name+description+location for every
-    # installed skill, plus how to activate one. Empty string when none are installed.
-    from . import skills
-    catalog = skills.catalog_block()
-    if catalog:
-        dynamic.append(catalog)
+    # Agent Skills contribute NOTHING here on purpose. A catalog of every installed
+    # skill's description measured 4,751 tokens — 60% of the whole system prompt — just
+    # to let the model pick one. The user picks instead, by typing `/name` (see
+    # skills.slash_commands), and only the skill they asked for ever enters the context.
     return dynamic
 
 

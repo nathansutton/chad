@@ -173,18 +173,12 @@ def reject_escalation(name: str) -> str:
     back-to-back. The plain repair message clearly is not landing — the model can't see
     the fix (or the call genuinely can't succeed as written), so re-emitting it verbatim
     just burns turns. Break the loop: stop repeating, and — critically — do NOT fabricate
-    the result the tool would have returned. A silently-failed `activate_skill` that the
-    model papers over by reciting a skill from memory is the worst outcome: confident
-    output that never loaded the real instructions."""
-    extra = ("\n[you have now emitted this exact call twice and it was rejected both "
-             "times — re-emitting it unchanged will not work. Either change the flagged "
-             "field(s), or use a DIFFERENT tool. Do NOT invent or guess the output this "
-             "tool would have returned.]")
-    if name == "activate_skill":
-        extra += ("\n[the skill was NOT loaded. Do not proceed from memory or fabricate "
-                  "its steps. Check the exact skill `name` against the '# Skills' list, or "
-                  "continue the task with the normal read/grep/bash tools instead.]")
-    return extra
+    the result the tool would have returned: confident output invented in place of a
+    call that never succeeded is the worst of the available outcomes."""
+    return ("\n[you have now emitted this exact call twice and it was rejected both "
+            "times — re-emitting it unchanged will not work. Either change the flagged "
+            "field(s), or use a DIFFERENT tool. Do NOT invent or guess the output this "
+            "tool would have returned.]")
 
 
 def close_unclosed_think(text: str, thinking: bool) -> str:
@@ -1506,6 +1500,20 @@ class Agent:
                 "resume, or re-scope the ask smaller (docs/troubleshooting.md)]")
 
 
+def skill_token_cost(engine, text: str) -> int:
+    """What loading this skill actually costs, in tokens of the model's own tokenizer.
+
+    Reported at the point of load because the number is the whole decision: a gstack
+    skill body can run past 40k tokens, which is most of the usable window on a 24 GB
+    box, and a user who types `/name` deserves to see that happen rather than discover
+    it as an unexplained compaction three turns later. Falls back to a chars/4 estimate
+    if the engine has no usable tokenizer."""
+    try:
+        return len(engine.tok.encode(text, add_special_tokens=False))
+    except Exception:  # noqa: BLE001 - a cosmetic number must never break the command
+        return len(text) // 4
+
+
 def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = None,
          thinking: bool = True, ctx_limit_fn=None):
     agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking,
@@ -1564,11 +1572,25 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             continue
         if line == "/help":
             print(f"{C_DIM}/init /skills /mcp /mcp trust /mcp login <server> /reset /clear "
-                  f"/compact /model /mode /exit · !cmd runs a shell command · "
+                  f"/compact /model /mode /exit · /<skill> runs an installed skill "
+                  f"(/skills lists them) · !cmd runs a shell command · "
                   f"@path attaches a file/dir{C_RST}")
             continue
         if line == "/init":
             agent.run_turn(INIT_PROMPT)
+            agent.save()
+            continue
+        # `/<skill>` — checked after every builtin, so a builtin always wins the name.
+        # The skill body becomes the turn itself (see skills.load); its token cost is
+        # printed because a large skill can be most of the window.
+        from . import skills
+        hit = skills.is_skill_command(line)
+        if hit:
+            name, task = hit
+            text = skills.load(name, task)
+            print(f"{C_DIM}loaded skill {name} "
+                  f"({skill_token_cost(engine, text):,} tokens){C_RST}")
+            agent.run_turn(text)
             agent.save()
             continue
         if line.startswith("!"):  # shell passthrough — run directly, don't call the model

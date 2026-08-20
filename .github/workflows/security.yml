@@ -31,37 +31,16 @@ jobs:
           enable-cache: true
       - run: uv sync
       - name: pip-audit (known CVEs in dependencies)
-        # The ignored advisories all live in transitive deps (starlette, python-multipart)
-        # pulled ONLY through `mcp` / the optional `serena-agent` (lsp extra).
-        # serena-agent 1.5.3 — the latest — hard-pins `mcp==1.27.0`, which in turn pins
-        # starlette==1.0.0 / python-multipart==0.0.27, so the whole subtree is frozen: no
-        # upstream upgrade exists to resolve to. Reachability review, per advisory:
-        #   • starlette (PYSEC-2026-{161,248,249}, CVE-2026-48817/48818) and
-        #     python-multipart (CVE-2026-53538/53539/53540) are ASGI SERVER request-handling
-        #     / multipart-parsing bugs. chad uses mcp as a CLIENT (ClientSession + stdio/http
-        #     client transports) — it never runs a Starlette server or parses uploads.
-        #   • mcp CVE-2026-52869/52870/59950 are all mcp==1.27.0 SERVER-side bugs — cross-
-        #     session access in server.experimental task handlers, the SSE/streamable-HTTP
-        #     server transports (mcp.server.sse / streamable_http_manager), and the
-        #     websocket server transport. chad imports only mcp.client.* and mcp.shared.auth
-        #     (verified: no mcp.server.* anywhere in src/chad); it never runs an MCP server,
-        #     so none of these code paths are reachable. Fixed in mcp 1.27.2/1.28.1, but the
-        #     serena-agent pin freezes the tree at 1.27.0 — no resolvable upgrade yet.
-        # Each is pinned by ID (not whole-package) so a NEW advisory still fails the gate.
-        # Drop these when serena-agent unpins mcp and the tree can move to patched versions.
-        run: >-
-          uv run --with pip-audit python -m pip_audit
-          --ignore-vuln PYSEC-2026-161
-          --ignore-vuln PYSEC-2026-248
-          --ignore-vuln PYSEC-2026-249
-          --ignore-vuln CVE-2026-48817
-          --ignore-vuln CVE-2026-48818
-          --ignore-vuln CVE-2026-53538
-          --ignore-vuln CVE-2026-53539
-          --ignore-vuln CVE-2026-53540
-          --ignore-vuln CVE-2026-52869
-          --ignore-vuln CVE-2026-52870
-          --ignore-vuln CVE-2026-59950
+        # No ignore list, deliberately. There used to be eleven, all rooted in one
+        # pin: the optional serena-agent hard-pinned mcp==1.27.0, which froze
+        # starlette==1.0.0 and python-multipart==0.0.27 with no resolvable upgrade,
+        # so the advisories against that subtree had to be waived by ID after a
+        # reachability review. 2.0.0 dropped serena-agent with the LSP tooling and
+        # moved to mcp>=2, which bounds neither package — the tree resolves clean and
+        # audits clean, so every waiver is gone. Keep it that way: a waiver here is a
+        # standing promise to re-review, and the honest fix is almost always to let
+        # the resolver move.
+        run: uv run --with pip-audit python -m pip_audit
 
   secrets:
     # Scans the entire history (fetch-depth: 0) for committed credentials. No license

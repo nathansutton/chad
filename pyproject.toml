@@ -105,7 +105,11 @@ Issues = "https://github.com/nathansutton/chad/issues"
 # types-pyyaml: skills.py imports yaml directly; mypy 1.x refuses to honor
 # ignore_missing_imports for packages with known typeshed stubs, so the gate
 # needs the stubs installed to pass on a plain (no-extra) sync.
-dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "types-pyyaml>=6"]
+# uvicorn: tests/test_mcp.py runs a real Streamable-HTTP MCP server on a loopback
+# port to exercise that transport end to end. It arrives transitively through `mcp`
+# today, but a transitive import in a test is a collection error waiting to happen —
+# `mcp` bounds it (>=0.31.1) and could make it optional. Declare what the tests import.
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "types-pyyaml>=6", "uvicorn>=0.31.1"]
 
 [build-system]
 requires = ["setuptools>=83.0.0"]
@@ -173,10 +177,11 @@ module = "chad.parakeet.*"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-# These modules patch mlx_lm classes that only exist on macOS: with mlx installed
-# (dev Macs, the macos CI jobs) their `type: ignore[method-assign]` comments are load-
+# This module patches mlx_lm classes that only exist on macOS: with mlx installed
+# (dev Macs, the macos CI jobs) its `type: ignore[method-assign]` comments are load-
 # bearing; on the Linux lint runner mlx_lm is absent, the patched classes type as Any,
 # and warn_unused_ignores flags those same comments — unfixable in the code for both
-# platforms at once, so the unused-ignore warning alone is relaxed for them.
-module = ["chad.mlx_fastpath", "chad.mlx_moe_fused"]
+# platforms at once, so the unused-ignore warning alone is relaxed for it. (mlx_qsdpa
+# patches a module-level function, not a class method, so it needs no relaxation.)
+module = ["chad.mlx_fastpath"]
 warn_unused_ignores = false

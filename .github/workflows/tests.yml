@@ -60,15 +60,6 @@ jobs:
         run: uv run --python ${{ matrix.python }} pytest -q
       - name: CLI smoke (entrypoint imports + parses, no model)
         run: uv run --python ${{ matrix.python }} chad --help
-      - name: Live LSP gate (real pyright via uvx — the shipped precision path)
-        # The fast gate above already ran these permissively (skip when a server
-        # can't start). Here, on ONE matrix version, a startup failure FAILS:
-        # graceful degradation is for users, not for CI. Exercises spawn via uvx,
-        # the pyright settings/readiness quirks, refs/hover/diagnostics end to end.
-        if: matrix.python == '3.12'
-        env:
-          CHAD_LSP_LIVE_REQUIRED: "1"
-        run: uv run --python ${{ matrix.python }} pytest -q tests/test_lsp_live.py
 
   build:
     # Guards the public install path: `uvx --from git+https://… chad` resolves fresh

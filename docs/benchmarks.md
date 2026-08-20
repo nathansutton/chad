@@ -29,12 +29,24 @@ that appends ~16 tokens):
 
 | Model | Prefill (cold) | Decode | Warm-step prefill |
 |---|---|---|---|
-| **Qwen3.8-27B** `UD-Q3_K_XL-MTP` (shipped) | *run `chad-bench`* | *run `chad-bench`* | ~0.2 s (16 tok) |
+| **Qwen3.8-27B** `UD-Q3_K_XL-MTP` (shipped) | ~99 tok/s | ~20.3 tok/s | ~0.75 s (16 tok) |
 
-> **2.0.0 changed the default model**, and the prefill/decode columns above are not yet
-> re-measured on it — rather than carry Ornith's numbers under a new model's name, they are
-> left for `chad-bench` to fill in on your own machine. The retired Ornith figures are kept
-> below under [Historical: Ornith](#historical-ornith-35b--9b).
+> Measured on this machine with the command above; run it on yours, the numbers are
+> hardware. The retired Ornith figures are kept below under
+> [Historical: Ornith](#historical-ornith-35b--9b) — do not compare the two columns
+> casually, a sparse MoE activating ~3B params/token and a dense 27B are different animals.
+
+Prefill is the number that moved most with the model change, and it is the honest cost of a
+dense checkpoint: every one of the 27B parameters is read for every token of the prompt, so
+~99 tok/s is close to this chip's compute roofline rather than a tuning failure. It is also
+why the [warm prefix cache](#the-second-session-in-a-project-starts-warm) matters more than any decode work — the third
+column, not the first, is what a session actually pays after its first turn.
+
+The decode figure is steady-state single-token decode. It does not capture the speculative
+plateau: `chad-bench` writes 128 tokens from a cold 5,000-token prompt, and the adaptive
+draft schedule only opens its deep widths behind a full-accept streak, so a short run
+mostly measures the shallow regime. Long generations at long context — the ones that
+dominate an agent session — do reach it.
 
 Two things hold whatever the model. Prefill rate **falls as context grows** (attention is
 quadratic), so a cold-prompt number measured at 5,000 tokens is materially lower by 32k.
@@ -47,30 +59,31 @@ Qwen3.8-27B is dense, so unlike the retired 35B MoE (which activated only ~3B pa
 token) every parameter is read on every token. That is why the quant is aggressive: on a
 dense model, shrinking the weights is the only decode lever there is.
 
-## The agentic-loop win: ~0.2 s per step, not ~10 s
+## The agentic-loop win: ~0.75 s per step, not ~50 s
 
-The headline isn't the cold-prefill rate — it's what a *follow-up* turn costs. Taking the
-retired 35B's measured numbers as the worked example, a 5,000-token transcript prefills
-cold in ~6.8 s. But the next agentic step only appends
-the model's reply, a tool call, and the tool's output, so with the persistent prefix cache
-it re-reads **nothing**: the follow-up turn prefills just the ~16 appended tokens in
-**~0.2 s**.
+The headline isn't the cold-prefill rate — it's what a *follow-up* turn costs. On the
+shipped model a 5,000-token transcript prefills cold in **~50 s**. But the next agentic step
+only appends the model's reply, a tool call, and the tool's output, so with the persistent
+prefix cache it re-reads **nothing**: the follow-up turn prefills just the ~16 appended
+tokens in **~0.75 s**.
 
 ```
-cache-less backend:  re-prefill all 5,144 tokens  ->  ~6.8 s of dead air, every step
-chad (prefix cache): prefill the 16 new tokens     ->  ~0.2 s, every step
+cache-less backend:  re-prefill all 5,143 tokens  ->  ~50 s of dead air, every step
+chad (prefix cache): prefill the 16 new tokens     ->  ~0.75 s, every step
 ```
 
-That ~30× gap is the entire reason a local model can feel like an agent instead of a batch
+That ~67× gap is the entire reason a local model can feel like an agent instead of a batch
 job — and it widens with the transcript, since the cache-less side grows while the warm
-step stays flat. The ratio is a property of the cache, not of the weights, so it survives the
+step stays flat. It also got *wider* with 2.0.0, not narrower: the dense 27B prefills
+slower than the retired 35B MoE did, which costs the first turn and changes nothing after
+it. The ratio is a property of the cache, not of the weights, so it survives the
 model change. Why the cache is *append-only* (and why that's the right trade for a hybrid
 SSM/attention model) is in
 [the cache trade](design.md#trimmable-vs-append-only-the-cache-trade-chad-lives-with).
 
 ## The second session in a project starts warm
 
-The ~0.2 s figure above is the *within*-session win. Across sessions there is a second one,
+The ~0.75 s figure above is the *within*-session win. Across sessions there is a second one,
 and it is larger: chad checkpoints the stable system+tools KV prefix to disk
 (`engine.warm_prefix`) and reloads it when you next start in the same project, so the
 ~7.4k-token system prefix is prefilled **once, ever** rather than once per session.
@@ -131,9 +144,10 @@ on the kernel and moves the whole decode step ~2%, because attention is only a f
 Trust steady-state `chad-bench` tok/s; don't extrapolate from a microbenchmark. 🗿
 
 You don't have to tune any of this. chad picks the fast configuration at startup — the
-KV-cache bit width, the fused-attention schedule (including its split factor, which widens
-past 16k context), and the speculative draft depth are chosen from measurements and applied
-for you. MLX's own runtime knobs are deliberately left alone: `MLX_METAL_FAST_SYNCH` and the
+KV-cache bit width, the fused-attention schedule (which of its kernels runs, up to what
+verify width, and the split factor — which widens past 16k context except for the one
+kernel whose partials slab makes that a loss), and the speculative draft depth are all
+chosen from measurements and applied for you. MLX's own runtime knobs are deliberately left alone: `MLX_METAL_FAST_SYNCH` and the
 command-buffer size limits were swept and every setting was *slower* than mlx's defaults, so
 chad overrides none of them. `chad-bench` reports what you're getting.
 

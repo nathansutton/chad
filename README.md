@@ -180,7 +180,7 @@ model weights**, runs in seconds, and is what CI runs. Throughput on your own ma
 - **live status line** — model, mode, context %, a state glyph + verb, elapsed seconds, and
   **↑prefilled / ↓generated** token counts (with an advancing **%** on an unavoidable full
   re-prefill, so it's never silent).
-- **slash commands** — `/init`, `/skills`, `/mcp`, `/accept`, `/resume`, `/compact`,
+- **slash commands** — `/init`, `/skills`, `/<skill>`, `/mcp`, `/accept`, `/resume`, `/compact`,
   `/model`, `/mode`, `/help`, `/exit`. Same set in the `--repl` line interface.
 - **`@file` / `@dir` mentions** and **`!command` shell passthrough** — pull a file into
   context inline, or run a shell command without invoking the model.
@@ -226,7 +226,8 @@ environment variables, fully documented there.
 chad speaks the same two extension formats as Claude Code:
 
 - **[Agent Skills](https://agentskills.io)** — drop a `SKILL.md` folder in `./.claude/skills/`
-  and chad discovers it, loading the full instructions only when a task matches.
+  and it becomes a slash command: `/ship`, `/investigate the flaky test`. Skills cost
+  nothing until you run one — chad puts no skill catalog in the system prompt.
 - **[MCP servers](https://modelcontextprotocol.io)** — configure stdio or HTTP servers in
   `./.mcp.json` to expose external tools (GitHub, Postgres, Linear, Slack, …) alongside
   chad's builtins, with static-token and OAuth auth.

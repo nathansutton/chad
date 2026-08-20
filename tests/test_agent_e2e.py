@@ -18,9 +18,17 @@ Mirrors the fake-engine style of test_completion_engine.py; hermetic via `tmp_pa
 """
 
 import json
+import shlex
+import sys
 
 from chad.agent import Agent
 from chad.base_engine import BaseEngine, GenStats
+
+# The interpreter running the tests, not whatever `python` PATH happens to hold.
+# A bare `python` does not exist on a stock macOS (only `python3`), so these bash
+# steps exited 127 and the scripted engine ran dry — a launcher-dependent failure
+# that looked like a loop bug.
+PY = shlex.quote(sys.executable)
 
 
 class _FakeTok:
@@ -266,7 +274,7 @@ def test_step_cap_extends_while_turn_lands_verified_changes(tmp_path, monkeypatc
         # The verify step must be an EXECUTING command (python …) — a display command
         # like `echo` no longer clears unverified_edit (bash_result_verifies).
         script += [_tool_call("write", path=str(f), content=f"x = {i}\n"),
-                   _tool_call("bash", command=f"python {f} && echo ok{i}")]
+                   _tool_call("bash", command=f"{PY} {f} && echo ok{i}")]
     script.append(_tool_call("done", summary="finished the long task"))
     agent = _agent(script, max_steps=4)
 
@@ -363,11 +371,11 @@ def test_bash_mutation_triggers_syntax_recheck(tmp_path, monkeypatch):
     # Not about the deliverable recheck (it would defer done here); disable it.
     f = tmp_path / "m.py"
     f.write_text("x = 1\n")
-    breaker = f"python -c \"open(r'{f}','w').write('def f(:\\n')\""
+    breaker = f"{PY} -c \"open(r'{f}','w').write('def f(:\\n')\""
     script = [
         _tool_call("edit", path=str(f), old="x = 1", new="x = 2"),
         _tool_call("bash", command=breaker),      # bash breaks the watched file
-        _tool_call("bash", command=f"python {f}"),  # (fails; keeps turn alive)
+        _tool_call("bash", command=f"{PY} {f}"),  # (fails; keeps turn alive)
         _tool_call("done", summary="attempted"),
     ]
     agent = _agent(script, max_steps=10)

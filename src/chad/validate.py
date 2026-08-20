@@ -41,17 +41,16 @@ VALIDATE = not config.flag("CHAD_NO_VALIDATE")
 
 def _param_schema(name):
     """The `parameters` JSON-Schema for a tool as it is exposed to the model RIGHT NOW —
-    chad's builtins plus every dynamically-appended tool (`activate_skill` when skills are
-    installed, `task`, and any connected MCP server's tool). None if the name is not
-    currently callable.
+    chad's builtins plus every dynamically-appended tool (any connected MCP server's).
+    None if the name is not currently callable.
 
     This reads the LIVE `active_schemas()` set rather than a frozen import-time snapshot.
-    The snapshot was the bug: dynamic tools like `activate_skill` are appended by
-    `active_schemas()` (so the model sees them) but were absent from the frozen table, so a
-    perfectly valid `activate_skill` call validated as an "unknown tool" — while the same
-    error listed it as available (`_known_tools` reads the dispatch table, which *does*
-    contain it). Sourcing both from `active_schemas()` guarantees the validation contract
-    can never drift from what the model is shown."""
+    The snapshot was the bug: a tool appended by `active_schemas()` (so the model sees
+    it) was absent from the frozen table, so a perfectly valid call validated as an
+    "unknown tool" — while the same error listed it as available (`_known_tools` reads
+    the dispatch table, which *does* contain it). An unwinnable loop: no retry could
+    pass. Sourcing both from `active_schemas()` guarantees the validation contract can
+    never drift from what the model is shown."""
     for s in active_schemas():
         if s["function"]["name"] == name:
             return s["function"].get("parameters", {"type": "object"})

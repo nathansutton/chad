@@ -9,7 +9,7 @@ Run: `uv run python tests/test_validate.py`
 
 import os
 
-from chad import skills
+from chad import skills, tools
 from chad.validate import (
     _param_schema,
     coerce_and_validate,
@@ -132,13 +132,44 @@ def test_legacy_validate():
 
 
 # --- Dynamically-appended tools validate against the LIVE schema set ----------
-# Regression: `activate_skill` is appended to what the model sees by
-# tools.active_schemas() only when skills are installed. The validator used to read a
-# frozen import-time snapshot that never contained it, so a valid activate_skill call
-# validated as an "unknown tool" — while the same error listed it as available. An
-# unwinnable loop: no retry could pass. This asserts the validator now tracks the live
-# set, and that the enum guard (constraining `name` to real skills) actually reaches it.
-def test_dynamic_tool_validates(tmp_path, monkeypatch):
+# Regression: tools appended at runtime (a connected MCP server's) are visible to the
+# model via tools.active_schemas() but were absent from the validator's frozen
+# import-time snapshot, so a perfectly valid call validated as an "unknown tool" — while
+# the same error listed it as available. An unwinnable loop: no retry could pass. This
+# pins that both the validator and the repair hint read the live set.
+def test_dynamic_tool_validates(monkeypatch):
+    dynamic = {
+        "type": "function",
+        "function": {
+            "name": "mcp__demo__widgets",
+            "description": "Do a widget thing.",
+            "parameters": {
+                "type": "object",
+                "properties": {"kind": {"type": "string", "enum": ["round", "square"]}},
+                "required": ["kind"],
+            },
+        },
+    }
+    check("dynamic tool unknown before it is appended",
+          _param_schema("mcp__demo__widgets") is None)
+    monkeypatch.setattr(tools, "SCHEMAS", tools.SCHEMAS + [dynamic])
+    # ...now it is a known tool with a real param schema...
+    sch = _param_schema("mcp__demo__widgets")
+    check("dynamic tool has a live param schema", sch is not None, sch)
+    # ...so a valid call validates cleanly (the exact call the trace could never land).
+    _, e = coerce_and_validate("mcp__demo__widgets", {"kind": "round"})
+    check("valid dynamic call accepted (no errors)", e == [], [str(x) for x in e])
+    # ...and an out-of-enum value is rejected, not silently dispatched.
+    _, e2 = coerce_and_validate("mcp__demo__widgets", {"kind": "nope"})
+    check("out-of-enum value rejected", bool(e2), [str(x) for x in e2])
+    # The 'available tools' hint lists it (mirror source), so no contradictory message.
+    msg = render_repair("frobnicate", {}, coerce_and_validate("frobnicate", {})[1])
+    check("repair hint lists the live dynamic tool", "mcp__demo__widgets" in msg, msg)
+
+
+def test_installed_skills_add_no_tool(tmp_path, monkeypatch):
+    """Skills are invoked by the user typing `/name`, never by the model calling a tool,
+    so installing one must not change the validator's view of the tool surface."""
     empty_home = tmp_path / "_home"
     empty_home.mkdir()
     monkeypatch.setattr(os.path, "expanduser",
@@ -150,38 +181,13 @@ def test_dynamic_tool_validates(tmp_path, monkeypatch):
     monkeypatch.chdir(proj)
     skills.reset_session()
     try:
-        # activate_skill is now a known tool with a real param schema...
-        sch = _param_schema("activate_skill")
-        check("activate_skill has a live param schema", sch is not None, sch)
-        check("enum constrained to installed skills",
-              sch["properties"]["name"]["enum"] == ["widgets"], sch)
-        # ...so a valid call validates cleanly (the exact call the trace could never land).
-        _, e = coerce_and_validate("activate_skill", {"name": "widgets"})
-        check("valid activate_skill accepted (no errors)", e == [], [str(x) for x in e])
-        # ...and a hallucinated skill name is rejected by the enum, not silently dispatched.
-        _, e2 = coerce_and_validate("activate_skill", {"name": "nope"})
-        check("unknown skill name rejected via enum", bool(e2), [str(x) for x in e2])
-        # The 'available tools' hint lists it (mirror source), so no contradictory message.
-        msg = render_repair("frobnicate", {}, coerce_and_validate("frobnicate", {})[1])
-        check("repair hint lists the live activate_skill", "activate_skill" in msg, msg)
-    finally:
-        skills.reset_session()
-
-
-def test_dynamic_tool_absent_without_skills(tmp_path, monkeypatch):
-    # With no skills installed, activate_skill is NOT exposed to the model, so the
-    # validator must treat it as unknown (symmetry: the hint won't list it either).
-    empty_home = tmp_path / "_home"
-    empty_home.mkdir()
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(empty_home) if p == "~" or p.startswith("~/") else p)
-    proj = tmp_path / "proj"
-    proj.mkdir()
-    monkeypatch.chdir(proj)
-    skills.reset_session()
-    try:
-        check("activate_skill unknown when no skills installed",
+        check("installed skill is not a callable tool",
+              _param_schema("widgets") is None)
+        check("no activate_skill tool exists",
               _param_schema("activate_skill") is None)
+        check("skill name absent from the available-tools hint",
+              "widgets" not in render_repair(
+                  "frobnicate", {}, coerce_and_validate("frobnicate", {})[1]))
     finally:
         skills.reset_session()
 

@@ -690,19 +690,7 @@ class Engine:
                     and not config.flag("CHAD_NO_DRAFT_SHORTLIST")):
                 self._mtp_draft_readout = mlx_mtp.build_draft_readout(
                     self.model, path)
-            av = config.env_str("CHAD_MTP_ADAPTIVE")
-            if av is not None and av != "":
-                self.mtp_adaptive = av.strip().lower() not in ("0", "false")
-            nd = config.env_int("CHAD_MTP_DRAFT", 0)
-            if nd:
-                self.mtp_num_draft = nd
-                self.mtp_adaptive = False   # an explicit width is an order
-            md = config.env_int("CHAD_MTP_MAX_DRAFT", 0)
-            if md:
-                self.mtp_max_draft = min(md, 8)
-            hv = config.env_float("CHAD_MTP_H", 0.0)
-            if hv:
-                self.mtp_h = hv
+            self._resolve_mtp_knobs()
         self._resolve_kv_bits(qsdpa_ok)
         self._warm_verify_widths()
         self._install_memory_clamp()
@@ -757,16 +745,48 @@ class Engine:
                         "will use the slow unfused path", self.kv_bits,
                         getattr(self, "_head_dim", "?"), gqa or "?")
 
+    def _resolve_mtp_knobs(self) -> None:
+        """Fold the CHAD_MTP_* environment overrides into the draft schedule.
+
+        Split out of load() so the clamping contract is testable without
+        weights — it has already been wrong once. CHAD_MTP_MAX_DRAFT used to
+        clamp to 8, a leftover from before the schedule had plateau candidates:
+        the default cap is DepthPolicy.MAX_DEPTH, so any request of 8 or more
+        silently delivered LESS than the default and took every deep candidate
+        with it. The knob's job is to LOWER the cap: within the policy's own
+        ceiling it must deliver exactly what was asked for, and past it, that
+        ceiling.
+        """
+        from .mlx_mtp import DepthPolicy
+
+        av = config.env_str("CHAD_MTP_ADAPTIVE")
+        if av is not None and av != "":
+            self.mtp_adaptive = av.strip().lower() not in ("0", "false")
+        nd = config.env_int("CHAD_MTP_DRAFT", 0)
+        if nd:
+            self.mtp_num_draft = nd
+            self.mtp_adaptive = False       # an explicit width is an order
+        md = config.env_int("CHAD_MTP_MAX_DRAFT", 0)
+        if md:
+            self.mtp_max_draft = min(md, DepthPolicy.MAX_DEPTH)
+        hv = config.env_float("CHAD_MTP_H", 0.0)
+        if hv:
+            self.mtp_h = hv
+
     def _warm_verify_widths(self) -> None:
         """Build the fused verify kernel's per-width variants at load instead of
         inside the first span that needs one.
 
         The kernel is templated on the verify width, so a width that has never
         run is a Metal compile on the critical path of a real step. Warming only
-        the widths THIS configuration can produce is the point: MTP verifies at
-        exactly one width, wide-PLD at any of 9..32, and warming the union of
-        everything would pay for variants the run will never dispatch. Opt out
-        with CHAD_NO_KERNEL_WARM."""
+        the widths THIS configuration can DISPATCH is the point, and that is two
+        conditions, not one: the schedule has to be able to pick the width (a
+        fixed draft width produces exactly one; the adaptive one produces its
+        candidate set), and the fused kernel has to be the thing that serves it
+        (past `mlx_qsdpa._wide_s_max` the step takes the dequantize-and-fuse
+        branch, which is one stock kernel at any width). Warming the union of
+        everything would pay for variants the run can never reach. Opt out with
+        CHAD_NO_KERNEL_WARM."""
         if not self.kv_bits or config.flag("CHAD_NO_KERNEL_WARM"):
             return          # fp16 cache: no fused kernel, so no variants exist
         widths: set[int] = set()
@@ -793,6 +813,16 @@ class Engine:
             from mlx.utils import tree_flatten
 
             from . import mlx_qsdpa
+            # Only widths the fused kernel actually dispatches are templated on
+            # S; wider steps take the dequantize-and-fuse branch, which is one
+            # stock kernel at any width and has nothing to warm. Warming them
+            # anyway compiled variants no step could reach.
+            if not self._n_kv_heads:
+                return          # warm_widths would reject the shape anyway
+            cap = mlx_qsdpa._wide_s_max(self._n_attn_heads // self._n_kv_heads)
+            widths = {w for w in widths if w <= cap}
+            if not widths:
+                return
             # Scales/norms carry the model's compute dtype; quantized weights
             # are uint32, so take the first float parameter rather than guess.
             # tree_flatten yields (path, array) pairs; the stub types it loosely
