@@ -11,6 +11,8 @@ engineering behind them, see [Design & internals](design.md).*
 ```bash
 uv run chad-bench                       # default: 5000-token prefill, 128-token decode
 uv run chad-bench --prefill-tokens 8000 --gen-tokens 256
+uv run chad-bench --chunk 1024          # force a prefill chunk size (overrides CHAD_PREFILL_CHUNK)
+uv run chad-bench --agentic             # the cache-miss benchmark, below
 ```
 
 It drives the **real** `Engine` on the **real** model (`src/chad/bench.py`) and reports
@@ -31,22 +33,28 @@ that appends ~16 tokens):
 |---|---|---|---|
 | **Qwen3.8-27B** `UD-Q3_K_XL-MTP` (shipped) | ~99 tok/s | ~20.3 tok/s | ~0.75 s (16 tok) |
 
-> Measured on this machine with the command above; run it on yours, the numbers are
-> hardware. The retired Ornith figures are kept below under
-> [Historical: Ornith](#historical-ornith-35b--9b) — do not compare the two columns
-> casually, a sparse MoE activating ~3B params/token and a dense 27B are different animals.
+> Measured on this machine with the command above; run it on yours — these are hardware
+> numbers, not scores. Figures for the models 1.x shipped are archived under
+> [Before 2.0.0](#before-200-the-ornith-tier), and are not comparable: a sparse MoE
+> activating ~3B params/token and a dense 27B are different animals.
 
-Prefill is the number that moved most with the model change, and it is the honest cost of a
-dense checkpoint: every one of the 27B parameters is read for every token of the prompt, so
-~99 tok/s is close to this chip's compute roofline rather than a tuning failure. It is also
-why the [warm prefix cache](#the-second-session-in-a-project-starts-warm) matters more than any decode work — the third
-column, not the first, is what a session actually pays after its first turn.
+Prefill is the honest cost of a dense checkpoint: every one of the 27B parameters is read
+for every token of the prompt, so ~99 tok/s is close to this chip's compute roofline rather
+than a tuning failure. It is also why the [warm prefix
+cache](#the-second-session-in-a-project-starts-warm) matters more than any decode work — the
+third column, not the first, is what a session actually pays after its first turn.
 
 The decode figure is steady-state single-token decode. It does not capture the speculative
 plateau: `chad-bench` writes 128 tokens from a cold 5,000-token prompt, and the adaptive
 draft schedule only opens its deep widths behind a full-accept streak, so a short run
 mostly measures the shallow regime. Long generations at long context — the ones that
 dominate an agent session — do reach it.
+
+`--agentic` measures a different thing and is worth knowing about: it seeds a large context
+(`--context-tokens`, default 24,000) and reproduces the **truncated-turn cache miss** — the
+case where a step ends mid-`<think>` and the next step's prompt is no longer an extension of
+the cache — reporting the re-prefill that step pays with and without the fix. The other three
+numbers tell you how fast the happy path is; this one tells you what an unhappy one costs.
 
 Two things hold whatever the model. Prefill rate **falls as context grows** (attention is
 quadratic), so a cold-prompt number measured at 5,000 tokens is materially lower by 32k.
@@ -55,9 +63,10 @@ warm-step number is the one that decides how the agent *feels*, and it is a prop
 persistent prefix cache rather than of the weights — a follow-up turn prefills the ~16
 tokens it appended, not the whole transcript.
 
-Qwen3.8-27B is dense, so unlike the retired 35B MoE (which activated only ~3B params per
-token) every parameter is read on every token. That is why the quant is aggressive: on a
-dense model, shrinking the weights is the only decode lever there is.
+Qwen3.8-27B is **dense**: every parameter is read on every token, with no sparse routing to
+hide behind. That is why the quant is aggressive — on a dense model, shrinking the weights is
+the only decode lever there is, which is also [why decode sits where it
+does](#why-decode-sits-where-it-does).
 
 ## The agentic-loop win: ~0.75 s per step, not ~50 s
 
@@ -73,12 +82,10 @@ chad (prefix cache): prefill the 16 new tokens     ->  ~0.75 s, every step
 ```
 
 That ~67× gap is the entire reason a local model can feel like an agent instead of a batch
-job — and it widens with the transcript, since the cache-less side grows while the warm
-step stays flat. It also got *wider* with 2.0.0, not narrower: the dense 27B prefills
-slower than the retired 35B MoE did, which costs the first turn and changes nothing after
-it. The ratio is a property of the cache, not of the weights, so it survives the
-model change. Why the cache is *append-only* (and why that's the right trade for a hybrid
-SSM/attention model) is in
+job — and it widens with the transcript, since the cache-less side grows while the warm step
+stays flat. Note which side of the trade the slow cold prefill lands on: it is paid once per
+divergence, and the cache is what makes it once. Why that cache is *append-only* (and why
+that's the right trade for a hybrid SSM/attention model) is in
 [the cache trade](design.md#trimmable-vs-append-only-the-cache-trade-chad-lives-with).
 
 ## The second session in a project starts warm
@@ -86,7 +93,11 @@ SSM/attention model) is in
 The ~0.75 s figure above is the *within*-session win. Across sessions there is a second one,
 and it is larger: chad checkpoints the stable system+tools KV prefix to disk
 (`engine.warm_prefix`) and reloads it when you next start in the same project, so the
-~7.4k-token system prefix is prefilled **once, ever** rather than once per session.
+~2.8k-token system+tools prefix is prefilled **once, ever** rather than once per session.
+(That prefix is the byte-identical head of every turn — the behavioral prompt, the
+workspace snapshot, and the five tool schemas. It grew no skills catalog in 2.0.0, which
+is most of why it is ~2.8k and not the ~8k a tier-1 disclosure would cost; see
+[Agent Skills](configuration.md#agent-skills-agentskillsio).)
 
 Measured on the shipped 27B (M4 Pro, 24 GB), one fixture and one ask, cold vs. warm:
 
@@ -104,61 +115,63 @@ is chad telling you which of these two turns you are about to have.
 
 ## Why decode sits where it does
 
-The intuitive answer is "memory bandwidth" — each token streams the resident weights through
-the chip once, so `tok/s ≈ bandwidth / resident-bytes-per-token`. On a **dense** model like
-the shipped 27B that first-order story is largely right, and it is the reason the quant is
-as aggressive as it is: every parameter is read for every token, so shrinking the weights is
-the only decode lever there is. ~12 GB of weights against this M4 Pro's ~273 GB/s is the
-envelope the engine works inside.
+The first-order answer is memory bandwidth: each token streams the resident weights through
+the chip once, so `tok/s ≈ bandwidth / resident-bytes-per-token`. On a **dense** model that
+story is largely right, and it is why the quant is as aggressive as it is — every parameter
+is read for every token, so shrinking the weights is the only decode lever there is. ~12 GB
+against this M4 Pro's ~273 GB/s is the envelope the engine works inside, and no amount of
+kernel work moves that wall.
 
-> The analysis below was measured on the **retired Ornith 35B MoE**. It is kept because the
-> lessons generalize — but a sparse MoE and a dense hybrid are limited by different things,
-> and 2.0.0 deleted the MoE-specific kernels along with the model, since they could never
-> install on a dense checkpoint.
+Inside the envelope, two things decide how close you get. Both were first measured on the
+retired 35B, whose sparse MoE made them unmissable; the *lessons* are what carried into
+2.0.0, and the code that serves them was rebuilt for the dense checkpoint.
 
-Bandwidth was **not** what limited the 35B MoE, and that mattered for anyone trying to make
-it faster. In-situ ablation of its decode step put bandwidth-minimal cost around 9 ms against
-~14 ms real: the step issued roughly **400 Metal kernels per token**, each carrying ~9 µs of
-launch and gap latency, so it was **dispatch-bound, not bandwidth-bound**. Two consequences:
+- **Dispatch cost is real, and work that removes kernels pays.** In-situ ablation of the
+  35B's decode step put bandwidth-minimal cost around 9 ms against ~14 ms real: the step
+  issued roughly **400 Metal kernels per token**, each carrying ~9 µs of launch and gap
+  latency. A step that is waiting on the command queue does not care how few bytes you
+  read. chad's decode fast-path
+  ([`mlx_fastpath.py`](../src/chad/mlx_fastpath.py)) attacks the kernel count directly: on
+  the shipped model it concatenates each layer's MLP `gate|up` pair and the GatedDeltaNet's
+  four same-input `in_proj` tensors into single `quantized_matmul`s, then compiles the whole
+  S=1 layer step — MLP block and GDN forward each one call, layernorms and residuals folded
+  in. Row-wise math is unchanged and greedy token choices were verified identical to stock.
+  Prefill deliberately keeps the stock op graph: the compiled kernels change bf16 rounding,
+  and on a recurrent hybrid a prefill-side rounding change compounds across the whole
+  transcript. `CHAD_NO_FASTPATH=1` is the A/B arm.
+- **Attention is a reuse problem, not a fetch problem.** Ablating the math out of the fused
+  quantized-KV kernel leaves it streaming at ~331 GB/s — already at this machine's measured
+  roofline — with ~68% of its runtime spent on the GQA q-heads re-reading staged K/V out of
+  threadgroup memory. That is why [`mlx_qsdpa.py`](../src/chad/mlx_qsdpa.py) has a
+  `simdgroup_matrix` schedule giving each simdgroup its own position-stream instead of its
+  own head. This is the part of the kernel work that survived the model change intact — the
+  same kernel serves the shipped model, and 2.0.0 *added* a multi-token (S>1) tier to it so
+  speculative verification and prefill get the fused path too, worth 8% at 8k context and
+  30% at 38k over the dequantize-the-whole-cache fallback at the widths the draft schedule
+  actually jumps to.
 
-- Work that removes *kernels* pays; work that removes *bytes* often doesn't. chad's decode
-  fast-path ([`mlx_fastpath.py`](../src/chad/mlx_fastpath.py)) fuses expert and GDN
-  projections and compiles the whole S=1 layer step, removing ~150 dispatches per token.
-  On top of that, the 35B's per-token MoE block ran as two custom Metal kernels — one for
-  all routed + shared gate|up projections, one folding the down-projections, routing
-  weights, and residual add — worth another 5–7% decode (70.7 → 74.3 tok/s at 8k context),
-  with routing bit-identical to stock. That code is gone as of 2.0.0; the dense fastpath
-  it sat beside is what ships.
-- Attention is the exception, and it's a reuse problem rather than a fetch problem. Ablating
-  the math out of the fused quantized-KV kernel leaves it streaming at ~331 GB/s — already at
-  this machine's measured roofline — with ~68% of its runtime spent on the 8 GQA q-heads
-  re-reading staged K/V out of threadgroup memory. That's why
-  [`mlx_qsdpa.py`](../src/chad/mlx_qsdpa.py) has a `simdgroup_matrix` schedule that gives each
-  simdgroup its own position-stream instead of its own head. This part *does* carry over: the
-  same kernel serves the shipped model, and 2.0.0 added a multi-token (S>1) tier to it for
-  speculative verification and prefill.
-
-The honest caveat, and the reason the numbers above are end-to-end rather than per-kernel:
-**isolated kernel speedups oversell badly.** The attention retile is a measured 1.26–1.40×
-on the kernel and moves the whole decode step ~2%, because attention is only a fifth of it.
-Trust steady-state `chad-bench` tok/s; don't extrapolate from a microbenchmark. 🗿
+The honest caveat, and the reason every number on this page is end-to-end rather than
+per-kernel: **isolated kernel speedups oversell badly.** The attention retile measured
+1.26–1.40× *on the kernel* and moved the whole decode step ~2%, because attention is only a
+fifth of it. Trust steady-state `chad-bench` tok/s; don't extrapolate from a microbenchmark. 🗿
 
 You don't have to tune any of this. chad picks the fast configuration at startup — the
 KV-cache bit width, the fused-attention schedule (which of its kernels runs, up to what
-verify width, and the split factor — which widens past 16k context except for the one
-kernel whose partials slab makes that a loss), and the speculative draft depth are all
-chosen from measurements and applied for you. MLX's own runtime knobs are deliberately left alone: `MLX_METAL_FAST_SYNCH` and the
-command-buffer size limits were swept and every setting was *slower* than mlx's defaults, so
-chad overrides none of them. `chad-bench` reports what you're getting.
+verify width, and the split factor, which widens past 16k context except for the one kernel
+whose partials slab makes that a loss), and the speculative draft depth are all chosen from
+measurements and applied for you. MLX's own runtime knobs are deliberately left alone:
+`MLX_METAL_FAST_SYNCH` and the command-buffer size limits were swept and every setting was
+*slower* than mlx's defaults, so chad overrides none of them. `chad-bench` reports what
+you're getting.
 
 ## The model: Qwen3.8-27B
 
 chad runs **one** model — [`Qwen3.8-27B UD-Q3_K_XL-MTP`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX),
 a dense `qwen3_5` hybrid (64 layers: 48 GatedDeltaNet + 16 full attention) quantized to
-3-bit group-64 with `lm_head` held at 5-bit, ~12 GB resident. There is no RAM-aware pick and
-no size tier: 2.0.0 retired the Ornith 35B/9B pair, and chad targets 24 GB Macs and nothing
-smaller. The vision tower is not present at all (it was dropped at conversion time; mlx-lm's
-`qwen3_5` loader would have discarded it at load anyway).
+3-bit group-64 with `lm_head` held at 5-bit, ~12 GB resident, 262k native context. One
+model, every machine — no RAM-aware pick, no size tier, no flag. chad targets 24 GB Macs and
+nothing smaller. The vision tower is not present at all (it was dropped at conversion time;
+mlx-lm's `qwen3_5` loader would have discarded it at load anyway).
 
 It's a *thinking* model that emits tool calls in the XML `<function=…>` dialect — the
 harness parses both that and JSON, and strips `<think>` blocks. It also ships its trained
@@ -195,24 +208,32 @@ self-speculating checkpoint the head is strictly the better of the two.
 
 Capability is measured on [Terminal-Bench 2.1](https://www.tbench.ai/leaderboard), and the
 whole run is reproducible **from a Mac**: the exact Harbor agent adapter, the runner script,
-and the serving recipe live in [`benchmarks/tb2/`](../benchmarks/tb2/README.md). Serve a
-model with `mlx_lm.server` (or a GGUF from a GPU box, if yours can't hold the weights), point
-the kit at it, and check the number yourself.
+and the serving recipe live in [`benchmarks/tb2/`](../benchmarks/tb2/README.md). chad is
+installed *into* each task container — TB2 verifies a task by the container's end state — so
+generation has to be remote: the in-container chad runs `--backend llama` against a server
+you provide. Serve this Mac's own weights with
+[`chad serve`](configuration.md#serving-the-local-model-to-a-container-chad-serve), or a GGUF
+with `llama-server` from a box that can hold them. Not `mlx_lm.server`: it strips the
+`<think>` block, which makes it unusable for a reasoning model.
 
-**The 2.0.0 default has not been scored yet.** Changing the default model invalidates the
-score measured on the old one, and chad's release rule is that a benchmark claim flips in its
-own dedicated commit once the run lands — never bundled into the release that changed the
-thing being measured. So 2.0.0 ships with no pass-rate claim.
+**The 2.0.0 default has not been scored yet, and this page will not guess.** Changing the
+default model invalidates the score measured on the old one, and chad's release rule is that
+a benchmark claim flips in its own dedicated commit once the run lands — never bundled into
+the release that changed the thing being measured. So 2.0.0 ships with no pass-rate claim,
+and the only scored number on this page is [archived under the model that earned
+it](#before-200-the-ornith-tier).
 
 Mind the kit's standing caveat when you run it: TB2 pass-rate is **throughput-sensitive**.
 Tasks carry wall-clock budgets, so your serving speed is part of the score, and a slow host
 can fail a task on time rather than on capability.
 
-### Historical: Ornith 35B / 9B
+### Before 2.0.0: the Ornith tier
 
-Kept for the record, and because the reproduction kit still works against these weights.
-**None of this describes what you get from chad 2.0.0** — the Ornith models were retired as
-defaults in that release.
+Archived, not claimed. Through 1.x chad shipped **two** models and picked between them by
+RAM — Ornith-1.0-35B on a 24 GB box, Ornith-1.0-9B on 16/18 GB. 2.0.0 retired both for a
+single dense 27B and made 24 GB the floor. **Nothing in this section describes what you get
+from chad today**; it is kept because the 57% below is a published number and a published
+number should stay checkable.
 
 <img src="tbench-size-vs-score.png" width="840" alt="Terminal-Bench 2.1: accuracy vs. cost per run. Every verified entry is a proprietary frontier model in a datacenter, costing $130–$2,000 per run. chad + Ornith (a 35B MoE) clears 57% on an Apple Silicon laptop for the electricity — the only no-API-cost point on the board.">
 
@@ -220,11 +241,11 @@ defaults in that release.
 |---|---|---|---|
 | chad 1.x, 2026 | Ornith-1.0-35B `UD-Q2_K_XL` | **57%** (51/89) | k=1, self-run, **not leaderboard-verified** |
 
-The comparison the chart makes was the point of it: every *verified* entry on the TB 2.1
-board is a proprietary frontier model in a datacenter, scoring 59–84% and spending
-$130–$2,000 in API fees per run. That result sat at 57% for the electricity. The axis is
-capability per dollar, and it is the reason chad exists — but the number itself belongs to a
-model chad no longer ships, and is recorded here rather than claimed on the front page.
+The comparison the chart makes is the durable part, and it is why chad exists: every
+*verified* entry on the TB 2.1 board is a proprietary frontier model in a datacenter, scoring
+59–84% and spending $130–$2,000 in API fees per run. That result sat at 57% for the
+electricity. The axis is capability per dollar. The *point* survives the model change; the
+number does not travel with it, which is why it lives here instead of on the front page.
 
 Throughput for the retired pair, measured with `chad-bench` on an M4 Pro (5,000-token cold
 prompt, 128-token decode, a follow-up turn appending ~16 tokens):
@@ -234,8 +255,12 @@ prompt, 128-token decode, a follow-up turn appending ~16 tokens):
 | Ornith-1.0-35B (2-bit MoE) | ≥ 24 GB | ~730 tok/s | ~74 tok/s | ~0.2 s (16 tok) |
 | Ornith-1.0-9B (4-bit dense) | 16 / 18 GB | ~360 tok/s | ~46 tok/s | ~0.25 s (16 tok) |
 
-The 35B MoE activated only ~3B params/token, which is why it decoded ~1.6× faster than the
-9B dense model despite 4× the parameters.
+Read those columns against the 27B's with care rather than as a regression. The 35B MoE
+activated only ~3B params per token — which is why it both prefilled ~7× faster and decoded
+~1.6× faster than the 9B dense model despite four times the parameters — and sparsity is
+exactly what 2.0.0 gave up. What it bought is on the [capability](#task-pass-rates-terminal-bench-21-reproducible)
+side of the ledger, and the warm-step column, the one a session actually pays, barely moved.
+
 
 ---
 

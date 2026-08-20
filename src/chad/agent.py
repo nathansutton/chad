@@ -1304,8 +1304,9 @@ class Agent:
                 return terminal.get("summary") or text or "Done."
 
             # Loop guard: count identical tool-call sets across the whole turn (not a
-            # sliding window) so alternating cycles like read A / read B / read A are
-            # caught too. 3rd identical occurrence -> nudge; if nudges don't help, abort.
+            # sliding window) so alternating cycles like `sed -n A` / `sed -n B` /
+            # `sed -n A` are caught too. 3rd identical occurrence -> nudge; if nudges
+            # don't help, abort.
             sig = guardrails.loop_signature(calls)
             seen_before = recent_sigs.count(sig)
             recent_sigs.append(sig)

@@ -669,7 +669,7 @@ class Engine:
             self.model, self.tok = load(path, model_config=override)
         self._read_model_shape(path)
         # Decode fast-path (fused projections + compiled S=1 layer step) for the
-        # hybrid MoE checkpoint; silent no-op on any other model or on failure.
+        # dense qwen3_5 hybrid; silent no-op on any other model or on failure.
         from . import mlx_fastpath
         _log_mlx_provenance()
         mlx_fastpath.install(self.model, model_path=path)

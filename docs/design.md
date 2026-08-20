@@ -6,11 +6,24 @@ usage, see the [README](../README.md). For measured numbers, see
 
 ## Why chad exists
 
-The interesting engineering in a local coding agent isn't the tool use — it's making a
-small model on a laptop feel *responsive* in an agentic loop. That comes down to one
-idea:
+Two ideas hold this design up, and 2.0.0 is the release where the second one won an
+argument with the first.
 
-**Context is not free, and prefill is the bill.**
+**Context is not free, and prefill is the bill** — the engine half, and the reason chad
+owns its inference loop instead of talking to a server.
+
+**The model already knows more than the harness can teach it** — the harness half, and the
+reason 2.0.0 is *smaller* than 1.x. A registry of ~56 behavioral levers and a much larger
+bespoke tool surface were measured against a bare model-plus-shell loop, repeatedly, and did
+not beat it.
+What shipped instead is five tools, eight result-channel behaviors, and a shell the model
+learned in pretraining ([below](#why-the-tool-surface-is-five-tools)).
+
+They meet in the same place: every tool you add and every lever you teach is prompt tokens
+the model re-reads on every turn, and prefill is what you pay for them. A harness that
+earns its context is also a faster one.
+
+### Context is not free, and prefill is the bill
 
 Every turn of an agentic loop, the model has to *read* the entire conversation so far
 before it can write a single new token. That read is the **prefill**: running the
@@ -22,10 +35,11 @@ output to the transcript, so a naive backend re-reads an ever-longer prompt *eve
 step*. That is O(n) work per step and O(n²) over a session.
 
 Concretely, on a 24 GB M4 Pro: by step 20 a real coding session is ~5,000 tokens of
-transcript, which the model prefills in ~6.8 s. Re-reading it every step is **~7 seconds of
-dead air before the model says anything — every step, and growing faster than linearly**,
-since the prefill *rate* also falls as the prompt lengthens (~730 tok/s at 5k, ~500 by
-32k). Over a 40-step task, prefill (not generation) is where the minutes vanish.
+transcript, which the shipped 27B prefills in **~50 s** (~99 tok/s — a dense model reads
+every one of its parameters for every token of the prompt). Re-reading that every step is
+**most of a minute of dead air before the model says anything — every step, and growing
+faster than linearly**, since the prefill *rate* also falls as the prompt lengthens. Over
+a 40-step task, prefill (not generation) is where the hours vanish.
 
 chad's answer is a **persistent prefix KV cache**: keep the KV state alive across turns
 and diff each new prompt against what's already cached, so you only prefill the handful
@@ -37,9 +51,12 @@ step N prompt:  [ system + tools | cwd · CLAUDE.md | turn 1 | … | turn N-1 | 
                           prefill 0 tokens (reused verbatim)              prefill ~30
 ```
 
-Same session, ~30 new tokens per step instead of 5,000: **~0.1 s of prefill per step
-instead of ~15 s.** That gap is the entire reason a 27B model on a laptop can feel like
-an agent instead of a batch job.
+Same session, a couple of dozen new tokens per step instead of 5,000: **under a second
+of prefill per step instead of ~50 s** (measured warm step: ~0.75 s for 16 appended
+tokens). That ~67× gap is the entire reason a 27B model on a laptop can feel like an
+agent instead of a batch job — and it *widens* with the transcript, since the cache-less
+side grows while the warm step stays flat. The numbers are in
+[benchmarks](benchmarks.md#the-agentic-loop-win-075-s-per-step-not-50-s).
 
 ### Why prefill is *hard*, not just expensive
 
@@ -63,9 +80,8 @@ model act like a coding agent.
 ## Why there's no model picker
 
 Every other local-agent harness leads with a model menu — 75-provider matrices,
-Ollama pulls, quant pickers. chad ships exactly one model per RAM tier and no flag to
-change it. That's not a missing feature; it's the design's load-bearing wall, for
-three reasons:
+Ollama pulls, quant pickers. chad ships exactly one model and no flag to change it.
+That's not a missing feature; it's the design's load-bearing wall, for three reasons:
 
 1. **The harness is tuned to the model, and that tuning is the product.** chad's
    tool-call parsing (four dialects + repair), edit forgiveness cascade, think-budget
@@ -81,7 +97,7 @@ three reasons:
    that boundary is the whole moat (see
    [The bet: the harness beats the model](../README.md#the-bet-at-this-end-of-the-report-card-the-harness-beats-the-model)).
 3. **Zero decisions is the UX, not a compromise.** The target user comes from Claude
-   Code, which also has no model picker. One command, RAM decides, it works — that's
+   Code, which also has no model picker. One command, no decision, it works — that's
    the experience being copied, and every menu before the first task is a place to
    lose someone.
 
@@ -92,12 +108,12 @@ llama.cpp server as a measured ablation arm (you lose the on-disk warm-prefix ch
 and cache-quarantine — the KV lives in the server — documented in-code).
 Opinionated defaults, real overrides. 🗿
 
-2.0.0 went *further* in this direction rather than softening it. The Ornith 35B/9B pair and
-the RAM-aware pick that chose between them are gone; chad ships one model, Qwen3.8-27B, on
-every machine. The `35b` / `9b` shorthands went with them — `--model` now takes a repo id or
-a directory and nothing else. The tier existed to serve Macs below 24 GB, and chad no longer
-claims to: 24 GB is the target and the floor. What used to be "one model per RAM tier" is
-now just one model, which is the same principle with one fewer branch.
+2.0.0 went *further* in this direction rather than softening it. Through 1.x there was one
+model *per RAM tier* — the Ornith 35B/9B pair, with a RAM-aware pick choosing between them.
+Both are gone; chad ships one model, Qwen3.8-27B, on every machine, and the `35b` / `9b`
+shorthands went with them (`--model` now takes a repo id or a directory and nothing else).
+The tier existed to serve Macs below 24 GB, and chad no longer claims to: 24 GB is the
+target and the floor. Same principle, one fewer branch.
 
 ## Trimmable vs. append-only: the cache trade chad lives with
 
@@ -194,8 +210,11 @@ A sixth tool was built and measured, and did not survive it:
   carried by a single task; on three of six the model ran a search *and* the same greps
   it would have run anyway, and on one it had the tool and never called it. Retrieval
   quality was never the problem: the model reaches for the shell because that is what
-  its prior does, and a tool it half-adopts is pure context cost. The measurement
-  harness stays in `benchmarks/search/`; the tool does not.
+  its prior does, and a tool it half-adopts is pure context cost. The tool is gone;
+  the measurement is kept in `benchmarks/search/` as the record of why, with the
+  paired rows under `_runs/`. It is a record, not a live harness — `rank.py` and
+  `measure.py` import the `chad.search` module that went with the tool, so they no
+  longer run against this tree.
 
 ## Architecture
 
@@ -203,19 +222,21 @@ The code is a standard `src/` package; tests live in `tests/`:
 
 ```
 src/chad/        importable package (uv installs it as the `chad` console script)
-  cli.py         argument parsing + the one entrypoint (chad.cli:main)
+  cli.py         argument parsing + entrypoint (chad.cli:main), plus `serve`/`prove`/`levers`
   agent.py       agentic loop + guardrails
   engine.py      MLX inference + persistent prefix cache
-  tools.py       the bash/edit/write toolset
+  tools.py       the five-tool surface + JSON schemas
+  ambient.py     the eight result-channel levers
   tui.py         full-screen prompt_toolkit UI
-  ...            prompt, render, ambient, repomap, validate, … (modular)
+  ...            prompt, render, repomap, validate, compaction, skills, mcp, … (modular)
 tests/           pytest suites (uv run pytest)
 ```
 
 ```
 cli.py ──▶ agent.py (agentic loop + guardrails) ──▶ engine.py (MLX + persistent prefix cache)
                  │                                          │
-                 └─ tools.py (bash/edit/write)
+                 ├─ tools.py (bash · edit · write · write_todos · done)
+                 └─ ambient.py (what the result channel adds back)
 ```
 
 - **engine.py** — loads the model once, keeps its KV cache alive across turns, and on every
@@ -225,7 +246,9 @@ cli.py ──▶ agent.py (agentic loop + guardrails) ──▶ engine.py (MLX +
 - **agent.py** — renders the conversation through the model's chat template (with tool
   schemas), streams the turn, parses tool calls, runs them, feeds results back, loops
   until the model stops calling tools.
-- **tools.py** — the Claude-Code-style toolset with JSON schemas.
+- **tools.py** — the five-tool surface and its JSON schemas, plus the edit forgiveness
+  cascade. **ambient.py** wraps the results on the way back.
+
 ## What it borrows from the masters
 
 Small local models are flaky tool-callers, so the harness leans on hard-won ideas from
@@ -242,18 +265,22 @@ existing agents:
   drift). `tool_edit` now retries exact → escape-normalized → whitespace-flexible, each
   still requiring a *unique* target (never edits on ambiguity), and returns the closest
   line in the file on a true miss so the model self-corrects instead of looping. Guarded
-  by `test_edit.py` (13 cases incl. safety: a wrong/ambiguous `old` must not change a byte).
-- **Loop guard** — identical tool calls counted across the whole turn (catches
-  alternating `read A / read B` cycles); 3rd repeat nudges, persistent looping aborts
-  the turn cleanly instead of spinning forever.
+  by `test_edit.py`, whose safety half asserts the converse: a wrong or ambiguous `old`
+  must not change a byte.
+- **Loop guard** — identical tool calls counted across the whole turn, not just
+  consecutively (so an alternating `sed -n A / sed -n B` cycle is caught too); 3rd
+  repeat nudges, persistent looping aborts the turn cleanly instead of spinning forever.
 
 **[opencode](https://github.com/anomalyco/opencode) `beast` prompt — making weaker models agentic:**
 - **Persistence** — keep going until the request is resolved; don't yield early.
 - **Verify by running** — and "when you say you'll call a tool, actually call it."
 
 **[OpenHarness](https://github.com/HKUDS/OpenHarness) — base prompt structure:**
-- Lead-with-the-answer tone, read-before-edit, don't over-engineer, prefer dedicated
-  tools over `bash`, and an injected **environment section** (OS/shell/cwd).
+- Lead-with-the-answer tone, read-before-edit, don't over-engineer, and an injected
+  **environment section** (OS/shell/cwd).
+- One principle from this list 2.0.0 **inverted**: prefer dedicated tools over `bash`.
+  chad has no dedicated tools left to prefer, and the prompt now says the opposite —
+  `bash` is the primary tool ([above](#why-the-tool-surface-is-five-tools)).
 
 **[deepagents](https://github.com/langchain-ai/deepagents) — "batteries included":**
 - **Planning tool** (`write_todos`) — for any 2+ step task the model lays out a plan and

@@ -173,41 +173,50 @@ agent loop (`agent.py`).
 
 ## Context window (agentic coding needs room)
 
-By default the harness uses the model's **full native window** instead of an arbitrary
-cap. `CHAD_MAX_CONTEXT` requests more and **YaRN-extends** a model past native when its
-config supports it, capped at the model's documented max — so `CHAD_MAX_CONTEXT=262144`
-resolves to "256k, or the model's max". KV cache grows lazily, so a large window costs
-nothing until tokens fill it — and on the shipped model the KV cache is
-**quantized to 8-bit by default** (half the fp16 footprint; `CHAD_KV_BITS=0`
-restores fp16).
+By default the harness uses the model's **full native window** instead of an arbitrary cap,
+then lets the RAM-aware governor decide how much of it this machine can actually spend. On
+the shipped model native is **262k**, so there is nothing to extend — `CHAD_MAX_CONTEXT` is
+mostly a knob for an arbitrary `--model`, where it requests a larger window and
+**YaRN-extends** the checkpoint past native if its config supports it, capped at the model's
+documented max. Setting it *below* native is the one use that bites on the shipped model:
+it lowers the ceiling the governor sizes against. KV cache grows lazily, so a large window
+costs nothing until tokens fill it — and the cache is **quantized to 8-bit by default** (half
+the fp16 footprint; `CHAD_KV_BITS=0` restores fp16).
 
-How much it costs depends on the model's attention design. The table below is
-illustrative for a **pure-attention** transformer (e.g. the Qwen2.5-Coder models the
-eval bench keeps for research), where the KV cache grows linearly with context:
+How much it costs is a property of the model's attention design, and the shipped one is
+unusually cheap here. Qwen3.8-27B is a **hybrid SSM/attention** model: 48 of its 64 layers
+are GatedDeltaNet and carry a *fixed-size* recurrent state no matter how long the context
+gets, so only the 16 full-attention layers grow with it. Measured footprint, at the 8-bit
+default:
 
-| Context | KV cache (`CHAD_KV_BITS=0`, fp16) | KV cache (8-bit, default) |
+| Context | KV cache (8-bit, default) | Notes |
 |---|---|---|
-| 32k | 1.2 GB | 0.6 GB |
-| 128k (YaRN) | 4.8 GB | 2.4 GB |
-| 256k | 9.7 GB | 4.8 GB |
+| 32k | 1.1 GB | |
+| ~56k | 2.0 GB | roughly where a 24 GB Mac's window lands |
+| 128k | 4.6 GB | needs a bigger box than the floor |
+| 262k (native) | 9.1 GB | the checkpoint's max; unreachable on 24 GB |
 
-Qwen3.8-27B — the model chad ships — is a **hybrid SSM/attention** model: 48 of its 64
-layers are GatedDeltaNet and carry a *fixed-size* recurrent state no matter how long the
-context gets, so only the 16 full-attention layers grow. Its real footprint is much flatter
-than the table above (measured: 34,816 bytes per token). When the prompt nears the window,
-old verbose tool outputs are compacted.
+That is **34,816 bytes per token**. A pure-attention transformer of the same shape — all 64
+layers keeping per-token K/V rather than 16 — would spend ~131,000 bytes per token at the
+same quantization, about **4×** as much, and its 128k row alone would exceed the whole
+machine. Trading trimmability for a flat memory profile is what buys the window
+([design](design.md#trimmable-vs-append-only-the-cache-trade-chad-lives-with)); `CHAD_KV_BITS=0`
+roughly doubles the numbers above. When the prompt nears the window, old verbose tool outputs
+are compacted.
 
-8-bit KV used to cost ~20-30% throughput (mlx_lm's quantized attention is
-unfused), which is why it was opt-in. chad now ships a fused quantized-KV
-decode kernel (installed automatically when the model's attention shape is
-covered — the shipped model is), making the quantized cache *faster*
-than fp16 at long context (measured on the retired 35B at 32k: 60.2 vs 55.8 tok/s) on top
-of the RAM halving, so it is the default. `CHAD_KV_BITS=0` restores the fp16 cache;
-`CHAD_NO_QSDPA=1` keeps the quantized cache but disables the fused kernel
-(debug only — that combination is the old slow path).
+8-bit KV used to cost ~20–30% throughput, because mlx_lm's quantized attention is unfused —
+which is why it was opt-in through most of 1.x. chad now ships a fused quantized-KV decode
+kernel, installed automatically when the model's attention shape is covered (the shipped
+model's is), which makes the quantized cache *faster* than fp16 at long context on top of
+halving the RAM. That is why it is the default. The crossover was measured on the shape that
+was shipped at the time — the 35B, at 32k: 60.2 vs 55.8 tok/s — and the mechanism is the
+kernel, not the weights, so it holds on any covered model; `chad-bench` reports what your
+machine is actually getting. `CHAD_KV_BITS=0` restores the fp16 cache; `CHAD_NO_QSDPA=1`
+keeps the quantized cache but disables the fused kernel (debug only — that combination is
+the old slow path).
 
 ```bash
-CHAD_MAX_CONTEXT=131072 uv run chad   # full 128k agentic context
+CHAD_MAX_CONTEXT=131072 uv run chad   # cap the window at 128k (the shipped model is 262k native)
 ```
 
 ## Advanced (env vars)
@@ -216,8 +225,9 @@ The rarely-touched tuning knobs live in environment variables so they stay off t
 `--help`. Same capability, sane defaults when unset:
 
 ```bash
-CHAD_MAX_CONTEXT=131072 uv run chad      # YaRN-extend to the model's full 128k window
+CHAD_MAX_CONTEXT=131072 uv run chad      # request a window (YaRN-extends a smaller --model past native)
 CHAD_KV_BITS=0          uv run chad      # fp16 KV cache (8-bit fused is the default where covered)
+CHAD_KV_CACHE_MAX_GB=4  uv run chad      # disk budget for the warm-prefix KV checkpoints (default 8; 0 = unlimited)
 CHAD_CTX_LIMIT=28000    uv run chad      # force the compaction threshold (overrides the RAM-aware default)
 CHAD_CTX_SAFETY=0.95    uv run chad      # the single headroom lever: fraction of the Metal budget
                                          # the auto-sizing may spend (default 0.975 — hold back 2.5%)
@@ -225,10 +235,19 @@ CHAD_CTX_SLOPE_FACTOR=1.5 uv run chad    # A/B knob: per-token cost multiplier f
                                          # (default 1.0 — a token's marginal cost is its KV cost)
 CHAD_MODEL=/path/to/mlx-model uv run chad  # power-user escape hatch: run a different MLX model
                                          # (also: --model auto|<repo> — the CLI twin, wins over this)
-CHAD_PREFILL_CHUNK=1024 uv run chad      # force a fixed prefill chunk (default: adaptive — MoE 2048
-                                         # / dense 512, decaying to 256 as context+pressure grow)
+CHAD_PREFILL_CHUNK=1024 uv run chad      # force a fixed prefill chunk (default: adaptive — 512 on the
+                                         # shipped dense model, decaying to 256 as context+pressure grow)
 CHAD_NO_MEMORY_CLAMP=1  uv run chad      # A/B knob: skip the Metal allocator clamps installed at load
 ```
+
+**`CHAD_KV_CACHE_MAX_GB`** is the only one of these that spends *disk* rather than RAM.
+The warm-prefix checkpoints ([benchmarks](benchmarks.md#the-second-session-in-a-project-starts-warm))
+live in `~/.cache/chad/kv`, one file per distinct system prompt — so a machine with many
+projects accumulates them. chad LRU-evicts that directory down to this budget (default
+**8 GB**) after each write, always protecting the file it just wrote and the live warm
+prefix, so trimming the budget costs a cold first turn in the least-recently-used projects
+and nothing else. `0` disables eviction. Each checkpoint has a fixed ~51 MB floor from the
+serialized recurrent SSM state, which is why the budget is in GB and not MB.
 
 By default the auto-compaction threshold (when chad reclaims old context — a full
 re-prefill on this non-trimmable cache, so we do it as rarely as RAM allows) is **sized
@@ -254,12 +273,11 @@ tens of thousands of tokens once the weights and the KV cache are paid for — a
 native number is context the run can never spend. When the governor is what bound it,
 the banner says so: `84k of 262k context`.
 
-`--model` (or `CHAD_MODEL`) takes `auto` — the shipped model — or any Hugging Face repo id
-/ local MLX model directory. There are no size shorthands: 2.0.0 retired the Ornith 35B/9B
-pair and the RAM-aware pick that chose between them, so `--model 9b` is now just a literal
-(and nonexistent) repo id rather than a silent alias. Pointing it at other weights is
-supported and kept on purpose — one shipped model is a default, not a restriction — but the
-harness is *tuned* to the shipped model, so the realistic cost is throughput, not
+`--model` (or `CHAD_MODEL`) takes `auto` — the shipped model — or any Hugging Face repo id /
+local MLX model directory, and nothing else. There are no size shorthands: `--model 9b` is a
+literal (and nonexistent) repo id, not an alias, and fails as one. Pointing it at other
+weights is supported and kept on purpose — one shipped model is a default, not a restriction
+— but the harness is *tuned* to the shipped model, so the realistic cost is throughput, not
 correctness. The flag wins over `CHAD_MODEL`, so a globally exported var can't pin every
 run.
 
@@ -281,11 +299,11 @@ the checkpoint's own trained MTP head as `mtp.safetensors` for
 
 [model]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX
 
-**chad targets 24 GB Apple Silicon and nothing smaller.** There is no low-RAM fallback any
-more, because there is no second model. On a smaller box chad prints a one-line warning at
-startup and runs anyway — it advises, it does not gate — but ~12 GB of weights plus the
-~4.3 GB prefill transient leave almost nothing for a KV cache, so the window collapses
-toward its floor. Even at 24 GB the honest figure is roughly ~56k of the model's 262k
+**chad targets 24 GB Apple Silicon and nothing smaller.** There is no low-RAM fallback,
+because there is no second model to fall back to. On a smaller box chad prints a one-line
+warning at startup and runs anyway — it advises, it does not gate — but ~12 GB of weights
+plus the ~4.3 GB prefill transient leave almost nothing for a KV cache, so the window
+collapses toward its floor. Even at 24 GB the honest figure is roughly ~56k of the model's 262k
 window; the banner states what you actually got, and the
 [context window](#context-window-agentic-coding-needs-room) section explains the sizing.
 
@@ -297,8 +315,10 @@ checkpoint agree on: `lm_head` is a second full 1.27B-param tensor (vocab 248,32
 `tie_word_embeddings` false) and is where protection is worth buying, while `embed_tokens`
 is a lookup table whose per-row error never compounds through a matmul and is the cheapest
 tier to cut. Holding both high, as a uniform "sensitive tier" would, spends ~0.78 GB on the
-tier the evidence says needs it least — and on a 24 GB box 1 GB of weights is about 16k
-tokens of context.
+tier the evidence says needs it least. That is not an abstract saving: the governor divides
+free bytes by the measured 34,816 B/token, so a gigabyte of weights *is* about **29k tokens
+of context**, and the 0.78 GB in question is ~22k tokens — a third of what a 24 GB Mac gets
+to work in.
 
 To run different weights through the same engine:
 
@@ -309,7 +329,34 @@ CHAD_MODEL=/path/to/local/mlx-model uv run chad           # env equivalent
 ```
 
 Precedence is `--model` → `CHAD_MODEL` → the shipped default. Both are honored without
-argument; nothing about the harness is tuned for them.
+argument. Expect to lose speed rather than correctness: the tuning that is fitted to the
+shipped checkpoint — the MTP head, the fused-attention coverage, the fastpath's architecture
+check, the measured per-token KV cost the governor sizes against — either declines to
+install or falls back to a stock path. The harness itself does not change.
+
+### Smoke test (`chad prove`)
+
+```bash
+uv run chad prove
+```
+
+Downloads the shipped model if it isn't cached, then drives four tiny fix-it tasks
+end-to-end against it — a real agent loop, real edits in a scratch directory, each verified
+by a check script re-written from read-only sources so an agent edit can't spoof a pass —
+and prints what worked, with time-to-first-token, decode speed and wall-clock per task.
+`results.json` lands in the invoking directory.
+
+Two deliberate rigidities. It **pins the shipped model**, ignoring `--model` and
+`CHAD_MODEL` (it says so when you set one): the question is "does the thing I am about to
+run work on this machine", and a smaller stand-in cannot answer it. And once the weights are
+present it **goes offline** — `HF_HUB_OFFLINE` plus an in-process socket guard — so a task
+cannot quietly reach the network. Exit codes: `0` all passed, `1` a task failed, `2` the
+preflight stopped.
+
+These are smoke tests, not a benchmark: on working hardware they should essentially never
+fail, so a failure points at the install or the machine rather than at the model's ability.
+Reach for it first when something is broadly wrong, before reading
+[Troubleshooting](troubleshooting.md).
 
 ### Alternate backend (remote)
 
@@ -357,11 +404,10 @@ The engine knobs are the same ones a local `chad` reads, and they mean the same 
 here — the server is the local product, so `CHAD_MAX_CONTEXT`, `CHAD_KV_BITS`,
 `CHAD_KV_CACHE_MAX_GB` and the full sampler family (`CHAD_TEMP`, `CHAD_MIN_P`,
 `CHAD_TOP_P`, `CHAD_TOP_K`, `CHAD_PRESENCE_PENALTY`) all apply to the model it serves.
-(In 1.x the server read *none* of the sampler vars — a `chad serve` started with
-`CHAD_MIN_P` set ran without it and said nothing. They travel as one call now, so the
-server and a local run cannot drift apart one setting at a time.) A knob a request doesn't mention keeps the server's value; a request that sends
-one explicitly wins for that request only, so a client can A/B a sampler setting against a
-server without restarting it.
+They travel as one call, so the server and a local run cannot drift apart one setting at a
+time. A knob a request doesn't mention keeps the server's value; a request that sends one
+explicitly wins for that request only, so a client can A/B a sampler setting against a server
+without restarting it.
 
 `GET /props` reports the context window the server actually enforces, and clients should
 budget against it. That number is pinned at load and never moves, because clients read it
@@ -378,14 +424,28 @@ fit at load may not fit now. `GET /health` reports both — `n_ctx` (advertised)
 tightened wall coming instead of meeting it as a `400`. `CHAD_CTX_SAFETY` tunes the
 headroom the estimate holds back (default 0.975).
 
-Two things it does that a stock llama.cpp server can't, because both ends are chad's — it
-advertises them in `/props` and the client feature-detects, so nothing changes when you
-point the same client at a real llama-server:
+The endpoints, since a client is a contract:
 
-- **cache quarantine** — a client can bracket an excursion with a real engine
-  push/pop, so it does not evict the main transcript's prefix.
+| Endpoint | Purpose |
+|---|---|
+| `POST /completion` | generation, token-id prompts in, SSE out; the final line carries the generated ids and real `timings` so the client's stats are exact. Dropping the connection cancels generation, as llama.cpp does |
+| `GET /props` | the context window the server enforces, plus which extensions it speaks |
+| `GET /health` | liveness, whether a generation is in flight, and `n_ctx` / `safe_ctx` / `ctx_pressure` |
+| `POST /cache/push`, `POST /cache/pop` | **chad-only** — cache quarantine |
+| `POST /warm` | **chad-only** — on-disk KV warm start |
+
+The last two are what a stock llama.cpp server can't do, and they exist because both ends
+are chad's. `/props` advertises them and the client feature-detects, so nothing changes when
+you point the same client at a real llama-server:
+
+- **cache quarantine** — a client brackets a sub-agent's excursion with a real engine
+  push/pop, so the excursion's prompt does not evict the main transcript's prefix and force
+  a re-prefill on the way back.
 - **warm prefix** — the on-disk KV warm-start of the stable system+tools prefix, which a
-  remote client can't do because the checkpoint lives on the server's disk.
+  remote client can't do for itself because the checkpoint lives on the server's disk.
+
+Both are latency, never correctness: a client that doesn't speak them, or a call that fails,
+degrades to plain remote behavior.
 
 The engine holds **one** KV cache, so generation is serialized: one agent at a time.
 Concurrent clients queue rather than thrash the prefix (`/props` and `/health` stay
@@ -489,9 +549,9 @@ CHAD_MAX_GEN_TOKENS=32768     uv run chad  # hard per-STEP generation cap (defau
   default.
 - **`CHAD_MAX_GEN_TOKENS`** — the hard ceiling on a single *step's* generation, 32768 by
   default. It is a backstop against non-repetitive runaway garble, not a reasoning lever:
-  a literal decode loop is the repeat guard's job. It was 8192 through 1.12; raising it
-  fixed a real loss class where a long chain of thought pinned the cap while still inside
-  `<think>`, ending the step as discarded reasoning with no action.
+  a literal decode loop is the repeat guard's job. The ceiling is deliberately high because
+  a low one has a real loss class: a long chain of thought pins the cap while still inside
+  `<think>`, and the step ends as discarded reasoning with no action.
 
 > **`CHAD_PREFILL_TRACE=path.jsonl`** is a dev/instrumentation knob, **not** supported
 > config: it captures one JSON row per engine prefill to the given path for measurement
@@ -516,6 +576,17 @@ uv run chad levers                          # inventory: every lever + what's ac
 CHAD_DISABLE=bash_line_clip uv run chad     # leave-one-out ablation arm
 CHAD_DISABLE=all uv run chad                # the bare model + tool loop
 ```
+
+| Lever | What it adds to the result channel |
+|---|---|
+| `env_manifest` | session-start toolchain inventory in the system prompt tail — which compilers/interpreters/package managers are present, with versions, and which commonly-probed ones are absent |
+| `bash_read_skeleton` | a one-line symbol map the first time a source file's content comes back through `cat`/`sed`/`head`, and a definition pointer when a grep for a known symbol comes back empty |
+| `bash_empty_diagnose` | why a command produced nothing — a `sed` range past EOF, or the pipeline stage whose filter matched |
+| `bash_trim_keep_failures` | when long output is head/tail-trimmed, the failure rows from the omitted middle are kept verbatim |
+| `verify_baseline` | the pre-edit outcome of the project's test command, recalled on a failing post-edit run |
+| `bash_line_clip` | per-line cap so one minified line can't spend the whole output budget; the full text goes to a spill file |
+| `edit_miss_diagnose` | a failed edit says whether the change looks *already applied*, or the first line/column where the sent text diverges |
+| `rg_replace_flag_note` | one line naming what an `rg -r` result actually is — `-rn` is `--replace n`, not grep's recursive flag |
 
 - **`CHAD_DISABLE`** — comma-separated lever names to switch off (`all` = every lever).
 
@@ -582,8 +653,11 @@ CHAD_PROTECT_GIT=1          uv run chad  # also write-DENY .git inside the yolo 
   when you want them unreachable from chad at all. Unlike the other `CHAD_NO_*` vars this
   one wants a real truthy value (`1`/`true`/`yes`/`on`).
 - **`CHAD_NO_FASTPATH`** — disables the fused-projection + compiled decode step installed
-  at load for the hybrid MoE checkpoint (`mlx_fastpath.py`). Pure speed, no behavior
-  change, so this is an A/B and bisection knob rather than something to run with.
+  at load for the dense `qwen3_5` hybrid (`mlx_fastpath.py`): the MLP `gate|up` concat, the
+  GDN `in_proj` concat, and the compiled S=1 layer step. It is a silent no-op on any other
+  checkpoint, so an arbitrary `--model` neither gains nor loses anything here. Pure speed,
+  no behavior change, so this is an A/B and bisection knob rather than something to run
+  with.
 chad sets **no** `MLX_*` runtime variables, so there is nothing to opt out of:
 `MLX_METAL_FAST_SYNCH`, `MLX_MAX_OPS_PER_BUFFER` and `MLX_MAX_MB_PER_BUFFER` were each
 measured end-to-end and every setting was *slower* than mlx's own defaults.

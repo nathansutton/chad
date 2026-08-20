@@ -64,7 +64,7 @@ electricity. On a laptop, *capability per dollar* is the axis you actually compe
 > **No scored claim ships with 2.0.0.** The 57% (51/89, k=1, self-run) that earlier releases
 > quoted was measured on **Ornith 35B**, which 2.0.0 retired as the default — so it is not a
 > number about what you get when you install chad today. It is kept, dated and labelled, in
-> [Throughput & performance](docs/benchmarks.md#historical-ornith-35b--9b).
+> [Throughput & performance](docs/benchmarks.md#before-200-the-ornith-tier).
 > The 2.0.0 default has not been scored on Terminal-Bench 2.1 yet, and this section will
 > stay claim-free until it has been. The whole benchmark is **publicly reproducible from a
 > Mac** — adapter, runner and recipe live in [`benchmarks/tb2/`](benchmarks/tb2/README.md).
@@ -152,10 +152,10 @@ it does not gate you, but it cannot give you a usable window either.
 
 `--model <repo or local dir>` runs different weights through the same engine, and stays a
 first-class escape hatch: shipping one model is a default, not a cage. What you give up is
-fit, not function — the speculation width, kernel dispatch, and context governor are tuned
-to the shipped model, so other weights are slower rather than broken. 2.0.0 removed the
-`35b` / `9b` shorthands along with the Ornith models they named; the flag itself takes a
-repo id or a directory.
+fit, not function — the speculation head, the fused-attention coverage, the decode fastpath
+and the context governor are all fitted to the shipped checkpoint, so other weights are
+slower rather than broken. The flag takes a repo id or a directory; there are no size
+shorthands.
 
 **Upgrading** — depends on how you installed: `uv tool upgrade chad-code`; `uvx --refresh
 chad-code`; or `git pull && uv sync` for a clone. What changed lands in
@@ -180,8 +180,10 @@ model weights**, runs in seconds, and is what CI runs. Throughput on your own ma
 - **live status line** — model, mode, context %, a state glyph + verb, elapsed seconds, and
   **↑prefilled / ↓generated** token counts (with an advancing **%** on an unavoidable full
   re-prefill, so it's never silent).
-- **slash commands** — `/init`, `/skills`, `/<skill>`, `/mcp`, `/accept`, `/resume`, `/compact`,
-  `/model`, `/mode`, `/help`, `/exit`. Same set in the `--repl` line interface.
+- **slash commands** — `/init`, `/skills`, `/<skill>`, `/mcp`, `/accept`, `/resume`,
+  `/compact`, `/model`, `/mode`, `/help`, `/exit`, and the two that undo the agent:
+  **`/undo`** reverts your files to the last edit checkpoint and **`/restore`** lists the
+  checkpoints so you can revert to any of them. Same set in the `--repl` line interface.
 - **`@file` / `@dir` mentions** and **`!command` shell passthrough** — pull a file into
   context inline, or run a shell command without invoking the model.
 - **voice mode, all local** — `/speech`, then ctrl-t to talk: Parakeet-on-MLX transcribes
