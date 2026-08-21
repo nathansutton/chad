@@ -688,8 +688,8 @@ are chasing a behaviour change:
 
 ```bash
 CHAD_NO_DFLASH=1          uv run chad  # disable the DFlash2 block drafter (MTP head takes over)
-CHAD_DFLASH_DRAFT=4       uv run chad  # verified width per round (1..7; default 4)
-CHAD_DFLASH_ADAPTIVE=1    uv run chad  # OPT-IN: schedule the width per round from acceptance
+CHAD_DFLASH_DRAFT=7       uv run chad  # verified-width cap per round (1..7; default the full block)
+CHAD_DFLASH_ADAPTIVE=0    uv run chad  # fixed width every round instead of the per-round schedule
 CHAD_DFLASH_PATH=/dir     uv run chad  # explicit drafter checkpoint or built sidecar dir
 CHAD_DFLASH_REPO=org/name uv run chad  # a different drafter repo for the loaded model
 CHAD_NO_MTP=1             uv run chad  # disable MTP self-speculative decoding
@@ -717,16 +717,21 @@ CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on t
   step per token and its acceptance decays past depth 3. Verification, rollback and the
   exact-acceptance rule are the same as MTP's, so greedy output is token-identical to the
   unspeculated path and sampled output keeps the true distribution. Measured on an M4 Pro
-  with the shipped 3-bit quant, 384-token greedy decodes: serial 17.7 → MTP head 26.5 → **DFlash2 28.1 tok/s**, and at the
-  thinking sampling preset (temp 1.0, top_p 0.95, top_k 20) MTP 25.3 → **27.3**; on code the
-  two tie. With this set,
-  or when the drafter is not available, the MTP head runs instead.
-- **`CHAD_DFLASH_DRAFT`** — how many of the block's 7 proposals are verified per round
-  (default 4). Verify cost on this box rises ~25 ms per row through
-  width 8, so the full block pays only on very predictable text; the default is the
-  measured optimum across prose and code. `CHAD_DFLASH_ADAPTIVE=1` opts into a per-round
-  width schedule (the MTP cost model with the block drafter's flat draft cost); measured
-  it under-drafts at the thinking preset (24.2 vs 27.3 tok/s), so it stays an A/B arm.
+  with the shipped 3-bit quant, 10 prompts × 384-token decodes, medians: greedy serial 17.7 →
+  MTP head 26.1 → **DFlash2 47.7 tok/s** (2.7×); at the thinking sampling preset (temp 1.0,
+  top_p 0.95, top_k 20) MTP 22.4 → **41.4**; non-thinking preset 23.7 → 42–43; code 24 →
+  35–37. With this set, or when the drafter is not available, the MTP head runs instead.
+- **`CHAD_DFLASH_DRAFT` / `CHAD_DFLASH_ADAPTIVE`** — the verified width. The drafter always
+  proposes its full block of 7; by default a per-round schedule (the MTP cost model with the
+  block drafter's measured round costs) picks how many to verify from recent acceptance —
+  the full block on hot content, a narrow round or a free skip where acceptance drops. That
+  matters at the sampled default: a fixed full block swings 12–45 tok/s per prompt as
+  trajectories wander into low-acceptance text (median 31.8), the schedule holds 41.4 with a
+  20 tok/s floor; on hot greedy prose it costs ~5% (45.3 vs 47.7). `CHAD_DFLASH_DRAFT=N`
+  caps the width (and, like `CHAD_MTP_DRAFT`, forces it fixed); `CHAD_DFLASH_ADAPTIVE=0`
+  fixes the width at the cap. Widths 6–8 cost about the same under the small-M matmul
+  kernel below; without it (`CHAD_NO_QMM_MMA=1`) each extra row costs ~33 ms and width 4 is
+  the optimum.
 - **`CHAD_DFLASH_PATH` / `CHAD_DFLASH_REPO`** — point the loader at a local drafter
   checkpoint (an HF-layout dir, quantized on first use) or an already-built sidecar dir,
   or name a different drafter repo for the loaded model. `python -m chad.mlx_dflash <dir>`
@@ -796,8 +801,11 @@ CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on t
   chip × mlx version — numerics against the stock kernel, then a dependent-chain race at
   each width — and routes only the (shape, width) pairs that won; the verdict is cached
   under `~/.cache/chad/qmm_mma/`. Same exactness class as the attention-kernel knobs
-  above: within rounding of the stock kernel, not bit-identical to it. Measured:
-  QMM_MEASURED. `CHAD_NO_QMM_MMA=1` is the A/B arm; `CHAD_QMM_MMA_RECAL=1` re-probes
+  above: within rounding of the stock kernel, not bit-identical to it. Measured on the
+  shipped model's shapes (dependent chains, M4 Pro): the 3-bit MLP matmuls 1.31× at six rows
+  and 1.64× at eight, the 5-bit `lm_head` 1.55× / 1.87×, and below five rows the stock
+  kernel wins — so verify widths 6–8 now cost about what width 5 does, which is what lets
+  the block drafter verify its full block (see `CHAD_DFLASH_DRAFT`). `CHAD_NO_QMM_MMA=1` is the A/B arm; `CHAD_QMM_MMA_RECAL=1` re-probes
   (after an mlx upgrade, say).
 - **`CHAD_NO_KERNEL_WARM`** — the attention kernel is templated on its verify width, so a
   width that has never run means a Metal compile lands on the critical path of a real

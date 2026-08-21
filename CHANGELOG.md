@@ -15,15 +15,16 @@ past depth 3. Verification, rollback and the exact-acceptance rule are unchanged
 drafters now run on one shared speculative loop (`Engine._generate_spec`) — so greedy output
 is token-identical to plain decoding and sampled output keeps the true distribution.
 
-- Measured on an M4 Pro, shipped 3-bit quant, one load, same prompts, 384-token decodes:
-  greedy serial 17.7 → MTP 26.5 → **DFlash2 28.1 tok/s** (1.59×); at the thinking sampling
-  preset MTP 25.3 → **27.3**; at the non-thinking preset 23.7 → **28.4** (a 3-bit g64 quant
-  of the shipped model). On the shipped `UD-Q3_K_XL-MTP` weights at the thinking preset:
-  MTP 24.4 → **29.3**, every prompt won, code included (24.4 → 29.3).
-- `CHAD_NO_DFLASH=1` restores the MTP path; `CHAD_DFLASH_DRAFT=N` sets the verified width
-  (default 4 of the block's 7); `CHAD_DFLASH_ADAPTIVE=1` opts into a per-round width
-  schedule (measured worse at the thinking preset, so off); `CHAD_DFLASH_PATH` / `CHAD_DFLASH_REPO`
-  point at other drafter weights. `python -m chad.mlx_dflash <dir>` builds a sidecar.
+- Measured on an M4 Pro, shipped 3-bit quant, one load, same prompts, 384-token decodes,
+  medians: greedy serial 17.7 → MTP 26.1 → **DFlash2 47.7 tok/s** (2.7×); at the thinking
+  sampling preset MTP 22.4 → **41.4**; non-thinking preset 23.7 → 42–43; code 24 → 35–37.
+  (Before the matmul kernel below: 28.1 / 27.3 at width 4, the ladder's optimum.)
+- The drafter always proposes its full block of 7; a per-round schedule picks how many to
+  verify from recent acceptance (`CHAD_DFLASH_ADAPTIVE=0` fixes it, `CHAD_DFLASH_DRAFT=N`
+  caps it). At the sampled default a fixed full block swings 12–45 tok/s per prompt; the
+  schedule holds a 20 tok/s floor for ~5% on hot greedy prose. `CHAD_NO_DFLASH=1` restores
+  the MTP path; `CHAD_DFLASH_PATH` / `CHAD_DFLASH_REPO` point at other drafter weights;
+  `python -m chad.mlx_dflash <dir>` builds a sidecar.
 - Memory: +1.1 GB resident for the drafter (its context cache is a 2048-row ring, ~40 MB);
   on a 24 GB box that is ~30k tokens of context ceiling.
 
@@ -35,7 +36,11 @@ width at 4. `mlx_qmm_mma.py` brings in avlp12's `qmm_mma4` MMA kernel (via mlx-d
 which dequantizes each weight group once for all rows, with a width-generic unpack so the
 3-bit body and the 5-bit `lm_head` qualify alongside 4/8-bit weights. A load-time probe
 races it against the stock kernel per weight shape and per width on the running machine,
-keeps only the winners (cached), and everything else stays stock. QMM_CHANGELOG.
+keeps only the winners (cached), and everything else stays stock. On the shipped model every
+eligible shape wins from six rows up (3-bit MLP 1.31× at six rows, 1.64× at eight; the 5-bit
+`lm_head` 1.55× / 1.87×), which flattens the verify ladder from width 5 to 8 — and that is
+what moves the block drafter from width 4 (28–29 tok/s) to its full block (42–48).
+`CHAD_NO_QMM_MMA=1` is the A/B arm; `CHAD_QMM_MMA_RECAL=1` re-probes after an mlx upgrade.
 
 ### A clip is a loan, not a deletion
 

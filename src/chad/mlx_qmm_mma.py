@@ -17,11 +17,12 @@ dequant unpack is generic over the affine bit width — MLX packs every width as
 continuous little-endian bitstream per row (verified for 3/4/5/6/8), so one unpack
 serves the shipped 3-bit body and 5-bit ``lm_head`` as well as 4/8-bit targets —
 (the unpack pulls each 8-value half through one 64-bit window so every shift is a
-compile-time constant after unrolling), and the dispatch is a persistent patch
+compile-time constant after unrolling, and each barrier pair covers two quant
+groups so both groups' loads are in flight together), and the dispatch is a persistent patch
 gated by a per-shape, per-width runtime probe instead of a context manager.
 Measured (M4 Pro, mlx 0.32, dependent chains, rotated weights): 17408x5120 3-bit
-M=6 1.27x / M=8 1.61x; 5120x248320 5-bit (lm_head) M=6 1.46x / M=8 1.76x; 4-bit
-reproduces upstream's 1.30x / 1.60x. Below M=5 the stock GEMV path wins.
+M=6 1.31x / M=8 1.64x; 5120x248320 5-bit (lm_head) M=6 1.55x / M=8 1.87x; 4-bit
+M=6 1.41x / M=8 1.74x (upstream's 64-k form: 1.30x / 1.60x). Below M=5 the stock GEMV path wins.
 
 Numerics: fp32 accumulation in a different order than qmm — 1-2 bf16 ulps apart,
 the same acceptance class as every other kernel swap here (fused attention,
@@ -55,6 +56,7 @@ _SRC = r"""
     const int K = KD, N = ND, M = MD;
     const int KPS = KD / 8;                 // K-span per simdgroup (split-K)
     const int GW = 64 * BITS / 32;          // packed words per 64-value group
+    const int NG = CHUNK / 64;              // quant groups per barrier pair (1 or 2)
 
     uint tid  = thread_position_in_threadgroup.x;
     uint tgid = threadgroup_position_in_grid.x;
@@ -63,53 +65,62 @@ _SRC = r"""
 
     int n0 = (int)tgid * 8;                 // one threadgroup -> 8 output columns
 
-    threadgroup bfloat16_t bs[8 * 512];     // per-simdgroup 64k x 8n dequant stage
+    threadgroup bfloat16_t bs[8 * 1024];    // per-simdgroup CHUNK k x 8 n dequant stage
     threadgroup float red[8 * 64];          // cross-simdgroup reduction
 
     simdgroup_matrix<float, 8, 8> C = simdgroup_matrix<float, 8, 8>(0);
-    threadgroup bfloat16_t* bt = bs + sg * 512;
+    threadgroup bfloat16_t* bt = bs + sg * 1024;
 
     int kbeg = (int)sg * KPS;
-    for (int kk = 0; kk < KPS; kk += 64) {
+    int j  = (int)(lane & 7);
+    int kq = (int)(lane >> 3);              // this lane's 16-value quarter of a group
+    int n  = n0 + j;
+    const int base = kq * 16 * BITS;
+    const int w0 = base >> 5;
+    // CHUNK k per barrier pair: with CHUNK=128 both groups' packed words are in
+    // flight before any dequant math (the 64-k form exposed one load latency per
+    // iteration; measured +3-8% on the real shapes).
+    for (int kk = 0; kk < KPS; kk += CHUNK) {
         int ka = kbeg + kk;
-        int j  = (int)(lane & 7);
-        int kq = (int)(lane >> 3);          // this lane's 16-value quarter of the group
-        int n  = n0 + j;
         if (n < N) {
-            int g = ka >> 6;
-            float s  = (float)sc[(size_t)n * (K / 64) + g];
-            float bb = (float)bi[(size_t)n * (K / 64) + g];
-            // Generic affine unpack: value t of the group sits at bit t*BITS of the
-            // row's little-endian word stream. This lane's 16 values start at bit
-            // kq*16*BITS; they span at most 4 words for BITS <= 8.
-            const device uint* wr = w + (size_t)n * (K * BITS / 32) + (size_t)g * GW;
-            const int base = kq * 16 * BITS;
-            const int w0 = base >> 5;
-            uint p[4];
 #pragma clang loop unroll(full)
-            for (int u = 0; u < 4; ++u) p[u] = (w0 + u < GW) ? wr[w0 + u] : 0u;
-            // Two 8-value halves, each pulled from one 64-bit window: for every
-            // width <= 8, 8*BITS plus the half's in-word shift fits in 64 bits, so
-            // after full unrolling every shift and mask is a compile-time constant
-            // (the per-value form with a runtime word index ran ~40% slower).
+            for (int c = 0; c < NG; ++c) {
+                int g = (ka >> 6) + c;
+                float s  = (float)sc[(size_t)n * (K / 64) + g];
+                float bb = (float)bi[(size_t)n * (K / 64) + g];
+                // Generic affine unpack: value t of the group sits at bit t*BITS of
+                // the row's little-endian word stream; this lane's 16 values start
+                // at bit kq*16*BITS and span at most 4 words for BITS <= 8.
+                const device uint* wr = w + (size_t)n * (K * BITS / 32) + (size_t)g * GW;
+                uint p[4];
 #pragma clang loop unroll(full)
-            for (int h = 0; h < 2; ++h) {
-                int off = base + h * 8 * BITS - (w0 << 5);
-                int wi = off >> 5, sh = off & 31;
-                ulong win = ((ulong)p[wi] | ((ulong)p[wi + 1] << 32)) >> sh;
+                for (int u = 0; u < 4; ++u) p[u] = (w0 + u < GW) ? wr[w0 + u] : 0u;
+                // Two 8-value halves, each pulled from one 64-bit window: for every
+                // width <= 8, 8*BITS plus the half's in-word shift fits in 64 bits,
+                // so after unrolling every shift and mask is a compile-time constant
+                // (a per-value runtime word index ran ~40% slower).
 #pragma clang loop unroll(full)
-                for (int t = 0; t < 8; ++t) {
-                    uint v = (uint)(win >> (t * BITS)) & ((1u << BITS) - 1u);
-                    bt[(kq * 16 + h * 8 + t) * 8 + j] = (bfloat16_t)((float)v * s + bb);
+                for (int h = 0; h < 2; ++h) {
+                    int off = base + h * 8 * BITS - (w0 << 5);
+                    int wi = off >> 5, sh = off & 31;
+                    ulong win = ((ulong)p[wi] | ((ulong)p[wi + 1] << 32)) >> sh;
+#pragma clang loop unroll(full)
+                    for (int t = 0; t < 8; ++t) {
+                        uint v = (uint)(win >> (t * BITS)) & ((1u << BITS) - 1u);
+                        bt[(c * 64 + kq * 16 + h * 8 + t) * 8 + j] =
+                            (bfloat16_t)((float)v * s + bb);
+                    }
                 }
             }
         } else {
-            for (int t = 0; t < 16; ++t) bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)0;
+            for (int t = 0; t < 16 * NG; ++t)
+                bt[((t >> 4) * 64 + kq * 16 + (t & 15)) * 8 + j] = (bfloat16_t)0;
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
         simdgroup_matrix<bfloat16_t, 8, 8> A, B;
-        for (int kt = 0; kt < 8; ++kt) {
+#pragma clang loop unroll(full)
+        for (int kt = 0; kt < CHUNK / 8; ++kt) {
             simdgroup_load(A, x + ka + kt * 8, K);   // x rows 0..7 (padded to 8)
             simdgroup_load(B, bt + kt * 64, 8);
             simdgroup_multiply_accumulate(C, A, B, C);
@@ -121,17 +132,18 @@ _SRC = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (int i = (int)tid; i < 64; i += 256) {
-        int m = i >> 3, j = i & 7;
-        int n = n0 + j;
-        if (m < M && n < N) {
+        int m = i >> 3, jj = i & 7;
+        int nn = n0 + jj;
+        if (m < M && nn < N) {
             float v = 0.0f;
             for (int q = 0; q < 8; ++q) v += red[q * 64 + i];
-            out[(size_t)m * N + n] = (bfloat16_t)v;
+            out[(size_t)m * N + nn] = (bfloat16_t)v;
         }
     }
 """
 
 _TG = 256
+_KERNEL_VERSION = 3      # bump when the kernel changes: the probe cache is keyed on it
 _kernels: dict = {}
 
 
@@ -153,7 +165,7 @@ def mma(x8, wq, sc, bi, M: int, N: int, K: int, bits: int):
     """Raw kernel call: x8 is (8, K) bf16 (rows >= M ignored), returns (M, N) bf16."""
     (out,) = _kernel(bits)(
         inputs=[x8, wq, sc, bi],
-        template=[("KD", K), ("ND", N), ("MD", M)],
+        template=[("KD", K), ("ND", N), ("MD", M), ("CHUNK", 128 if K % 1024 == 0 else 64)],
         output_shapes=[(M, N)], output_dtypes=[x8.dtype],
         grid=(((N + 7) // 8) * _TG, 1, 1), threadgroup=(_TG, 1, 1),
     )
@@ -273,7 +285,7 @@ def _cache_key() -> str:
         chip = mx.metal.device_info().get("device_name", "metal")
     except Exception:  # noqa: BLE001
         chip = platform.machine()
-    return f"{chip}-mlx{mx.__version__}".replace(" ", "_").replace("/", "_")
+    return f"{chip}-mlx{mx.__version__}-k{_KERNEL_VERSION}".replace(" ", "_").replace("/", "_")
 
 
 def measure(groups: dict, verbose: bool = False) -> dict:

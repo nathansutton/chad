@@ -556,27 +556,26 @@ class Engine:
     # residual stream at five tapped layers, with the same verify/rollback/
     # exact-accept machinery as MTP. Engages when a drafter is registered for
     # the loaded target (Qwen3.8-27B class) and loads; takes precedence over
-    # the MTP head. CHAD_NO_DFLASH disables, CHAD_DFLASH_DRAFT sets the
-    # verified width (1..block_size-1). Width 4 by measurement (M4 Pro, the
-    # shipped 3-bit quant, 10 prompts x 384 tokens, medians): greedy serial
-    # 17.7 -> MTP 26.5 -> DFlash2 28.1 tok/s; at the thinking preset (temp 1.0
-    # / top_p 0.95 / top_k 20) MTP 25.3 -> 27.3; at the non-thinking preset
-    # MTP 23.7 -> 28.4. Acceptance sits near width+1 tokens per round on
-    # prose, so the verify ladder (~33 ms per extra row here) sets the width:
-    # 3 and 5 both measured ~1.5 tok/s below 4, the full block 7 only ties it
-    # on the hottest prose and loses on code.
+    # the MTP head. CHAD_NO_DFLASH disables, CHAD_DFLASH_DRAFT caps the
+    # verified width (1..block_size-1; default the full block, 7). Measured
+    # (M4 Pro, the shipped 3-bit quant, 10 prompts x 384 tokens, medians, the
+    # mlx_qmm_mma verify kernel on): greedy serial 17.7 -> MTP 26.1 -> DFlash2
+    # width 7 47.7 tok/s (schedule 45.3); thinking preset (temp 1.0 / top_p
+    # 0.95 / top_k 20) MTP 22.4 -> 41.4 (schedule); non-thinking preset 23.7
+    # -> 42-43. Without the kernel the verify ladder (~33 ms per extra row)
+    # pinned the width at 4 (28.1 greedy / 27.3 thinking).
     dflash: bool = True
-    dflash_num_draft: int = 4
+    dflash_num_draft: int = 7
     # Per-round verified-width schedule (mlx_dflash.block_policy): the block
     # is drafted whole either way; this picks how many of its proposals to
-    # verify from recent acceptance and a seeded verify ladder. OFF by
-    # measurement: at the thinking preset it under-drafted (24.2 vs the
-    # fixed width's 27.3 — its seed ladder prices the first extra row too
-    # cheaply against the stock S>1 graph, so medium acceptance collapses it
-    # to skips); it only matched fixed width where acceptance was high.
-    # CHAD_DFLASH_ADAPTIVE=1 opts in; CHAD_DFLASH_DRAFT=N forces a width
+    # verify from recent acceptance and the measured round-cost ladder. ON by
+    # measurement: at the thinking preset a fixed full block swings 12-45
+    # tok/s per prompt as sampled trajectories wander into low-acceptance
+    # text (median 31.8), the schedule holds 41.4 with a 20.4 floor; on hot
+    # greedy prose it costs ~5% (45.3 vs 47.7). CHAD_DFLASH_ADAPTIVE=0 fixes
+    # the width at dflash_num_draft; CHAD_DFLASH_DRAFT=N forces a width
     # (implies adaptive off).
-    dflash_adaptive: bool = False
+    dflash_adaptive: bool = True
     cache_dir: Optional[str] = None # on-disk KV checkpoints; None disables
     kv_cache_max_bytes: int = 8 * 1024**3  # LRU-evict the on-disk KV cache above this; 0 disables
 
@@ -2828,12 +2827,12 @@ class _DFlashDrafter:
         self.eng = eng
         self.m = eng._dflash
         cfg = self.m.config
-        self.cap = max(1, min(int(getattr(eng, "dflash_num_draft", 4)),
+        self.cap = max(1, min(int(getattr(eng, "dflash_num_draft", 7)),
                               cfg.block_size - 1))
         # Fresh per-turn schedule state: acceptance statistics are a property
         # of the current prompt/content, not of the session.
         self.policy = (mlx_dflash.block_policy(self.cap)
-                       if getattr(eng, "dflash_adaptive", False) else None)
+                       if getattr(eng, "dflash_adaptive", True) else None)
         self._ids = list(cfg.target_layer_ids)
         self._mask = int(cfg.mask_token_id)
         self._vocab = int(eng.model.language_model.args.vocab_size)

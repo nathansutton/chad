@@ -427,21 +427,30 @@ def build(config: DFlashConfig):
 
 # -- verified-width schedule ---------------------------------------------------
 
-def block_policy(max_depth: int, per_row: float = 0.5, h_block: float = 0.2):
+# Measured round cost T(d) for a DFlash round of verified width d, in serial-step
+# units (M4 Pro, the shipped 3-bit 27B, mlx_qmm_mma on from M=6): one drafter
+# forward (~0.2 step, flat in d) plus the verify. Rows 2..5 pay the stock
+# quantized_matmul ladder; rows 6..8 are FLAT under the MMA kernel, so past
+# width 4 more width is nearly free and the argmax lands on the full block
+# whenever acceptance carries it. observe_cost() re-anchors the scale online;
+# the SHAPE is what has to be right (a per-row seed priced the first extra
+# row too cheaply and collapsed the schedule on medium acceptance).
+BLOCK_ROUND_COSTS = (1.0, 1.9, 2.2, 2.55, 3.0, 3.15, 3.15, 3.2)
+
+
+def block_policy(max_depth: int, costs=None):
     """Per-round verified-width schedule for the block drafter.
 
     Same expected-tokens-per-time argmax as mlx_mtp.DepthPolicy (per-position
     acceptance EMAs, pooled tail, full-accept streaks, the near-tie margin
-    clamp, online cost observation), with the block drafter's cost shape: the
-    block is always drafted WHOLE in one forward, so drafting costs the same
-    `h_block` whatever width is verified, and the round cost is that plus the
-    verify ladder — seeded at `per_row` serial-steps per extra verify row (the
-    M4 Pro / 3-bit measurement: ~33 ms per row on a 56 ms step), corrected by
-    observe_cost() from real rounds. Candidates are every width up to the
-    block cap (7): there is no plateau past it to jump to, so nothing is gated
-    behind a streak. Hot content runs the full block; where acceptance drops
-    (sampled decoding, cold prompts) it collapses to 1-2 or a free skip, so a
-    bad regime degrades to the serial step rather than below it."""
+    clamp, online cost observation), with the block drafter's cost shape
+    (BLOCK_ROUND_COSTS): the block is always drafted WHOLE in one forward, so
+    the round cost is one drafter step plus the verify ladder. Candidates are
+    every width up to the block cap (7): there is no plateau past it to jump
+    to, so nothing is gated behind a streak. Hot content runs the full block;
+    where acceptance drops (sampled decoding on hard content) it collapses to
+    a narrow round or a free skip, so a bad regime degrades to the serial
+    step rather than below it."""
     from .mlx_mtp import DepthPolicy
 
     class BlockPolicy(DepthPolicy):
@@ -449,9 +458,9 @@ def block_policy(max_depth: int, per_row: float = 0.5, h_block: float = 0.2):
         CANDIDATES = tuple(range(8))
         SHALLOW_MAX = 7
 
-    costs = [1.0 + per_row * d + (h_block if d else 0.0)
-             for d in range(DepthPolicy.MAX_DEPTH + 1)]
-    return BlockPolicy(max_depth, h_block, costs)
+    table = list(costs or BLOCK_ROUND_COSTS)
+    table += [table[-1]] * (DepthPolicy.MAX_DEPTH + 1 - len(table))
+    return BlockPolicy(max_depth, 0.2, table)
 
 
 # -- target tap ---------------------------------------------------------------

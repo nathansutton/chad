@@ -195,18 +195,18 @@ and verifies in one batched main-model forward, accepting by exact rejection sam
 output stays token-identical, sampled output keeps the model's true distribution. Measured on
 an M4 Pro with the shipped quant (one load, same prompts, 384-token decodes):
 
-| sampling | serial | MTP head | **DFlash2 (width 4)** |
+| sampling | serial | MTP head | **DFlash2** |
 |---|---|---|---|
-| greedy | 17.7 tok/s | 26.5 (1.50×) | **28.1 (1.59×)** |
-| thinking preset (temp 1.0, top_p 0.95, top_k 20 — the default) | — | 25.3 | **27.3** |
-| non-thinking preset (temp 0.7, top_p 0.80, top_k 20) | — | 23.7 | **28.4** |
+| greedy | 17.7 tok/s | 26.1 (1.48×) | **47.7 (2.70×)** |
+| thinking preset (temp 1.0, top_p 0.95, top_k 20 — the default) | — | 22.4 | **41.4** |
+| non-thinking preset (temp 0.7, top_p 0.80, top_k 20) | — | 23.7 | **42–43** |
 
 Ten prompts (eight ~512-token prose seeds, two code continuations), 384-token decodes, medians,
-one load per run, on a 3-bit g64 quant of the same model. On the shipped `UD-Q3_K_XL-MTP`
-weights at the thinking preset (five of those prompts, 256-token decodes): MTP 24.4 →
-**DFlash2 29.3 tok/s**, every prompt won, code included (24.4 → 29.3, 4.8 tokens per round). On prose the drafter lands ~5 tokens per round at width 4 — acceptance is
-near-perfect, and the verify ladder (~33 ms per extra row on this box) is what sets the width.
-On code the two drafters tie (~25 tok/s).
+one load per run, on a 3-bit g64 quant of the same model. On prose the drafter lands ~8 tokens
+per round; code runs 35–37 tok/s greedy. Two pieces make that number: the block drafter's
+acceptance, and the small-M matmul kernel (`mlx_qmm_mma.py`) that makes an 8-row verify cost
+about what a 5-row one does — without it each extra verify row costs ~33 ms and the drafter's
+optimum is width 4 at 28 tok/s.
 The checkpoint's own multi-token-prediction head is the fallback drafter (`CHAD_NO_DFLASH=1`
 selects it): it chains one head step per drafted token and its acceptance decays past depth 3,
 which is the gap the block drafter closes.
