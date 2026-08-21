@@ -12,10 +12,10 @@ top-K per slot plus a bilinear score over adjacent-slot pairs, walked from the
 verified anchor so the block is one coherent path rather than K independent argmaxes.
 The drafter shares the target's embedding and ``lm_head``.
 
-Versus the checkpoint's own MTP head (mlx_mtp.py): the block comes out of one
-drafter forward instead of a k-step chain, and acceptance holds to depth 7 where the
-1-layer MTP chain decays past 3. The verify side is identical — one batched target
-forward, exact rejection sampling, the same rollback primitives.
+One drafter forward proposes the whole block, and acceptance holds to depth 7 —
+where a chained 1-token-at-a-time drafter decays past 3. The verify side is one
+batched target forward with exact rejection sampling, so the committed output is
+what plain decoding would have produced at the same sampling settings.
 
 Provenance
 ----------
@@ -35,10 +35,14 @@ quantized codebooks, a cached quantized sidecar, chad's loader/tap conventions.
   permission notice shall be included in all copies or substantial portions of the
   Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 
-Weights resolve in order: $CHAD_DFLASH_PATH (a local dir holding the HF checkpoint
-or a built sidecar), then ~/.cache/chad/dflash/<repo>-q4g64/ (built on first use),
-else the registered HF checkpoint for the loaded target is downloaded (bf16,
-~3.8 GB once) and quantized to a 4-bit sidecar (~1.1 GB resident).
+The drafter ships QUANTIZED, inside the model repo, as ``<model_dir>/dflash/``
+(config.json + model.safetensors, 4-bit group-64, ~1.1 GB resident) — one
+download, nothing built at runtime. $CHAD_DFLASH_PATH overrides it with a local
+dir holding either a built sidecar or an unquantized HF checkpoint (quantized on
+load). No bundle and no override means no drafter: decoding runs serial.
+
+Build a sidecar for a new target from its bf16 DFlash checkpoint with
+``uv run python -m chad.mlx_dflash <hf_checkpoint_dir> --out <model_dir>/dflash``.
 """
 
 import json
@@ -48,13 +52,8 @@ from typing import Any, Optional
 
 from .diag import log
 
-_SIDECAR_DIR = os.path.expanduser("~/.cache/chad/dflash")
-
-# (target hidden_size, target num_hidden_layers, vocab_size) -> published drafter.
-# `incoai/Qwen3.8-27B-DFlash2` and `z-lab/Qwen3.8-27B-DFlash2` are byte-identical.
-_REGISTRY = {
-    (5120, 64, 248320): "incoai/Qwen3.8-27B-DFlash2",
-}
+# The drafter sidecar's subdirectory inside a model weights dir.
+_BUNDLE = "dflash"
 
 # Residual-stream tap. When an engine arms a dict here, every tapped target layer
 # (see install_tap) writes its OUTPUT hidden [B, S, H] under its layer index for the
@@ -438,29 +437,197 @@ def build(config: DFlashConfig):
 BLOCK_ROUND_COSTS = (1.0, 1.9, 2.2, 2.55, 3.0, 3.15, 3.15, 3.2)
 
 
+class WidthPolicy:
+    """Cost-model width schedule: choose the verified width that maximizes
+    expected committed tokens per unit round time.
+
+    The block is always drafted WHOLE in one drafter forward; this picks how
+    many of its proposals to verify. A round of width d+1 costs T(d) (one
+    drafter step plus the verify ladder, BLOCK_ROUND_COSTS) and commits
+    E[tokens](d) = 1 + sum_{k=1..d} prod_{i<k} p_i, where p_i is the
+    estimated acceptance of draft position i GIVEN the prefix before it was
+    accepted. The p_i are per-position EMAs seeded with an optimistic,
+    gently decaying prior (the first rounds should draft, not stall); a
+    fully accepted round also transfers bounded optimism to the first
+    unreached position, so the full block becomes reachable inside a short
+    window. On hot prose this runs to the cap; where acceptance drops
+    (sampled decoding on hard content) it collapses to 1 and then to 0 — an
+    adaptive skip costs exactly what a serial step costs, so a bad regime
+    degrades to serial decoding rather than below it.
+
+    The pending top-2 logit margin (of the row that produced the pending
+    token) additionally caps p_0/p_1: a near-tie next token is exactly where
+    the drafter is about to be wrong, whatever its recent streak says.
+
+    depth() is an ARGMAX over every width up to the cap rather than a greedy
+    marginal walk: the cost ladder is not convex (rows 6..8 are flat under
+    the MMA kernel), and a marginal rule stops at the first negative step
+    instead of finding the flat region past it.
+    """
+
+    MAX_DEPTH = 7        # the block cap: block_size - 1
+    CANDIDATES = tuple(range(8))
+    STREAK_GATE = 2      # full-accept rounds before the tail may be inferred
+    RETRY_GATE = 6       # perfect rounds that re-open a stale pooled tail
+    TAIL_SPLIT = 5       # positions >= this share the pooled tail estimate
+
+    def __init__(self, max_depth: int, costs: list):
+        """`costs` is the measured round cost T(d) for width d+1, d = 0..
+        MAX_DEPTH (any unit), as measured on THIS stack. observe_cost()
+        corrects it online from real round wall-times, so a wrong seed only
+        shapes the first rounds."""
+        self.max_depth = max(0, min(max_depth, self.MAX_DEPTH))
+        # Seed cost RATIOS (unit-free). Observed wall-times override per
+        # depth; unobserved depths are priced as seed * unit, with the unit
+        # anchored at the most-observed depth. Never mix a raw observation
+        # into the seed list directly: E/T argmax is scale-invariant only
+        # while the whole table shares one scale, and a partially-observed
+        # mixed-scale table silently prices the unobserved depths out.
+        self._seed = [float(c) for c in costs]
+        self._obs: dict = {}      # depth -> (ema wall, count)
+        self.ema = [0.85 * (0.98 ** i) for i in range(self.TAIL_SPLIT)]
+        self.alpha = 0.15
+        # Pooled tail acceptance for positions >= TAIL_SPLIT. Per-position
+        # EMAs starve there — only wide rounds visit those positions, so each
+        # gets single-sample evidence and one miss craters it (measured: one
+        # rejected wide round locked width out for the whole turn). Pooling is
+        # sound because conditional acceptance is near-flat in position for a
+        # trained drafter on stationary content.
+        self.tail = 0.80          # pooled estimate (prior until observed)
+        self.tail_n = 0           # samples folded in
+        self.margin: Optional[float] = None   # pending top-2 logit margin
+        self.streak = 0                       # consecutive fully-accepted rounds
+        self._skips = 0                       # consecutive adaptive skips
+
+    def observe_cost(self, depth: int, cost: float) -> None:
+        """Fold one measured round wall-time (seconds) into the per-depth
+        observations. Round costs are noisy (rollback, detok, host work),
+        hence the light EMA."""
+        if not (0 <= depth < len(self._seed) and cost > 0):
+            return
+        ema, n = self._obs.get(depth, (cost, 0))
+        self._obs[depth] = (ema + 0.25 * (cost - ema), n + 1)
+
+    def _unit(self) -> float:
+        """Seconds per seed-unit, anchored at the most-observed depth (the
+        depth the loop actually lives at — a stable, representative sample;
+        a one-off inflated round elsewhere cannot skew the whole table)."""
+        if not self._obs:
+            return 1.0
+        d0 = max(self._obs, key=lambda d: self._obs[d][1])
+        return self._obs[d0][0] / self._seed[d0]
+
+    def cost(self, depth: int) -> float:
+        ob = self._obs.get(depth)
+        if ob is not None and ob[1] >= 2:
+            return ob[0]
+        return self._seed[depth] * self._unit()
+
+    def _tail_p(self) -> float:
+        """Acceptance estimate for positions >= TAIL_SPLIT. Real pooled
+        observations once any wide round has run; before that, INFERENCE
+        from the near positions on a qualifying full-accept streak (capped
+        at 0.95 — the block being cut short by the schedule, not by the
+        drafter, is evidence about the tail, but never certainty), else the
+        prior."""
+        inference = min(0.95, sum(self.ema) / len(self.ema))
+        if self.tail_n > 0:
+            pooled = min(0.95, self.tail)
+            # A long full-accept streak at a narrow width is fresh evidence
+            # the content turned hot: let inference override stale pooled
+            # pessimism so width gets re-probed (one bad early probe must not
+            # lock the full block out for the rest of the turn).
+            if self.streak >= self.RETRY_GATE:
+                return max(pooled, inference)
+            return pooled
+        if self.streak >= self.STREAK_GATE:
+            return inference
+        return self.tail   # prior
+
+    def _position_p(self, i: int, tail_p: float) -> float:
+        # No continuous margin cap here: the arena's sigmoid(margin/2) gates
+        # were fitted to a different logit scale and measured WRONG on this
+        # stack — they capped p0 at ~0.7 while realized first-draft
+        # acceptance was 0.988, locking the schedule at depth 1. Margins
+        # participate only through the extreme-tie clamp in depth(); ongoing
+        # calibration belongs to the EMAs, which are calibrated to realized
+        # acceptance by construction.
+        return self.ema[i] if i < self.TAIL_SPLIT else tail_p
+
+    def depth(self) -> int:
+        cap = self.max_depth
+        if cap <= 0:
+            return 0
+        if self.margin is not None and self.margin < 0.25:
+            # The pending token is a near coin-flip: the drafter's next block
+            # is close to a guess whatever the recent streak says. Probe at
+            # most one draft; the EMAs stay in charge of everything else.
+            cap = min(cap, 1)
+        tail_p = self._tail_p()
+        best_d, best_rate = 0, 1.0 / self.cost(0)
+        reach, expected = 1.0, 0.0
+        limit = min(cap, self.MAX_DEPTH)
+        for d in range(1, limit + 1):
+            reach *= self._position_p(d - 1, tail_p)
+            expected += reach
+            rate = (1.0 + expected) / self.cost(d)
+            # 2% hysteresis toward narrower rounds: at equal throughput the
+            # narrow round wastes less on a reject.
+            if rate > best_rate * 1.02:
+                best_d, best_rate = d, rate
+        if best_d == 0:
+            # An adaptive skip is free, but the EMAs only observe drafted
+            # rounds — a hard stretch would otherwise lock drafting out for
+            # the rest of the turn even after the content turns easy. Probe
+            # depth 1 every 16th consecutive skip (~one EMA half-life).
+            self._skips += 1
+            if self._skips >= 16:
+                self._skips = 0
+                return 1
+        else:
+            self._skips = 0
+        return best_d
+
+    def record(self, proposed: int, accepted: int, stopped_early: bool) -> None:
+        """Fold one round's outcome into the per-position EMAs. Positions
+        before `accepted` observed a success; the position AT `accepted`
+        observed a failure only when the walk actually rejected there (not
+        when the round ended on a committed stop token); deeper positions
+        observe nothing. A FULLY accepted round transfers bounded optimism
+        (toward 0.95, never past it) to the first unreached position."""
+        a = self.alpha
+        e = self.ema
+        for i in range(min(accepted, len(e))):
+            e[i] += a * (1.0 - e[i])
+        if accepted < proposed and not stopped_early and accepted < len(e):
+            e[accepted] += a * (0.0 - e[accepted])
+        elif accepted == proposed and proposed > 0 and accepted < len(e):
+            if e[accepted] < 0.95:
+                e[accepted] += a * (0.95 - e[accepted])
+        # Pooled tail: positions TAIL_SPLIT..accepted-1 observed successes;
+        # the position AT `accepted` observed the failure when the walk
+        # genuinely rejected there. Batch-fold with per-sample weight so one
+        # wide round's samples count individually, not as one observation.
+        ts = self.TAIL_SPLIT
+        if proposed > ts:
+            succ = max(0, min(accepted, proposed) - ts)
+            fail = 1 if (ts <= accepted < proposed and not stopped_early) else 0
+            n = succ + fail
+            if n:
+                obs = succ / n
+                w = 1.0 - (1.0 - 0.05) ** n
+                self.tail += w * (obs - self.tail)
+                self.tail_n += n
+        self.streak = self.streak + 1 if (proposed > 0 and accepted == proposed) \
+            else 0
+
+
 def block_policy(max_depth: int, costs=None):
-    """Per-round verified-width schedule for the block drafter.
-
-    Same expected-tokens-per-time argmax as mlx_mtp.DepthPolicy (per-position
-    acceptance EMAs, pooled tail, full-accept streaks, the near-tie margin
-    clamp, online cost observation), with the block drafter's cost shape
-    (BLOCK_ROUND_COSTS): the block is always drafted WHOLE in one forward, so
-    the round cost is one drafter step plus the verify ladder. Candidates are
-    every width up to the block cap (7): there is no plateau past it to jump
-    to, so nothing is gated behind a streak. Hot content runs the full block;
-    where acceptance drops (sampled decoding on hard content) it collapses to
-    a narrow round or a free skip, so a bad regime degrades to the serial
-    step rather than below it."""
-    from .mlx_mtp import DepthPolicy
-
-    class BlockPolicy(DepthPolicy):
-        MAX_DEPTH = 7
-        CANDIDATES = tuple(range(8))
-        SHALLOW_MAX = 7
-
+    """Fresh per-turn WidthPolicy seeded with the measured round-cost ladder."""
     table = list(costs or BLOCK_ROUND_COSTS)
-    table += [table[-1]] * (DepthPolicy.MAX_DEPTH + 1 - len(table))
-    return BlockPolicy(max_depth, 0.2, table)
+    table += [table[-1]] * (WidthPolicy.MAX_DEPTH + 1 - len(table))
+    return WidthPolicy(max_depth, table)
+
 
 
 # -- target tap ---------------------------------------------------------------
@@ -505,9 +672,11 @@ def _target_key(model: Any):
     return (int(args.hidden_size), int(args.num_hidden_layers), int(args.vocab_size))
 
 
-def _sidecar_dir(repo: str, bits: int, gs: int) -> str:
-    return os.path.join(_SIDECAR_DIR,
-                        f"{os.path.basename(repo.rstrip('/'))}-q{bits}g{gs}")
+def _built_dir(src: str, bits: int, gs: int) -> str:
+    """Where a CHAD_DFLASH_PATH checkpoint's locally-built sidecar lands."""
+    return os.path.join(
+        os.path.expanduser("~/.cache/chad/dflash"),
+        f"{os.path.basename(src.rstrip('/'))}-q{bits}g{gs}")
 
 
 def _quantize(drafter, bits: int, gs: int) -> None:
@@ -588,64 +757,29 @@ def _is_sidecar(d: str) -> bool:
         return False
 
 
-def repo_for_model_dir(model_dir: str) -> Optional[str]:
-    """The registered drafter repo for the model at `model_dir` (config.json
-    shape lookup, no weights touched), honoring CHAD_DFLASH_REPO; None when
-    no drafter is published for that shape."""
-    env = os.environ.get("CHAD_DFLASH_REPO")
-    if env:
-        return env
-    try:
-        with open(os.path.join(model_dir, "config.json")) as f:
-            cfg = json.load(f)
-        tc = cfg.get("text_config", cfg)
-        key = (int(tc["hidden_size"]), int(tc["num_hidden_layers"]),
-               int(tc["vocab_size"]))
-    except Exception:  # noqa: BLE001
-        return None
-    return _REGISTRY.get(key)
-
-
-def sidecar_ready(repo: str, bits: int = 4, gs: int = 64) -> bool:
-    """True when the quantized sidecar for `repo` is already built (or an
-    explicit CHAD_DFLASH_PATH is set) — i.e. no download is needed."""
-    if os.environ.get("CHAD_DFLASH_PATH"):
-        return True
-    d = _sidecar_dir(repo, bits, gs)
-    return (os.path.isfile(os.path.join(d, "model.safetensors"))
-            and os.path.isfile(os.path.join(d, "config.json")))
+def bundle_dir(model_dir: str) -> Optional[str]:
+    """The drafter sidecar bundled with the weights at `model_dir`, or None.
+    CHAD_DFLASH_PATH wins when set (an explicit dir is an order)."""
+    explicit = os.environ.get("CHAD_DFLASH_PATH")
+    if explicit:
+        return os.path.expanduser(explicit)
+    d = os.path.join(model_dir, _BUNDLE)
+    return d if os.path.isfile(os.path.join(d, "config.json")) else None
 
 
 def load_drafter(model: Any, model_dir: str, bits: int = 4, gs: int = 64) -> Optional[Any]:
-    """Load (building/downloading on first use) the DFlash drafter matching a
-    loaded target, bound to its embedding/lm_head, with the target tap
-    installed. None when no drafter is registered for this target or on any
+    """Load the DFlash drafter bundled with the target's weights (or the dir
+    CHAD_DFLASH_PATH names), bound to the target's embedding/lm_head, with the
+    target tap installed. None when no drafter ships for this model or on any
     failure — DFlash is a pure speed feature, never load-bearing."""
     try:
         key = _target_key(model)
-        if key is None:
+        sdir = bundle_dir(model_dir)
+        if key is None or sdir is None:
             return None
-        repo = os.environ.get("CHAD_DFLASH_REPO") or _REGISTRY.get(key)
-        explicit = os.environ.get("CHAD_DFLASH_PATH")
-        if not repo and not explicit:
-            return None
-        if explicit:
-            explicit = os.path.expanduser(explicit)
-            if _is_sidecar(explicit):
-                sdir = explicit
-            else:
-                sdir = build_sidecar(explicit, _sidecar_dir(explicit, bits, gs),
-                                     bits, gs)
-        else:
-            sdir = _sidecar_dir(repo, bits, gs)
-            if not (os.path.isfile(os.path.join(sdir, "model.safetensors"))
-                    and os.path.isfile(os.path.join(sdir, "config.json"))):
-                from huggingface_hub import snapshot_download
-                log.info("DFlash drafter: fetching %s (one-time, bf16 -> %d-bit "
-                         "sidecar at %s)", repo, bits, sdir)
-                src = snapshot_download(
-                    repo, allow_patterns=["config.json", "*.safetensors"])
-                build_sidecar(src, sdir, bits, gs)
+        if not _is_sidecar(sdir):
+            # An unquantized HF checkpoint: quantize it once into the cache.
+            sdir = build_sidecar(sdir, _built_dir(sdir, bits, gs), bits, gs)
         drafter = _load_sidecar(sdir, bits, gs)
         cfg = drafter.config
         if cfg.hidden_size != key[0] or cfg.vocab_size != key[2] \
@@ -675,13 +809,14 @@ def load_drafter(model: Any, model_dir: str, bits: int = 4, gs: int = 64) -> Opt
 def main(argv=None):  # pragma: no cover - thin CLI
     import argparse
     ap = argparse.ArgumentParser(
-        description="Build a quantized DFlash sidecar from an HF checkpoint dir")
+        description="Build a quantized DFlash sidecar from an HF checkpoint dir. "
+                    "Write it to <model_dir>/dflash/ to bundle it with the weights.")
     ap.add_argument("src", help="HF checkpoint dir (config.json + *.safetensors)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--bits", type=int, default=4)
     ap.add_argument("--group-size", type=int, default=64)
     a = ap.parse_args(argv)
-    out = a.out or _sidecar_dir(a.src, a.bits, a.group_size)
+    out = a.out or _built_dir(a.src, a.bits, a.group_size)
     print(build_sidecar(a.src, out, a.bits, a.group_size))
 
 

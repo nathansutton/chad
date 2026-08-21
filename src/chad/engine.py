@@ -471,7 +471,7 @@ class Engine:
     enable_pld_hybrid: bool = False
     # Wide prompt-lookup on the hybrid (Qwen3.8-class): a separate, on-by-default
     # path that removes both reasons enable_pld_hybrid stayed off. (1) Rejection
-    # rollback uses the MTP capture-replay collector (no re-feed forward).
+    # rollback uses the capture-replay collector (no re-feed forward).
     # (2) Drafting is gated on n-gram MATCH LENGTH instead of periodic blind
     # probes, so cold (novel-text) steps pay only a host-side lookup — the
     # measured S>1 cost cliff makes a missed speculative forward expensive, so
@@ -480,8 +480,8 @@ class Engine:
     # this machine: verifying 31 draft tokens costs the same forward as 11, so
     # once the n-gram evidence clears the bar, maximum width is free. Exact at
     # any temp: point-mass rejection sampling (accept w.p. p(draft)), the same
-    # correction _generate_mtp ships. Takes precedence over MTP on the hybrid;
-    # MTP is the fallback when this is disabled or ineligible.
+    # correction _generate_spec ships. On the hybrid it takes precedence over
+    # block speculation, which serves when this is off or ineligible.
     # Gate sizing is measured, not guessed: replaying this exact matcher over real
     # dogfood traces gives accepted-tokens-per-verify, and a wide verify only pays for
     # itself above ~7.5 (the S=32-forward vs plain-step cost ratio on this machine).
@@ -497,73 +497,20 @@ class Engine:
     pld_wide_ngram: int = 16        # longest suffix length to try matching
     pld_wide_min_ngram: int = 16    # shortest match that justifies a wide verify
     pld_wide_min_draft: int = 8     # skip verify if the source span is shorter
-    # MTP self-speculative decoding: draft with the checkpoint's own trained
-    # multi-token-prediction head (loaded as a sidecar — mlx_mtp.py), verify in
-    # one batched forward, exact rejection sampling at any temp. Engages only
-    # when a head loaded (Qwen3.8-class models); CHAD_NO_MTP disables, and
-    # CHAD_MTP_DRAFT overrides the draft width. Default 2: the 27B sweep
-    # (M4 Pro, temp 1.0, coding prompt) measured 19.4 tok/s at k=2 vs 17.3 at
-    # k=3 and 12.3 at k=5 — mlx 0.32's S>1 forward costs ~1.5x plain at S=3
-    # and ~2x at S=4, so deeper drafts lose to verify cost even at good
-    # acceptance. Revisit when the small-batch kernel story changes.
-    mtp_num_draft: int = 2
-    # Adaptive draft schedule (cost-model, mlx_mtp.DepthPolicy): per round,
-    # draft the depth 0..mtp_max_draft that maximizes expected committed
-    # tokens per unit round time under per-position acceptance EMAs and the
-    # measured head-step/verify cost ratio mtp_h. Hot prose runs deep, cold
-    # prompts collapse to 1 or a free skip (0); the fixed-k sweep behind
-    # mtp_num_draft is the degenerate constant-depth version. Default ON by
-    # measurement (M4 Pro, 4-bit 27B, 8-prompt 512-token arena protocol):
-    # the verify ladder pays ~25 ms PER ROW through S=8 but is FLAT from
-    # S=10 to S=32 (the tiled-GEMM plateau, holds at 12k ctx), and the
-    # plateau-aware argmax beat fixed k=2 on 8/8 prompts — median 29.1 vs
-    # 26.5 tok/s (1.90x vs 1.73x over serial), +25-40% on hot prose (6-7
-    # committed tokens/round), +23% on the hardest prompt (the schedule
-    # collapses to depth 1-2 or a free skip where acceptance drops, so
-    # low-acceptance regimes like temp-1 thinking degrade to k2-like
-    # behavior, not below it). CHAD_MTP_ADAPTIVE=0 restores fixed-width;
-    # CHAD_MTP_DRAFT forces a width (and implies adaptive off);
-    # CHAD_MTP_MAX_DRAFT / CHAD_MTP_H override the cap and cost seed.
-    mtp_adaptive: bool = True
-    # 31 = verify width 32, the far edge of the measured FLAT tile plateau
-    # (S>=10 verifies cost ~the same through S=32; see DepthPolicy). The
-    # policy itself keeps rounds at width <= 6 (the fused-SDPA envelope)
-    # until a full-accept streak qualifies a plateau jump, so cold or hard
-    # content never sees a wide round. Width >5 verifies can flip near-tie
-    # argmaxes off the serial trajectory — the same numerics chad already
-    # accepts from wide-PLD's width-32 verifies on this model class.
-    mtp_max_draft: int = 31
-    # Head-step cost / serial-step cost, MEASURED: 4.3 ms chained head step
-    # (1-layer head + lm_head readout) against the 66 ms serial trunk step
-    # (M4 Pro, 4-bit 27B). This seeds DepthPolicy's cost ratios; getting it
-    # wrong is a depth lock — at the old flat-model 0.35 the seed priced
-    # depth 2 below depth 1 and the schedule never explored past 1, so no
-    # observation could ever correct the table.
-    mtp_h: float = 0.065
-    # Measured per-depth round costs T(0)..T(max), any unit; None = the
-    # width-flat scalar-h model. See mlx_mtp.DepthPolicy.
-    mtp_costs: Optional[list] = None
-    # Draft PROPOSAL mode at temp>0. True (default) samples the proposal from
-    # the head's distribution (classic Leviathan/Chen): at the recommended
-    # temp 1.0 the target is broad and proposal≈target overlap acceptance wins
-    # — measured 55% acc / 19.8 tok/s vs 39% / 16.5 for argmax proposals on
-    # the 27B. False drafts the head's argmax and accepts with prob p(d)
-    # (point-mass proposal) — the better mode only near-greedy. Both preserve
-    # the output distribution exactly.
-    mtp_sample_drafts: bool = True
-    # DFlash2 block drafter (mlx_dflash.py): an external 1.9B drafter that
-    # proposes a whole block in ONE forward, conditioned on the target's
-    # residual stream at five tapped layers, with the same verify/rollback/
-    # exact-accept machinery as MTP. Engages when a drafter is registered for
-    # the loaded target (Qwen3.8-27B class) and loads; takes precedence over
-    # the MTP head. CHAD_NO_DFLASH disables, CHAD_DFLASH_DRAFT caps the
-    # verified width (1..block_size-1; default the full block, 7). Measured
-    # (M4 Pro, the shipped 3-bit quant, 10 prompts x 384 tokens, medians, the
-    # mlx_qmm_mma verify kernel on): greedy serial 17.7 -> MTP 26.1 -> DFlash2
-    # width 7 47.7 tok/s (schedule 45.3); thinking preset (temp 1.0 / top_p
-    # 0.95 / top_k 20) MTP 22.4 -> 41.4 (schedule); non-thinking preset 23.7
-    # -> 42-43. Without the kernel the verify ladder (~33 ms per extra row)
-    # pinned the width at 4 (28.1 greedy / 27.3 thinking).
+    # DFlash2 block drafter (mlx_dflash.py) — THE speculative path. An external
+    # 1.9B drafter proposes a whole block in ONE forward, conditioned on the
+    # target's residual stream at five tapped layers; the block is verified in
+    # one batched target forward with exact rejection sampling, so the output
+    # distribution is unchanged at any temp. Engages when the drafter ships
+    # with the loaded weights (see mlx_dflash.bundle_dir) and loads.
+    # CHAD_NO_DFLASH disables, CHAD_DFLASH_DRAFT caps the verified width
+    # (1..block_size-1; default the full block, 7). Measured (M4 Pro, the
+    # shipped 3-bit quant, 10 prompts x 384 tokens, medians, the mlx_qmm_mma
+    # verify kernel on): greedy serial 17.7 -> width 7 47.7 tok/s (schedule
+    # 45.3); thinking preset (temp 1.0 / top_p 0.95 / top_k 20) 22.4 serial
+    # -> 41.4 (schedule); non-thinking preset -> 42-43. Without the kernel the
+    # verify ladder (~33 ms per extra row) pinned the width at 4 (28.1 greedy
+    # / 27.3 thinking).
     dflash: bool = True
     dflash_num_draft: int = 7
     # Per-round verified-width schedule (mlx_dflash.block_policy): the block
@@ -603,8 +550,6 @@ class Engine:
     # attention's transient scales with heads*chunk*kv_len. The shipped model is
     # dense — the MoE arm is here for `--model`.
     _is_moe: bool = field(init=False, default=False)
-    _mtp_head: Any = field(init=False, default=None)
-    _mtp_draft_readout: Any = field(init=False, default=None)
     _dflash: Any = field(init=False, default=None)
     _n_attn_heads: int = field(init=False, default=16)
     _n_kv_heads: int = field(init=False, default=0)
@@ -705,19 +650,6 @@ class Engine:
         # only; inert unless a QuantizedKVCache is actually in play.
         from . import mlx_qsdpa
         qsdpa_ok = mlx_qsdpa.install()
-        # MTP head sidecar (Qwen3.8-class): pure speed feature, None on any miss.
-        if not config.flag("CHAD_NO_MTP"):
-            from . import mlx_mtp
-            self._mtp_head = mlx_mtp.load_head(self.model, path)
-            # 2-bit shortlist readout for the greedy draft chain — pure speed
-            # (the chained drafts' full-vocab lm_head read is ~70% of the
-            # head-step cost). Draft-side only, never load-bearing.
-            self._mtp_draft_readout = None
-            if (self._mtp_head is not None
-                    and not config.flag("CHAD_NO_DRAFT_SHORTLIST")):
-                self._mtp_draft_readout = mlx_mtp.build_draft_readout(
-                    self.model, path)
-            self._resolve_mtp_knobs()
         # DFlash2 block drafter: pure speed feature, None on any miss.
         if self.dflash and not config.flag("CHAD_NO_DFLASH"):
             from . import mlx_dflash
@@ -735,7 +667,7 @@ class Engine:
         # Small-M MMA quantized matmul for the speculative verify widths
         # (mlx_qmm_mma): probed per shape on this chip, cached; stock elsewhere.
         from . import mlx_qmm_mma
-        mlx_qmm_mma.install(self.model, self._dflash, self._mtp_head)
+        mlx_qmm_mma.install(self.model, self._dflash)
         self._resolve_kv_bits(qsdpa_ok)
         self._warm_verify_widths()
         self._install_memory_clamp()
@@ -790,34 +722,6 @@ class Engine:
                         "will use the slow unfused path", self.kv_bits,
                         getattr(self, "_head_dim", "?"), gqa or "?")
 
-    def _resolve_mtp_knobs(self) -> None:
-        """Fold the CHAD_MTP_* environment overrides into the draft schedule.
-
-        Split out of load() so the clamping contract is testable without
-        weights — it has already been wrong once. CHAD_MTP_MAX_DRAFT used to
-        clamp to 8, a leftover from before the schedule had plateau candidates:
-        the default cap is DepthPolicy.MAX_DEPTH, so any request of 8 or more
-        silently delivered LESS than the default and took every deep candidate
-        with it. The knob's job is to LOWER the cap: within the policy's own
-        ceiling it must deliver exactly what was asked for, and past it, that
-        ceiling.
-        """
-        from .mlx_mtp import DepthPolicy
-
-        av = config.env_str("CHAD_MTP_ADAPTIVE")
-        if av is not None and av != "":
-            self.mtp_adaptive = av.strip().lower() not in ("0", "false")
-        nd = config.env_int("CHAD_MTP_DRAFT", 0)
-        if nd:
-            self.mtp_num_draft = nd
-            self.mtp_adaptive = False       # an explicit width is an order
-        md = config.env_int("CHAD_MTP_MAX_DRAFT", 0)
-        if md:
-            self.mtp_max_draft = min(md, DepthPolicy.MAX_DEPTH)
-        hv = config.env_float("CHAD_MTP_H", 0.0)
-        if hv:
-            self.mtp_h = hv
-
     def _warm_verify_widths(self) -> None:
         """Build the fused verify kernel's per-width variants at load instead of
         inside the first span that needs one.
@@ -835,17 +739,6 @@ class Engine:
         if not self.kv_bits or config.flag("CHAD_NO_KERNEL_WARM"):
             return          # fp16 cache: no fused kernel, so no variants exist
         widths: set[int] = set()
-        if self._mtp_head is not None:
-            if self.mtp_adaptive:
-                # The adaptive schedule only dispatches the policy's candidate
-                # widths (bounded on purpose — an unwarmed width is a Metal
-                # compile inside a live round, and warming all of 2..32 would
-                # pay for variants no round dispatches).
-                from .mlx_mtp import DepthPolicy
-                widths.update(d + 1 for d in DepthPolicy.CANDIDATES
-                              if 0 < d <= self.mtp_max_draft)
-            else:
-                widths.add(self.mtp_num_draft + 1)
         if getattr(self, "_dflash", None) is not None:
             if self.dflash_adaptive:
                 widths.update(range(2, self.dflash_num_draft + 2))
@@ -1492,10 +1385,11 @@ class Engine:
         # what this agent generates: ~62-66% of generated tokens are <think>, and
         # reasoning prose replays at only ~2.3%. Whole-session contribution came out
         # at +2.2% of generated tokens — and was NEGATIVE before the n-gram gate was
-        # raised from 6 to 16. MTP drafts from the model itself, so it is
-        # traffic-independent and covers the think mass PLD structurally cannot.
-        # They do not compose (one generate loop each), so this is a real choice;
-        # MTP is the default and PLD is available for quote-heavy workloads
+        # raised from 6 to 16. The DFlash2 drafter drafts from the model's own
+        # residual stream, so it is traffic-independent and covers the think mass
+        # PLD structurally cannot. They do not compose (one generate loop each),
+        # so this is a real choice; block speculation is the default and PLD is
+        # available for quote-heavy workloads
         # (file rewrites, large verbatim edits) where recurrence is the norm.
         if (config.flag("CHAD_USE_PLD") and self.prompt_lookup and self.pld_wide
                 and self._pld_hybrid and not self._trimmable):
@@ -1504,26 +1398,18 @@ class Engine:
                                            on_prefill_progress, stop_condition,
                                            think_ceiling)
 
-        # MTP self-speculative decoding — the DEFAULT speculative path (see the
-        # PLD note above for why). Drafts with the checkpoint's own trained head.
-        # Exact at ANY temp (rejection sampling preserves the sampling distribution)
-        # and tolerates the quantized KV cache: rollback is offset-trim + rewrite,
-        # the same mechanism _take_rewind_snapshot documents as safe on a
-        # quantized-from-the-start cache.
-        # DFlash2 block drafter first (measured faster than the MTP chain on the
-        # shipped model), the MTP head as the fallback — same verify loop.
+        # DFlash2 block speculation — the DEFAULT speculative path (see the PLD
+        # note above for why). Exact at ANY temp (rejection sampling preserves
+        # the sampling distribution) and tolerates the quantized KV cache:
+        # rollback is offset-trim + rewrite, the same mechanism
+        # _take_rewind_snapshot documents as safe on a quantized-from-the-start
+        # cache.
         if (getattr(self, "_dflash", None) is not None
                 and (self._trimmable or self._pld_hybrid)):
-            return self._generate_spec("dflash", prompt_ids, max_tokens,
+            return self._generate_spec(prompt_ids, max_tokens,
                                        on_token, stop_texts, should_stop,
                                        on_prefill, on_prefill_progress,
                                        stop_condition, think_ceiling)
-        if (self._mtp_head is not None
-                and (self._trimmable or self._pld_hybrid)):
-            return self._generate_mtp(prompt_ids, max_tokens, on_token,
-                                      stop_texts, should_stop, on_prefill,
-                                      on_prefill_progress, stop_condition,
-                                      think_ceiling)
 
         # Prompt-lookup decoding path: needs greedy decoding (exact),
         # an unquantized cache, and a trimmable cache (cheap rollback). A qwen3_5-style
@@ -1913,7 +1799,7 @@ class Engine:
         the residual on rejection), which preserves the output distribution
         exactly — greedy included.
 
-        Rollback on partial rejection is the MTP capture-replay mechanism:
+        Rollback on partial rejection is the capture-replay mechanism:
         the verify forward records each GDN layer's recurrence inputs, and a
         rejection replays the accepted prefix from the captured state — no
         re-feed forward, which is what made enable_pld_hybrid a loss."""
@@ -1948,7 +1834,7 @@ class Engine:
             return True
 
         # Prefill everything but the last token — identical contract to the
-        # MTP path, including the degenerate fully-cached-prompt branch.
+        # block path, including the degenerate fully-cached-prompt branch.
         if not suffix:
             self._reset_cache()
             mc = self._cache
@@ -2036,7 +1922,7 @@ class Engine:
                 scaled = self._spec_scaled(logits)
                 # Two-phase accept: evaluate the k Bernoulli tests first
                 # (tiny), find n_acc on the host, then build ONE residual
-                # resample. The MTP path builds all k+1 candidate draws
+                # resample. The block path builds all k+1 candidate draws
                 # lazily to save a sync, but at k=31 that is 31 wasted
                 # 248k-vocab categoricals per step; a second tiny eval is
                 # cheaper here.
@@ -2078,7 +1964,7 @@ class Engine:
             stats.draft_accepted += n_acc
 
             # Roll the main cache back over rejected drafts (identical
-            # mechanism to _generate_mtp's hybrid branch).
+            # mechanism to _generate_spec's hybrid branch).
             if k - n_acc > 0:
                 arr = [c for c in mc
                        if isinstance(c, cache_utils.ArraysCache)]
@@ -2208,7 +2094,7 @@ class Engine:
                 stop = True
 
             # -- think-ceiling close-and-continue ---------------------------
-            # Same salvage as the MTP path (this loop also runs at temp>0);
+            # Same salvage as the block path (this loop also runs at temp>0);
             # a plain prefix-extension forward, no trim logic.
             if (not stop and not stats.salvaged
                     and think_ceiling_hit(detok.text, len(out_ids),
@@ -2258,7 +2144,7 @@ class Engine:
         mx.clear_cache()
         return detok.text, stats
 
-    # -- MTP self-speculative decoding -------------------------------------
+    # -- speculative decoding ----------------------------------------------
 
     def _spec_scaled(self, logits, seen_rows=None):
         """Temp-scaled (+ presence/top_k/top_p/min_p filtered) logprobs over the
@@ -2298,18 +2184,7 @@ class Engine:
             scaled = apply_min_p(scaled, self.min_p)
         return scaled
 
-    def _generate_mtp(self, prompt_ids, max_tokens, on_token, stop_texts,
-                      should_stop=None, on_prefill=None,
-                      on_prefill_progress=None, stop_condition=None,
-                      think_ceiling=None):
-        """Self-speculative decoding with the checkpoint's own MTP head —
-        the MTP drafter on the shared speculative loop (`_generate_spec`)."""
-        return self._generate_spec("mtp", prompt_ids, max_tokens, on_token,
-                                   stop_texts, should_stop, on_prefill,
-                                   on_prefill_progress, stop_condition,
-                                   think_ceiling)
-
-    def _generate_spec(self, kind, prompt_ids, max_tokens, on_token, stop_texts,
+    def _generate_spec(self, prompt_ids, max_tokens, on_token, stop_texts,
                        should_stop=None, on_prefill=None,
                        on_prefill_progress=None, stop_condition=None,
                        think_ceiling=None):
@@ -2318,32 +2193,21 @@ class Engine:
         output distribution is identical to plain decoding at the same
         temp/top_p/min_p — greedy included (temp 0 reduces to argmax-match).
 
-        `kind` picks the drafter (see _MTPDrafter / _DFlashDrafter): how the
-        k proposals are produced and what per-turn drafter state is kept are
-        the only things that differ; verify, accept, rollback, commit and the
-        think-ceiling salvage are shared.
-
-        - "mtp": chain the checkpoint's 1-layer MTP head k times (each chained
-          step feeds the head's own output hidden back — the serving-engine
-          reference behavior).
-        - "dflash": one forward of the DFlash2 block drafter proposes all k
-          (mlx_dflash), conditioned on the target's tapped residual stream.
+        The k proposals come from one forward of the DFlash2 block drafter
+        (mlx_dflash, see _DFlashDrafter), conditioned on the target's tapped
+        residual stream.
 
         Cache contracts:
         - Main cache rollback on rejection is the PLD-hybrid primitive
           (recurrent snapshot/restore + KV offset-trim + re-feed), which also
           holds on the quantized-from-the-start cache: trim moves the offset
           and the re-feed rewrites rows above it before they are ever read.
-        - Drafter caches hold only COMMITTED positions. The MTP head is
-          attention-only, so its private KVCache trims natively; it is rebuilt
-          fresh each turn and fed only REAL (main-model hidden, committed
-          token) pairs after each verify — drafting's speculative entries are
-          always trimmed. The DFlash drafter never caches its block at all:
-          its context cache is fed the verify forward's tapped hiddens of the
-          committed tokens. RoPE is relative under attention, so the
-          turn-local (zero-based) drafter context is sound; it only costs the
-          drafter cross-turn context, which affects acceptance rate, never
-          correctness.
+        - The drafter cache holds only COMMITTED positions: the drafter never
+          caches its block at all, and its context cache is fed the verify
+          forward's tapped hiddens of the committed tokens. RoPE is relative
+          under attention, so the turn-local (zero-based) drafter context is
+          sound; it only costs the drafter cross-turn context, which affects
+          acceptance rate, never correctness.
         """
         from . import mlx_fastpath
 
@@ -2366,8 +2230,7 @@ class Engine:
         hybrid = self._pld_hybrid and not self._trimmable
         t0 = time.time()
 
-        drafter = (_DFlashDrafter(self, embed, _logits) if kind == "dflash"
-                   else _MTPDrafter(self, embed, _logits))
+        drafter = _DFlashDrafter(self, embed, _logits)
         drafter.start_turn()
 
         def _prefill_head():
@@ -2702,111 +2565,6 @@ class _Rng:
 
     def uniform(self, n: int):
         return mx.random.uniform(shape=(n,), key=self.split())
-
-
-class _MTPDrafter:
-    """Drafter strategy for Engine._generate_spec: the checkpoint's own 1-layer
-    MTP head (mlx_mtp), chained k times per round.
-
-    Per-turn state: the head's private KVCache (attention-only, natively
-    trimmable) and `h_last`, the main model's post-final-norm hidden of the
-    LAST FED position — the head's `previous hidden` input. None until the
-    first verify forward, so the first round drafts k=0 (a plain step that
-    seeds it)."""
-
-    on_prefill_chunk = None          # MTP needs nothing from the prefill
-
-    def __init__(self, eng, embed, logits_fn):
-        self.eng = eng
-        self.head = eng._mtp_head
-        self.embed = embed
-        self.logits = logits_fn
-        self.policy = None
-        self.cache = None
-        self.h_last = None
-
-    @staticmethod
-    def tapped():
-        return contextlib.nullcontext()
-
-    def start_turn(self):
-        from .mlx_mtp import DepthPolicy
-        eng = self.eng
-        self.cache = self.head.make_cache()
-        self.h_last = None
-        # Fresh per-turn policy state: acceptance statistics are a property
-        # of the current prompt/content, not of the session.
-        self.policy = (DepthPolicy(eng.mtp_max_draft, eng.mtp_h, eng.mtp_costs)
-                       if eng.mtp_adaptive else None)
-
-    def depth(self) -> int:
-        if self.h_last is None:
-            return 0
-        if self.policy is not None:
-            return self.policy.depth()
-        return self.eng.mtp_num_draft
-
-    @staticmethod
-    def collect():
-        return None
-
-    def propose(self, k, y_val, rng):
-        """Chain the head k times. The chain stays LAZY: each drafted token
-        feeds the next step's embedding as an mx array; the caller's one eval
-        after the verify fetches all k ids."""
-        eng = self.eng
-        # Greedy proposals can take the shortlist readout (2-bit lm_head
-        # shadow + exact top-32 rerank — mlx_mtp.DraftReadout) instead of
-        # the full-vocab read. Sampled proposals need the whole
-        # distribution, so they keep the full readout.
-        sampled = eng.temp > 0 and eng.mtp_sample_drafts
-        readout = None if sampled else getattr(eng, "_mtp_draft_readout", None)
-        e = self.embed(mx.array([[y_val]], dtype=mx.uint32))
-        hin = self.h_last
-        d_arrs, q_rows = [], []
-        for _ in range(k):
-            hout = self.head(e, hin, cache=self.cache)
-            if sampled:
-                scaled = eng._spec_scaled(self.logits(hout)[0, -1])
-                d = mx.random.categorical(scaled, key=rng.split())
-                q_rows.append(mx.softmax(scaled, axis=-1))
-            elif readout is not None:
-                d = readout.argmax_token(hout)
-            else:
-                # argmax proposal — also correct at temp>0 (point-mass q;
-                # see mtp_sample_drafts). argmax of raw logits == argmax
-                # after temp/top_p/min_p, which never drop the max.
-                d = mx.argmax(self.logits(hout)[0, -1])
-            d_arrs.append(d)
-            e = self.embed(d.reshape(1, 1))
-            hin = hout
-        return d_arrs, q_rows
-
-    def _feed(self, tokens, hid_seq):
-        """Write real (hidden, next-token) pairs into the drafter cache:
-        (h_last, tokens[0]), (hid_seq[:,0], tokens[1]), ... Cheap: one
-        1-layer forward of S=len(tokens)."""
-        from mlx_lm.models.base import create_attention_mask
-        e = self.embed(mx.array([tokens], dtype=mx.uint32))
-        s = len(tokens)
-        hs = self.h_last if s == 1 else mx.concatenate(
-            [self.h_last, hid_seq[:, : s - 1]], axis=1)
-        m = create_attention_mask(e, self.cache) if s > 1 else None
-        self.head(e, hs, cache=self.cache, mask=m)
-
-    def reconcile(self, k, n_acc, y_val, draft, hid, fused):
-        # Drop ALL k speculative entries, then feed the real pairs for the
-        # tokens that actually landed ([y_val] + accepted drafts).
-        if k:
-            cache_utils.trim_prompt_cache([self.cache], k)
-        if self.h_last is not None:
-            self._feed([y_val] + draft[:n_acc], hid)
-        self.h_last = hid[:, n_acc : n_acc + 1]
-
-    def after_inject(self, y_val, close_ids, hid2, fused2):
-        if self.h_last is not None:
-            self._feed([y_val] + close_ids, hid2)
-        self.h_last = hid2[:, -1:]
 
 
 class _DFlashDrafter:

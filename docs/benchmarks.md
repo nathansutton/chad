@@ -31,7 +31,7 @@ that appends ~16 tokens):
 
 | Model | Prefill (cold) | Decode | Warm-step prefill |
 |---|---|---|---|
-| **Qwen3.8-27B** `UD-Q3_K_XL-MTP` (shipped) | ~99 tok/s | ~20.3 tok/s | ~0.75 s (16 tok) |
+| **Qwen3.8-27B** `UD-Q3_K_XL-DFlash2` (shipped) | ~99 tok/s | ~20.3 tok/s | ~0.75 s (16 tok) |
 
 > Measured on this machine with the command above; run it on yours — these are hardware
 > numbers, not scores. Figures for the models 1.x shipped are archived under
@@ -166,7 +166,7 @@ you're getting.
 
 ## The model: Qwen3.8-27B
 
-chad runs **one** model — [`Qwen3.8-27B UD-Q3_K_XL-MTP`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX),
+chad runs **one** model — [`Qwen3.8-27B UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX),
 a dense `qwen3_5` hybrid (64 layers: 48 GatedDeltaNet + 16 full attention) quantized to
 3-bit group-64 with `lm_head` held at 5-bit, ~12 GB resident, 262k native context. One
 model, every machine — no RAM-aware pick, no size tier, no flag. chad targets 24 GB Macs and
@@ -174,8 +174,8 @@ nothing smaller. The vision tower is not present at all (it was dropped at conve
 mlx-lm's `qwen3_5` loader would have discarded it at load anyway).
 
 It's a *thinking* model that emits tool calls in the XML `<function=…>` dialect — the
-harness parses both that and JSON, and strips `<think>` blocks. It also ships its trained
-**multi-token-prediction head**, which is what the engine drafts with; see
+harness parses both that and JSON, and strips `<think>` blocks. The repo also carries the
+**DFlash2 block drafter** it decodes with, pre-quantized in `dflash/`; see
 [speculative decoding](configuration.md#speculative-decoding--kernel-knobs). One fast, good
 model per machine beats a menu of mediocre ones, so there are no model flags to pick from —
 you just run `chad`.
@@ -195,28 +195,26 @@ and verifies in one batched main-model forward, accepting by exact rejection sam
 output stays token-identical, sampled output keeps the model's true distribution. Measured on
 an M4 Pro with the shipped quant (one load, same prompts, 384-token decodes):
 
-| sampling | serial | MTP head | **DFlash2** |
-|---|---|---|---|
-| greedy | 17.7 tok/s | 26.1 (1.48×) | **47.7 (2.70×)** |
-| thinking preset (temp 1.0, top_p 0.95, top_k 20 — the default) | — | 22.4 | **41.4** |
-| non-thinking preset (temp 0.7, top_p 0.80, top_k 20) | — | 23.7 | **42–43** |
+| sampling | serial | **DFlash2** |
+|---|---|---|
+| greedy | 17.7 tok/s | **47.7 (2.70×)** |
+| thinking preset (temp 1.0, top_p 0.95, top_k 20 — the default) | 22.4 | **41.4** |
+| non-thinking preset (temp 0.7, top_p 0.80, top_k 20) | 23.7 | **42–43** |
 
 Ten prompts (eight ~512-token prose seeds, two code continuations), 384-token decodes, medians,
 one load per run, on a 3-bit g64 quant of the same model. On prose the drafter lands ~8 tokens
 per round; code runs 35–37 tok/s greedy. Two pieces make that number: the block drafter's
 acceptance, and the small-M matmul kernel (`mlx_qmm_mma.py`) that makes an 8-row verify cost
 about what a 5-row one does — without it each extra verify row costs ~33 ms and the drafter's
-optimum is width 4 at 28 tok/s.
-The checkpoint's own multi-token-prediction head is the fallback drafter (`CHAD_NO_DFLASH=1`
-selects it): it chains one head step per drafted token and its acceptance decays past depth 3,
-which is the gap the block drafter closes.
+optimum is width 4 at 28 tok/s. `CHAD_NO_DFLASH=1` turns speculation off entirely and
+decodes one token per forward — the `serial` column.
 
 Prompt-lookup decoding (PLD) — the draft-model-free variant that proposes continuations from
 n-grams already in context — is implemented and greedy-exact, but is **opt-in** (`CHAD_USE_PLD=1`)
 rather than default. It drafts from context *recurrence*, and on real agentic traces that is a
 minority of what this agent writes: whole-session contribution measured at **+2.2%** of
-generated tokens. It also doesn't compose with the MTP path (one generate loop each), so on a
-self-speculating checkpoint the head is strictly the better of the two.
+generated tokens. It also doesn't compose with block speculation (one generate loop each), so
+where the drafter is available it is strictly the better of the two.
 
 ---
 

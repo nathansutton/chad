@@ -1,8 +1,8 @@
 """DFlash2 block-drafter speculative decoding: distribution safety and the
 drafter bookkeeping on the shared speculative loop.
 
-Same promise as the MTP suite: whatever the block drafter proposes, the
-committed output must be EXACTLY what plain decoding would have produced
+The core promise: whatever the block drafter proposes, the committed output
+must be EXACTLY what plain decoding would have produced
 (greedy: bit-equal tokens). A random-weight drafter proposes garbage, so it
 exercises the full-rollback arm (GDN replay + KV trim) on every round and the
 drafter-context bookkeeping across rejections; an oracle drafter that knows
@@ -26,9 +26,60 @@ from mlx_lm.models import cache as cache_utils  # noqa: E402
 
 from chad import mlx_dflash, mlx_fastpath  # noqa: E402
 from chad.engine import Engine  # noqa: E402
-from test_engine_mtp import PROMPT, _build_tiny, _greedy, _Tok  # noqa: E402
+from test_mlx_fastpath import TINY_DENSE_CFG  # noqa: E402
 
+PROMPT = [5, 9, 11, 22, 33, 44, 55, 66, 77, 88, 101, 102, 7]
 N_TOKENS = 40
+
+
+def _build_tiny(seed=0, zero=False):
+    import copy
+
+    from mlx.utils import tree_map
+    from mlx_lm.models.qwen3_5 import Model, ModelArgs
+
+    cfg = copy.deepcopy(TINY_DENSE_CFG)
+    cfg["text_config"]["head_dim"] = 64
+    mx.random.seed(seed)
+    model = Model(ModelArgs.from_dict(cfg))
+    if zero:
+        model.update(tree_map(mx.zeros_like, model.parameters()))
+    model.eval()
+    return model
+
+
+def _greedy(model, prompt_ids, n):
+    cache = cache_utils.make_prompt_cache(model)
+    logits = model(mx.array(prompt_ids)[None], cache=cache)
+    out = [int(mx.argmax(logits[0, -1]).item())]
+    for _ in range(n - 1):
+        logits = model(mx.array([out[-1]])[None], cache=cache)
+        out.append(int(mx.argmax(logits[0, -1]).item()))
+    return out
+
+
+class _Detok:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.text = ""
+        self.last_segment = ""
+
+    def add_token(self, t):
+        self.last_segment = f" {t}"
+        self.text += self.last_segment
+
+    def finalize(self):
+        pass
+
+
+class _Tok:
+    eos_token_id = None
+    eos_token_ids = []
+
+    def __init__(self):
+        self.detokenizer = _Detok()
 
 
 def _drafter_for(model, seed=7, block_size=4, sliding=True):
@@ -72,7 +123,6 @@ def _engine(model, drafter, temp=0.0, num_draft=3, adaptive=False):
     eng.min_p = eng.top_p = 0.0
     eng.prompt_lookup = False
     eng.enable_pld_hybrid = False
-    eng._mtp_head = None
     eng._dflash = drafter
     eng.dflash_num_draft = num_draft
     eng.cache_dir = None
@@ -98,7 +148,7 @@ def test_random_drafter_greedy_is_bit_exact():
     model = _build_tiny()
     ref = _greedy(model, PROMPT, N_TOKENS)
     eng = _engine(model, _drafter_for(model))
-    text, stats = eng._generate_spec("dflash", PROMPT, N_TOKENS, None, None)
+    text, stats = eng._generate_spec(PROMPT, N_TOKENS, None, None)
     assert _ids(text) == ref
     assert stats.draft_proposed > 0
     # garbage drafts: (almost) nothing accepted, so ~one forward per token
@@ -119,7 +169,7 @@ def test_random_drafter_greedy_bit_exact_through_capture_replay():
     ref = _greedy(model, PROMPT, N_TOKENS)
     eng = _engine(model, _drafter_for(model))
     assert mlx_fastpath.GDN_COLLECTOR is None
-    text, stats = eng._generate_spec("dflash", PROMPT, N_TOKENS, None, None)
+    text, stats = eng._generate_spec(PROMPT, N_TOKENS, None, None)
     assert _ids(text) == ref
     assert mlx_fastpath.GDN_COLLECTOR is None
     assert mlx_dflash.TAP is None
@@ -130,7 +180,7 @@ def test_no_sliding_window_drafter_is_bit_exact():
     model = _build_tiny()
     ref = _greedy(model, PROMPT, N_TOKENS)
     eng = _engine(model, _drafter_for(model, sliding=False), num_draft=2)
-    text, _ = eng._generate_spec("dflash", PROMPT, N_TOKENS, None, None)
+    text, _ = eng._generate_spec(PROMPT, N_TOKENS, None, None)
     assert _ids(text) == ref
 
 
@@ -167,7 +217,7 @@ def test_oracle_drafter_full_accept_saves_forwards():
     ref = _greedy(model, PROMPT, N_TOKENS)
     real = _drafter_for(model)
     eng = _engine(model, _Oracle(real, ref, len(PROMPT)), num_draft=3)
-    text, stats = eng._generate_spec("dflash", PROMPT, N_TOKENS, None, None)
+    text, stats = eng._generate_spec(PROMPT, N_TOKENS, None, None)
     assert _ids(text) == ref
     assert stats.draft_accepted == stats.draft_proposed > 0
     # k=3 accepted + 1 bonus per round -> ~N/4 forwards
@@ -177,10 +227,10 @@ def test_oracle_drafter_full_accept_saves_forwards():
 def test_second_turn_extends_cleanly():
     model = _build_tiny()
     eng = _engine(model, _drafter_for(model))
-    text1, _ = eng._generate_spec("dflash", PROMPT, 12, None, None)
+    text1, _ = eng._generate_spec(PROMPT, 12, None, None)
     prompt2 = list(PROMPT) + _ids(text1) + [17, 18, 19]
     ref2 = _greedy(model, prompt2, 12)
-    text2, stats2 = eng._generate_spec("dflash", prompt2, 12, None, None)
+    text2, stats2 = eng._generate_spec(prompt2, 12, None, None)
     assert _ids(text2) == ref2
     assert stats2.cached_tokens > 0
 
@@ -188,7 +238,7 @@ def test_second_turn_extends_cleanly():
 def test_sampled_path_stays_consistent():
     model = _build_tiny()
     eng = _engine(model, _drafter_for(model), temp=0.8)
-    text, stats = eng._generate_spec("dflash", PROMPT, 25, None, None)
+    text, stats = eng._generate_spec(PROMPT, 25, None, None)
     ids = _ids(text)
     assert len(ids) == 25
     assert stats.draft_proposed > 0
@@ -246,7 +296,7 @@ def test_adaptive_width_greedy_is_bit_exact():
     model = _build_tiny()
     ref = _greedy(model, PROMPT, N_TOKENS)
     eng = _engine(model, _drafter_for(model), num_draft=3, adaptive=True)
-    text, stats = eng._generate_spec("dflash", PROMPT, N_TOKENS, None, None)
+    text, stats = eng._generate_spec(PROMPT, N_TOKENS, None, None)
     assert _ids(text) == ref
     assert stats.forwards >= 1
 
@@ -261,13 +311,22 @@ def test_block_policy_dynamics():
         pol.record(k, k, stopped_early=False)
         pol.observe_cost(k, 0.05 + 0.03 * k)
     assert pol.depth() == 7
-    # a cold run: rejections at position 0 collapse the schedule
+    # a cold run: rejections at position 0 collapse the schedule to the free
+    # skip, but the 16-skip probe must eventually re-offer a width
     pol = mlx_dflash.block_policy(7)
     for _ in range(30):
         k = pol.depth()
         pol.record(max(k, 1), 0, stopped_early=False)
         pol.observe_cost(k, 0.05 + 0.03 * k)
     assert pol.depth() <= 1
+    assert any(pol.depth() == 1 for _ in range(20))
+    # a near-tie pending margin clamps the round whatever the streak says
+    tie = mlx_dflash.block_policy(7)
+    for _ in range(12):
+        k = tie.depth()
+        tie.record(k, k, stopped_early=False)
+    tie.margin = 0.0
+    assert tie.depth() <= 1
     # an explicit cap below the block is honored
     assert mlx_dflash.block_policy(2).depth() <= 2
 

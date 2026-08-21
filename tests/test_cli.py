@@ -130,7 +130,7 @@ def test_pick_model_small_box_warns(monkeypatch, capsys):
 
 
 def test_model_download_gb():
-    check("shipped repo -> ~12 GB", cli._model_download_gb(cli._HF_MODEL) == 12.0)
+    check("shipped repo -> ~13 GB", cli._model_download_gb(cli._HF_MODEL) == 13.2)
 
 
 def test_free_disk_gb():
@@ -155,7 +155,7 @@ def test_ensure_model_disk_preflight(monkeypatch, capsys):
     check("preflight exits 1", e.value.code == 1, e.value.code)
     err = capsys.readouterr().err
     check("names the shortfall", "not enough free disk" in err, err)
-    check("names required space", "~12 GB" in err, err)
+    check("names required space", "~13 GB" in err, err)
     check("points at cache GC", "hf cache" in err, err)
 
 
@@ -594,99 +594,19 @@ def test_backend_failure_reports_problem_cause_fix(capsys):
 
 # --- DFlash2 drafter consent/download (rides _ensure_model) ---------------------
 
-def _drafter_env(monkeypatch, tmp_path, *, ready=False, cached=False, free=100.0):
-    """A model dir whose config.json matches the shipped target shape, with the
-    drafter sidecar / HF cache / disk state under test control."""
+def test_drafter_bundle_resolution(monkeypatch, tmp_path):
+    """The drafter ships INSIDE the weights dir: found when `dflash/` is there,
+    None when it isn't (decode runs serial, no download), and CHAD_DFLASH_PATH
+    overrides both."""
     from chad import mlx_dflash
+    monkeypatch.delenv("CHAD_DFLASH_PATH", raising=False)
     mdir = tmp_path / "model"
     mdir.mkdir(parents=True)
-    (mdir / "config.json").write_text(json.dumps({
-        "text_config": {"hidden_size": 5120, "num_hidden_layers": 64,
-                        "vocab_size": 248320}}))
-    monkeypatch.delenv("CHAD_NO_DFLASH", raising=False)
-    monkeypatch.delenv("CHAD_DFLASH_PATH", raising=False)
-    monkeypatch.delenv("CHAD_DFLASH_REPO", raising=False)
-    monkeypatch.setattr(mlx_dflash, "_SIDECAR_DIR", str(tmp_path / "sidecars"))
-    if ready:
-        sd = tmp_path / "sidecars" / "Qwen3.8-27B-DFlash2-q4g64"
-        sd.mkdir(parents=True)
-        (sd / "model.safetensors").write_bytes(b"x")
-        (sd / "config.json").write_text("{}")
-    monkeypatch.setattr(cli, "_cached_weights_complete", lambda repo: cached)
-    monkeypatch.setattr(cli, "_free_disk_gb", lambda path: free)
-    calls = []
-    import huggingface_hub
-    monkeypatch.setattr(huggingface_hub, "snapshot_download",
-                        lambda repo, **kw: calls.append((repo, kw)))
-    return str(mdir), calls
-
-
-def test_ensure_drafter_no_registry_match_is_a_noop(monkeypatch, tmp_path):
-    mdir = tmp_path / "other"
-    mdir.mkdir()
-    (mdir / "config.json").write_text(json.dumps({"hidden_size": 64,
-                                                  "num_hidden_layers": 2,
-                                                  "vocab_size": 256}))
-    monkeypatch.delenv("CHAD_NO_DFLASH", raising=False)
-    import huggingface_hub
-    monkeypatch.setattr(huggingface_hub, "snapshot_download",
-                        lambda *a, **k: pytest.fail("must not download"))
-    cli._ensure_drafter(str(mdir))
-    assert "CHAD_NO_DFLASH" not in os.environ
-
-
-def test_ensure_drafter_skips_when_sidecar_or_cache_present(monkeypatch, tmp_path):
-    mdir, calls = _drafter_env(monkeypatch, tmp_path, ready=True)
-    cli._ensure_drafter(mdir)
-    assert calls == []
-    mdir, calls = _drafter_env(monkeypatch, tmp_path / "b", cached=True)
-    cli._ensure_drafter(mdir)
-    assert calls == []
-    assert "CHAD_NO_DFLASH" not in os.environ
-
-
-def test_ensure_drafter_headless_downloads_weights_only(monkeypatch, tmp_path, capsys):
-    mdir, calls = _drafter_env(monkeypatch, tmp_path)
-    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
-    cli._ensure_drafter(mdir)
-    assert len(calls) == 1
-    repo, kw = calls[0]
-    assert repo == "incoai/Qwen3.8-27B-DFlash2"
-    assert set(kw["allow_patterns"]) == {"config.json", "*.safetensors"}
-    assert "headless" in capsys.readouterr().err
-
-
-def test_ensure_drafter_decline_runs_without_it(monkeypatch, tmp_path, capsys):
-    mdir, calls = _drafter_env(monkeypatch, tmp_path)
-    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda *a: "n")
-    cli._ensure_drafter(mdir)
-    assert calls == []
-    assert os.environ.get("CHAD_NO_DFLASH") == "1"   # this session only
-    assert "Skipping" in capsys.readouterr().err
-    monkeypatch.delenv("CHAD_NO_DFLASH")
-
-
-def test_ensure_drafter_disk_preflight_skips_not_exits(monkeypatch, tmp_path, capsys):
-    """Unlike the model weights, a drafter is never worth refusing a launch over."""
-    mdir, calls = _drafter_env(monkeypatch, tmp_path, free=1.0)
-    cli._ensure_drafter(mdir)
-    assert calls == []
-    assert os.environ.get("CHAD_NO_DFLASH") == "1"
-    assert "skipping the DFlash2 drafter" in capsys.readouterr().err
-    monkeypatch.delenv("CHAD_NO_DFLASH")
-
-
-def test_ensure_drafter_download_failure_is_soft(monkeypatch, tmp_path, capsys):
-    mdir, _ = _drafter_env(monkeypatch, tmp_path)
-    import huggingface_hub
-
-    def boom(*a, **k):
-        raise OSError("offline")
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", boom)
-    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
-    cli._ensure_drafter(mdir)          # no raise, no exit
-    assert os.environ.get("CHAD_NO_DFLASH") == "1"
-    assert "unavailable" in capsys.readouterr().err
-    monkeypatch.delenv("CHAD_NO_DFLASH")
-
+    check("no bundle -> None", mlx_dflash.bundle_dir(str(mdir)) is None)
+    bundle = mdir / "dflash"
+    bundle.mkdir()
+    (bundle / "config.json").write_text("{}")
+    check("bundle found", mlx_dflash.bundle_dir(str(mdir)) == str(bundle))
+    monkeypatch.setenv("CHAD_DFLASH_PATH", str(tmp_path / "elsewhere"))
+    check("env overrides the bundle",
+          mlx_dflash.bundle_dir(str(mdir)) == str(tmp_path / "elsewhere"))

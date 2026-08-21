@@ -4,29 +4,39 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
-### DFlash2 block drafter
+### DFlash2 block speculation replaces the MTP head
 
-Decoding on the shipped model now speculates with a **DFlash2 block drafter** instead of the
-checkpoint's MTP head. The drafter (`incoai/Qwen3.8-27B-DFlash2`, 1.9B, fetched once on
-first run with the same consent prompt as the model, quantized to a ~1.1 GB sidecar) reads
-the main model's residual stream at five tapped layers and proposes a whole block of tokens
-in **one** forward; the MTP head had to chain one step per token and its acceptance decayed
-past depth 3. Verification, rollback and the exact-acceptance rule are unchanged — both
-drafters now run on one shared speculative loop (`Engine._generate_spec`) — so greedy output
-is token-identical to plain decoding and sampled output keeps the true distribution.
+Decoding on the shipped model speculates with a **DFlash2 block drafter**, and the
+checkpoint's multi-token-prediction head is **gone** — head, sidecar loader, draft-schedule
+knobs and shortlist readout, ~900 lines and eight environment variables. The drafter (1.9B,
+converted from the DFlash2 release for this model) reads the main model's residual stream at
+five tapped layers and proposes a whole block of tokens in **one** forward, where the MTP
+head had to chain one step per token and its acceptance decayed past depth 3. It measured
+faster in every mode, so keeping a second, slower drafter alive only bought a fallback that
+nothing preferred.
 
 - Measured on an M4 Pro, shipped 3-bit quant, one load, same prompts, 384-token decodes,
-  medians: greedy serial 17.7 → MTP 26.1 → **DFlash2 47.7 tok/s** (2.7×); at the thinking
-  sampling preset MTP 22.4 → **41.4**; non-thinking preset 23.7 → 42–43; code 24 → 35–37.
+  medians: greedy serial 17.7 → **47.7 tok/s** (2.7×, MTP was 26.1); at the thinking
+  sampling preset 22.4 → **41.4** (MTP 22.4); non-thinking 23.7 → 42–43; code 24 → 35–37.
   (Before the matmul kernel below: 28.1 / 27.3 at width 4, the ladder's optimum.)
+- **The drafter ships inside the model repo**, pre-quantized, as `dflash/`. There is no
+  second download, no consent prompt, no 3.8 GB bf16 fetch and no local quantize step on
+  first run — one repo, ~13.2 GB, and the speculative decoder is simply there. Weights
+  outside a bundle still load via `CHAD_DFLASH_PATH`, and
+  `python -m chad.mlx_dflash <dir> --out <model_dir>/dflash` builds a bundle for another
+  target.
+- Verification, rollback and the exact-acceptance rule are unchanged: greedy output is
+  token-identical to plain decoding and sampled output keeps the true distribution.
 - The drafter always proposes its full block of 7; a per-round schedule picks how many to
   verify from recent acceptance (`CHAD_DFLASH_ADAPTIVE=0` fixes it, `CHAD_DFLASH_DRAFT=N`
   caps it). At the sampled default a fixed full block swings 12–45 tok/s per prompt; the
-  schedule holds a 20 tok/s floor for ~5% on hot greedy prose. `CHAD_NO_DFLASH=1` restores
-  the MTP path; `CHAD_DFLASH_PATH` / `CHAD_DFLASH_REPO` point at other drafter weights;
-  `python -m chad.mlx_dflash <dir>` builds a sidecar.
+  schedule holds a 20 tok/s floor for ~5% on hot greedy prose. `CHAD_NO_DFLASH=1` now
+  decodes serially rather than falling back to a second drafter.
 - Memory: +1.1 GB resident for the drafter (its context cache is a 2048-row ring, ~40 MB);
   on a 24 GB box that is ~30k tokens of context ceiling.
+- **Removed:** `CHAD_NO_MTP`, `CHAD_MTP_ADAPTIVE`, `CHAD_MTP_DRAFT`, `CHAD_MTP_MAX_DRAFT`,
+  `CHAD_MTP_H`, `CHAD_MTP_PATH`, `CHAD_NO_DRAFT_SHORTLIST`, `CHAD_DFLASH_REPO`, and
+  `python -m chad.mlx_mtp`.
 
 ### Small-M matmul kernel for speculative verify
 

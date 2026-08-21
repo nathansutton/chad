@@ -291,13 +291,14 @@ that the Metal budget can't see) and is re-checked between turns.
 
 ### The model
 
-chad ships exactly one: [`nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX`][model], a dense
+chad ships exactly one: [`nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX`][model], a dense
 `qwen3_5` hybrid (64 layers — 48 GatedDeltaNet, 16 full attention) quantized to 3-bit
-group-64 with `lm_head` held at 5-bit. ~12 GB resident, 262k native context, and it carries
-the checkpoint's own trained MTP head as `mtp.safetensors` for
-[self-speculative decoding](#speculative-decoding--kernel-knobs).
+group-64 with `lm_head` held at 5-bit. ~12 GB resident, 262k native context. The repo also
+carries the DFlash2 block drafter, pre-quantized to 4-bit in `dflash/` (~1.1 GB resident),
+so one download gets the model and its
+[speculative decoder](#speculative-decoding--kernel-knobs) with nothing built on first run.
 
-[model]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX
+[model]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX
 
 **chad targets 24 GB Apple Silicon and nothing smaller.** There is no low-RAM fallback,
 because there is no second model to fall back to. On a smaller box chad prints a one-line
@@ -330,7 +331,7 @@ CHAD_MODEL=/path/to/local/mlx-model uv run chad           # env equivalent
 
 Precedence is `--model` → `CHAD_MODEL` → the shipped default. Both are honored without
 argument. Expect to lose speed rather than correctness: the tuning that is fitted to the
-shipped checkpoint — the MTP head, the fused-attention coverage, the fastpath's architecture
+shipped checkpoint — the DFlash2 drafter, the fused-attention coverage, the fastpath's architecture
 check, the measured per-token KV cost the governor sizes against — either declines to
 install or falls back to a stock path. The harness itself does not change.
 
@@ -671,7 +672,7 @@ Everything in this block is **speed only** — bisection and A/B knobs, not some
 run with. Two different kinds of exactness live here, and the difference matters when you
 are chasing a behaviour change:
 
-- **The speculation knobs are exact.** `CHAD_NO_MTP` and the draft-schedule settings
+- **The speculation knobs are exact.** `CHAD_NO_DFLASH` and the width-schedule settings
   change *which* tokens get proposed, never which get emitted: greedy decoding is
   token-identical with and without speculation (checked on the shipped model), and the
   sampled path keeps the model's true distribution at any temperature. If flipping one of
@@ -687,87 +688,55 @@ are chasing a behaviour change:
   quality moves.
 
 ```bash
-CHAD_NO_DFLASH=1          uv run chad  # disable the DFlash2 block drafter (MTP head takes over)
+CHAD_NO_DFLASH=1          uv run chad  # disable block speculation (decode serially)
 CHAD_DFLASH_DRAFT=7       uv run chad  # verified-width cap per round (1..7; default the full block)
 CHAD_DFLASH_ADAPTIVE=0    uv run chad  # fixed width every round instead of the per-round schedule
 CHAD_DFLASH_PATH=/dir     uv run chad  # explicit drafter checkpoint or built sidecar dir
-CHAD_DFLASH_REPO=org/name uv run chad  # a different drafter repo for the loaded model
-CHAD_NO_MTP=1             uv run chad  # disable MTP self-speculative decoding
-CHAD_MTP_ADAPTIVE=0       uv run chad  # fixed draft width instead of the adaptive schedule
-CHAD_MTP_DRAFT=2          uv run chad  # force a draft width (implies adaptive off)
-CHAD_MTP_MAX_DRAFT=6      uv run chad  # cap the adaptive schedule's depth (default 31)
-CHAD_MTP_H=…              uv run chad  # seed the depth policy's cost model
-CHAD_NO_DRAFT_SHORTLIST=1 uv run chad  # full-vocab readout for the draft chain
 CHAD_USE_PLD=1            uv run chad  # OPT-IN: wide prompt-lookup decoding
 CHAD_NO_QSDPA_WIDE=1      uv run chad  # disable the S>1 tier of the fused attention kernel
 CHAD_NO_QSDPA_WIDE_SGM=1  uv run chad  # disable just its split-head variant
 CHAD_QSDPA_WIDE_SGM_RT=1  uv run chad  # force the RT-split wide kernel instead of the one-read form
-CHAD_MTP_PATH=/path.safetensors uv run chad  # explicit MTP head sidecar (default: found beside the weights)
 CHAD_NO_KERNEL_WARM=1     uv run chad  # skip warming verify-width attention kernels at load
 CHAD_NO_QMM_MMA=1         uv run chad  # stock quantized_matmul at every verify width
 CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on this machine
 ```
 
-- **`CHAD_NO_DFLASH`** — disables the **DFlash2 block drafter** (`mlx_dflash.py`), the
-  default speculative path on the shipped model. A separate 1.9B drafter
-  ([`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2),
-  fetched once on first run with your consent and quantized to a ~1.1 GB sidecar under
-  `~/.cache/chad/dflash/`) reads the main model's residual stream at five layers and
-  proposes a whole block of tokens in **one** forward — where the MTP head must chain one
-  step per token and its acceptance decays past depth 3. Verification, rollback and the
-  exact-acceptance rule are the same as MTP's, so greedy output is token-identical to the
-  unspeculated path and sampled output keeps the true distribution. Measured on an M4 Pro
-  with the shipped 3-bit quant, 10 prompts × 384-token decodes, medians: greedy serial 17.7 →
-  MTP head 26.1 → **DFlash2 47.7 tok/s** (2.7×); at the thinking sampling preset (temp 1.0,
-  top_p 0.95, top_k 20) MTP 22.4 → **41.4**; non-thinking preset 23.7 → 42–43; code 24 →
-  35–37. With this set, or when the drafter is not available, the MTP head runs instead.
+- **`CHAD_NO_DFLASH`** — disables **DFlash2 block speculation** (`mlx_dflash.py`), the
+  speculative path on the shipped model, and decodes one token per forward. A 1.9B drafter
+  (an MLX port of [z-lab's DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2),
+  pre-quantized to 4-bit and shipped inside the model repo as `dflash/`) reads the main
+  model's residual stream at five layers and proposes a whole block of tokens in **one**
+  forward. The block is verified in one batched target forward and accepted by exact
+  rejection sampling, so greedy output is token-identical to the unspeculated path and
+  sampled output keeps the model's true distribution at any temperature. Measured on an
+  M4 Pro with the shipped 3-bit quant, 10 prompts × 384-token decodes, medians: greedy
+  serial 17.7 → **47.7 tok/s** (2.7×); at the thinking sampling preset (temp 1.0, top_p
+  0.95, top_k 20) 22.4 → **41.4**; non-thinking 23.7 → 42–43; code 24 → 35–37. It engages
+  when the drafter ships with the loaded weights — the shipped model does; an arbitrary
+  `--model` does not, and decodes serially unless you point `CHAD_DFLASH_PATH` at a
+  drafter built for it.
 - **`CHAD_DFLASH_DRAFT` / `CHAD_DFLASH_ADAPTIVE`** — the verified width. The drafter always
-  proposes its full block of 7; by default a per-round schedule (the MTP cost model with the
+  proposes its full block of 7; by default a per-round schedule (a cost model over the
   block drafter's measured round costs) picks how many to verify from recent acceptance —
   the full block on hot content, a narrow round or a free skip where acceptance drops. That
   matters at the sampled default: a fixed full block swings 12–45 tok/s per prompt as
   trajectories wander into low-acceptance text (median 31.8), the schedule holds 41.4 with a
   20 tok/s floor; on hot greedy prose it costs ~5% (45.3 vs 47.7). `CHAD_DFLASH_DRAFT=N`
-  caps the width (and, like `CHAD_MTP_DRAFT`, forces it fixed); `CHAD_DFLASH_ADAPTIVE=0`
-  fixes the width at the cap. Widths 6–8 cost about the same under the small-M matmul
-  kernel below; without it (`CHAD_NO_QMM_MMA=1`) each extra row costs ~33 ms and width 4 is
-  the optimum.
-- **`CHAD_DFLASH_PATH` / `CHAD_DFLASH_REPO`** — point the loader at a local drafter
-  checkpoint (an HF-layout dir, quantized on first use) or an already-built sidecar dir,
-  or name a different drafter repo for the loaded model. `python -m chad.mlx_dflash <dir>`
-  builds a sidecar by hand.
-- **`CHAD_NO_MTP`** — disables **MTP self-speculative decoding** (`mlx_mtp.py`), the
-  fallback speculative path (and the default on a checkpoint that ships a head but has
-  no registered block drafter). chad drafts several tokens with the checkpoint's own
-  trained multi-token-prediction head (loaded as a sidecar), verifies them in one batched
-  forward, and accepts by exact rejection sampling — so greedy output is *token-identical*
-  to the unspeculated path and sampled output keeps the model's true distribution at any
-  temperature. It engages only on checkpoints that ship a head — the shipped model does;
-  an arbitrary `--model` almost certainly does not. Measured on an M4 Pro at
-  temp 1.0: **1.38× on quote-heavy spans, 1.11× on novel code, 1.0× on free prose** — it
-  speeds up predictable text and costs nothing on unpredictable text.
-- **`CHAD_MTP_ADAPTIVE` / `CHAD_MTP_DRAFT` / `CHAD_MTP_MAX_DRAFT` / `CHAD_MTP_H`** — the
-  draft-depth schedule. By default a per-round cost model picks the depth from recent
-  acceptance and, on a full-accept streak, jumps onto the measured flat verify plateau
-  (an S≥10 verify costs about the same through S=32). Where acceptance is poor — temp-1
-  thinking, cold content — it collapses to depth 1–2 or a free skip, so a bad regime
-  degrades to fixed-width behavior rather than below it. `CHAD_MTP_ADAPTIVE=0` restores a
-  fixed width; `CHAD_MTP_DRAFT=N` forces one and implies adaptive off (an explicit width
-  is an order); `CHAD_MTP_MAX_DRAFT=N` lowers the schedule's depth cap from its default of
-  31 — set it below 9 and the plateau candidates are unreachable, which is the point when
-  you are bisecting one — and `CHAD_MTP_H` seeds the cost model.
-- **`CHAD_NO_DRAFT_SHORTLIST`** — the greedy draft chain reads its next token from a 2-bit
-  shortlist rather than the full vocabulary, because that full-vocab `lm_head` read was
-  ~70% of the head-step cost. Draft-side only: a shortlist miss costs a rejected draft
-  token, never a wrong output token. This restores the full readout for bisection.
+  caps the width and forces it fixed; `CHAD_DFLASH_ADAPTIVE=0` fixes the width at the cap.
+  Widths 6–8 cost about the same under the small-M matmul kernel below; without it
+  (`CHAD_NO_QMM_MMA=1`) each extra row costs ~33 ms and width 4 is the optimum.
+- **`CHAD_DFLASH_PATH`** — point the loader at a drafter outside the model repo: either an
+  HF-layout checkpoint dir (quantized on first use into `~/.cache/chad/dflash/`) or an
+  already-built sidecar dir. `python -m chad.mlx_dflash <dir> --out <model_dir>/dflash`
+  builds a sidecar by hand — that is how the shipped repo's bundle was made.
 - **`CHAD_USE_PLD`** — turns **wide prompt-lookup decoding** back on. It was the default
   before 2.0.0 and is now opt-in, because PLD drafts from *context recurrence* and can
   therefore only accelerate text that already appeared. On real agentic traces that is a
   minority of what this agent generates: ~62–66% of generated tokens are `<think>`, and
   reasoning prose replays at only ~2.3%. Whole-session contribution measured at **+2.2%**
-  of generated tokens. It does not compose with MTP — one generate loop each — so on a
-  self-speculating checkpoint MTP is strictly the better of the two, and this flag is how
-  you measure the other arm.
+  of generated tokens. It does not compose with block speculation — one generate loop each
+  — so where the DFlash2 drafter is available it is strictly the better of the two, and
+  this flag is how you measure the other arm.
 - **`CHAD_NO_QSDPA_WIDE` / `CHAD_NO_QSDPA_WIDE_SGM`** — disable the multi-token (S>1) tier
   of the fused quantized-KV attention kernel (`mlx_qsdpa.py`), which serves speculative
   verification. Without it those steps fall back to dequantizing the whole cache once per
@@ -787,9 +756,6 @@ CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on t
   (K/V bytes touched once, all row tiles resident); this forces the *RT-split* form (one
   8-row tile per threadgroup, K/V read once per tile), which is what runs anyway at S>4.
   Both are exact; the knob exists to A/B them at a given width.
-- **`CHAD_MTP_PATH`** — an explicit path to the MTP head's `.safetensors` sidecar. Unset,
-  the loader looks beside the weights (the shipped model bundles it as `mtp.safetensors`).
-  Useful when building a head yourself with `python -m chad.mlx_mtp`.
 - **`CHAD_NO_QMM_MMA` / `CHAD_QMM_MMA_RECAL`** — the **small-M quantized matmul kernel**
   (`mlx_qmm_mma.py`) that serves speculative verification. Stock `quantized_matmul` is at
   roofline for one row and tiles well from ~13 rows, but in between — verify width = draft

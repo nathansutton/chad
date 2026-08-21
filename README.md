@@ -127,7 +127,7 @@ to work it out from here.
 
 | Model | Quant | Footprint |
 |---|---|---|
-| [Qwen3.8-27B `UD-Q3_K_XL-MTP`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX) | 3-bit group-64 body, 5-bit `lm_head`, bundled 4-bit MTP head | ~12 GB resident, 262k native context |
+| [Qwen3.8-27B `UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX) | 3-bit group-64 body, 5-bit `lm_head`, bundled 4-bit DFlash2 drafter | ~12 GB resident, 262k native context |
 
 Qwen3.8-27B is **dense** (64 layers: 48 GatedDeltaNet + 16 full attention), so every
 parameter is on the critical path for every token and shrinking the model is the only
@@ -138,11 +138,11 @@ whose per-row error never compounds through a matmul, is the cheapest. Quant nam
 [Unsloth's dynamic-quant convention](https://docs.unsloth.ai/) (`UD-…`); the quant itself
 is MLX group-64 affine, not a llama.cpp k-quant.
 
-It decodes speculatively: a small **DFlash2 block drafter** (fetched once, ~1.1 GB
-resident) proposes several tokens per forward from the main model's own hidden states, the
-main model verifies them in one batched forward, and exact rejection sampling keeps greedy
-output token-identical to the unspeculated path. The checkpoint's own trained
-**multi-token-prediction head** is bundled as the fallback drafter.
+It decodes speculatively: a small **DFlash2 block drafter** (bundled with the weights,
+~1.1 GB resident) proposes a whole block of tokens in one forward from the main model's own
+hidden states, the main model verifies the block in one batched forward, and exact rejection
+sampling keeps greedy output token-identical to the unspeculated path. Measured on an M4
+Pro, that is 17.7 → 47.7 tok/s greedy and 22.4 → 41.4 at the default sampling preset.
 
 **24 GB is the floor.** The context window is sized from the live Metal budget, not a
 constant, so a tighter box narrows its window rather than dying — but ~12 GB of weights
@@ -153,7 +153,7 @@ it does not gate you, but it cannot give you a usable window either.
 
 `--model <repo or local dir>` runs different weights through the same engine, and stays a
 first-class escape hatch: shipping one model is a default, not a cage. What you give up is
-fit, not function — the speculation head, the fused-attention coverage, the decode fastpath
+fit, not function — the block drafter, the fused-attention coverage, the decode fastpath
 and the context governor are all fitted to the shipped checkpoint, so other weights are
 slower rather than broken. The flag takes a repo id or a directory; there are no size
 shorthands.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """chad — a local, MLX-backed, Claude-Code-style coding agent.
 
-One model (Qwen3.8-27B, 3-bit, with its MTP head), one entrypoint, run with uv:
+One model (Qwen3.8-27B, 3-bit, with its DFlash2 drafter), one entrypoint, run with uv:
 
     uv run chad                                # interactive full-screen TUI
     uv run chad "fix the bug in greet.py"      # one-shot, headless
@@ -38,10 +38,11 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
 # The shipped model, on Hugging Face. Naming follows Unsloth's dynamic-quant
 # convention so the quant scheme is recognizable (UD = Unsloth Dynamic; Q3_K_XL =
 # a 3-bit body with extra bits where they pay), plus an -MLX suffix for format
-# discoverability and -MTP because the trained multi-token-prediction head ships
-# with the weights. The quant itself is MLX group-64 affine, not llama.cpp Q3_K
+# discoverability. The quant itself is MLX group-64 affine, not llama.cpp Q3_K
 # k-quants — the model card says so; the tag is for recognition, not bit-for-bit
-# equivalence.
+# equivalence. The repo also carries the DFlash2 block drafter, pre-quantized, in
+# `dflash/` (~1.1 GB): one download gets the model and its speculative decoder,
+# with nothing built on first run (mlx_dflash.py).
 #
 # Qwen3.8-27B is `qwen3_5` — DENSE (64 layers: 48 GatedDeltaNet + 16 full attention),
 # so every parameter is on the critical path for every token and shrinking the model
@@ -51,7 +52,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
 # of this same checkpoint are unanimous that it is the tier worth protecting while
 # embed_tokens — a lookup table, whose per-row error never compounds through a matmul
 # — is the cheapest. ~12.1 GB resident.
-_HF_MODEL = "nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX"
+_HF_MODEL = "nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX"
 # A dev clone that already built the weights locally should use them rather than
 # re-download — prefer this dir when present.
 _LOCAL_MODEL = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-q3_e3h5")
@@ -390,9 +391,10 @@ def _pick_model(spec=None):
 
 def _model_download_gb(model_id):
     """Approximate download size in GiB for the shipped model (for the disk preflight
-    and the confirm prompt — display honesty, not accounting). An arbitrary `--model`
-    is unknowable ahead of the resolve, so it gets the same figure."""
-    return 12.0
+    and the confirm prompt — display honesty, not accounting): ~12.1 GB of weights
+    plus the ~1.1 GB bundled DFlash2 drafter. An arbitrary `--model` is unknowable
+    ahead of the resolve, so it gets the same figure."""
+    return 13.2
 
 
 def _free_disk_gb(path):
@@ -445,14 +447,6 @@ def _cached_weights_complete(model_id) -> bool:
 
 
 def _ensure_model(model_id):
-    """First-run consent + download for the model weights, then the same contract
-    for the model's speculative drafter (`_ensure_drafter`). Every entrypoint that
-    loads a model (cli, serve, bench, prove) goes through here."""
-    _ensure_model_weights(model_id)
-    _ensure_drafter(model_id)
-
-
-def _ensure_model_weights(model_id):
     """If model_id is a HF repo id not yet in the local cache, confirm and download it
     into ~/.cache/huggingface (shared, resumable, paid once per machine). Local dirs
     and already-cached repos return immediately. Headless (no TTY) auto-downloads.
@@ -513,56 +507,6 @@ def _ensure_model_weights(model_id):
             "  fix:   check your connection; if the repo is gated, run `hf auth login`.\n"
             "         Or point CHAD_MODEL at a local model dir you've already built.\n")
         sys.exit(1)
-
-
-def _ensure_drafter(model_id):
-    """First-run consent + download for the model's DFlash2 block drafter
-    (mlx_dflash.py): a separate ~3.8 GB bf16 checkpoint, quantized to a ~1.1 GB
-    sidecar at load. Pure speed: declining (or any failure) just runs this
-    session without it, via CHAD_NO_DFLASH. Models with no registered drafter,
-    already-built sidecars and a cached checkpoint return immediately; headless
-    (no TTY) auto-downloads like the model."""
-    if os.environ.get("CHAD_NO_DFLASH"):
-        return
-    try:
-        from . import mlx_dflash
-        from .engine import _local_path
-        model_dir = _local_path(model_id)
-        repo = mlx_dflash.repo_for_model_dir(model_dir)
-        if not repo or mlx_dflash.sidecar_ready(repo):
-            return
-        if _cached_weights_complete(repo):
-            return  # Engine.load quantizes it from the HF cache (no network)
-        from huggingface_hub import snapshot_download
-        need_gb = 3.8
-        hf_home = os.environ.get("HF_HOME", "~/.cache/huggingface")
-        free_gb = _free_disk_gb(hf_home)
-        if free_gb is not None and free_gb < need_gb + 2.0:
-            sys.stderr.write(
-                f"\nchad: skipping the DFlash2 drafter download ({free_gb:.1f} GB free at "
-                f"{hf_home}, needs ~{need_gb:.0f} GB + 2 GB headroom); decoding without "
-                "it this session.\n")
-            os.environ["CHAD_NO_DFLASH"] = "1"
-            return
-        sys.stderr.write(
-            f"\nchad also uses a speculative-decoding drafter for this model: '{repo}' "
-            f"(~{need_gb:.1f} GB, one-time, resumable; quantized locally to ~1.1 GB).\n"
-            "It makes decoding substantially faster and never changes what the model "
-            "says.\n")
-        if sys.stdin.isatty():
-            ans = input("Download it now? [Y/n] ").strip().lower()
-            if ans and ans not in ("y", "yes"):
-                sys.stderr.write("Skipping — decoding without the drafter this session "
-                                 "(CHAD_NO_DFLASH=1 silences this prompt).\n")
-                os.environ["CHAD_NO_DFLASH"] = "1"
-                return
-        else:
-            sys.stderr.write("[headless: downloading automatically]\n")
-        snapshot_download(repo, allow_patterns=["config.json", "*.safetensors"])
-    except Exception as e:  # noqa: BLE001 — a drafter is never worth failing a launch
-        sys.stderr.write(f"\nchad: DFlash2 drafter unavailable ({type(e).__name__}: {e}); "
-                         "decoding without it this session.\n")
-        os.environ["CHAD_NO_DFLASH"] = "1"
 
 
 def _fail_model_load(model_id, err):

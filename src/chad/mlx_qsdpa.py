@@ -58,7 +58,7 @@ attention; past `_wide_s_max` that is measured the faster of the two.
 Everything else falls through to stock. Opt out: CHAD_NO_QSDPA=1.
 
 Scope note: the engine builds the cache quantized from the start, so these
-kernels serve normal decode, MTP verification and prefill alike. The one path
+kernels serve normal decode, speculative verification and prefill alike. The one path
 that still requires an fp16 cache is opt-in wide prompt-lookup decoding
 (CHAD_USE_PLD). This also serves `chad serve` setups exposing the in-process
 engine with --kv-bits.
@@ -225,7 +225,7 @@ _P1_SRC = """
   for (int j = 0; j < 4; j++) out_p[4 + j] = o1[j];
 """
 
-# Pass 1, wide-S form (S in 2..6): the MTP verify forward's shape. Same
+# Pass 1, wide-S form (S in 2..6): the speculative verify forward's shape. Same
 # staging/double-buffering as _P1_SRC; a simdgroup still owns one q head but
 # now carries that head's S query rows (staged pre-scaled into threadgroup
 # memory — S x 8 floats of extra registers per lane would spill at S >= 4),
@@ -948,7 +948,7 @@ _p1_wide = None
 
 
 def _kernel_wide():
-    """Pass 1 in wide-S form (the MTP verify shape); pass 2 is shared — its
+    """Pass 1 in wide-S form (the speculative verify shape); pass 2 is shared — its
     grid already enumerates B*HQ*S heads and the partials contract carries S."""
     global _p1_wide
     if _p1_wide is None:
@@ -1259,7 +1259,7 @@ def qsdpa(q: Any, k_quant: tuple, v_quant: tuple, scale: float, n: int) -> Any:
 
 def _eligible(q: Any, cache: Any, mask: Any) -> bool:
     """True iff this call is a validated decode shape: S==1 (plain decode) or
-    S in 2.._wide_s_max(gqa, offset) (the MTP/PLD verify forward), D==256,
+    S in 2.._wide_s_max(gqa, offset) (the block/PLD verify forward), D==256,
     GQA in _GQAS, 8-bit group-64 quantized cache, no restricting mask.
 
     A width past that cap is not an error — `install()` sends it to the
@@ -1366,7 +1366,7 @@ def kernel_healthy() -> bool:
                             "GPU/toolchain; refusing to install it", hkv, n, dtype, err, tol)
                 _KERNEL_HEALTHY = False
                 return False
-        # Wide-S probes (the MTP verify shape): per-row causal reference —
+        # Wide-S probes (the speculative verify shape): per-row causal reference —
         # row s of the S tail positions attends to the first n-S+1+s. Probes
         # cover the partial-chunk edges (n near CH), both GQA tiers the wide
         # kernel serves, and both dtypes. A wide kernel that silently NaNs
@@ -1423,7 +1423,7 @@ def warm_widths(widths, hq: int, hkv: int, dtype, n: int = _SGM_MIN_N + 8) -> in
     puts it back on every run.
 
     `kernel_healthy` already builds S in {1,2,3,4,6} as a side effect of its
-    probes. This closes the rest: S=5 (CHAD_MTP_DRAFT=4) and wide-PLD's 9..32.
+    probes. This closes the rest: S=5 (CHAD_DFLASH_DRAFT=4) and wide-PLD's 9..32.
     Widths under 3 need nothing -- S==2 and S==1 both dispatch the per-head
     kernel the self-check already built -- and `n` only has to clear
     _SGM_MIN_N, since the variant is keyed on S and not on context length.

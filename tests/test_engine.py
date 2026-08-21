@@ -1232,7 +1232,8 @@ def test_spec_scaled_penalizes_each_verify_row_against_its_own_prefix():
     target p it is given, so p at verify row j must equal the p a PLAIN step
     would have built at that position — i.e. penalized against the committed
     history PLUS the drafts before j. If every row shared the pre-forward
-    history, MTP output would drift from plain output inside every accepted run,
+    history, speculative output would drift from plain output inside every
+    accepted run,
     silently breaking the 'exact at any temp' property."""
     try:
         import mlx.core as mx

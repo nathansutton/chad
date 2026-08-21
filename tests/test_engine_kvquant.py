@@ -188,7 +188,6 @@ def test_warm_verify_widths_only_warms_dispatchable_widths(monkeypatch):
     tell: chad paid the Metal compile for exactly the widths _eligible refused.)
     """
     from chad import mlx_qsdpa
-    from chad.mlx_mtp import DepthPolicy
 
     seen = {}
 
@@ -197,18 +196,19 @@ def test_warm_verify_widths_only_warms_dispatchable_widths(monkeypatch):
         return len(seen["widths"])
 
     monkeypatch.setattr(mlx_qsdpa, "warm_widths", _fake_warm)
+    monkeypatch.setenv("CHAD_USE_PLD", "1")
 
     eng = object.__new__(Engine)
     eng.kv_bits = 8
-    eng._mtp_head = object()
-    eng.mtp_adaptive = True
-    eng.mtp_max_draft = DepthPolicy.MAX_DEPTH
-    eng.mtp_num_draft = 2
+    eng._dflash = object()
+    eng.dflash_adaptive = True
+    eng.dflash_num_draft = 7
     eng._n_attn_heads, eng._n_kv_heads = 24, 4       # the shipped gqa-6 shape
-    eng.prompt_lookup = False
-    eng.pld_wide = False
-    eng.pld_wide_draft = 0
-    eng.pld_wide_min_draft = 0
+    # wide-PLD is the only path that asks for widths past the fused cap.
+    eng.prompt_lookup = True
+    eng.pld_wide = True
+    eng.pld_wide_draft = 31
+    eng.pld_wide_min_draft = 8
     eng.model = _StubParams()
 
     eng._warm_verify_widths()
@@ -216,7 +216,9 @@ def test_warm_verify_widths_only_warms_dispatchable_widths(monkeypatch):
     cap = mlx_qsdpa._wide_s_max(6)
     assert seen["widths"], "nothing warmed"
     assert max(seen["widths"]) <= cap
-    # the plateau widths under the cap are warmed, the one above it is not
+    # every block width the schedule can dispatch (2..8) is warmed
+    assert set(range(2, 9)) <= set(seen["widths"])
+    # wide-PLD widths under the cap are warmed, the ones above it are not
     assert 10 in seen["widths"] and 24 in seen["widths"]
     assert 32 not in seen["widths"]
 

@@ -178,7 +178,7 @@ def _concat_gdn_in_projs(model) -> None:
     _patch_gdn_call()
 
 
-# Verify-forward input capture (MTP speculative decoding). When an engine
+# Verify-forward input capture (speculative decoding). When an engine
 # arms a collector dict here, the NEXT S>1 GDN forwards record, per GDN
 # layer, the conv_input activation and the recurrence's inputs + pre-round
 # state — all by reference (they are intermediates of the round's graph, held
@@ -188,7 +188,7 @@ def _concat_gdn_in_projs(model) -> None:
 # recurrent models (the PLD lesson) or the stepped per-position state
 # checkpoints that made verify forwards ~3x a plain step. The batched matmuls
 # are untouched, so weights are still read once per verify. Armed per-forward
-# by engine._generate_mtp; always None during prefill and normal decode.
+# by engine._generate_spec; always None during prefill and normal decode.
 GDN_COLLECTOR = None
 
 

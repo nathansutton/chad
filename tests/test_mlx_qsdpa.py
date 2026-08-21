@@ -147,7 +147,7 @@ def _reference_wide(q, cache, n):
 @pytest.mark.parametrize("s", [2, 3, 4])
 def test_wide_matches_causal_reference(dispatch, dtype, hq, hkv, n, s,
                                        monkeypatch):
-    """S>1 is the MTP verify forward's attention: both dispatches (the
+    """S>1 is the speculative verify forward's attention: both dispatches (the
     default per-row S=1 calls and the CHAD_QSDPA_WIDE_KERNEL one-read
     kernel) must match the per-row tail-causal dequantize->fp32 reference,
     including the partial-chunk edges (n=9 with S=4 leaves rows with
@@ -262,24 +262,26 @@ def test_wide_s_max_is_per_schedule(monkeypatch):
     assert mlx_qsdpa._PER_ROW_S_CAP < mlx_qsdpa._WIDE_S_CAP
 
 
-def test_depth_policy_plateau_widths_are_eligible():
-    """Regression guard for the cap bug: every draft depth the adaptive MTP
-    schedule can pick must land on the fused path at a realistic context,
-    except the topmost — S=32 is measured slower fused than dequantized, and
-    the cap is set to exclude exactly it."""
-    mtp = pytest.importorskip("chad.mlx_mtp")
+def test_dispatchable_verify_widths_are_eligible():
+    """Regression guard for the cap bug: every verify width chad can dispatch
+    must land on the fused path at a realistic context, except the topmost —
+    S=32 is measured slower fused than dequantized, and the cap is set to
+    exclude exactly it."""
+    dflash = pytest.importorskip("chad.mlx_dflash")
     n = 4096                                    # a mid-session context
     q, k, v = _make_wide(24, 4, n, 1, mx.float16)
     cache = _fill_cache(k, v, mx.float16)
-    widths = sorted(d + 1 for d in mtp.DepthPolicy.CANDIDATES if d > 0)
+    # the block schedule's widths (2..8) plus wide-PLD's ladder up to 32
+    widths = sorted({d + 1 for d in dflash.WidthPolicy.CANDIDATES if d > 0}
+                    | {10, 12, 16, 20, 24, 32})
     fused = []
     for s in widths:
         qs, *_ = _make_wide(24, 4, n, s, mx.float16)
         if mlx_qsdpa._eligible(qs, cache, "causal"):
             fused.append(s)
     assert fused == [w for w in widths if w <= 24], fused
-    assert 10 in fused and 24 in fused      # the plateau jump is fused
-    assert 32 not in fused                  # and its top rung deliberately is not
+    assert 8 in fused and 24 in fused       # the full block and the wide ladder
+    assert 32 not in fused                  # the top rung deliberately is not
 
 
 def test_pick_blocks_table():
