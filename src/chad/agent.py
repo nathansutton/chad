@@ -44,7 +44,15 @@ from .render import (
     render_tool_start,
 )
 from .toolcall_parse import parse_tool_calls, strip_think
-from .tools import IGNORE_DIRS, TERMINAL, _under_plans, active_schemas, dispatch_for, is_mutating
+from .tools import (
+    IGNORE_DIRS,
+    TERMINAL,
+    _under_plans,
+    active_schemas,
+    dispatch_for,
+    is_mutating,
+    tool_write_todos,
+)
 from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_repair
 
 # Validation (VALIDATE knob, legacy_validate baseline) lives in validate.py, the
@@ -1359,6 +1367,20 @@ class Agent:
             # run since, send the model back to actually test its work.
             terminal = next((a for n, a in calls if n in TERMINAL), None)
             if terminal is not None:
+                # A `write_todos` sharing the step with `done` is the model's habitual
+                # last bookkeeping call. The short-circuit below returns before the
+                # execute loop, so that final update used to be dropped and the recorded
+                # plan always ended a step stale — every item the model just marked
+                # `[x]` was thrown away. Run it here: it touches no files, needs no
+                # confirmation, and counts as no work under any of the done-gates, so
+                # nothing below changes. It matters on the reject paths too, where the
+                # turn continues and the model must see its own plan.
+                for _n, _a in calls:
+                    if _n == "write_todos" and isinstance(_a, dict) and "todos" in _a:
+                        render_tool_start(self._emit, _n, _a)
+                        _res = tool_write_todos(_a["todos"])
+                        render_tool_result(self._emit, _n, _a, _res)
+                        self.messages.append({"role": "tool", "name": _n, "content": _res})
                 # Don't accept `done` if the model only narrated/planned without running
                 # any real tool (the markdown-code-fence failure mode).
                 log.info("step %d: model says DONE (summary=%r) | did_work=%s "

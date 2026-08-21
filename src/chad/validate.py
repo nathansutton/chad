@@ -191,6 +191,9 @@ def _tname(v: Any) -> str:
 
 
 def _expected(schema: dict) -> str:
+    alts = schema.get("anyOf")
+    if alts:
+        return " | ".join(_expected(a) for a in alts)
     enum = schema.get("enum")
     if enum:
         return " | ".join(json.dumps(e) for e in enum)
@@ -251,6 +254,22 @@ def _coerce_scalar(value: Any, typ: Optional[str]) -> Tuple[Any, bool]:
 
 
 def _walk(value: Any, schema: dict, path: str) -> Tuple[Any, List[Err]]:
+    # `anyOf` — a field with two equally legitimate shapes (write_todos' checklist
+    # string vs the structured list). Take the first branch that validates cleanly, so
+    # the model never has to guess which one the schema wanted. Branch order is
+    # preference order: when none validate we report the branch that came closest, so
+    # the repair message names one concrete fix instead of "no alternative matched".
+    alts = schema.get("anyOf")
+    if alts:
+        best_v, best_e = value, None
+        for alt in alts:
+            cv, errs = _walk(value, alt, path)
+            if not errs:
+                return cv, []
+            if best_e is None or len(errs) < len(best_e):
+                best_v, best_e = cv, errs
+        return best_v, best_e or [Err(path, _expected(schema), _tname(value))]
+
     typ = schema.get("type")
     # Un-double-stringify: a container field whose value arrived as a JSON string
     # (Qwen3 does this on nested fields — typia's signature failure mode).

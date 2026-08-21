@@ -14,6 +14,7 @@ Implementations are deliberately conservative: writes/bash are real but the CLI
 gates them behind a confirmation unless --yolo is set.
 """
 
+import json
 import os
 import re
 import signal
@@ -665,17 +666,90 @@ def _indent_unit(data: str) -> str:
 
 # Planning tool (deepagents' write_todos): a scaffold that keeps the model on track
 # across multi-step tasks. Stateless-ish — the model re-sends the whole list each call.
+#
+# The wire format is a markdown checklist, one item per line — the SAME text this tool
+# prints back, so updating the plan is copying your own last output forward and flipping
+# a box. Models write checklists natively; a list of {content, status} objects they do
+# not, and asking for one bought a nested shape they mis-typed far more often than not.
+# The structured form is still accepted (see `parse_todos`) — nothing that already sends
+# it has to change.
 _TODOS = []
+
+_MARK_TO_STATUS = {
+    "x": "completed", "✓": "completed", "✔": "completed", "done": "completed",
+    "completed": "completed", "complete": "completed",
+    "~": "in_progress", ">": "in_progress", "-": "in_progress", "*": "in_progress",
+    "wip": "in_progress", "doing": "in_progress", "active": "in_progress",
+    "in_progress": "in_progress", "in progress": "in_progress",
+}
+
+# `[ ] content`, tolerating a markdown bullet or "1." numbering in front and any short
+# word in the box ("[wip]", "[done]") as well as the single-character marks.
+_TODO_LINE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?\[(?P<mark>[^\]]{0,12})\]\s*(?P<content>.*)$")
+
+
+def _status_for(mark) -> str:
+    """Map a checkbox mark (or a status word from the structured form) to a status.
+    Anything unrecognized — including the empty box — is pending."""
+    return _MARK_TO_STATUS.get(str(mark).strip().lower(), "pending")
+
+
+def _todo_from_line(line: str):
+    """One checklist line -> {content, status}, or None if the line carries no item."""
+    line = line.strip()
+    if not line:
+        return None
+    m = _TODO_LINE.match(line)
+    if m is None:  # a bare line with no checkbox is still an item, not yet started
+        return {"content": line, "status": "pending"}
+    content = m.group("content").strip()
+    return {"content": content, "status": _status_for(m.group("mark"))} if content else None
+
+
+def parse_todos(value) -> list:
+    """Normalize whatever the model sent into `[{content, status}, ...]`.
+
+    Accepts, in the order they are tried: JSON (the structured list, or either form
+    double-encoded as a string — Qwen3 stringifies nested fields), then a markdown
+    checklist. Unparseable input yields an empty list, which the tool turns into a
+    repair message rather than a silent no-op plan.
+    """
+    if isinstance(value, str):
+        try:
+            loaded = json.loads(value)
+        except (ValueError, TypeError):
+            loaded = None
+        if isinstance(loaded, (list, dict)):
+            return parse_todos(loaded)
+        return [t for t in (_todo_from_line(ln) for ln in value.splitlines()) if t]
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if isinstance(item, dict):
+            content = str(item.get("content", "")).strip()
+            if content:
+                out.append({"content": content, "status": _status_for(item.get("status"))})
+        elif isinstance(item, str):
+            parsed = _todo_from_line(item)
+            if parsed is not None:
+                out.append(parsed)
+    return out
+
+
+_STATUS_MARKS = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
 
 
 def tool_write_todos(todos) -> str:
     global _TODOS
-    if not isinstance(todos, list):
-        return "[todos must be a list of {content, status} objects]"
-    _TODOS = todos
-    marks = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
-    lines = [f"  {marks.get(t.get('status', 'pending'), '[ ]')} {t.get('content', '')}"
-             for t in todos]
+    items = parse_todos(todos)
+    if not items:
+        return ("[no todos found. Send `todos` as a checklist, one item per line: "
+                "`[x] a finished step` / `[~] the step you are on` / `[ ] a step to do`.]")
+    _TODOS = items
+    lines = [f"  {_STATUS_MARKS[t['status']]} {t['content']}" for t in items]
     return "Plan updated:\n" + "\n".join(lines)
 
 
@@ -704,21 +778,43 @@ SCHEMAS: list[dict[str, Any]] = [
             "name": "write_todos",
             "description": "Record or update your step-by-step plan for a multi-step task. "
                            "Call this first for any task with 2+ steps, and again to update "
-                           "statuses as you progress.",
+                           "statuses as you progress.\n"
+                           "`todos` is a checklist, one item per line, written exactly the "
+                           "way this tool prints it back to you:\n"
+                           "  [x] a step that is finished\n"
+                           "  [~] the step you are working on now\n"
+                           "  [ ] a step still to do\n"
+                           "Send the whole list every time — it replaces the previous one.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "todos": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "content": {"type": "string"},
-                                "status": {"type": "string",
-                                           "enum": ["pending", "in_progress", "completed"]},
+                        "description": "The full checklist, one `[x]` / `[~]` / `[ ]` item "
+                                       "per line.",
+                        # Three accepted shapes, in match order. The structured list is
+                        # tried first so a caller that sends it keeps precise per-field
+                        # validation (a bad status -> a named enum error, not "expected
+                        # string"). The checklist string — what the description asks for
+                        # and what models actually write — must come before the list of
+                        # bare lines, or a multi-line checklist would match that branch
+                        # as ONE item and collapse the whole plan into a single row.
+                        "anyOf": [
+                            {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "content": {"type": "string"},
+                                        "status": {"type": "string",
+                                                   "enum": ["pending", "in_progress",
+                                                            "completed"]},
+                                    },
+                                    "required": ["content", "status"],
+                                },
                             },
-                            "required": ["content", "status"],
-                        },
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
                     },
                 },
                 "required": ["todos"],

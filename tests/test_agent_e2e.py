@@ -641,3 +641,32 @@ def _run_capped_think(monkeypatch, *, ablated: bool):
     agent.run_turn("change the config value")
     return tok.flags
 
+
+
+def test_final_plan_update_paired_with_done_is_not_dropped(tmp_path, monkeypatch):
+    """`write_todos` + `done` in ONE step: the terminal short-circuit returns before the
+    execute loop, so the model's last plan update — the step where it marks everything
+    `[x]` — used to be silently discarded. It is the model's habitual closing move, so
+    the recorded plan ended every turn a step stale."""
+    from chad import tools
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "note.txt"
+    script = [
+        _tool_call("write_todos", todos="[~] Write the note\n[ ] Read it back"),
+        _tool_call("write", path=str(target), content="hi\n"),
+        _tool_call("bash", command="cat " + str(target)),
+        # The closing step: plan update and done together.
+        _tool_call("write_todos", todos="[x] Write the note\n[x] Read it back")
+        + "\n" + _tool_call("done", summary="wrote and read back the note"),
+    ]
+    agent = _agent(script)
+    agent.run_turn("write a note and read it back")
+
+    assert [t["status"] for t in tools._TODOS] == ["completed", "completed"], tools._TODOS
+    # The result is in the transcript too, so a `done` that gets rejected replays the
+    # turn with the model's own plan visible rather than a hole where the call was.
+    plan_results = [m for m in agent.messages
+                    if m.get("role") == "tool" and m.get("name") == "write_todos"]
+    assert len(plan_results) == 2, [m.get("content") for m in plan_results]
+    assert "[x] Read it back" in plan_results[-1]["content"]

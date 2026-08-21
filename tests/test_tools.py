@@ -10,6 +10,7 @@ focuses on the write table plus the core edit truth table.
 Run: `.venv/bin/python test_tools.py`
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -296,3 +297,72 @@ def test_write():
             check("write: file has the content", f.read() == "hello")
     finally:
         os.chdir(cwd)
+
+
+# --- write_todos: the wire format ---------------------------------------------
+# The tool's format is a markdown checklist — the same text it prints back — because
+# that is what a model writes unprompted. Every other shape it has been observed to
+# emit still has to land, since a mis-shaped plan used to cost a repair round-trip.
+
+def test_write_todos_formats():
+    checklist = "[x] Read the spec\n[~] Implement the parser\n[ ] Run the tests"
+    expected = [("Read the spec", "completed"),
+                ("Implement the parser", "in_progress"),
+                ("Run the tests", "pending")]
+
+    def statuses(v):
+        return [(t["content"], t["status"]) for t in tools.parse_todos(v)]
+
+    check("todos: checklist string", statuses(checklist) == expected, statuses(checklist))
+    # Markdown bullets, numbering, capital/alternate marks, and word-marks are all in
+    # the wild; none of them should change the parse.
+    check("todos: bulleted + alternate marks",
+          statuses("- [X] Read the spec\n- [-] Implement the parser\n- [ ] Run the tests")
+          == expected)
+    check("todos: numbered + word marks",
+          statuses("1. [done] Read the spec\n2. [wip] Implement the parser\n3. [] Run the tests")
+          == expected)
+    # The structured form still works unchanged, and so does either form arriving
+    # double-encoded as a JSON string (the shape the served model actually emits).
+    structured = [{"content": c, "status": s} for c, s in expected]
+    check("todos: structured list", statuses(structured) == expected)
+    check("todos: JSON-string of objects", statuses(json.dumps(structured)) == expected)
+    # A bare line with no checkbox is an item that has not been started.
+    check("todos: bare lines are pending",
+          statuses("Read the spec\nImplement the parser")
+          == [("Read the spec", "pending"), ("Implement the parser", "pending")])
+    check("todos: list of bare strings", statuses(["[x] a", "b"])
+          == [("a", "completed"), ("b", "pending")])
+    # Blank lines and empty boxes carry no item.
+    check("todos: blanks dropped", statuses("[x] a\n\n   \n[ ] b")
+          == [("a", "completed"), ("b", "pending")])
+    check("todos: unparseable -> nothing", statuses("") == [] and statuses(7) == [])
+
+    # Round trip: what the tool prints must parse back to what it was given, so
+    # "copy your last plan forward and flip a box" is a closed loop.
+    printed = tools.tool_write_todos(checklist)
+    check("todos: render is the input format",
+          statuses(printed.split("\n", 1)[1]) == expected, printed)
+    # Nothing parseable is a repair message, never a silent empty plan.
+    check("todos: empty input explains the format",
+          tools.tool_write_todos("").startswith("[no todos found"))
+
+
+def test_write_todos_validation():
+    """The schema advertises the checklist but keeps the structured form's precise
+    per-field errors — an `anyOf` is only worth having if it doesn't blur diagnostics."""
+    from chad.validate import coerce_and_validate
+
+    for label, value in [("checklist", "[x] a\n[ ] b"),
+                         ("structured", [{"content": "a", "status": "pending"}]),
+                         ("JSON-string", '[{"content": "a", "status": "pending"}]'),
+                         ("bare strings", ["a", "b"])]:
+        _, errs = coerce_and_validate("write_todos", {"todos": value})
+        check(f"todos validate: {label} accepted", not errs, [str(e) for e in errs])
+
+    _, errs = coerce_and_validate("write_todos", {"todos": [{"content": "x", "status": "doing"}]})
+    check("todos validate: bad status still named precisely",
+          any("status" in e.path and "doing" in e.got for e in errs), [str(e) for e in errs])
+    _, errs = coerce_and_validate("write_todos", {})
+    check("todos validate: missing required reported",
+          any(e.got == "missing" for e in errs), [str(e) for e in errs])

@@ -4,6 +4,43 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+### `write_todos` takes a checklist
+
+The planning tool's wire format is now a markdown checklist — one item per line, the same
+text the tool prints back — instead of a list of `{content, status}` objects:
+
+```
+[x] a step that is finished
+[~] the step you are working on now
+[ ] a step still to do
+```
+
+Updating the plan is now copying your own last output forward and flipping a box, which
+is what a model writes unprompted. The nested-object form it does not: across a 44-task
+benchmark screen, **every one of 96 `write_todos` calls arrived mis-shaped** — the array
+double-encoded as a JSON string — and only landed because the validator's repair stage
+un-stringified each one. The tool worked, but entirely on the strength of a repair path,
+and the `CHAD_NO_VALIDATE` baseline had no such path.
+
+- The structured list is still accepted, as is either form double-encoded as a string, a
+  list of bare lines, markdown bullets, `1.` numbering, and word marks (`[done]`, `[wip]`).
+  Nothing that already worked stops working.
+- Unparseable input returns a message that shows the format, instead of a silent no-op plan.
+- The schema declares the shapes with `anyOf`, which the validator now understands: it
+  takes the first branch that validates cleanly, and on total failure reports the branch
+  that came closest, so a bad `status` still names the field and the enum rather than
+  degrading to "expected string".
+
+### A final plan update paired with `done` is no longer dropped
+
+A `write_todos` and a `done` emitted in the same step — the model's habitual closing move —
+lost the plan update: the terminal-tool short-circuit returned before the execute loop, so
+the step where every item gets marked `[x]` was discarded and the recorded plan ended each
+turn a step stale. The update now runs before the turn ends. It touches no files and counts
+as no work, so the verify-before-done gates are unaffected; on the paths where `done` is
+rejected and the turn continues, the model now sees its own plan instead of a hole.
+
+
 ### DFlash2 block speculation replaces the MTP head
 
 Decoding on the shipped model speculates with a **DFlash2 block drafter**, and the

@@ -17,6 +17,8 @@ import os
 import re
 import sys
 
+from . import tools
+
 C_DIM = "\033[2m"; C_CYAN = "\033[36m"; C_GREEN = "\033[32m"; C_YEL = "\033[33m"
 C_RED = "\033[31m"; C_BOLD = "\033[1m"; C_RST = "\033[0m"
 
@@ -303,11 +305,12 @@ def render_tool_result(emit, name: str, args: dict, result: str):
     elif name == "write_todos":
         for line in result.splitlines()[1:]:  # drop the "Plan updated:" header
             emit("muted", "  " + line.strip())
-        # Also feed the structured list to the TUI's pinned todo panel.
+        # Also feed the structured list to the TUI's pinned todo panel. Parsed rather
+        # than read straight off `args`, because the wire format is a checklist string.
         # The plain REPL / one-shot emitter drops the `todos` kind (like ctx/gen/prefill),
         # so the inline muted lines above remain its only rendering.
-        todos = args.get("todos")
-        if isinstance(todos, list):
+        todos = tools.parse_todos(args.get("todos"))
+        if todos:
             emit("todos", json.dumps(todos))
     else:
         _indent_block(emit, result)
