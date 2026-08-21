@@ -307,7 +307,11 @@ def main(argv=None) -> int:
 
     # Warm the Metal variants once so the first measured round is not a compile.
     print("warming ...", flush=True)
-    warm = next(iter(corpora.values()))[0][1]
+    # Warm on the SHORTEST prompt available. Warming is only about compiling the
+    # Metal variants each arm dispatches; doing it on a 12-19k agentic context
+    # instead spends three full prefills (~9 min) proving nothing.
+    warm = min((m for c in corpora.values() for _, m in c),
+               key=lambda m: sum(len(str(x.get("content", ""))) for x in m))
     for arm in arms:
         set_arm(eng, arm, saved)
         for k, v in PRESETS["greedy"].items():
@@ -320,43 +324,49 @@ def main(argv=None) -> int:
     for corpus_name, corpus in corpora.items():
         for label, messages in corpus:
             first = True
-            for preset in presets:
-                for arm in arms:
-                    set_arm(eng, arm, saved)
-                    for k, v in PRESETS[preset].items():
-                        setattr(eng, k, v)
-                    t0 = time.time()
-                    tps, stats, gen_ids, rounds = run_one(
-                        eng, tok, messages, a.tokens,
-                        record=(arm == "schedule"), reset=first or a.fresh,
-                        tools=(corpus_name == "agentic"))
-                    first = False
-                    row = dict(corpus=corpus_name, preset=preset, arm=arm, prompt=label,
-                               tok_s=round(tps, 2), tokens=stats.generated_tokens,
-                               gen_s=round(stats.gen_s, 2),
-                               prompt_tokens=stats.prompt_tokens,
-                               cached_tokens=stats.cached_tokens,
-                               prefill_s=round(stats.prefill_s, 2),
-                               forwards=stats.forwards,
-                               proposed=stats.draft_proposed,
-                               accepted=stats.draft_accepted,
-                               full=stats.generated_tokens >= a.tokens,
-                               wall_s=round(time.time() - t0, 1))
-                    if rounds:
-                        row["buckets"] = classify(tok, gen_ids, rounds)
-                        row["widths"] = [w for w, _, _ in rounds]
-                    row["gen_ids"] = gen_ids
-                    rows.append(row)
-                    if a.json:
-                        # Flush after every run. This is a ~45 min run on a machine
-                        # where one stray SIGTERM (or another model loading) ends it;
-                        # a partial JSON is a partial result, a lost JSON is an hour.
-                        with open(a.json, "w") as f:
-                            json.dump(rows, f)
-                    print(f"  {corpus_name:8s} {preset:8s} {arm:9s} {label:10s} "
-                          f"{tps:6.1f} tok/s  ({stats.generated_tokens} tok, "
-                          f"prefill {stats.prompt_tokens}/{stats.prefill_s:.1f}s)",
-                          flush=True)
+            # Speculative arms first, serial last. Only a speculative run leaves a
+            # rewind snapshot, so an arm that FOLLOWS serial cannot rewind onto the
+            # warm cache and re-prefills the whole context — three minutes at 19k
+            # tokens. Ordering this way pays one full prefill per prompt instead of
+            # three, and changes nothing measured (`gen_s` excludes prefill).
+            order = [(p, arm) for p in presets for arm in arms if arm != "serial"]
+            order += [(p, "serial") for p in presets if "serial" in arms]
+            for preset, arm in order:
+                set_arm(eng, arm, saved)
+                for k, v in PRESETS[preset].items():
+                    setattr(eng, k, v)
+                t0 = time.time()
+                tps, stats, gen_ids, rounds = run_one(
+                    eng, tok, messages, a.tokens,
+                    record=(arm == "schedule"), reset=first or a.fresh,
+                    tools=(corpus_name == "agentic"))
+                first = False
+                row = dict(corpus=corpus_name, preset=preset, arm=arm, prompt=label,
+                           tok_s=round(tps, 2), tokens=stats.generated_tokens,
+                           gen_s=round(stats.gen_s, 2),
+                           prompt_tokens=stats.prompt_tokens,
+                           cached_tokens=stats.cached_tokens,
+                           prefill_s=round(stats.prefill_s, 2),
+                           forwards=stats.forwards,
+                           proposed=stats.draft_proposed,
+                           accepted=stats.draft_accepted,
+                           full=stats.generated_tokens >= a.tokens,
+                           wall_s=round(time.time() - t0, 1))
+                if rounds:
+                    row["buckets"] = classify(tok, gen_ids, rounds)
+                    row["widths"] = [w for w, _, _ in rounds]
+                row["gen_ids"] = gen_ids
+                rows.append(row)
+                if a.json:
+                    # Flush after every run. This is a ~45 min run on a machine
+                    # where one stray SIGTERM (or another model loading) ends it;
+                    # a partial JSON is a partial result, a lost JSON is an hour.
+                    with open(a.json, "w") as f:
+                        json.dump(rows, f)
+                print(f"  {corpus_name:8s} {preset:8s} {arm:9s} {label:10s} "
+                      f"{tps:6.1f} tok/s  ({stats.generated_tokens} tok, "
+                      f"prefill {stats.prompt_tokens}/{stats.prefill_s:.1f}s)",
+                      flush=True)
 
     report(rows, arms, presets, list(corpora))
     if a.json:
