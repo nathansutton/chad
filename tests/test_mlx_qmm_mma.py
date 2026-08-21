@@ -30,13 +30,28 @@ def test_matches_stock_kernel_at_every_width(bits):
     wq, sc, bi = _weights(bits)
     for M in range(1, q.M_MAX + 1):
         x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
-        x8 = x if M == 8 else mx.concatenate(
-            [x, mx.zeros((8 - M, K), dtype=x.dtype)], axis=0)
         ref = mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
                                   group_size=64, bits=bits).astype(mx.float32)
-        got = q.mma(x8, wq, sc, bi, M, N, K, bits).astype(mx.float32)
+        got = q.mma(x, wq, sc, bi, M, N, K, bits).astype(mx.float32)
         rel = float(mx.max(mx.abs(ref - got))) / max(float(mx.max(mx.abs(ref))), 1e-6)
         assert rel < 0.02, (bits, M, rel)
+
+
+def test_partial_last_tile_is_guarded():
+    """N that is not a multiple of the 32-column threadgroup tile: the last tile's
+    out-of-range rows must neither read past the weights nor write past out."""
+    bits, Np = 3, N + 8 * 3 + 8      # one full tile short, then 3 tiles + 1 row
+    mx.random.seed(1)
+    w = (mx.random.normal((Np, K)) * 0.02).astype(mx.bfloat16)
+    wq, sc, bi = mx.quantize(w, group_size=64, bits=bits)
+    for M in (3, 8):
+        x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
+        ref = mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
+                                  group_size=64, bits=bits).astype(mx.float32)
+        got = q.mma(x, wq, sc, bi, M, Np, K, bits).astype(mx.float32)
+        assert got.shape == (M, Np)
+        rel = float(mx.max(mx.abs(ref - got))) / max(float(mx.max(mx.abs(ref))), 1e-6)
+        assert rel < 0.02, (M, rel)
 
 
 def test_qmm_dispatch_gate():

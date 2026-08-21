@@ -191,23 +191,40 @@ well-specified and you'd rather not wait on the reasoning tokens.
 
 **Speculative decoding.** chad drafts with a DFlash2 block drafter — a 1.9B model that reads
 the main model's residual stream at five layers and proposes a block of tokens in one forward —
-and verifies in one batched main-model forward, accepting by exact rejection sampling: greedy
-output stays token-identical, sampled output keeps the model's true distribution. Measured on
+and verifies in one batched main-model forward, accepting by exact rejection sampling: every
+emitted token is the model's own choice, sampled output keeps its true distribution, and greedy
+output matches plain decoding to kernel rounding (it follows serial until the first near-tie —
+the batched verify and the serial step run different kernels). Measured on
 an M4 Pro with the shipped quant (one load, same prompts, 384-token decodes):
 
 | sampling | serial | **DFlash2** |
 |---|---|---|
-| greedy | 17.7 tok/s | **47.7 (2.70×)** |
-| thinking preset (temp 1.0, top_p 0.95, top_k 20 — the default) | 22.4 | **41.4** |
-| non-thinking preset (temp 0.7, top_p 0.80, top_k 20) | 23.7 | **42–43** |
+| greedy | 17.5 tok/s | **60.1 (3.4×)** |
+| thinking preset (temp 1.0, top_p 0.95, top_k 20 — the default) | 22.4 | **49–51** |
+| non-thinking preset (temp 0.7, top_p 0.80, top_k 20) | 23.7 | **52–54** |
 
 Ten prompts (eight ~512-token prose seeds, two code continuations), 384-token decodes, medians,
 one load per run, on a 3-bit g64 quant of the same model. On prose the drafter lands ~8 tokens
-per round; code runs 35–37 tok/s greedy. Two pieces make that number: the block drafter's
+per round; code runs ~44 tok/s greedy. Those seeds are public-domain text the model has
+memorized, so they show the ceiling. **On real traffic** — `benchmarks/spec_decode.py`, ten
+mid-session contexts of 12–19k tokens replayed out of `~/.chad/sessions` with their tool results
+and schemas, 384-token decodes — acceptance inside `<think>` is 35–55% and the numbers are:
+
+| sampling (real contexts) | serial | schedule (default) | fixed full block |
+|---|---|---|---|
+| greedy — median / floor | 14.8 / 13.2 | **31.7** / **21.4** | 36.0 / 17.5 |
+| thinking preset — median / floor | 13.9 / 13.1 | **27.6** / **17.7** | 27.1 / 15.7 |
+
+The per-round width schedule is the default because of the floor column: a full-block round
+costs ~2.2 serial steps whatever it commits, so on the worst prompt a fixed block drops to
+17.5 tok/s (and to 11.7, below serial, on a repo-text seed at the thinking preset) while the
+schedule narrows and never measured under serial. `CHAD_DFLASH_ADAPTIVE=0` is the fixed arm. Two pieces make that number: the block drafter's
 acceptance, and the small-M matmul kernel (`mlx_qmm_mma.py`) that makes an 8-row verify cost
-about what a 5-row one does — without it each extra verify row costs ~33 ms and the drafter's
-optimum is width 4 at 28 tok/s. `CHAD_NO_DFLASH=1` turns speculation off entirely and
-decodes one token per forward — the `serial` column.
+what a 5-row one does — a full-block round is 2.2 serial steps, flat from width 4 up. Without
+the kernel each extra verify row costs ~33 ms and the drafter's optimum is width 4 at 28 tok/s;
+with its first, threadgroup-staged version the round cost 3.2 steps (47.7 / 41.4). The wall
+now is the chip's MMA issue rate, not memory. `CHAD_NO_DFLASH=1` turns speculation off
+entirely and decodes one token per forward — the `serial` column.
 
 Prompt-lookup decoding (PLD) — the draft-model-free variant that proposes continuations from
 n-grams already in context — is implemented and greedy-exact, but is **opt-in** (`CHAD_USE_PLD=1`)

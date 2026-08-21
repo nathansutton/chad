@@ -505,23 +505,30 @@ class Engine:
     # with the loaded weights (see mlx_dflash.bundle_dir) and loads.
     # CHAD_NO_DFLASH disables, CHAD_DFLASH_DRAFT caps the verified width
     # (1..block_size-1; default the full block, 7). Measured (M4 Pro, the
-    # shipped 3-bit quant, 10 prompts x 384 tokens, medians, the mlx_qmm_mma
-    # verify kernel on): greedy serial 17.7 -> width 7 47.7 tok/s (schedule
-    # 45.3); thinking preset (temp 1.0 / top_p 0.95 / top_k 20) 22.4 serial
-    # -> 41.4 (schedule); non-thinking preset -> 42-43. Without the kernel the
-    # verify ladder (~33 ms per extra row) pinned the width at 4 (28.1 greedy
-    # / 27.3 thinking).
+    # shipped 3-bit quant, benchmarks/spec_decode.py: 10 real mid-session
+    # contexts of 12-19k tokens, 384-token decodes, medians): greedy serial
+    # 14.8 -> 31.7 tok/s (schedule) / 36.0 (fixed block); thinking preset
+    # (temp 1.0 / top_p 0.95 / top_k 20) 13.9 -> 27.6 / 27.1. On memorized
+    # prose (acceptance ~95%, 8 tokens a round) the same stack reads 60 greedy
+    # / 49-51 thinking; real traffic accepts 35-55% of drafted positions
+    # inside <think> and ~70-90% on tool calls. Without the mlx_qmm_mma verify
+    # kernel the ladder (~33 ms per extra row) pinned the width at 4.
     dflash: bool = True
     dflash_num_draft: int = 7
     # Per-round verified-width schedule (mlx_dflash.block_policy): the block
     # is drafted whole either way; this picks how many of its proposals to
-    # verify from recent acceptance and the measured round-cost ladder. ON by
-    # measurement: at the thinking preset a fixed full block swings 12-45
-    # tok/s per prompt as sampled trajectories wander into low-acceptance
-    # text (median 31.8), the schedule holds 41.4 with a 20.4 floor; on hot
-    # greedy prose it costs ~5% (45.3 vs 47.7). CHAD_DFLASH_ADAPTIVE=0 fixes
-    # the width at dflash_num_draft; CHAD_DFLASH_DRAFT=N forces a width
-    # (implies adaptive off).
+    # verify from recent acceptance and the measured round-cost ladder. ON,
+    # chosen on the FLOOR, not the median: a fixed full-block round costs
+    # ~2.2 serial steps whatever it commits, so on low-acceptance text it
+    # lands below serial (worst prompts: 11.7 tok/s at the thinking preset
+    # against 15.2 serial; 17.5 greedy on a real session context where the
+    # schedule held 21.4). The schedule narrows or skips there and never
+    # measured under serial (floors 16.1 / 17.7 / 17.8 / 21.4 across the
+    # four corpus x preset cells, the fixed block 11.7 / 15.7 / 20.9 / 17.5).
+    # It pays ~12% at the greedy median (31.7 vs 36.0 on real contexts) and
+    # ties at the thinking preset, which is what chad runs.
+    # CHAD_DFLASH_ADAPTIVE=0 fixes the width at dflash_num_draft;
+    # CHAD_DFLASH_DRAFT=N forces a width (implies adaptive off).
     dflash_adaptive: bool = True
     cache_dir: Optional[str] = None # on-disk KV checkpoints; None disables
     kv_cache_max_bytes: int = 8 * 1024**3  # LRU-evict the on-disk KV cache above this; 0 disables
@@ -653,7 +660,7 @@ class Engine:
         # DFlash2 block drafter: pure speed feature, None on any miss.
         if self.dflash and not config.flag("CHAD_NO_DFLASH"):
             from . import mlx_dflash
-            self._dflash = mlx_dflash.load_drafter(self.model, path)
+            self._dflash = mlx_dflash.load_drafter(self.model, path, self.model_id)
             if self._dflash is not None:
                 av = config.env_str("CHAD_DFLASH_ADAPTIVE")
                 if av is not None and av != "":

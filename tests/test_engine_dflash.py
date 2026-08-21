@@ -330,3 +330,61 @@ def test_block_policy_dynamics():
     # an explicit cap below the block is honored
     assert mlx_dflash.block_policy(2).depth() <= 2
 
+
+
+def test_ensure_bundle_completes_a_config_only_download(monkeypatch, tmp_path):
+    """The measured half-state: mlx-lm's `model*.safetensors` download pattern is
+    anchored at the start of the relative path, so `dflash/config.json` arrives (it
+    matches `*.json`) and `dflash/model.safetensors` does not. That leaves a bundle
+    that looks present and loads nothing, and the base weights look complete so no
+    retry ever runs. ensure_bundle heals it; a complete bundle and a local model dir
+    must not touch the network."""
+    import huggingface_hub
+
+    calls = []
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda repo, fn, *a, **k: calls.append((repo, fn)))
+    mdir = tmp_path / "snapshot"
+    bundle = mdir / "dflash"
+    bundle.mkdir(parents=True)
+    (bundle / "config.json").write_text("{}")
+
+    mlx_dflash.ensure_bundle(str(mdir), "org/model")
+    assert calls == [("org/model", "dflash/model.safetensors")]
+
+    # already complete -> no fetch
+    calls.clear()
+    (bundle / "model.safetensors").write_bytes(b"x")
+    mlx_dflash.ensure_bundle(str(mdir), "org/model")
+    assert calls == []
+
+    # a local model dir is not a repo id -> no fetch, and no bundle at all is not
+    # this function's problem (that model simply ships no drafter)
+    (bundle / "model.safetensors").unlink()
+    mlx_dflash.ensure_bundle(str(mdir), str(tmp_path))
+    mlx_dflash.ensure_bundle(str(tmp_path / "no-bundle"), "org/model")
+    assert calls == []
+
+
+def test_ensure_bundle_failure_is_soft(monkeypatch, tmp_path):
+    """Offline or gated: warn and decode without the drafter, never raise into load."""
+    import huggingface_hub
+
+    def boom(*a, **k):
+        raise OSError("offline")
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", boom)
+    bundle = tmp_path / "m" / "dflash"
+    bundle.mkdir(parents=True)
+    (bundle / "config.json").write_text("{}")
+    mlx_dflash.ensure_bundle(str(tmp_path / "m"), "org/model")   # no raise
+
+
+def test_schedule_is_the_default_width_policy():
+    """The per-round verified-width schedule is ON by default, chosen on the floor: a
+    fixed full-block round costs ~2.2 serial steps whatever it commits, and on
+    low-acceptance text it measured below serial decoding where the schedule held
+    above it (benchmarks/spec_decode.py). CHAD_DFLASH_ADAPTIVE=0 / CHAD_DFLASH_DRAFT=N
+    select the fixed arm at load."""
+    assert Engine.dflash_adaptive is True
+    assert Engine.dflash_num_draft == 7

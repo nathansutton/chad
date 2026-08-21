@@ -672,11 +672,19 @@ Everything in this block is **speed only** — bisection and A/B knobs, not some
 run with. Two different kinds of exactness live here, and the difference matters when you
 are chasing a behaviour change:
 
-- **The speculation knobs are exact.** `CHAD_NO_DFLASH` and the width-schedule settings
-  change *which* tokens get proposed, never which get emitted: greedy decoding is
-  token-identical with and without speculation (checked on the shipped model), and the
-  sampled path keeps the model's true distribution at any temperature. If flipping one of
-  these changes output, that is a bug.
+- **The speculation knobs are exact in the acceptance rule, not bit-identical in the
+  forward.** `CHAD_NO_DFLASH` and the width settings change *which* tokens get proposed;
+  every emitted token is still the target's own choice for its position, and the sampled
+  path keeps the model's true distribution. But a verified block is a batched S>1 forward
+  and a serial step is an S=1 forward, and those run different matmul and attention
+  kernels, so their logits agree to rounding, not to the bit — a greedy run therefore
+  follows serial until the first near-tie and can take the other branch there. Measured
+  on the shipped model (`benchmarks/spec_decode.py`, greedy, 10 repo-text seeds): 4/10
+  160-token generations token-identical to serial, the rest diverging 10–95 tokens in at
+  the same positions whether or not the cache is shared, and at *different* positions
+  with `CHAD_NO_QMM_MMA=1` — the signature of rounding, not of a logic bug. A divergence
+  that is not a near-tie (different output from the first token on an ordinary prompt,
+  or a quality drop) is a bug.
 - **The kernel knobs are exact to rounding, not bit-identical.** `CHAD_NO_QSDPA*` swap one
   attention kernel for another; each is within output-dtype rounding of an fp32 reference
   (the acceptance class MLX holds its own fused kernels to), but they are not bit-identical
@@ -690,7 +698,7 @@ are chasing a behaviour change:
 ```bash
 CHAD_NO_DFLASH=1          uv run chad  # disable block speculation (decode serially)
 CHAD_DFLASH_DRAFT=7       uv run chad  # verified-width cap per round (1..7; default the full block)
-CHAD_DFLASH_ADAPTIVE=0    uv run chad  # fixed width every round instead of the per-round schedule
+CHAD_DFLASH_ADAPTIVE=0    uv run chad  # verify the full block every round instead of the per-round schedule
 CHAD_DFLASH_PATH=/dir     uv run chad  # explicit drafter checkpoint or built sidecar dir
 CHAD_USE_PLD=1            uv run chad  # OPT-IN: wide prompt-lookup decoding
 CHAD_NO_QSDPA_WIDE=1      uv run chad  # disable the S>1 tier of the fused attention kernel
@@ -707,8 +715,9 @@ CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on t
   pre-quantized to 4-bit and shipped inside the model repo as `dflash/`) reads the main
   model's residual stream at five layers and proposes a whole block of tokens in **one**
   forward. The block is verified in one batched target forward and accepted by exact
-  rejection sampling, so greedy output is token-identical to the unspeculated path and
-  sampled output keeps the model's true distribution at any temperature. Measured on an
+  rejection sampling: every emitted token is the target's own choice and sampled output
+  keeps the model's true distribution at any temperature (to kernel rounding — see the
+  exactness note above: greedy runs follow serial until the first near-tie). Measured on an
   M4 Pro with the shipped 3-bit quant, 10 prompts × 384-token decodes, medians: greedy
   serial 17.7 → **47.7 tok/s** (2.7×); at the thinking sampling preset (temp 1.0, top_p
   0.95, top_k 20) 22.4 → **41.4**; non-thinking 23.7 → 42–43; code 24 → 35–37. It engages
@@ -717,14 +726,19 @@ CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on t
   drafter built for it.
 - **`CHAD_DFLASH_DRAFT` / `CHAD_DFLASH_ADAPTIVE`** — the verified width. The drafter always
   proposes its full block of 7; by default a per-round schedule (a cost model over the
-  block drafter's measured round costs) picks how many to verify from recent acceptance —
-  the full block on hot content, a narrow round or a free skip where acceptance drops. That
-  matters at the sampled default: a fixed full block swings 12–45 tok/s per prompt as
-  trajectories wander into low-acceptance text (median 31.8), the schedule holds 41.4 with a
-  20 tok/s floor; on hot greedy prose it costs ~5% (45.3 vs 47.7). `CHAD_DFLASH_DRAFT=N`
-  caps the width and forces it fixed; `CHAD_DFLASH_ADAPTIVE=0` fixes the width at the cap.
-  Widths 6–8 cost about the same under the small-M matmul kernel below; without it
-  (`CHAD_NO_QMM_MMA=1`) each extra row costs ~33 ms and width 4 is the optimum.
+  measured round costs and recent acceptance) picks how many of those proposals to verify,
+  narrowing or skipping a round when acceptance drops. That default was chosen on the
+  **floor**, not the median: under the small-M matmul kernel below a full-block round
+  costs ~2.2 serial steps whatever it commits, so on low-acceptance text a fixed block
+  lands *below* serial decoding (worst measured prompts: 11.7 tok/s at the thinking
+  preset against 15.2 serial; 17.5 greedy on a real session context where the schedule
+  held 21.4), while the schedule never measured under serial. It pays for that with ~12%
+  at the greedy median (31.7 vs 36.0 tok/s on real contexts) and ties at the thinking
+  preset. `CHAD_DFLASH_ADAPTIVE=0` verifies the full block every round — the faster
+  arm if you decode greedily on text the drafter knows. `CHAD_DFLASH_DRAFT=N` caps the
+  width (and implies the fixed arm). Without the kernel (`CHAD_NO_QMM_MMA=1`) each extra
+  verify row costs ~33 ms and width 4 is the optimum. `benchmarks/spec_decode.py` measures
+  all three arms in one load, on this repo's text and on real mid-session contexts.
 - **`CHAD_DFLASH_PATH`** — point the loader at a drafter outside the model repo: either an
   HF-layout checkpoint dir (quantized on first use into `~/.cache/chad/dflash/`) or an
   already-built sidecar dir. `python -m chad.mlx_dflash <dir> --out <model_dir>/dflash`

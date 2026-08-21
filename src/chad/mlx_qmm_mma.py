@@ -8,21 +8,52 @@ weight read per row. Measured on this engine's verify ladder: ~33 ms per extra
 row on the 3-bit 27B (a 56 ms serial step), which is why the DFlash block's width
 was pinned at 4 when its acceptance would carry 7.
 
-The kernel here is avlp12's ``qmm_mma4`` (github.com/avlp12/mlx-lm ``fast_qmm.py``,
-MIT) as vendored and re-dispatched in ARahim3/mlx-dspark (``small_m_qmm.py``, MIT,
-Copyright (c) 2026 ARahim3): an 8x8 ``simdgroup_matrix`` MMA tile covers M <= 8
-exactly, so each quantized weight group is dequantized once and reused by every
-row; K is split across the 8 simdgroups of a threadgroup. Changed here: the
-dequant unpack is generic over the affine bit width — MLX packs every width as a
-continuous little-endian bitstream per row (verified for 3/4/5/6/8), so one unpack
-serves the shipped 3-bit body and 5-bit ``lm_head`` as well as 4/8-bit targets —
-(the unpack pulls each 8-value half through one 64-bit window so every shift is a
-compile-time constant after unrolling, and each barrier pair covers two quant
-groups so both groups' loads are in flight together), and the dispatch is a persistent patch
-gated by a per-shape, per-width runtime probe instead of a context manager.
-Measured (M4 Pro, mlx 0.32, dependent chains, rotated weights): 17408x5120 3-bit
-M=6 1.31x / M=8 1.64x; 5120x248320 5-bit (lm_head) M=6 1.55x / M=8 1.87x; 4-bit
-M=6 1.41x / M=8 1.74x (upstream's 64-k form: 1.30x / 1.60x). Below M=5 the stock GEMV path wins.
+Lineage: avlp12's ``qmm_mma4`` (github.com/avlp12/mlx-lm ``fast_qmm.py``, MIT) as
+vendored in ARahim3/mlx-dspark (``small_m_qmm.py``, MIT, Copyright (c) 2026
+ARahim3) — an 8x8 ``simdgroup_matrix`` tile covers M <= 8 exactly, so each weight
+group is dequantized once and reused by every row, with K split across the 8
+simdgroups of a threadgroup. That design staged the dequantized tile through
+threadgroup memory (two barriers per chunk) and measured ~68 GB/s against the
+stock GEMV's 156. The kernel here keeps the tiling idea and rebuilds the loop:
+
+* Both MMA operands are written straight into the ``simdgroup_matrix`` fragment
+  registers (``thread_elements()``: lane holds row (qid&4)+((lane>>1)&3), columns
+  (qid&2)*2+(lane&1)*2 and +1 — the layout MLX's own steel GEMM relies on). No
+  threadgroup staging, no barriers inside the K loop; threadgroup memory only
+  holds the final split-K reduction.
+* The product is computed transposed, out^T = W x^T, and k inside each 64-group
+  is permuted as k = c*8 + kt identically on both operands, so every lane's
+  weight values are 16 CONTIGUOUS values of one row (two 64-bit windows, all
+  extraction shifts compile-time) and its x values are two contiguous 16-byte
+  loads — and rows of x past M are simply zero-filled in-kernel, so M < 8 needs
+  no padded copy of x.
+* Weights enter the MMA as the exact bf16 of (2^bits + v), built by a bit-insert
+  into a constant (no int->float->bf16 conversion per value); each 64-group is
+  accumulated in fp32 and folded in once: acc += s*C_g + (b - 2^bits*s)*sum(x_g),
+  with the per-group row sums of x computed in-kernel from the fragment (three
+  xor-shuffles). The dequantized weight is never rounded to bf16, so this is
+  CLOSER to the stock kernel than the staged version was (max rel err ~0.003 vs
+  ~0.007 on the shipped shapes). 8-bit, whose 2^8+v is not exact in bf16, uses
+  the exact bf16 of v instead.
+* Each simdgroup carries four 8-column tiles (32 output columns per threadgroup),
+  which amortizes the x-side work; eight tiles starve occupancy on N=5120.
+
+Why it stops here: measured on this chip the simdgroup MMA issues at ~5.4 TFLOPS
+whatever the precision or chain count, and at M=8 a 17408x5120 matmul is 1.4
+GFLOP = 0.265 ms of MMA alone — the same as its memory floor. The kernel is ALU-
+issue-bound (the weight stream through this access pattern alone runs at 177
+GB/s), so every non-MMA instruction in the loop is the cost; what remains is ~70
+ALU ops per tile-group against 8 MMAs. Threadgroup/tile shapes, software
+prefetch, explicit bfe/bfi, tile-interleaved chains were all measured flat or
+worse.
+
+Measured (M4 Pro, mlx 0.32, dependent chains, rotated weights; ms per call,
+stock M=1 / stock at M / this kernel; the staged kernel in brackets):
+  17408x5120 3-bit  M=8: 0.207 / 0.796 / 0.380 [0.485]   2.09x stock, 1.28x staged
+  5120x34816 3-bit  M=8: 0.371 / 1.503 / 0.688 [0.917]   2.18x / 1.33x
+  5120x248320 5-bit M=8: 3.43  / 11.1  / 4.82  [5.91]    2.30x / 1.23x
+  M=5 already wins 1.2-1.4x on every shape (the staged kernel tied stock there);
+  the kernel is flat in M, so widths 4..8 cost the same.
 
 Numerics: fp32 accumulation in a different order than qmm — 1-2 bf16 ulps apart,
 the same acceptance class as every other kernel swap here (fused attention,
@@ -54,96 +85,124 @@ _SUPPORTED_BITS = (3, 4, 5, 6, 8)
 
 _SRC = r"""
     const int K = KD, N = ND, M = MD;
-    const int KPS = KD / 8;                 // K-span per simdgroup (split-K)
+    const int KPS = KD / SG;                // K-span per simdgroup (split-K)
     const int GW = 64 * BITS / 32;          // packed words per 64-value group
-    const int NG = CHUNK / 64;              // quant groups per barrier pair (1 or 2)
+    const int WPH = (BITS == 4) ? 1 : 2;    // words per 8-value half (after alignment)
+    // bf16(2^BITS + v) == MAGIC | (v << (7 - BITS)), exact for BITS <= 7;
+    // 8-bit takes the exact bf16 of v itself (POW = 0).
+    const uint MAGIC = (BITS == 8) ? 0u : ((uint)(127 + BITS) << 7);
+    const uint MAGIC2 = MAGIC | (MAGIC << 16);
+    const float POW = (BITS == 8) ? 0.0f : (float)(1 << BITS);
 
     uint tid  = thread_position_in_threadgroup.x;
     uint tgid = threadgroup_position_in_grid.x;
     uint sg   = tid >> 5;
     uint lane = tid & 31;
+    // simdgroup_matrix<T,8,8> fragment layout: lane -> row fm, columns fn, fn+1
+    uint qid = lane >> 2;
+    int fm = (int)((qid & 4) + ((lane >> 1) & 3));        // lane bits 1,2,4
+    int fn = (int)(((qid & 2) << 1) + ((lane & 1) << 1));  // lane bits 0,3
 
-    int n0 = (int)tgid * 8;                 // one threadgroup -> 8 output columns
+    int n0 = (int)tgid * 8 * TILES;
+    threadgroup float red[SG * TILES * 64];
 
-    threadgroup bfloat16_t bs[8 * 1024];    // per-simdgroup CHUNK k x 8 n dequant stage
-    threadgroup float red[8 * 64];          // cross-simdgroup reduction
+    float acc0[TILES], acc1[TILES];
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) { acc0[t] = 0.0f; acc1[t] = 0.0f; }
 
-    simdgroup_matrix<float, 8, 8> C = simdgroup_matrix<float, 8, 8>(0);
-    threadgroup bfloat16_t* bt = bs + sg * 1024;
+    // x rows this lane feeds into the B fragment (m = fn, fn+1); rows >= M are zero
+    const bool xa_ok = fn < M, xb_ok = fn + 1 < M;
+    const device bfloat16_t* xa_p = x + (size_t)(xa_ok ? fn : 0) * K + fm * 8;
+    const device bfloat16_t* xb_p = x + (size_t)(xb_ok ? fn + 1 : 0) * K + fm * 8;
+    // this lane's 16 contiguous weight values start at value fn*8 of each group
+    // (k inside a group is permuted as k = c*8 + kt, identically for W and x)
+    const int hoff0 = (fn * 8) * BITS, hoff1 = (fn * 8 + 8) * BITS;
+    const int hw0 = hoff0 >> 5, hs0 = hoff0 & 31;
+    const int hw1 = hoff1 >> 5, hs1 = hoff1 & 31;
 
-    int kbeg = (int)sg * KPS;
-    int j  = (int)(lane & 7);
-    int kq = (int)(lane >> 3);              // this lane's 16-value quarter of a group
-    int n  = n0 + j;
-    const int base = kq * 16 * BITS;
-    const int w0 = base >> 5;
-    // CHUNK k per barrier pair: with CHUNK=128 both groups' packed words are in
-    // flight before any dequant math (the 64-k form exposed one load latency per
-    // iteration; measured +3-8% on the real shapes).
-    for (int kk = 0; kk < KPS; kk += CHUNK) {
-        int ka = kbeg + kk;
-        if (n < N) {
+    const int gbeg = (int)sg * (KPS / 64);
+    const int gend = gbeg + KPS / 64;
+    for (int g = gbeg; g < gend; ++g) {
+        uint4 xa = xa_ok ? *((const device uint4*)(xa_p + g * 64)) : uint4(0u);
+        uint4 xb = xb_ok ? *((const device uint4*)(xb_p + g * 64)) : uint4(0u);
+        simdgroup_matrix<bfloat16_t, 8, 8> B[8];
+        float sa = 0.0f, sb = 0.0f;
 #pragma clang loop unroll(full)
-            for (int c = 0; c < NG; ++c) {
-                int g = (ka >> 6) + c;
-                float s  = (float)sc[(size_t)n * (K / 64) + g];
-                float bb = (float)bi[(size_t)n * (K / 64) + g];
-                // Generic affine unpack: value t of the group sits at bit t*BITS of
-                // the row's little-endian word stream; this lane's 16 values start
-                // at bit kq*16*BITS and span at most 4 words for BITS <= 8.
-                const device uint* wr = w + (size_t)n * (K * BITS / 32) + (size_t)g * GW;
-                uint p[4];
+        for (int kt = 0; kt < 8; ++kt) {
+            uint wa = (kt & 1) ? (xa[kt >> 1] & 0xFFFF0000u) : (xa[kt >> 1] << 16);
+            uint wb = (kt & 1) ? (xb[kt >> 1] & 0xFFFF0000u) : (xb[kt >> 1] << 16);
+            sa += as_type<float>(wa);
+            sb += as_type<float>(wb);
+            thread auto& eb = B[kt].thread_elements();
+            reinterpret_cast<thread uint&>(eb) = (wa >> 16) | wb;
+        }
+        // group sums of x rows fn / fn+1: reduce over the 8 lanes that differ in fm
+        sa += simd_shuffle_xor(sa, 2u);  sb += simd_shuffle_xor(sb, 2u);
+        sa += simd_shuffle_xor(sa, 4u);  sb += simd_shuffle_xor(sb, 4u);
+        sa += simd_shuffle_xor(sa, 16u); sb += simd_shuffle_xor(sb, 16u);
+
 #pragma clang loop unroll(full)
-                for (int u = 0; u < 4; ++u) p[u] = (w0 + u < GW) ? wr[w0 + u] : 0u;
-                // Two 8-value halves, each pulled from one 64-bit window: for every
-                // width <= 8, 8*BITS plus the half's in-word shift fits in 64 bits,
-                // so after unrolling every shift and mask is a compile-time constant
-                // (a per-value runtime word index ran ~40% slower).
-#pragma clang loop unroll(full)
-                for (int h = 0; h < 2; ++h) {
-                    int off = base + h * 8 * BITS - (w0 << 5);
-                    int wi = off >> 5, sh = off & 31;
-                    ulong win = ((ulong)p[wi] | ((ulong)p[wi + 1] << 32)) >> sh;
-#pragma clang loop unroll(full)
-                    for (int t = 0; t < 8; ++t) {
-                        uint v = (uint)(win >> (t * BITS)) & ((1u << BITS) - 1u);
-                        bt[(c * 64 + kq * 16 + h * 8 + t) * 8 + j] =
-                            (bfloat16_t)((float)v * s + bb);
-                    }
-                }
+        for (int t = 0; t < TILES; ++t) {
+            int n = n0 + t * 8 + fm;
+            bool ok = n < N;
+            int nn = ok ? n : 0;
+            float s  = (float)sc[(size_t)nn * (K / 64) + g];
+            float bb = (float)bi[(size_t)nn * (K / 64) + g];
+            const device uint* wr = w + (size_t)nn * (K * BITS / 32) + (size_t)g * GW;
+            ulong win0, win1;
+            if (WPH == 1) {
+                win0 = (ulong)wr[hw0];
+                win1 = (ulong)wr[hw1];
+            } else {
+                win0 = ((ulong)wr[hw0] | ((ulong)wr[hw0 + 1] << 32)) >> hs0;
+                win1 = ((ulong)wr[hw1] | ((ulong)wr[hw1 + 1] << 32)) >> hs1;
             }
-        } else {
-            for (int t = 0; t < 16 * NG; ++t)
-                bt[((t >> 4) * 64 + kq * 16 + (t & 15)) * 8 + j] = (bfloat16_t)0;
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-
-        simdgroup_matrix<bfloat16_t, 8, 8> A, B;
+            simdgroup_matrix<float, 8, 8> Cg = simdgroup_matrix<float, 8, 8>(0);
+            simdgroup_matrix<bfloat16_t, 8, 8> A;
+            thread auto& ea = A.thread_elements();
 #pragma clang loop unroll(full)
-        for (int kt = 0; kt < CHUNK / 8; ++kt) {
-            simdgroup_load(A, x + ka + kt * 8, K);   // x rows 0..7 (padded to 8)
-            simdgroup_load(B, bt + kt * 64, 8);
-            simdgroup_multiply_accumulate(C, A, B, C);
+            for (int kt = 0; kt < 8; ++kt) {
+                uint v0 = (uint)(win0 >> (kt * BITS)) & ((1u << BITS) - 1u);
+                uint v1 = (uint)(win1 >> (kt * BITS)) & ((1u << BITS) - 1u);
+                if (BITS == 8) {
+                    ea[0] = (bfloat16_t)((float)v0);
+                    ea[1] = (bfloat16_t)((float)v1);
+                } else {
+                    reinterpret_cast<thread uint&>(ea) =
+                        MAGIC2 | (v0 << (7 - BITS)) | (v1 << (23 - BITS));
+                }
+                simdgroup_multiply_accumulate(Cg, A, B[kt], Cg);
+            }
+            thread auto& cg = Cg.thread_elements();
+            float bbs = ok ? (bb - POW * s) : 0.0f;
+            s = ok ? s : 0.0f;
+            acc0[t] += s * cg[0] + bbs * sa;
+            acc1[t] += s * cg[1] + bbs * sb;
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    simdgroup_store(C, red + sg * 64, 8);
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+        red[(sg * TILES + t) * 64 + fm * 8 + fn]     = acc0[t];
+        red[(sg * TILES + t) * 64 + fm * 8 + fn + 1] = acc1[t];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int i = (int)tid; i < 64; i += 256) {
-        int m = i >> 3, jj = i & 7;
-        int nn = n0 + jj;
-        if (m < M && nn < N) {
+    for (int i = (int)tid; i < TILES * 64; i += 32 * SG) {
+        int t = i >> 6, nl = (i >> 3) & 7, m = i & 7;
+        int n = n0 + t * 8 + nl;
+        if (m < M && n < N) {
             float v = 0.0f;
-            for (int q = 0; q < 8; ++q) v += red[q * 64 + i];
-            out[(size_t)m * N + nn] = (bfloat16_t)v;
+            for (int q = 0; q < SG; ++q) v += red[(q * TILES + t) * 64 + nl * 8 + m];
+            out[(size_t)m * N + n] = (bfloat16_t)v;
         }
     }
 """
 
-_TG = 256
-_KERNEL_VERSION = 3      # bump when the kernel changes: the probe cache is keyed on it
+_SG = 8                  # simdgroups per threadgroup (split-K factor)
+_TILES = 4               # 8-column tiles per simdgroup
+_TG = 32 * _SG
+_KERNEL_VERSION = 4      # bump when the kernel changes: the probe cache is keyed on it
 _kernels: dict = {}
 
 
@@ -161,13 +220,15 @@ def _kernel(bits: int):
     return k
 
 
-def mma(x8, wq, sc, bi, M: int, N: int, K: int, bits: int):
-    """Raw kernel call: x8 is (8, K) bf16 (rows >= M ignored), returns (M, N) bf16."""
+def mma(x, wq, sc, bi, M: int, N: int, K: int, bits: int):
+    """Raw kernel call: x is (M, K) bf16, M <= 8 (rows past M are zero in-kernel),
+    returns (M, N) bf16."""
+    cols = 8 * _TILES
     (out,) = _kernel(bits)(
-        inputs=[x8, wq, sc, bi],
-        template=[("KD", K), ("ND", N), ("MD", M), ("CHUNK", 128 if K % 1024 == 0 else 64)],
-        output_shapes=[(M, N)], output_dtypes=[x8.dtype],
-        grid=(((N + 7) // 8) * _TG, 1, 1), threadgroup=(_TG, 1, 1),
+        inputs=[x, wq, sc, bi],
+        template=[("KD", K), ("ND", N), ("MD", M), ("TILES", _TILES), ("SG", _SG)],
+        output_shapes=[(M, N)], output_dtypes=[x.dtype],
+        grid=(((N + cols - 1) // cols) * _TG, 1, 1), threadgroup=(_TG, 1, 1),
     )
     return out
 
@@ -196,11 +257,8 @@ def qmm(x, wq, sc, bi, group_size: int, bits: int):
             for d in x.shape[:-1]:
                 M *= d
             if m_min <= M <= M_MAX:
-                flat = x.reshape(M, K)
-                if M < 8:
-                    flat = mx.concatenate(
-                        [flat, mx.zeros((8 - M, K), dtype=flat.dtype)], axis=0)
-                return mma(flat, wq, sc, bi, M, N, K, bits).reshape(*x.shape[:-1], N)
+                return mma(x.reshape(M, K), wq, sc, bi, M, N, K, bits
+                           ).reshape(*x.shape[:-1], N)
     return mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
                                group_size=group_size, bits=bits)
 
@@ -301,11 +359,9 @@ def measure(groups: dict, verbose: bool = False) -> dict:
         ok = True
         for M in range(2, M_MAX + 1):
             x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
-            x8 = x if M == 8 else mx.concatenate(
-                [x, mx.zeros((8 - M, K), dtype=x.dtype)], axis=0)
             ref = mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
                                       group_size=64, bits=bits).astype(mx.float32)
-            got = mma(x8, wq, sc, bi, M, N, K, bits).astype(mx.float32)
+            got = mma(x, wq, sc, bi, M, N, K, bits).astype(mx.float32)
             diff = mx.max(mx.abs(ref - got))
             scale = mx.max(mx.abs(ref))
             mx.eval(diff, scale)
@@ -318,9 +374,7 @@ def measure(groups: dict, verbose: bool = False) -> dict:
         ratios = {}
         for M in range(2, M_MAX + 1):
             x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
-            x8 = x if M == 8 else mx.concatenate(
-                [x, mx.zeros((8 - M, K), dtype=x.dtype)], axis=0)
-            mx.eval(x, x8)
+            mx.eval(x)
 
             def q_step(xx, t, _ws=ws, _b=bits):
                 w = _ws[t % len(_ws)]
@@ -332,7 +386,7 @@ def measure(groups: dict, verbose: bool = False) -> dict:
                 return mma(xx, w[0], w[1], w[2], _M, _N, _K, _b)
 
             tq = min(_time_chain(q_step, x), _time_chain(q_step, x))
-            tk = min(_time_chain(k_step, x8), _time_chain(k_step, x8))
+            tk = min(_time_chain(k_step, x), _time_chain(k_step, x))
             ratios[M] = tq / tk
         first = next((M for M in range(2, M_MAX + 1)
                       if all(ratios[m] >= _MIN_GAIN for m in range(M, M_MAX + 1))),

@@ -427,14 +427,15 @@ def build(config: DFlashConfig):
 # -- verified-width schedule ---------------------------------------------------
 
 # Measured round cost T(d) for a DFlash round of verified width d, in serial-step
-# units (M4 Pro, the shipped 3-bit 27B, mlx_qmm_mma on from M=6): one drafter
-# forward (~0.2 step, flat in d) plus the verify. Rows 2..5 pay the stock
-# quantized_matmul ladder; rows 6..8 are FLAT under the MMA kernel, so past
-# width 4 more width is nearly free and the argmax lands on the full block
-# whenever acceptance carries it. observe_cost() re-anchors the scale online;
-# the SHAPE is what has to be right (a per-row seed priced the first extra
-# row too cheaply and collapsed the schedule on medium acceptance).
-BLOCK_ROUND_COSTS = (1.0, 1.9, 2.2, 2.55, 3.0, 3.15, 3.15, 3.2)
+# units (M4 Pro, the shipped 3-bit 27B, a 57 ms serial step, mlx_qmm_mma on from
+# M=5): one drafter forward (~0.2 step, flat in d) plus the verify. Rows 2..4
+# pay the stock quantized_matmul ladder; rows 5..8 are FLAT under the MMA kernel
+# (~125 ms, 2.2 steps), and the last stock row (width 3, M=4) is dearer than the
+# first kernel row, so past width 3 more width is free and the argmax lands on
+# the full block whenever acceptance carries it. observe_cost() re-anchors the
+# scale online; the SHAPE is what has to be right (a per-row seed priced the
+# first extra row too cheaply and collapsed the schedule on medium acceptance).
+BLOCK_ROUND_COSTS = (1.0, 1.76, 1.93, 2.30, 2.18, 2.20, 2.19, 2.20)
 
 
 class WidthPolicy:
@@ -767,13 +768,55 @@ def bundle_dir(model_dir: str) -> Optional[str]:
     return d if os.path.isfile(os.path.join(d, "config.json")) else None
 
 
-def load_drafter(model: Any, model_dir: str, bits: int = 4, gs: int = 64) -> Optional[Any]:
+def _complete(d: str) -> bool:
+    return (os.path.isfile(os.path.join(d, "config.json"))
+            and os.path.isfile(os.path.join(d, "model.safetensors")))
+
+
+def ensure_bundle(model_dir: str, repo_id: Optional[str]) -> None:
+    """Fetch the bundle's weights when the weights dir has its config but not its
+    `model.safetensors`. Best-effort and quiet on failure — a missing drafter costs
+    speed, never correctness.
+
+    This half-state is reachable and was measured, so it is worth healing rather than
+    asserting against: mlx-lm downloads a repo with `allow_patterns=[... ,
+    "model*.safetensors", ...]`, and that pattern is anchored at the START of the
+    relative path. `dflash/config.json` matches `*.json` (the leading star absorbs the
+    directory) but `dflash/model.safetensors` matches nothing — so any path that reaches
+    the weights through mlx-lm rather than through `cli._ensure_model`'s pattern-free
+    snapshot lands a config-only bundle. `cli._cached_weights_complete` then reports the
+    cache complete, so the full download never runs and the drafter stays dark forever.
+    The same glob is why the file is named `model.safetensors` under a subdirectory in
+    the first place: mlx-lm's LOADER globs `model*.safetensors` at the repo root, so the
+    bundle is invisible to it. Downloader and loader read the same pattern differently.
+    """
+    if not repo_id or os.path.isdir(repo_id):
+        return
+    d = os.path.join(model_dir, _BUNDLE)
+    if _complete(d) or not os.path.isfile(os.path.join(d, "config.json")):
+        return
+    try:
+        from huggingface_hub import hf_hub_download
+        log.info("DFlash drafter: fetching the bundled weights from %s "
+                 "(the base download's file filter skips them)", repo_id)
+        hf_hub_download(repo_id, f"{_BUNDLE}/model.safetensors")
+    except Exception as e:  # noqa: BLE001 — offline/gated: decode without the drafter
+        log.warning("DFlash drafter: could not fetch %s/%s (%s); decoding without it",
+                    repo_id, _BUNDLE, e)
+
+
+def load_drafter(model: Any, model_dir: str, repo_id: Optional[str] = None,
+                 bits: int = 4, gs: int = 64) -> Optional[Any]:
     """Load the DFlash drafter bundled with the target's weights (or the dir
     CHAD_DFLASH_PATH names), bound to the target's embedding/lm_head, with the
     target tap installed. None when no drafter ships for this model or on any
-    failure — DFlash is a pure speed feature, never load-bearing."""
+    failure — DFlash is a pure speed feature, never load-bearing.
+
+    `repo_id` is the model's HF repo when it came from the hub, so a bundle whose
+    weights the base download filtered out can be completed (see ensure_bundle)."""
     try:
         key = _target_key(model)
+        ensure_bundle(model_dir, repo_id)
         sdir = bundle_dir(model_dir)
         if key is None or sdir is None:
             return None

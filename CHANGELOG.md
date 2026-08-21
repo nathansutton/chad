@@ -16,22 +16,40 @@ faster in every mode, so keeping a second, slower drafter alive only bought a fa
 nothing preferred.
 
 - Measured on an M4 Pro, shipped 3-bit quant, one load, same prompts, 384-token decodes,
-  medians: greedy serial 17.7 → **47.7 tok/s** (2.7×, MTP was 26.1); at the thinking
-  sampling preset 22.4 → **41.4** (MTP 22.4); non-thinking 23.7 → 42–43; code 24 → 35–37.
-  (Before the matmul kernel below: 28.1 / 27.3 at width 4, the ladder's optimum.)
+  medians: greedy serial 17.5 → **60.1 tok/s** (3.4×, MTP was 26.1); at the thinking
+  sampling preset 22.4 → **49–51** (MTP 22.4); non-thinking 23.7 → **52–54**; code 24 → 44.
+  (Before the matmul kernel below: 28.1 / 27.3 at width 4, the ladder's optimum; with its
+  first version 47.7 / 41.4.)
 - **The drafter ships inside the model repo**, pre-quantized, as `dflash/`. There is no
   second download, no consent prompt, no 3.8 GB bf16 fetch and no local quantize step on
   first run — one repo, ~13.2 GB, and the speculative decoder is simply there. Weights
   outside a bundle still load via `CHAD_DFLASH_PATH`, and
   `python -m chad.mlx_dflash <dir> --out <model_dir>/dflash` builds a bundle for another
   target.
-- Verification, rollback and the exact-acceptance rule are unchanged: greedy output is
-  token-identical to plain decoding and sampled output keeps the true distribution.
-- The drafter always proposes its full block of 7; a per-round schedule picks how many to
-  verify from recent acceptance (`CHAD_DFLASH_ADAPTIVE=0` fixes it, `CHAD_DFLASH_DRAFT=N`
-  caps it). At the sampled default a fixed full block swings 12–45 tok/s per prompt; the
-  schedule holds a 20 tok/s floor for ~5% on hot greedy prose. `CHAD_NO_DFLASH=1` now
-  decodes serially rather than falling back to a second drafter.
+- Verification, rollback and the exact-acceptance rule are unchanged: every emitted token
+  is the target's own choice for its position and sampled output keeps the true
+  distribution. Greedy output is identical to plain decoding *to kernel rounding*: the
+  batched verify forward and the serial step run different matmul/attention kernels, so a
+  greedy run follows serial until the first near-tie and can branch there (measured: 4/10
+  160-token generations bit-identical, the rest diverging 10–95 tokens in, with or without
+  the matmul kernel below and with or without cache reuse). The earlier "token-identical"
+  claim was a short run that never met a near-tie.
+- The drafter always proposes its full block of 7; a per-round schedule decides how many
+  of those proposals to verify, narrowing or skipping a round when recent acceptance drops.
+  It is the default on the **floor**: a full-block round costs ~2.2 serial steps whatever it
+  commits, so a fixed block on low-acceptance text measured *below* serial (11.7 tok/s
+  against 15.2 at the thinking preset; 17.5 against a 21.4 schedule on a real session
+  context), where the schedule never went under serial. `CHAD_DFLASH_ADAPTIVE=0` verifies
+  the full block every round (~12% faster at the greedy median, a tie at the thinking
+  preset); `CHAD_DFLASH_DRAFT=N` caps the width. `CHAD_NO_DFLASH=1` now decodes serially
+  rather than falling back to a second drafter.
+- `benchmarks/spec_decode.py` measures serial, schedule and fixed-block arms in one load,
+  on windows of this repo's own docs and code and on real mid-session contexts replayed
+  out of `~/.chad/sessions` (12–19k tokens, tool results and schemas in place), and reports
+  median and floor per arm plus acceptance by what the model was writing. On real contexts:
+  greedy serial 14.8 → 31.7 tok/s (schedule) / 36.0 (fixed block); thinking preset 13.9 →
+  27.6 / 27.1. The drafter accepts 35–55% of drafted positions inside `<think>` and
+  70–90% on tool calls; the 60 / 49–51 figures above are memorized-prose seeds at ~95%.
 - Memory: +1.1 GB resident for the drafter (its context cache is a 2048-row ring, ~40 MB);
   on a 24 GB box that is ~30k tokens of context ceiling.
 - **Removed:** `CHAD_NO_MTP`, `CHAD_MTP_ADAPTIVE`, `CHAD_MTP_DRAFT`, `CHAD_MTP_MAX_DRAFT`,
@@ -42,15 +60,23 @@ nothing preferred.
 
 Verifying a draft of k tokens is a k+1-row forward, and stock `quantized_matmul` priced
 every extra row at ~33 ms on the shipped model — the ladder that pinned the block drafter's
-width at 4. `mlx_qmm_mma.py` brings in avlp12's `qmm_mma4` MMA kernel (via mlx-dspark, MIT),
-which dequantizes each weight group once for all rows, with a width-generic unpack so the
-3-bit body and the 5-bit `lm_head` qualify alongside 4/8-bit weights. A load-time probe
-races it against the stock kernel per weight shape and per width on the running machine,
-keeps only the winners (cached), and everything else stays stock. On the shipped model every
-eligible shape wins from six rows up (3-bit MLP 1.31× at six rows, 1.64× at eight; the 5-bit
-`lm_head` 1.55× / 1.87×), which flattens the verify ladder from width 5 to 8 — and that is
-what moves the block drafter from width 4 (28–29 tok/s) to its full block (42–48).
-`CHAD_NO_QMM_MMA=1` is the A/B arm; `CHAD_QMM_MMA_RECAL=1` re-probes after an mlx upgrade.
+width at 4. `mlx_qmm_mma.py` is a small-M MMA kernel in the lineage of avlp12's `qmm_mma4`
+(via mlx-dspark, MIT): one 8×8 `simdgroup_matrix` tile covers every verify width, so each
+weight group is read once for all rows. Its loop is rebuilt around the fragment registers —
+both operands are written straight into the MMA fragments (no threadgroup staging, no
+barriers in the K loop), the product runs transposed so each lane's weights are sixteen
+contiguous values of one row, weights enter the MMA as the exact bf16 of `2^bits + v` built
+by a bit-insert with the affine scale and bias folded in once per group, and rows past M are
+zero-filled in-kernel (no padded copy of the activations). It serves 3/4/5/6/8-bit g64
+weights, so the 3-bit body and the 5-bit `lm_head` qualify. A load-time probe races it
+against the stock kernel per weight shape and per width on the running machine, keeps only
+the winners (cached), and everything else stays stock. On the shipped model every eligible
+shape wins from five rows up (3-bit MLP 1.3× at five rows, 2.1× at eight; the 5-bit
+`lm_head` 1.4× / 2.3×; the kernel is flat in M), which makes a full-block verify round cost
+2.2 serial steps instead of 3.2 — greedy 47.7 → 60.1 tok/s, thinking preset 41.4 → 49–51.
+The chip's MMA issue rate (~5.4 TFLOPS, measured) is now the wall: at eight rows the
+MMA alone costs what the weight stream costs. `CHAD_NO_QMM_MMA=1` is the A/B arm;
+`CHAD_QMM_MMA_RECAL=1` re-probes after an mlx upgrade.
 
 ### A clip is a loan, not a deletion
 
