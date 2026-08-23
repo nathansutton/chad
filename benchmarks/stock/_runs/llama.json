@@ -1,0 +1,11 @@
+{
+  "engine": "llama.cpp",
+  "version": "build 10470 (34af94cd9)",
+  "model": "Qwen3.8-27B-UD-Q3_K_XL.gguf",
+  "prompt_tokens": 512,
+  "gen_tokens": 128,
+  "prefill_tps": 101.5,
+  "decode_tps": 10.9,
+  "reps": 3,
+  "flags": "llama-bench defaults (all layers on Metal, flash-attn auto)"
+}

@@ -25,15 +25,6 @@ def check(name, cond, detail=""):
 
 
 def test_preview():
-    # symbolic edit: name + body are visible (old blank-preview bug is gone)
-    p = confirm_preview("replace_symbol", {"name": "Foo/bar", "new": "def bar(): ..."})
-    check("replace_symbol shows name", "Foo/bar" in p, f"p={p!r}")
-    check("replace_symbol shows body", "def bar" in p, f"p={p!r}")
-
-    # rename: arrow form
-    p = confirm_preview("rename_symbol", {"name": "a", "new_name": "b"})
-    check("rename_symbol arrow", p == "a → b", f"p={p!r}")
-
     # text edit: path + diff lines
     p = confirm_preview("edit", {"path": "x.py", "old": "A", "new": "B"})
     check("edit shows path", "x.py" in p, f"p={p!r}")

@@ -113,11 +113,8 @@ def _confirm_title(name: str) -> str:
         return "run a terminal command"
     if name.startswith("mcp__"):
         return f"call the MCP tool {name[len('mcp__'):]}"
-    return {"write": "write a file", "edit": "edit a file",
-            "replace_lines": "replace lines in a file",
-            "insert_lines": "insert lines into a file",
-            "replace_symbol": "replace a symbol", "insert_symbol": "insert a symbol",
-            "rename_symbol": "rename a symbol"}.get(name, f"run {name}")
+    return {"write": "write a file",
+            "edit": "edit a file"}.get(name, f"run {name}")
 
 
 # Spinner frames + the gerund shown next to it, keyed off the latest activity.
@@ -207,11 +204,12 @@ def _todo_panel_rows(todos, max_items: int = 8):
 SLASH_COMMANDS = [
     ("/help", "commands & keybindings"),
     ("/init", "analyze the project, write CLAUDE.md"),
-    ("/skills", "list available Agent Skills"),
+    ("/skills", "list installed Agent Skills (run one with /<name>)"),
     ("/mcp", "MCP server status"),
     ("/mcp trust", "trust this project's .mcp.json servers"),
     ("/mcp login", "authenticate an MCP server (OAuth)"),
     ("/compact", "reclaim context now"),
+    ("/ctx", "where the context window is going, in tokens"),
     ("/undo", "revert files to the last edit checkpoint"),
     ("/restore", "list edit checkpoints; /restore <hash> reverts to one"),
     ("/resume", "list recent sessions; /resume <n> forks one"),
@@ -226,13 +224,31 @@ SLASH_COMMANDS = [
 ]
 
 
+def _skills_mod():
+    """Lazy import of the skills module (keeps TUI import cost off the startup path)."""
+    from . import skills
+    return skills
+
+
 def slash_matches(text: str):
     """`[(cmd, desc)]` whose command starts with the typed line. Only fires for a
     single-line input that starts with `/`; once the text runs past a known command
-    (an arg is being typed, e.g. `/mcp login foo`) nothing matches, so completion stops."""
+    (an arg is being typed, e.g. `/mcp login foo`) nothing matches, so completion stops.
+
+    Installed Agent Skills are appended as `/name` rows. This menu is chad's ONLY skill
+    discovery surface — nothing about skills reaches the model until the user picks one
+    — so the descriptions have to be here, where they cost nothing, rather than in the
+    system prompt, where all of them together cost 60% of it."""
     if "\n" in text or not text.startswith("/"):
         return []
-    return [(c, d) for (c, d) in SLASH_COMMANDS if c.startswith(text)]
+    try:
+        skill_rows = _skills_mod().slash_commands()
+    except Exception:  # noqa: BLE001 - a broken skills dir must not kill completion
+        skill_rows = []
+    # Builtins first and they win a tie: a skill named `model` must never shadow /model.
+    builtin = {c for c, _ in SLASH_COMMANDS}
+    rows = SLASH_COMMANDS + [r for r in skill_rows if r[0] not in builtin]
+    return [(c, d) for (c, d) in rows if c.startswith(text)]
 
 
 def at_path_token(text_before_cursor: str) -> Optional[str]:
@@ -308,11 +324,16 @@ def _make_history():
 class TUI:
     def __init__(self, engine: BaseEngine, ctx_limit: int, mode: str = "normal",
                  thinking: bool = True, max_chars: int = 400_000, resume: list = None,
-                 ctx_window: int = None, finalize=None, ctx_limit_fn=None):
+                 ctx_window: int = None, finalize=None, ctx_limit_fn=None,
+                 native_ctx: int = None):
         self.engine = engine
         self.ctx_limit = ctx_limit
         self._ctx_limit_fn = ctx_limit_fn  # live per-turn recheck
         self.ctx_window = ctx_window or ctx_limit  # window shown in the banner
+        # The model's native window, kept only to say so when the RAM governor is what
+        # actually sets the session's window. Naming both is the honest form: "103k" alone
+        # looks like a small model, "262k" alone is a number the run can never reach.
+        self.native_ctx = native_ctx
         self.thinking = thinking
         self._resume = resume
 
@@ -1005,6 +1026,14 @@ class TUI:
 
     # -- input handling --------------------------------------------------
 
+    def _skill_cost(self, text: str) -> int:
+        """Tokens a loaded skill will occupy, reported in the confirmation line. A
+        gstack skill body can exceed 40k tokens — most of the usable window on this
+        hardware — so the cost is shown when it is paid, not inferred later from an
+        unexplained compaction."""
+        from .agent import skill_token_cost
+        return skill_token_cost(self.engine, text)
+
     def _on_accept(self, buff):
         text = buff.text.strip()
         if not text:
@@ -1018,7 +1047,7 @@ class TUI:
         # commands that reset/compact/reslot the KV cache would crash. Typing a task is
         # fine — it just queues (type-ahead). Everything else waits for the model.
         if not self._model_ready.is_set() and (
-                text.startswith(("/reset", "/clear", "/compact", "/resume", "/accept"))):
+                text.startswith(("/reset", "/clear", "/compact", "/ctx", "/resume", "/accept"))):
             self._emit("info", "still loading the model — try that once it's ready.")
             return False
         if text in ("/reset", "/clear"):
@@ -1044,31 +1073,40 @@ class TUI:
                 self._emit("info", f"compacted context: {b:,}→{a:,} tokens"
                                    + (" (already lean)" if a >= b else ""))
             return False
+        if text == "/ctx":
+            # Read-only and tokenizer-only, so unlike /compact it needs no busy
+            # guard — it never mutates the transcript the worker thread is rendering.
+            # Allowed mid-turn on purpose: "why is this session compacting already?"
+            # is asked while the session is compacting. A concurrent append can make
+            # the render inconsistent, which is what the except below is for.
+            from .agent import format_ctx_breakdown
+            try:
+                for ln in format_ctx_breakdown(self.agent.ctx_breakdown()):
+                    self._emit("info", "  " + ln)
+            except Exception as e:  # noqa: BLE001 - a gauge must not kill the session
+                self._emit("info", f"  [context breakdown unavailable: "
+                                   f"{type(e).__name__}: {e}]")
+            return False
         if text == "/undo" or text == "/restore" or text.startswith("/restore "):
             # Checkout mutates workspace files: refuse mid-turn for the same reason
             # /compact does — the running turn is operating on those files.
             if self._busy:
                 self._emit("info", "busy — try again once the current turn finishes.")
                 return False
-            from . import checkpoint, levers
+            from . import checkpoint
             ws = os.getcwd()
             arg = text[len("/restore"):].strip() if text.startswith("/restore") else ""
             if text == "/restore" and not arg:
                 rows = checkpoint.snapshots(ws)
                 if not rows:
                     self._emit("info", "no checkpoints for this workspace yet — "
-                                       "snapshots are taken before file edits when the "
-                                       "edit_checkpoint lever is on (CHAD_ENABLE=edit_checkpoint)")
+                                       "snapshots are taken before file edits")
                 else:
                     for h, when, label in rows:
                         self._emit("info", f"  {h}  {when}  {label}")
                     self._emit("info", "restore one with /restore <hash>")
                 return False
             msg = checkpoint.restore(ws, arg or "HEAD")
-            # Restoring from an older session's snapshots is legal with the lever
-            # off, so only count the fire when this session's guard is actually on.
-            if msg.startswith("restored") and levers.enabled("edit_checkpoint"):
-                levers.fired("edit_checkpoint", restore=True)
             self._emit("info", msg)
             return False
         if text == "/resume" or text.startswith("/resume "):
@@ -1113,11 +1151,25 @@ class TUI:
             self._emit("info", "shift-tab: cycle mode (normal/auto-accept edits/yolo/plan) "
                                "· esc/ctrl-c: "
                                "interrupt · /init /skills /mcp /mcp trust /mcp login <server> "
-                               "/resume /reset /clear /compact /undo /restore /model /mode /speech /accept /exit · !cmd shell · @path "
+                               "/resume /reset /clear /compact /ctx /undo /restore /model /mode /speech /accept /exit "
+                               "· /<skill> runs an installed skill (/skills lists them) "
+                               "· !cmd shell · @path "
                                "attach · type while busy to steer the running turn "
                                "(applies after the current step) · plan ready: type to "
                                "steer, ctrl-g to accept")
             return False
+        # `/<skill>` — the user picked an Agent Skill. Rewrite the line into the skill's
+        # instructions and fall through to the normal message path: a skill is guidance
+        # for one task, so it rides as a user turn that compaction can reclaim, not as
+        # a tool result or a permanent system-prompt block. Everything after the command
+        # (`/investigate the flaky test`) carries through as the concrete ask.
+        echo = text
+        hit = _skills_mod().is_skill_command(text)
+        if hit:
+            name, task = hit
+            text = _skills_mod().load(name, task)
+            self._emit("info", f"loaded skill {name} "
+                               f"({self._skill_cost(text):,} tokens)")
         # A typed message while a governor budget note is pending = continue fresh:
         # clear context and relaunch, seeding the note + the user's steer.
         if self._pending_budget_note and not self._busy:
@@ -1128,7 +1180,7 @@ class TUI:
             seed = f"{text}\n\n[{note}]"
             self._queue.append(seed)
             self._emit("info", "context cleared · continuing with the progress note")
-            self._emit("user", text)
+            self._emit("user", echo)
             self._wake.set()
             return False
         # A typed message while a plan is pending = steer: continue the plan-mode
@@ -1141,11 +1193,11 @@ class TUI:
         # to the model); esc/ctrl-c remain the hard stop.
         if self._busy and not text.startswith("!"):
             self._steer_queue.append(text)
-            self._emit("user", text + "   (steering — applies after current step)")
+            self._emit("user", echo + "   (steering — applies after current step)")
             return False
         # enqueue the message; echo it (note when it's queued behind running work)
         self._queue.append(text)
-        self._emit("user", text + ("   (queued)" if self._busy else ""))
+        self._emit("user", echo + ("   (queued)" if self._busy else ""))
         self._wake.set()
         return False
 
@@ -1245,8 +1297,11 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
             load_s, ctx_limit = self._finalize()
             self.ctx_limit = ctx_limit
             self.agent.ctx_limit = ctx_limit
-            self._emit("info", f"ready in {load_s:.0f}s · context {self.engine.effective_ctx:,} "
-                               f"(compact at {ctx_limit:,})")
+            native = self.engine.effective_ctx
+            detail = (f"context {ctx_limit:,} · RAM-limited from {native:,} native"
+                      if native and ctx_limit < native * 0.95
+                      else f"context {ctx_limit:,}")
+            self._emit("info", f"ready in {load_s:.0f}s · {detail}")
         except Exception as e:  # noqa: BLE001 — surface load failure; don't hang the worker
             self._load_error = f"{type(e).__name__}: {e}"
             self._emit("error", f"[model load failed: {self._load_error}]")
@@ -1271,7 +1326,7 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
         worker.start()
         refresher = asyncio.create_task(self._refresher())
         art = banner(self.engine.model_id.split("/")[-1], self.ctx_window,
-                     mode=self.agent.mode)
+                     mode=self.agent.mode, native_ctx=self.native_ctx)
         with self._lock:
             self._pending.append("\n" + art + "\n")
         self._emit("info", "shift-tab for modes · /help")
@@ -1292,6 +1347,8 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
 
 
 def run_tui(engine: BaseEngine, ctx_limit: int, mode: str = "normal", thinking: bool = True,
-            resume: list = None, ctx_window: int = None, finalize=None, ctx_limit_fn=None):
+            resume: list = None, ctx_window: int = None, finalize=None, ctx_limit_fn=None,
+            native_ctx: int = None):
     asyncio.run(TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume,
-                    ctx_window=ctx_window, finalize=finalize, ctx_limit_fn=ctx_limit_fn).run())
+                    ctx_window=ctx_window, finalize=finalize, ctx_limit_fn=ctx_limit_fn,
+                    native_ctx=native_ctx).run())

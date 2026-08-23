@@ -13,6 +13,7 @@ the validate.py schema fallback (coercion + unknown-tool listing with no duplica
 import json
 import os
 import socket
+import sys
 import textwrap
 import threading
 import time
@@ -150,7 +151,7 @@ def project(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setattr(os.path, "expanduser",
                         lambda p: str(home) if p == "~" or p.startswith("~/") else p)
-    config = {"mcpServers": {"demo": {"command": "python", "args": [str(server_py)]}}}
+    config = {"mcpServers": {"demo": {"command": sys.executable, "args": [str(server_py)]}}}
     (tmp_path / ".mcp.json").write_text(json.dumps(config))
     monkeypatch.chdir(tmp_path)
     # The demo server is project-scoped (./.mcp.json), which is gated behind the trust
@@ -326,7 +327,7 @@ def test_disabled_server_skipped(tmp_path, monkeypatch):
     monkeypatch.setattr(os.path, "expanduser",
                         lambda p: str(home) if p == "~" or p.startswith("~/") else p)
     (tmp_path / ".mcp.json").write_text(json.dumps(
-        {"mcpServers": {"demo": {"command": "python", "args": [str(server_py)],
+        {"mcpServers": {"demo": {"command": sys.executable, "args": [str(server_py)],
                                  "disabled": True}}}))
     monkeypatch.chdir(tmp_path)
     mcp.reset_session()
@@ -343,7 +344,7 @@ def test_unusable_sdk_degrades_gracefully(tmp_path, monkeypatch):
     monkeypatch.setattr(os.path, "expanduser",
                         lambda p: str(home) if p == "~" or p.startswith("~/") else p)
     (tmp_path / ".mcp.json").write_text(json.dumps(
-        {"mcpServers": {"demo": {"command": "python", "args": ["-c", "pass"]}}}))
+        {"mcpServers": {"demo": {"command": sys.executable, "args": ["-c", "pass"]}}}))
     monkeypatch.chdir(tmp_path)
     mcp._set_trusted(str(tmp_path))
     monkeypatch.setattr(mcp, "_SDK_ERROR", "ImportError: cannot import name 'x'")
@@ -408,7 +409,7 @@ def _isolate_home(tmp_path, monkeypatch):
 
 def _write_project(tmp_path, server_py, name="demo", server_src=_SERVER, **spec):
     server_py.write_text(server_src)
-    full_spec = {"command": "python", "args": [str(server_py)]}
+    full_spec = {"command": sys.executable, "args": [str(server_py)]}
     full_spec.update(spec)
     (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {name: full_spec}}))
 
@@ -446,7 +447,7 @@ def test_user_level_server_trusted_by_default(tmp_path, monkeypatch):
     (home / ".chad").mkdir(parents=True)
     server_py = tmp_path / "server.py"; server_py.write_text(_SERVER)
     (home / ".chad" / "mcp.json").write_text(json.dumps(
-        {"mcpServers": {"udemo": {"command": "python", "args": [str(server_py)]}}}))
+        {"mcpServers": {"udemo": {"command": sys.executable, "args": [str(server_py)]}}}))
     workdir = tmp_path / "work"; workdir.mkdir()
     monkeypatch.chdir(workdir)                         # no project ./.mcp.json here
     mcp.reset_session()

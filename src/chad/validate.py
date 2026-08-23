@@ -31,7 +31,7 @@ from typing import Any, List, Optional, Tuple
 from . import config
 from .tools import active_schemas
 
-# A/B knob (mirrors CHAD_NO_SYMBOLS), the single source of truth for both the
+# A/B knob, the single source of truth for both the
 # typed-validate path here and the lenient tool-call parse in toolcall_parse.py.
 # With CHAD_NO_VALIDATE set, callers bypass the typia-style lenient-parse +
 # typed-validate + self-repair loop and fall back to strict json.loads + the terse
@@ -41,17 +41,16 @@ VALIDATE = not config.flag("CHAD_NO_VALIDATE")
 
 def _param_schema(name):
     """The `parameters` JSON-Schema for a tool as it is exposed to the model RIGHT NOW —
-    chad's builtins plus every dynamically-appended tool (`activate_skill` when skills are
-    installed, `task`, and any connected MCP server's tool). None if the name is not
-    currently callable.
+    chad's builtins plus every dynamically-appended tool (any connected MCP server's).
+    None if the name is not currently callable.
 
     This reads the LIVE `active_schemas()` set rather than a frozen import-time snapshot.
-    The snapshot was the bug: dynamic tools like `activate_skill` are appended by
-    `active_schemas()` (so the model sees them) but were absent from the frozen table, so a
-    perfectly valid `activate_skill` call validated as an "unknown tool" — while the same
-    error listed it as available (`_known_tools` reads the dispatch table, which *does*
-    contain it). Sourcing both from `active_schemas()` guarantees the validation contract
-    can never drift from what the model is shown."""
+    The snapshot was the bug: a tool appended by `active_schemas()` (so the model sees
+    it) was absent from the frozen table, so a perfectly valid call validated as an
+    "unknown tool" — while the same error listed it as available (`_known_tools` reads
+    the dispatch table, which *does* contain it). An unwinnable loop: no retry could
+    pass. Sourcing both from `active_schemas()` guarantees the validation contract can
+    never drift from what the model is shown."""
     for s in active_schemas():
         if s["function"]["name"] == name:
             return s["function"].get("parameters", {"type": "object"})
@@ -192,6 +191,9 @@ def _tname(v: Any) -> str:
 
 
 def _expected(schema: dict) -> str:
+    alts = schema.get("anyOf")
+    if alts:
+        return " | ".join(_expected(a) for a in alts)
     enum = schema.get("enum")
     if enum:
         return " | ".join(json.dumps(e) for e in enum)
@@ -252,9 +254,25 @@ def _coerce_scalar(value: Any, typ: Optional[str]) -> Tuple[Any, bool]:
 
 
 def _walk(value: Any, schema: dict, path: str) -> Tuple[Any, List[Err]]:
+    # `anyOf` — a field with two equally legitimate shapes (write_todos' checklist
+    # string vs the structured list). Take the first branch that validates cleanly, so
+    # the model never has to guess which one the schema wanted. Branch order is
+    # preference order: when none validate we report the branch that came closest, so
+    # the repair message names one concrete fix instead of "no alternative matched".
+    alts = schema.get("anyOf")
+    if alts:
+        best_v, best_e = value, None
+        for alt in alts:
+            cv, alt_errs = _walk(value, alt, path)
+            if not alt_errs:
+                return cv, []
+            if best_e is None or len(alt_errs) < len(best_e):
+                best_v, best_e = cv, alt_errs
+        return best_v, best_e or [Err(path, _expected(schema), _tname(value))]
+
     typ = schema.get("type")
     # Un-double-stringify: a container field whose value arrived as a JSON string
-    # (Qwen3/Ornith do this on nested fields — typia's signature failure mode).
+    # (Qwen3 does this on nested fields — typia's signature failure mode).
     if typ in ("object", "array") and isinstance(value, str):
         un = repair_json(value) if typ == "object" else _load_json(value)
         if un is not None:
@@ -350,9 +368,9 @@ def render_repair(name: str, args: Any, errors: List[Err]) -> str:
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", str(name)):
             return (f"[malformed tool call — the tool name parsed as {name!r}, which "
                     "means your call syntax was garbled. Do not retry the same text. "
-                    "Re-emit the call as ONE json object in this exact shape: "
-                    '<tool_call>{"name": "grep", "arguments": {"pattern": "..."}}'
-                    "</tool_call> — substituting your intended tool and arguments.]")
+                    "Re-emit the call in this exact shape: <tool_call><function=grep>"
+                    "<parameter=pattern>...</parameter></function></tool_call> — "
+                    "substituting your intended tool and arguments.]")
         return (f"[unknown tool {name!r}. Available tools: {', '.join(_known_tools())}. "
                 "Re-emit the call using one of these names.]")
     lines = [f"[invalid arguments for `{name}` — fix ONLY the fields marked ✗ below, "
@@ -362,11 +380,27 @@ def render_repair(name: str, args: Any, errors: List[Err]) -> str:
             lines.append(f"  ✗ {e.path}  → required, but missing (expected {e.expected})")
         else:
             lines.append(f"  ✗ {e.path} = {e.got}  → expected {e.expected}")
-    try:
-        echo = json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
-    except (TypeError, ValueError):
-        echo = str({"name": name, "arguments": args})
-    if len(echo) <= 600:
+    echo = _echo_call(name, args)
+    if echo and len(echo) <= 600:
         lines.append("your call was:")
-        lines.append(f"<tool_call>{echo}</tool_call>")
+        lines.append(echo)
     return "\n".join(lines)
+
+
+def _echo_call(name: str, args: Any) -> str:
+    """The model's own call, re-rendered in the dialect the chat template mandates.
+    This echo sits directly above the model's retry, so it is a few-shot example of the
+    call shape whether or not it is meant as one; rendering it as a JSON object showed
+    the model a format its template forbids, and misquoted what it had actually sent."""
+    if not isinstance(args, dict):
+        return ""
+    parts = [f"<tool_call>\n<function={name}>"]
+    for k, v in args.items():
+        if not isinstance(v, str):
+            try:
+                v = json.dumps(v, ensure_ascii=False)
+            except (TypeError, ValueError):
+                v = str(v)
+        parts.append(f"<parameter={k}>\n{v}\n</parameter>")
+    parts.append("</function>\n</tool_call>")
+    return "\n".join(parts)

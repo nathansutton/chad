@@ -24,11 +24,12 @@ from . import (
     levers,
     seatbelt,
     session,
+    spill,
     syntaxgate,
 )
-from .base_engine import BackendError, BaseEngine
+from .base_engine import BaseEngine
 from .diag import args_preview, log, redact, result_preview
-from .prompt import build_subagent_prompt, build_system_prompt, classify_intent
+from .prompt import build_system_prompt, classify_intent
 from .render import (
     C_DIM,
     C_RED,
@@ -43,41 +44,17 @@ from .render import (
     render_tool_start,
 )
 from .toolcall_parse import parse_tool_calls, strip_think
-from .tools import IGNORE_DIRS, TERMINAL, _under_plans, active_schemas, dispatch_for, is_mutating
-
-# Sub-agent / Task tool. A spawned sub-agent runs on the SAME engine (after a
-# cache push) but a fresh transcript, with a tight step/context budget and — by default —
-# a read-only toolset, so it can spelunk without mutating anything or bloating the main
-# context. The read-only set is exploration + planning + the terminal tools; bash, write,
-# edit and the symbol editors are excluded (they land only under tools="all").
-# Spelunking is step-hungry (grep → read → grep → read) and its whole value is bringing
-# back a condensed answer, so starve it and it returns nothing. These are ceilings, not
-# targets: a sub-agent that finds its answer calls `done` on step 3. ctx_limit is further
-# clamped to the parent's by min() at the spawn site.
-SUBAGENT_MAX_STEPS = 24
-SUBAGENT_CTX_LIMIT = 32000
-SUBAGENT_READ_ONLY = {
-    "read", "grep", "glob", "repo_map", "overview", "view_symbol",
-    "find_symbol", "definition", "find_refs", "done", "finish", "stop",
-}
-# `write_todos` is deliberately absent: a sub-agent that plans its own work would mutate
-# the process-global `_TODOS` and clobber the parent's pinned todo panel (and `_sub_emit`
-# has no panel route for the "todos" kind anyway). A sub-agent's plan is not the parent's
-# concern.
-
-
-def subagent_tools_for(parent_mode: str, requested: str) -> str:
-    """The toolset a sub-agent may run with. A sub-agent auto-approves its own tool
-    calls (mode='yolo', no confirm callback), so it must never hold more autonomy
-    than its parent: only a 'yolo' parent (--yolo / headless) may delegate 'all'.
-    A 'normal' parent's human-approval promise, an 'auto' parent's narrower promise
-    (edits yes, shell no — and 'all' includes bash), and plan mode's read-only
-    promise all clamp the sub-agent to read-only."""
-    if parent_mode == "yolo" and requested == "all":
-        return "all"
-    return "read-only"
-
-
+from .tools import (
+    IGNORE_DIRS,
+    TERMINAL,
+    _under_plans,
+    active_schemas,
+    alias_to_bash,
+    dispatch_for,
+    is_mutating,
+    tool_write_todos,
+    unfinished_todos,
+)
 from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_repair
 
 # Validation (VALIDATE knob, legacy_validate baseline) lives in validate.py, the
@@ -138,12 +115,35 @@ _MENTION_RE = re.compile(r"(?:^|\s)@([A-Za-z0-9_.~/-]+)")
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[A-Za-z0-9_]+\|>")
 
 
+# Bounded @mention attachment: line- and char-capped so a big file can't blow up
+# prefill; the model can pull more of it through bash if it needs to.
+MENTION_MAX_LINES = 400
+MENTION_MAX_CHARS = 10000
+
+
+def _attach_snapshot(path: str) -> str:
+    try:
+        with open(path, errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        return f"[cannot read {path}: {e}]"
+    total = len(lines)
+    body = "".join(lines[:MENTION_MAX_LINES])
+    note = ""
+    if len(body) > MENTION_MAX_CHARS:
+        body = body[:MENTION_MAX_CHARS]
+        note = f"\n[…clipped; read more with `sed -n 'a,bp' {path}`]"
+    elif total > MENTION_MAX_LINES:
+        note = (f"\n[showed the first {MENTION_MAX_LINES} of {total} lines; "
+                f"read more with `sed -n 'a,bp' {path}`]")
+    return (body + note) if body else "[empty]"
+
+
 def expand_mentions(text: str):
     """Expand each @path in `text` into attached context: a real FILE becomes a bounded
-    snapshot (reusing the read tool's skeleton/char-cap policy, so a big file can't blow
-    up prefill); a DIRECTORY becomes a short listing of its entries. Returns
-    (augmented_text, [resolved_paths]); text unchanged and list empty when nothing
-    resolves."""
+    snapshot (line/char-capped, so a big file can't blow up prefill); a DIRECTORY
+    becomes a short listing of its entries. Returns (augmented_text,
+    [resolved_paths]); text unchanged and list empty when nothing resolves."""
     resolved = []  # (kind, path)
     seen = set()
     for m in _MENTION_RE.finditer(text):
@@ -157,11 +157,10 @@ def expand_mentions(text: str):
             resolved.append(("dir", path)); seen.add(path)
     if not resolved:
         return text, []
-    from .tools import tool_read
     blocks = []
     for kind, p in resolved:
         if kind == "file":
-            blocks.append(f"@{p}:\n{tool_read(p)}")
+            blocks.append(f"@{p}:\n{_attach_snapshot(p)}")
         else:
             entries = sorted(e + ("/" if os.path.isdir(os.path.join(p, e)) else "")
                              for e in os.listdir(p) if e not in IGNORE_DIRS)
@@ -186,18 +185,12 @@ def reject_escalation(name: str) -> str:
     back-to-back. The plain repair message clearly is not landing — the model can't see
     the fix (or the call genuinely can't succeed as written), so re-emitting it verbatim
     just burns turns. Break the loop: stop repeating, and — critically — do NOT fabricate
-    the result the tool would have returned. A silently-failed `activate_skill` that the
-    model papers over by reciting a skill from memory is the worst outcome: confident
-    output that never loaded the real instructions."""
-    extra = ("\n[you have now emitted this exact call twice and it was rejected both "
-             "times — re-emitting it unchanged will not work. Either change the flagged "
-             "field(s), or use a DIFFERENT tool. Do NOT invent or guess the output this "
-             "tool would have returned.]")
-    if name == "activate_skill":
-        extra += ("\n[the skill was NOT loaded. Do not proceed from memory or fabricate "
-                  "its steps. Check the exact skill `name` against the '# Skills' list, or "
-                  "continue the task with the normal read/grep/bash tools instead.]")
-    return extra
+    the result the tool would have returned: confident output invented in place of a
+    call that never succeeded is the worst of the available outcomes."""
+    return ("\n[you have now emitted this exact call twice and it was rejected both "
+            "times — re-emitting it unchanged will not work. Either change the flagged "
+            "field(s), or use a DIFFERENT tool. Do NOT invent or guess the output this "
+            "tool would have returned.]")
 
 
 def close_unclosed_think(text: str, thinking: bool) -> str:
@@ -209,7 +202,7 @@ def close_unclosed_think(text: str, thinking: bool) -> str:
     emits its own `</think>`. A turn truncated at the token cap can stop BEFORE that
     close. The template then renders the stored (unclosed) content as an EMPTY think
     block + trailing content — which diverges from the cache at the very first content
-    token. On Ornith's non-trimmable cache that single divergence forces a FULL
+    token. On this non-trimmable cache that single divergence forces a FULL
     re-prefill of the whole transcript next step (measured: tens of thousands of tokens
     at large context). Appending the missing `</think>` keeps the cached tokens a strict
     prefix of the re-render, so only a couple of tokens prefill instead. No-op when
@@ -217,6 +210,49 @@ def close_unclosed_think(text: str, thinking: bool) -> str:
     if thinking and "<think>" not in text and "</think>" not in text and text:
         return text + "\n</think>"
     return text
+
+
+def split_inline_reasoning(m: dict) -> dict:
+    """Lift an assistant turn's inline `<think>…</think>` out of `content` into the
+    `reasoning_content` field the chat template reads.
+
+    chad stores a generated turn verbatim in `content`, reasoning inline, because that
+    is the exact byte stream the model emitted (and so the stored turn re-renders into a
+    prefix of the live KV cache). The model's template reconstructs the split itself: when
+    `reasoning_content` is absent it recovers the reasoning by splitting `content` on
+    `</think>`. Qwen3.8's stock template DROPPED that recovery branch — it reads
+    `reasoning_content` and nothing else, so an inline-think turn renders as an EMPTY
+    `<think>\\n\\n</think>\\n\\n` followed by the whole raw turn. That injected empty block
+    lands at the very first generated token, so the re-render diverges from the cache
+    there and every step re-prefills its own last generation (reasoning + action + tool
+    call). Measured on real ky sessions: 6–11k discarded cache tokens per session,
+    25–32% of all prefill.
+
+    Doing the split here feeds the reasoning through the field BOTH templates read, so
+    the render matches what was decoded. Pure, and a no-op on non-assistant turns, on
+    turns with no `</think>` (a `--no-think`/no-think-escalation step, whose generation
+    prompt already carried the empty block), and on turns compaction has already
+    think-stripped."""
+    content = m.get("content") or ""
+    if m.get("role") != "assistant" or "</think>" not in content:
+        return m
+    head, _, tail = content.partition("</think>")
+    return {**m,
+            "reasoning_content": head.rstrip("\n").split("<think>")[-1].lstrip("\n"),
+            "content": tail.lstrip("\n")}
+
+
+# Probe messages for `_reasoning_split_supported`: a minimal transcript whose assistant
+# turn carries inline reasoning, in the exact shape chad stores (no opening `<think>` —
+# the generation prompt emitted it). Rendered twice, split and unsplit, to classify the
+# template. Distinctive sentinels so the check is a substring test, not a parse.
+_PROBE_REASONING = "chadprobeRSN"
+_PROBE_ANSWER = "chadprobeANS"
+_PROBE_MESSAGES = [
+    {"role": "system", "content": "s"},
+    {"role": "user", "content": "u"},
+    {"role": "assistant", "content": f"{_PROBE_REASONING}\n</think>\n\n{_PROBE_ANSWER}"},
+]
 
 
 # Permission modes (Claude Code parity, cycled with shift-tab in the TUI):
@@ -235,8 +271,7 @@ MODE_LABEL = {"normal": "normal", "auto": "auto-accept edits", "yolo": "yolo",
 # for the same reason (a server-side tool can send mail or hit an API). The list is
 # explicit rather than `MUTATING - {"bash"}` so it fails CLOSED: a mutating tool added
 # later asks for approval until someone deliberately adds it here.
-AUTO_EDIT_TOOLS = {"write", "edit", "replace_lines", "insert_lines",
-                   "replace_symbol", "insert_symbol", "rename_symbol"}
+AUTO_EDIT_TOOLS = {"write", "edit"}
 
 
 def auto_approves(mode: str, name: str) -> bool:
@@ -246,7 +281,7 @@ def auto_approves(mode: str, name: str) -> bool:
         return True
     return mode == "auto" and name in AUTO_EDIT_TOOLS
 _PLAN_PREFIX = (
-    "[PLAN MODE. Research first (read/grep/glob/repo_map/overview) — do NOT edit "
+    "[PLAN MODE. Research first (bash: rg / sed -n / ls) — do NOT edit "
     "project files or run commands. Then write ONE self-contained plan to "
     "./plans/NNN-kebab-title.md (continue the existing number sequence) with the "
     "`write` tool. The plan must inline everything an executor needs WITHOUT this "
@@ -259,10 +294,9 @@ _PLAN_PREFIX = (
 # plan file — a "give me a 3-sentence tour" must not become an 84-line plans/ doc.
 # Still fully read-only: research, then reply in prose.
 _PLAN_PREFIX_CONCEPTUAL = (
-    "[PLAN MODE. This is a question, not a change request — do NOT edit project files, "
-    "run commands, or write a plan file. Research as needed "
-    "(read/grep/glob/repo_map/overview), then ANSWER the question directly in prose and "
-    "call done.]\n\n"
+    "[PLAN MODE. This is a question, not a change request — do NOT edit project files "
+    "or write a plan file. Research as needed with read-only bash (rg / sed -n / ls), "
+    "then ANSWER the question directly in prose and call done.]\n\n"
 )
 
 
@@ -274,18 +308,10 @@ def _plan_prefix(intent: dict) -> str:
 
 
 # Backstop cap on any single tool result appended to the transcript. Each big char is
-# prefill on a bandwidth-bound local model, and dogfooding showed a single tool call can
-# stall the next turn for tens of seconds: a whole-file read (fixed by READ_MAX_CHARS), a
-# wide grep (GREP_MAX_CHARS), and — the case those per-tool caps miss — the symbolic map
-# tools (overview/repo_map/view_symbol), whose output scales with a file's symbol count
-# (a 9,864-token `overview` = a 32s stall). This bounds EVERY tool uniformly so no one
-# call blows up prefill; it sits just above the per-tool caps so it only bites the
-# otherwise-uncapped tools. ~14k chars ≈ 4k tokens ≈ a ~14s worst-case prefill on the 9B.
-# Transient backend faults (llama.cpp 5xx / mid-stream error chunks) are re-rolled rather
-# than allowed to kill an unattended turn. Bounded so a server that is genuinely down
-# surfaces as an error instead of burning the task's whole budget on retries.
-_MAX_BACKEND_RETRIES = 3
-
+# prefill on a bandwidth-bound local model, and dogfooding showed a single tool call
+# can stall the next turn for tens of seconds. This bounds EVERY tool uniformly so no
+# one call blows up prefill; it sits above bash's own head/tail caps so it only bites
+# an otherwise-uncapped tool. ~14k chars ≈ 4k tokens.
 _MAX_TOOL_RESULT_CHARS = 14000
 # Per-STEP budget on the total tool-output chars appended before the next prefill. The
 # per-result cap above bounds each call, but a step that emits SEVERAL calls stacks
@@ -305,23 +331,97 @@ def _step_tool_cap(spent: int) -> int:
                min(_MAX_TOOL_RESULT_CHARS, _STEP_TOOL_BUDGET_CHARS - spent))
 
 
+# Split of the backstop cap between head and tail, tail-biased for the same reason
+# bash's is: a head-only clip of a long MCP error or a verbose command echo keeps the
+# preamble and drops the sentence that says what went wrong.
+_CLIP_HEAD_FRAC = 0.4
+
+
 def _clip_tool_result(result: str, cap: int = _MAX_TOOL_RESULT_CHARS) -> str:
     """Bound a tool result's size so no single call blows up the next turn's prefill.
-    Keeps the head (usually the most relevant) and notes how to fetch the rest."""
+
+    Keeps a head and a tail, and hands back an executable pointer to the full body:
+    the dropped bytes go to a spill file the model can grep, so a clip costs a
+    `grep` rather than a repeat of the call. A result that already carries a spill
+    pointer (an oversized bash body, capped once by bash and again here) re-points at
+    its existing file instead of writing the same bytes twice."""
     if not isinstance(result, str) or len(result) <= cap:
         return result
     omitted = len(result) - cap
-    return (result[:cap]
-            + f"\n[… {omitted} chars truncated to keep the turn responsive — narrow the "
-            f"query (grep a pattern, view_symbol(name), or read(path, offset=N)), or "
-            f"re-run this call by itself, to pull just what you need.]")
+    head = int(cap * _CLIP_HEAD_FRAC)
+    tail = cap - head
+    path = None
+    if levers.enabled("result_spill"):
+        path = spill.path_in(result) or spill.write(result, "result")
+    if path:
+        levers.fired("result_spill", chars=omitted)
+        where = (f"full output saved to {path}; grep/sed that file instead of "
+                 f"re-running this call")
+    else:
+        where = ("narrow the query (rg a pattern, sed -n a range), or re-run this "
+                 "call by itself, to pull just what you need")
+    return (result[:head]
+            + f"\n[… {omitted} chars omitted to keep the turn responsive — {where}. "
+            f"The TAIL below is usually the outcome …]\n"
+            + result[-tail:])
+
+
+# Sentinel for _stable_prefix_ids: "render with whatever schemas are active", which
+# `None` cannot mean — None is the legitimate request for a prefix with NO tools.
+_ACTIVE_SCHEMAS = object()
+
+_THINK_SPAN = re.compile(r"<think>(.*?)</think>", re.S)
+
+
+def _ctx_spans(messages, count) -> tuple[int, int, int]:
+    """(think residue, all tool results, trailing tool results) in tokens.
+
+    Pure over a message list and a token-counting callable so the split can be tested
+    without a model. Trailing = the run of tool messages at the end of the transcript,
+    i.e. what the last step just appended — the part a user can shrink by narrowing
+    the next call rather than by starting over."""
+    think = tools_all = 0
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content") or ""
+        if role == "assistant":
+            think += sum(count(seg) for seg in _THINK_SPAN.findall(content))
+        elif role == "tool":
+            tools_all += count(content)
+    recent = 0
+    for m in reversed(messages):
+        if m.get("role") != "tool":
+            break
+        recent += count(m.get("content") or "")
+    return think, tools_all, recent
+
+
+def format_ctx_breakdown(bd: dict) -> list[str]:
+    """`ctx_breakdown` as display lines. The nested rows are a decomposition of
+    `history`, not additions to it, so they are indented under it and the total is
+    the only number that has to add up."""
+    def row(label, n, indent=0, of=None):
+        pct = f"  {100 * n / of:4.1f}%" if of else ""
+        return f"{' ' * indent + label:<24}{n:>8,}{pct}"
+    total = max(1, bd["total"])
+    lines = [row("context total", bd["total"]) + f"   (compact at {bd['limit']:,})",
+             row("system prompt", bd["system"], 2, total),
+             row("tool schemas", bd["schemas"], 2, total),
+             row("history", bd["history"], 2, total),
+             row("· think residue", bd["think"], 4, total),
+             row("· tool results", bd["tools"], 4, total),
+             row("· chat + template", bd["chat"], 4, total)]
+    if bd["tools_recent"]:
+        lines.append(row("last step's results", bd["tools_recent"], 2, total))
+    return lines
+
 
 # Canned task behind the /init slash command (Claude-Code parity): scaffold a CLAUDE.md
-# the way `claude /init` does. Runs through the normal agentic loop (repo_map → read the
+# the way `claude /init` does. Runs through the normal agentic loop (orient → read the
 # config files → write), so it benefits from every reliability fix above.
 INIT_PROMPT = (
     "Create a CLAUDE.md file at the root of this project to help an AI coding assistant "
-    "work here effectively. First orient yourself: call repo_map, then read the key "
+    "work here effectively. First orient yourself with bash (ls, rg --files), then read the key "
     "config/entry files that exist (README, pyproject.toml/package.json/go.mod/Cargo.toml, "
     "Makefile). Then write CLAUDE.md with the `write` tool containing, concisely (aim for "
     "under 60 lines): a one-paragraph overview of what the project does; the main "
@@ -340,27 +440,18 @@ class Agent:
                  max_gen_tokens: int = None, resume: list = None, persist: bool = False,
                  think_budget: int = None, think_ceiling: int = None,
                  turn_budget_tokens: int = None,
-                 turn_budget_s: float = None, subagent: bool = False,
-                 subagent_tools: str = "read-only", session_id: str = None,
+                 turn_budget_s: float = None, session_id: str = None,
                  ctx_limit_fn=None):
         self.engine = engine
-        # A spawned sub-agent SHARES the parent's session — the same engine,
-        # the same live skills/MCP connections — so it must NOT tear those down. Only a
-        # top-level Agent resets them (a fresh session clears stale activation state and
-        # reaps prior MCP processes; matches engine._reset_cache on /reset).
-        self._subagent = subagent
-        # Which tools a sub-agent may see: "read-only" (default) or "all". Ignored for a
-        # top-level agent (it always gets the full toolset minus the CHAD_NO_* gates).
-        self._subagent_tools = subagent_tools
-        if not subagent:
-            from . import skills
-            skills.reset_session()
-            from . import mcp
-            mcp.reset_session()
-            ambient.reset()  # fresh session-state ledger; sub-agents share the
-                             # parent's and never feed it (see run_turn)
+        # A fresh session clears stale skill activation state and reaps prior MCP
+        # processes (matches engine._reset_cache on /reset).
+        from . import skills
+        skills.reset_session()
+        from . import mcp
+        mcp.reset_session()
+        ambient.reset()
         self.mode = mode or ("yolo" if yolo else "normal")
-        self.thinking = thinking  # Ornith is a reasoning model; toggles <think> blocks
+        self.thinking = thinking  # a reasoning model; toggles <think> blocks
         # Steps per WINDOW, not a hard kill: a window that landed+verified a change
         # earns an extension (see guardrails.extend_step_cap; absolute ceiling 4x).
         self.max_steps = max_steps
@@ -402,15 +493,19 @@ class Agent:
         if think_budget is None:
             think_budget = config.env_int("CHAD_THINK_BUDGET")
         self.think_budget = think_budget
-        # Close-and-continue think ceiling. None => OFF (byte-identical to
-        # before), like think_budget. Distinct from it: think_budget is a low soft-cap that
-        # ENDS the step (the model re-derives next step — 084 confirmed that inflates total
-        # think 3.8x); this is a HIGH pathological cap (~6000) that force-closes the runaway
-        # <think> and CONTINUES decoding the action in the same step, so the reasoning so
-        # far stays in context and nothing is re-derived. Env-armed for the eval harness.
+        # Close-and-continue think ceiling: force-closes a runaway <think> and
+        # CONTINUES decoding the action in the same step, so the reasoning so far
+        # stays in context and nothing is re-derived. OFF by default: force-closing
+        # </think> mid-generation is the most invasive thing the harness can do to
+        # the token stream, and the measured record says the bare loop doesn't need
+        # it. CHAD_THINK_CEILING=N arms it.
         if think_ceiling is None:
-            think_ceiling = config.env_int("CHAD_THINK_CEILING")
+            think_ceiling = config.env_int("CHAD_THINK_CEILING", 0)
         self.think_ceiling = think_ceiling
+        # Template-level reasoning budget (Qwen3.8: xhigh | medium | low). Unset =>
+        # the template's own default, and the argument is not passed at all, so
+        # templates without the knob are unaffected. See _render.
+        self.reasoning_effort = config.env_str("CHAD_REASONING_EFFORT") or None
         # Degenerate-repetition stop (see guardrails.degenerate_tail): default ON —
         # it only fires on output that is already garbage (a literal decode loop), so
         # unlike the think-budget there is no capability trade. A/B off via env.
@@ -446,13 +541,7 @@ class Agent:
         # note so the caller (TUI / one-shot / evals) can relaunch a fresh turn seeded
         # with it. Reset at the start of every run_turn.
         self.budget_note: str | None = None
-        # The profile is keyed off the served model id, so an `--backend llama` run
-        # against a non-Ornith endpoint drops the Ornith accommodations automatically
-        # instead of silently carrying them into a cross-model comparison.
-        _mid = getattr(engine, "model_id", None)
-        self.messages = [{"role": "system",
-                          "content": build_subagent_prompt(_mid) if subagent
-                          else build_system_prompt(_mid)}]
+        self.messages = [{"role": "system", "content": build_system_prompt()}]
         if resume:
             self.messages += [m for m in resume if m.get("role") != "system"]
         self._emit = emit or _default_emit
@@ -463,11 +552,8 @@ class Agent:
         # transcript (a pure append — the warm KV prefix stays valid) instead of
         # forcing interrupt + re-prefill. None (headless/bench/sub-agent) = off.
         self._drain_steering = drain_steering
-        self._backend_retries = 0   # reset per turn; see _MAX_BACKEND_RETRIES
-        # ATIF trajectory capture, off unless CHAD_TRAJECTORY_JSON is set. A
-        # sub-agent runs on the parent's engine inside one of the parent's steps; recording
-        # it as a sibling segment would interleave two transcripts into one step sequence.
-        self._atif = None if subagent else atif.recorder()
+        # ATIF trajectory capture, off unless CHAD_TRAJECTORY_JSON is set.
+        self._atif = atif.recorder()
         self._atif_seg = self._atif.new_segment() if self._atif else None
         self._atif_stats: list = []   # one entry per successful generate, in step order
         if self._atif and self._atif.model_name is None:
@@ -486,12 +572,10 @@ class Agent:
         self.think_capped = 0   # times the soft think-cap force-closed a step
         # Real tool dispatches this agent has executed (fn actually ran — excludes
         # terminal `done`, validation rejects, and harness-injected nudge messages,
-        # which reuse real tool names in the transcript). The evidence signal behind
-        # the sub-agent zero-evidence warning in _run_subagent.
+        # which reuse real tool names in the transcript).
         self.tool_dispatches = 0
         # prefill accounting: the master cost for a local model is how many *new*
         # tokens it has to prefill across a turn (context bloat -> big prefills).
-        # This is the metric symbolic/repo-map retrieval is meant to shrink.
         self.prefill_tokens = 0   # sum of newly-prefilled (uncached) tokens, all steps
         self.peak_ctx = 0         # largest prompt the turn ever rendered (tokens)
         # Total cache length (cached+prefilled+generated) after the prior
@@ -550,36 +634,49 @@ class Agent:
                   if m.get("role") == "assistant" and "</think>" in m["content"]][:-2]:
             c = self.messages[i]["content"]
             self.messages[i]["content"] = c.split("</think>", 1)[1].lstrip("\n")
-        # A compaction notice is guidance, not output: head/tail-clipping one would leave
-        # the model a mangled instruction, and it must not consume one of the four spared
-        # slots either. Same exemption the skill messages get in compact_if_needed.
+        # Already-collapsed results are skipped — re-trimming a trimmed body reclaims
+        # almost nothing and would strand the spill pointer compaction wrote into it.
         idxs = [i for i, m in enumerate(self.messages)
-                if m.get("role") == "tool" and self._COLLAPSED not in m["content"]
-                and compaction._NOTICE_TAG not in m["content"]]
+                if m.get("role") == "tool" and self._COLLAPSED not in m["content"]]
         for i in idxs[:max(0, len(idxs) - 4)]:  # keep the last 4 tool outputs verbatim
             if len(self.messages[i]["content"]) > 400:
                 self.messages[i]["content"] = self._headtail(self.messages[i]["content"])
         return before, len(self._render())
 
+    def ctx_breakdown(self) -> dict:
+        """Where the window actually went, in tokens of the model's own tokenizer.
+
+        `context N` answers "how full" and nothing else, so a session that compacts
+        early is a mystery: an eager MCP server's schemas, a 40k skill body and a
+        transcript of think blocks all read the same on the gauge. This splits the
+        rendered prompt into the parts a user can act on — drop a server, stop
+        loading a skill, start a fresh session — using the tokenizer chad already
+        runs, at zero cost when the command is not invoked.
+
+        The static parts are exact (two prefix renders, differenced); `chat` is the
+        remainder, so template scaffolding lands there rather than being attributed
+        to content that did not produce it."""
+        total = len(self._render())
+        prefix = len(self._stable_prefix_ids())
+        system = len(self._stable_prefix_ids(tools=None))
+        think, tools_all, tools_recent = _ctx_spans(self.messages,
+                                                    lambda t: token_len(self.engine, t))
+        history = max(0, total - prefix)
+        return {
+            "total": total,
+            "limit": self.ctx_limit,
+            "system": system,
+            "schemas": max(0, prefix - system),
+            "history": history,
+            "think": think,
+            "tools": tools_all,
+            "tools_recent": tools_recent,
+            "chat": max(0, history - think - tools_all),
+        }
+
     def _active_schemas(self):
-        """The tool schemas to expose THIS agent, on top of the module-level gates
-        (CHAD_NO_SYMBOLS / CHAD_NO_TASK / skills / MCP). A sub-agent never
-        sees `task` — reentrancy guard, subagents can't spawn subagents — and, unless it
-        was granted tools="all", is restricted to the read-only exploration set so it
-        can't mutate the repo it's spelunking through."""
-        schemas = active_schemas()
-        if not self._subagent:
-            return schemas
-        allow = None if self._subagent_tools == "all" else SUBAGENT_READ_ONLY
-        out = []
-        for s in schemas:
-            n = s["function"]["name"]
-            if n == "task":
-                continue
-            if allow is not None and n not in allow:
-                continue
-            out.append(s)
-        return out
+        """The tool schemas to expose this agent (builtins + skills + MCP)."""
+        return active_schemas()
 
     @staticmethod
     def _template_ids(rendered):
@@ -590,14 +687,69 @@ class Agent:
         MLX path returns a plain list already — untouched by this guard."""
         return rendered["input_ids"] if hasattr(rendered, "input_ids") else rendered
 
+    def _reasoning_split_supported(self) -> bool:
+        """Does THIS template need `split_inline_reasoning`, and is it safe to apply?
+
+        Behavioral probe, not a substring sniff on the template source: mlx_lm may swap
+        in its own template callable, and a template's real contract is what it renders.
+        Two renders of `_PROBE_MESSAGES` decide it:
+
+        * split render loses the reasoning  -> the template ignores `reasoning_content`
+          entirely (a non-thinking template). NOT safe: splitting would silently drop the
+          model's reasoning from the transcript. Off.
+        * split render == unsplit render    -> the template already recovers inline
+          `</think>` on its own. Nothing to fix; off, so the rendered
+          prompt stays byte-identical to before this change.
+        * otherwise                         -> the template reads `reasoning_content` but
+          does not recover inline think (Qwen3.8). On.
+
+        Resolved once per agent and cached; a failed probe (an exotic template that
+        raises) falls back to OFF, i.e. exactly the pre-existing behavior."""
+        cached = getattr(self, "_split_ok", None)
+        if cached is not None:
+            return cached
+        try:
+            tok = self.engine.tok
+            def render(msgs):
+                return tok.apply_chat_template(msgs, add_generation_prompt=True,
+                                               enable_thinking=True, tokenize=False)
+            plain = render(_PROBE_MESSAGES)
+            split = render([split_inline_reasoning(m) for m in _PROBE_MESSAGES])
+            ok = _PROBE_REASONING in split and _PROBE_ANSWER in split and split != plain
+        except Exception:  # noqa: BLE001 — an unprobeable template must not break startup
+            ok = False
+        log.info("reasoning-content split: %s", "ON (template lacks inline-think "
+                 "recovery)" if ok else "off (template recovers it, or ignores "
+                 "reasoning_content)")
+        self._split_ok = ok
+        return ok
+
     def _render(self, thinking: bool = None):
         # `thinking` overrides self.thinking for THIS render only (no-think
         # escalation renders one step with <think> off, then restores). None => self.thinking.
         if thinking is None:
             thinking = self.thinking
+        # Lift inline reasoning into `reasoning_content` when the template needs it, so
+        # the re-render is a prefix extension of the KV cache instead of diverging at the
+        # first generated token. Off (and byte-identical to before) on the shipped model.
+        messages = self.messages
+        if self._reasoning_split_supported():
+            messages = [split_inline_reasoning(m) for m in messages]
+        # Qwen3.8's template exposes a reasoning_effort knob (xhigh | medium | low,
+        # defaulting to medium) that chad had no way to reach — so every run silently
+        # took the default. It is the middle ground this model badly needs: measured
+        # on the ky task, full thinking spends ~64% of generated tokens and is the
+        # only mode that produces correct code, while --no-think is fast but emits
+        # malformed TypeScript it cannot repair. `low` keeps the reasoning block and
+        # shrinks it. Passed only when set, and via **kwargs, so templates that do not
+        # accept the argument (q3_s6's, which has no reasoning_effort at all) render
+        # byte-identically to before.
+        extra = {}
+        if self.reasoning_effort:
+            extra["reasoning_effort"] = self.reasoning_effort
         ids = self._template_ids(self.engine.tok.apply_chat_template(
-            self.messages, tools=self._active_schemas(), add_generation_prompt=True,
-            enable_thinking=thinking,
+            messages, tools=self._active_schemas(), add_generation_prompt=True,
+            enable_thinking=thinking, **extra,
         ))
         # Debug hook (env-gated, off by default): dump the first decoded render so a
         # rendered-prompt difference across environments can be diffed. Best-effort.
@@ -611,17 +763,22 @@ class Agent:
                 pass
         return ids
 
-    def _stable_prefix_ids(self):
+    def _stable_prefix_ids(self, tools=_ACTIVE_SCHEMAS):
         """The byte-identical head of every session: system prompt + tool schemas,
         up to (but not including) the first user turn. Computed by diffing two
         first-turn renders with different user text — their common token prefix is
         exactly the system+tools block. This is what warm_prefix checkpoints to disk
         so a cold start skips re-prefilling it (the template can't render a system
-        message alone — it raises 'No user query found' — hence the diff trick)."""
+        message alone — it raises 'No user query found' — hence the diff trick).
+
+        `tools=None` prices the same prefix with the schema block removed; the
+        difference between the two is what the tool definitions actually cost, which
+        is the one number the context gauge cannot get any other way."""
+        schemas = self._active_schemas() if tools is _ACTIVE_SCHEMAS else tools
         sysm = self.messages[0]
         def render1(u):
             return self._template_ids(self.engine.tok.apply_chat_template(
-                [sysm, {"role": "user", "content": u}], tools=self._active_schemas(),
+                [sysm, {"role": "user", "content": u}], tools=schemas,
                 add_generation_prompt=True, enable_thinking=self.thinking))
         a, b = render1("a"), render1("the quick brown fox jumps")
         n = 0
@@ -650,14 +807,12 @@ class Agent:
                 # user]" reads as a human refusal and teaches the wrong lesson (the
                 # measured trace: a model re-phrasing the same delete 30 times). The
                 # guard names itself and the fix — narrow the target.
-                if levers.enabled("scoped_destructive_guard"):
-                    levers.fired("scoped_destructive_guard", deny_text=True)
-                    self._deny_reason = (
-                        "[blocked by the destructive-command guard, not by a person: "
-                        "the command matches a catastrophic pattern (recursive delete "
-                        "of a filesystem root, top-level directory, or home tree — or "
-                        "mkfs / dd-to-device / curl|sh). Re-issue it with a narrower "
-                        "target (a specific subdirectory), or skip the deletion.]")
+                self._deny_reason = (
+                    "[blocked by the destructive-command guard, not by a person: "
+                    "the command matches a catastrophic pattern (recursive delete "
+                    "of a filesystem root, top-level directory, or home tree — or "
+                    "mkfs / dd-to-device / curl|sh). Re-issue it with a narrower "
+                    "target (a specific subdirectory), or skip the deletion.]")
                 return False
         if self._confirm_cb is not None:
             return self._confirm_cb(name, args)
@@ -665,117 +820,6 @@ class Agent:
         warn = f"{C_RED}  ⚠ looks destructive — review carefully\n{C_RST}" if dangerous else ""
         ans = input(f"{C_YEL}  allow {name}:\n{preview}\n{warn}  approve? [y/N] {C_RST}").strip().lower()
         return ans in ("y", "yes")
-
-    def _sub_emit(self, kind: str, text: str):
-        """Emit callback handed to a spawned sub-agent so its activity renders DIMMED and
-        subordinate in the main transcript. Live status gauges (spinner verb, ctx/gen/
-        prefill counters) pass through so the UI still reflects the sub-agent's work; its
-        streamed prose and reasoning are suppressed (only its final return matters); its
-        tool activity and notices are downgraded to the dim 'muted' channel."""
-        if kind in ("status", "ctx", "gen", "prefill"):
-            self._emit(kind, text)
-        elif kind in ("stream", "think"):
-            return  # sub-agent prose/reasoning isn't the deliverable — keep it out
-        elif kind == "tool":
-            self._emit("muted", "   ⌊ " + text)
-        else:  # muted / info / add / del / error
-            self._emit("muted", "     " + str(text).lstrip())
-
-    def _run_subagent(self, description: str, prompt: str, tools: str = "read-only") -> str:
-        """Run a scoped sub-agent on a QUARANTINED cache and return its final
-        text as the `task` tool result. push_cache stashes the main session's warm cache
-        aside; the sub-agent runs on a fresh one with a tight step/context budget and a
-        (default) read-only toolset; pop_cache restores the main cache bit-identically —
-        even on error/interrupt (the finally), so a stuck sub-agent never corrupts the
-        parent. Its grep/read churn never enters the main transcript; only this return
-        does. Depth 1 only: a sub-agent can't itself call `task` (its schema omits it)."""
-        # Never grant a sub-agent more autonomy than its parent: the sub-agent runs
-        # mode='yolo' with no confirm callback, so an 'all' toolset is honored only when
-        # the parent itself is fully auto-approved (--yolo/headless); 'normal' (human
-        # confirms every mutation), 'auto' (human still confirms shell) and 'plan'
-        # (read-only) parents clamp it to read-only.
-        requested, tools = tools, subagent_tools_for(self.mode, tools)
-        if requested == "all" and tools == "read-only":
-            self._emit("muted", "   ⌊ sub-agent clamped to read-only (parent mode is not yolo)")
-        self._emit("muted", f"   ⌊ delegating to sub-agent: {description}")
-        log.info("TASK start | desc=%r | tools=%s | prompt=%r",
-                 description, tools, redact(prompt[:300]))
-        sub = None
-        _t0 = time.perf_counter()
-        self.engine.push_cache()
-        try:
-            sub = Agent(
-                self.engine,
-                mode="yolo",                       # auto-approve within its restricted toolset
-                max_steps=SUBAGENT_MAX_STEPS,
-                ctx_limit=min(self.ctx_limit, SUBAGENT_CTX_LIMIT),
-                thinking=self.thinking,
-                max_gen_tokens=self.max_gen_tokens,
-                emit=self._sub_emit,
-                should_stop=self._should_stop,
-                think_budget=self.think_budget,
-                think_ceiling=self.think_ceiling,
-                turn_budget_tokens=0,              # the sub-agent's own max_steps bounds it
-                turn_budget_s=0.0,
-                subagent=True,
-                subagent_tools=tools,
-            )
-            result = sub.run_turn(prompt)
-        except Exception as e:  # noqa: BLE001 — a sub-agent crash must not kill the parent turn
-            result = f"[task failed: {type(e).__name__}: {e}]"
-        finally:
-            self.engine.pop_cache()
-        # Roll the sub-agent's cost into the parent's rolling accounting so total turn
-        # spend stays visible (its prefill also feeds the governor budget); peak_ctx is
-        # left as the MAIN transcript's — the whole point is that it does NOT grow.
-        if sub is not None:
-            self.gen_tokens += sub.gen_tokens
-            self.gen_time += sub.gen_time
-            self.prefill_tokens += sub.prefill_tokens
-            self.think_tokens += sub.think_tokens
-            self.forwards += sub.forwards
-            # Fail-safe: a sub-agent that ends early — step cap, crash, interrupt — or
-            # that returns nothing at all must still hand back where it got to. Never
-            # surface a bare sentinel: the parent then restarts the localization from
-            # zero (the demonstrated failure), and the anti-respawn guard
-            # above refuses the retry, so the turn dies with the findings still in the
-            # dead sub-agent's transcript. progress_note is deterministic and model-free,
-            # so it works even from a crashed turn: it re-reads the sub-agent's own tool
-            # calls for the files it examined, the commands it ran, and the last
-            # hypothesis it stated.
-            def _salvage(res: str) -> str:
-                if not levers.enabled("subagent_budget_note"):
-                    return res   # legacy arm: the capped sub-agent's findings are discarded
-                note = sub.budget_note or guardrails.progress_note(sub.messages)
-                if not note:
-                    return res
-                levers.fired("subagent_budget_note")
-                return (res.rstrip() + "\n[sub-agent progress before it "
-                        f"stopped: {note}]").strip()
-            if sub.interrupted:
-                result = _salvage("[task interrupted]")
-            elif (not result or result.startswith("[stopped:")
-                    or result.startswith("[task failed:")):
-                result = _salvage(result or "[task returned nothing]")
-            else:
-                # A confident, non-empty report produced with ZERO tool dispatches came
-                # from model memory, not this repo — the one sub-agent failure the empty/
-                # crashed salvage above cannot see, and the most dangerous fold-back: it
-                # reads as evidence (guardrails.subagent_evidence_warning).
-                warned = guardrails.subagent_evidence_warning(result, sub.tool_dispatches)
-                if warned is not None:
-                    log.info("TASK zero-evidence warning appended | desc=%r", description)
-                    result = warned
-        # tool_dispatches (not a transcript count — harness nudges reuse real tool names
-        # in tool-role messages) is the number that diagnoses a sub-agent returning
-        # nothing: it separates "never got to search" from "searched and lost its
-        # findings", and 0 with a confident report is the answered-from-memory tell.
-        log.info("TASK end | desc=%r | %.1fs | tool_dispatches=%d gen=%d prefill=%d | -> %s",
-                 description, time.perf_counter() - _t0,
-                 sub.tool_dispatches if sub else 0,
-                 sub.gen_tokens if sub else 0,
-                 sub.prefill_tokens if sub else 0, result_preview(result or ""))
-        return result or "[task returned nothing]"
 
     def _atif_sync(self) -> None:
         """Rebuild this Agent's ATIF segment from `messages` and rewrite the document.
@@ -803,7 +847,6 @@ class Agent:
 
     def _run_turn(self, user_text: str, stream=True):
         self.interrupted = False
-        self._backend_retries = 0   # per-turn allowance; see _MAX_BACKEND_RETRIES
         # Live ctx-limit recheck: re-derive the compaction trigger
         # from current memory conditions. Hysteresis: apply only a >10% move, so the
         # limit doesn't jitter with ordinary turn-to-turn allocator noise.
@@ -852,33 +895,14 @@ class Agent:
         verify_nudges = 0
         did_work = False  # a substantive tool (not plan/done) ran this turn
         empty_done_nudges = 0
-        done_recheck_done = False  # the one-shot deliverable recheck fired this turn
-        recheck_fix_edits = 0  # landed edits AFTER the recheck fired (spiral cap)
-        done_audit_fired = False  # the one-shot done-audit bounce fired this turn
-        made_edit = False  # an edit/write/replace/insert actually landed this turn
+        made_edit = False  # an edit/write actually landed this turn
         answer_nudges = 0
-        noop_edit_streak = 0  # consecutive edits that failed to land (loop-break)
-        last_edit_fail_kind = None  # 'noop'/'nomatch' of the latest dead edit (nudge choice)
-        break_nudges = 0      # times we escalated a stuck edit this turn
-        readonly_streak = 0   # consecutive steps with substantive tools but no landed edit
-        gate_nudges = 0       # times the investigation->edit gate fired this turn
-        explore_streak = 0    # consecutive bash steps since the last landed edit (counts
-                              # AFTER an edit too — investigation_gate can't; see
-                              # guardrails.verification_matrix)
-        explore_gate_fires = 0  # times the verification-matrix gate fired this turn
-        subagent_sigs = set() # (description, prompt) of sub-agents already spawned this turn
         truncation_nudges = 0  # times we pushed past a token-cap truncation this turn
-        garble_nudges = 0  # malformed-tool-call re-nudges (own counter, so a step-0
-                           # cap-hit can't spend the garble recovery budget)
-        consecutive_garbles = 0  # back-to-back garbled steps (drives exemplar + scrub)
-        last_garble_idx = None   # self.messages index of the previous garbled assistant
-                                 # message (scrubbed if the next step garbles too)
-        done_audit_bounces = 0   # total audit bounces this turn (hard cap 2)
-        audit_absent_list = []   # task-named paths the FIRST audit stat'ed as absent
         landing_nudges = 0  # one-shot "you're out of steps, land the edit" near the cap
         consecutive_failed_bash = 0  # back-to-back errored bash with no edit (thrash)
         thrash_nudges = 0
-        plan_reviews = 0    # one-shot "re-read the plan you just wrote" (levers.plan_review)
+        todo_nudges = 0
+        planned_this_turn = False  # write_todos ran this turn
         # Files edited this turn -> mtime at last syntax check. Bash can mutate files
         # too (sed -i, python rewrites) but bypasses the write/edit syntax gate; watch
         # edited files and re-check them after any bash that touched them (a measured
@@ -887,27 +911,6 @@ class Agent:
         think_cap_hits = 0  # soft think-cap firings this turn (drives escalation)
         repeat_stops = 0  # degenerate-repetition cut-offs this turn (3rd aborts the turn)
         salvaged_steps = 0  # close-and-continue firings this turn (telemetry)
-        # No-think escalation: after 2 consecutive steps that hit the gen
-        # cap (or salvaged) yet produced NO tool call — the think-spiral signature — run the
-        # NEXT step with <think> disabled for one step to force an action, then restore.
-        # capped_stall_streak counts the consecutive stalls; no_think_next is the one-shot.
-        capped_stall_streak = 0
-        no_think_next = False
-        # Turn-level cumulative think budget: distinct from self.think_tokens
-        # (lifetime across the whole Agent instance, used for cross-turn telemetry) — this
-        # is THIS turn's spend, reset every run_turn call, checked against a wall- and
-        # decode-speed-aware budget. turn_think_exhausted latches the once-only
-        # log/steer; past it, no-think steps are paid on a duty cycle
-        # (guardrails.turn_think_throttle) rather than muting the rest of the turn —
-        # the blanket mute regressed passing runs with garbled no-think tails.
-        # landing_no_think is the hard-wrapup landing's own unconditional latch: once
-        # wrap-up fires, the landing and everything after it stay no-think regardless.
-        turn_think_tokens = 0
-        turn_think_half_fired = False
-        turn_think_exhausted = False
-        turn_think_nothink_paid = 0
-        turn_think_budget_now = 0
-        landing_no_think = False
         # Runaway-turn governor state. turn_start drives the optional wall
         # budget; gov_band is the highest budget checkpoint already evaluated; gov_progress
         # tracks whether a change landed+verified within the CURRENT band (resets each time
@@ -915,23 +918,9 @@ class Agent:
         # bounds the soft nudge to one per turn.
         self.budget_note = None
         turn_start = time.monotonic()
-        # Wall-clock twin of turn_start for st_mtime comparisons (done-audit path facts),
-        # plus recent per-step wall times for its runway margin.
-        turn_start_epoch = time.time()
-        step_walls: list = []
-        _step_t0 = turn_start
         gov_band = 0
         gov_progress = False
         gov_soft_fired = False
-        # Deadline wrap-up window: one-shot latch for the final-stretch nudge,
-        # independent of the governor's progress logic (it fires even on a working turn).
-        gov_wrapup_fired = False
-        # Hard wrap-up (103): one-shot latch for the deadline ABORT + forced landing.
-        # Distinct from gov_wrapup_fired (085's soft nudge, which only lands at a step
-        # boundary) — this cuts an in-flight generation mid-stream once the wall is within
-        # land_margin, then runs ONE time-boxed no-think landing turn. Inert without a
-        # wall budget (interactive/unmetered runs never arm it).
-        hard_wrapup_fired = False
         # Action vs Q&A intent (see classify_intent): a task that asks to change code
         # should END in an applied edit, not a prose explanation. Telemetry caught the
         # model navigating to the right function then "answering on paper" without
@@ -955,27 +944,10 @@ class Agent:
         hard_ceiling = self.max_steps * guardrails.STEP_CAP_CEILING
         landed_in_window = False  # a change landed AND verified since this window began
         for step in range(hard_ceiling):
-            # Per-step wall bookkeeping for the done-audit runway margin.
-            _step_now = time.monotonic()
-            if step:
-                step_walls.append(_step_now - _step_t0)
-                del step_walls[:-5]
-            _step_t0 = _step_now
             # Flush at the TOP of each step: the previous step's tool results are now in
             # `messages`, and a harness SIGKILL at the task timeout lands mid-step. A
             # trajectory written only at exit would be lost on exactly the long trials.
             self._atif_sync()
-            # Hard wrap-up backstop (103): the deadline abort already ran its one landing
-            # generation (latch set) and we've now crossed the wall — don't start another
-            # full step past the budget; bank a progress note and end so the trajectory
-            # flushes cleanly instead of drifting into a SIGKILL. One landing turn only.
-            if (hard_wrapup_fired and self._turn_budget_s
-                    and time.monotonic() - turn_start >= self._turn_budget_s):
-                log.info("HARD-WRAPUP: past wall after landing at step %d — ending turn",
-                         step)
-                self.budget_note = (self.budget_note
-                                    or guardrails.progress_note(self.messages))
-                return f"{guardrails.BUDGET_SENTINEL} {self.budget_note}"
             if step >= step_cap:
                 new_cap = guardrails.extend_step_cap(
                     step_cap, self.max_steps, landed_in_window, hard_ceiling)
@@ -1016,22 +988,6 @@ class Agent:
                              self.prefill_tokens, self._turn_budget_tokens)
                     self.messages.append({"role": "tool", "name": "edit",
                                           "content": guardrails.GOVERNOR_SOFT_NUDGE})
-                # Deadline wrap-up window: a WALL-CLOCK nudge fired once, near
-                # the end, regardless of progress — the governor above only interrupts a
-                # NO-progress turn, but a slow-but-working turn also needs to stop and land
-                # a scored partial before the wall SIGKILLs it mid-edit. Reuses the steer
-                # tool-role note pattern; bounded to one per turn by gov_wrapup_fired. The
-                # wrapup_window lever gate lives inside the helper.
-                wrap = guardrails.wrapup_window_nudge(
-                    time.monotonic() - turn_start, self._turn_budget_s, gov_wrapup_fired)
-                if wrap:
-                    gov_wrapup_fired = True
-                    log.info("WRAPUP nudge at step %d: %.0fs of %ss wall budget", step,
-                             time.monotonic() - turn_start, self._turn_budget_s)
-                    self._emit("info", "  [final wrap-up window — asking the model to "
-                                       "land its best answer now]")
-                    self.messages.append({"role": "tool", "name": "steer",
-                                          "content": wrap})
             # Forced landing (A): inside the last few steps with nothing cleanly applied,
             # tell the model to stop exploring and commit its edit before the hard cap —
             # otherwise the loop just dies at max_steps with the task untouched.
@@ -1048,7 +1004,7 @@ class Agent:
             # before the next generation (this point sits at the top of the iteration
             # so the retry/nudge `continue` paths above also pass through it). It rides
             # the same synthetic tool-role path as the guardrail nudges, a template
-            # shape proven not to confuse Ornith; and it is a pure append, so the warm
+            # shape proven not to confuse the model; and it is a pure append, so the warm
             # KV prefix stays valid and the steer prefills only itself — vs an
             # interrupt's lost work + big re-prefill on the non-trimmable cache.
             if self._drain_steering is not None:
@@ -1059,31 +1015,7 @@ class Agent:
                         "content": "[user steering — this overrides prior instructions "
                                    "for the rest of the turn]\n" + steer})
                     self._emit("info", "  [steering injected]")
-            # No-think escalation: a one-shot armed by the no-tool-call
-            # branch after 2 consecutive capped/salvaged stalls. Render THIS step with
-            # <think> off so the model must act, then the flag clears and thinking restores.
-            # Consumes the one-shot here; the render/decode/accounting below all key off
-            # `step_thinking` rather than self.thinking for exactly this step.
-            # Turn-level think budget: past exhaustion, forced no-think steps are
-            # paid on a duty cycle (one per TURN_THINK_REARM_TOK further think tokens)
-            # so thinking RESTORES once the model stops over-spending — a blanket
-            # rest-of-turn mute regressed passing runs. The hard-landing's
-            # landing_no_think stays unconditional.
-            _tt_throttled = (turn_think_exhausted
-                             and guardrails.turn_think_throttle(
-                                 turn_think_tokens, turn_think_budget_now,
-                                 turn_think_nothink_paid))
-            if _tt_throttled:
-                turn_think_nothink_paid += 1
-            step_thinking = (self.thinking and not landing_no_think
-                             and not _tt_throttled)
-            if no_think_next:
-                no_think_next = False
-                capped_stall_streak = 0
-                step_thinking = False
-                log.info("NO-THINK ESCALATION at step %d: rendering with <think> disabled "
-                         "for one step to break a capped no-tool-call stall", step)
-                self._emit("info", "  [no-think escalation: acting without <think> this step]")
+            step_thinking = self.thinking
             # The engine diffs this full render against its live KV cache and prefills
             # only the appended tokens, so a plain re-render IS the cache-extension path
             # (truncated-turn divergence is handled inside engine._sync_to, not here).
@@ -1128,32 +1060,9 @@ class Agent:
             # apart from the think-cap, which shares stats.stop_condition_fired) and the
             # branch below nudges the model out of the loop instead of grinding on.
             rep_fired = [False]
-            deadline_fired = [False]
-            # Hard wrap-up deadline (103): once the turn's wall clock is within land_margin
-            # of the budget, cut the in-flight generation so the landing turn below can
-            # write artifacts before the harness SIGKILLs us mid-token. Armed only with a
-            # wall budget, the lever on, once per turn (the latch disarms it after it
-            # fires), and never on plan / read-only turns. Checked coarsely (every 16
-            # tokens) — the margin is >= 90s, far wider than any 16-token decode gap.
-            _deadline_stop = None
-            _margin = guardrails.hard_wrapup_deadline(
-                self._turn_budget_s, hard_wrapup_fired,
-                self.mode == "plan", read_only_intent)
-            if _margin is not None:
-                _deadline_at = turn_start + self._turn_budget_s - _margin
-
-                def _deadline_stop(text_so_far, n):
-                    if n % 16 == 0 and time.monotonic() >= _deadline_at:
-                        deadline_fired[0] = True
-                        return True
-                    return False
-
             stop_condition = None
-            if (think_stop is not None or not self._no_repeat_guard
-                    or _deadline_stop is not None):
+            if think_stop is not None or not self._no_repeat_guard:
                 def stop_condition(text_so_far, n):
-                    if _deadline_stop is not None and _deadline_stop(text_so_far, n):
-                        return True
                     if think_stop is not None and think_stop(text_so_far, n):
                         return True
                     if (not self._no_repeat_guard and n % 16 == 0
@@ -1200,45 +1109,15 @@ class Agent:
             # set AND this step is actually thinking (a no-think escalation step has no
             # <think> to salvage). None => the engine path is byte-identical to before.
             step_ceiling = self.think_ceiling if (self.think_ceiling and step_thinking) else None
-            # Landing generations (after the deadline abort armed the latch) are
-            # token-boxed so the forced landing can't itself run long or spiral: the
-            # remaining wall only affords so many tokens, halved to leave room for the
-            # landing's own tool dispatch. Default path is byte-identical (self.max_gen_tokens).
-            step_max_tokens = self.max_gen_tokens
-            if hard_wrapup_fired and self._turn_budget_s:
-                step_max_tokens = guardrails.landing_max_tokens(
-                    self._turn_budget_s - (time.monotonic() - turn_start), self.tok_per_s)
-            try:
-                text, stats = self.engine.generate(
-                    prompt_ids, max_tokens=step_max_tokens, on_token=on_token,
-                    should_stop=self._should_stop, on_prefill=on_prefill,
-                    on_prefill_progress=on_prefill_progress, stop_condition=stop_condition,
-                    think_ceiling=step_ceiling)
-            except BackendError as e:
-                # A transient backend fault (5xx / mid-stream error chunk) used to escape
-                # run_turn and kill the process from cli.main — forfeiting the rest of an
-                # unattended task's budget — a measured run died at 721s of a 1770s
-                # budget on a single llama.cpp 500. Re-issue the step instead: the
-                # prompt is rebuilt from `messages` each iteration and the failed
-                # generation was never appended, so a retry is a clean re-roll — and at
-                # temp>0 a resample usually clears a parser-rejected completion.
-                if view:            # the retry skips the normal close() below
-                    view.close()
-                if (not levers.enabled("backend_retry") or not e.transient
-                        or self._backend_retries >= _MAX_BACKEND_RETRIES):
-                    raise
-                self._backend_retries += 1
-                levers.fired("backend_retry", attempt=self._backend_retries)
-                log.warning("backend error (retry %d/%d): %s",
-                            self._backend_retries, _MAX_BACKEND_RETRIES, e)
-                self._emit("status", f"Backend error; retrying "
-                                     f"({self._backend_retries}/{_MAX_BACKEND_RETRIES})")
-                time.sleep(min(2 ** self._backend_retries, 8))
-                continue
+            text, stats = self.engine.generate(
+                prompt_ids, max_tokens=self.max_gen_tokens, on_token=on_token,
+                should_stop=self._should_stop, on_prefill=on_prefill,
+                on_prefill_progress=on_prefill_progress, stop_condition=stop_condition,
+                think_ceiling=step_ceiling)
             if gen_count[0] % 16:  # flush the final (un-throttled) count for the ↓ readout
                 self._emit("gen", str(gen_count[0]))
             # The generation ran to the token cap: the turn was cut off, not finished.
-            # A truncated assistant turn is NOT a final answer (and on Ornith's
+            # A truncated assistant turn is NOT a final answer (and on this
             # non-trimmable cache its decoded text won't re-tokenize identically, so it
             # also forces the next-step re-prefill). Tracked so the no-call branch can
             # tell "truncated mid-thought" apart from "deliberately answered."
@@ -1305,63 +1184,27 @@ class Agent:
             elif "</think>" in text and len(text):
                 frac = len(text.split("</think>", 1)[0]) / len(text)
                 _think_delta = int(stats.generated_tokens * frac)
-            elif (hit_cap and step_thinking and text
-                    and levers.enabled("capped_think_credit")):
-                # Same reasoning as the soft-stop branch, for the generation that ran
-                # to the RAW token cap while still inside <think>: no </think> was
-                # emitted, so every token is reasoning. Without this the biggest
-                # thinks in a run — a full cap each, and the ones the budget exists
-                # to bound — credit zero and the throttle never engages.
-                # close_unclosed_think above rests on the same premise: a thinking
-                # generation with no </think> never left the block. The predicate is
-                # the reasoning_length_stop telemetry's, minus the soft-stop overlap
-                # the first branch already credits; an unclosed generation that
-                # stopped SHORT of the cap is a truncation of some other kind, not
-                # the reasoning overspend this counts.
-                levers.fired("capped_think_credit", step=step,
-                             tokens=stats.generated_tokens)
-                _think_delta = stats.generated_tokens
             else:
                 _think_delta = 0
             self.think_tokens += _think_delta
 
-            # Turn-level cumulative think budget: checked every step against a
-            # wall- and decode-speed-aware budget (self._turn_budget_s / self.tok_per_s —
-            # the engine's own recent decode rate). Off in plan mode / read-only-intent
-            # turns (a Q&A turn shouldn't be pushed to "act now") and without a configured
-            # wall budget (interactive/unmetered runs, like wrapup_window above).
-            turn_think_tokens += _think_delta
-            # Inert below TURN_THINK_MIN_WALL_S: a short auto-continue tail clamps to
-            # the LO budget and half-fires on its first step, churning against
-            # hard_wrapup's landing (the regex-log relaunch signature).
-            if (self._turn_budget_s
-                    and self._turn_budget_s >= guardrails.TURN_THINK_MIN_WALL_S
-                    and self.mode != "plan" and not read_only_intent
-                    and levers.enabled("turn_think_budget")):
-                _tt_budget = guardrails.turn_think_budget(self._turn_budget_s, self.tok_per_s)
-                turn_think_budget_now = _tt_budget
-                _tt_decision, turn_think_half_fired, turn_think_exhausted = (
-                    guardrails.turn_think_budget_check(
-                        turn_think_tokens, _tt_budget,
-                        turn_think_half_fired, turn_think_exhausted))
-                if _tt_decision == "half":
-                    log.info("THINK-BUDGET half at step %d: %d/%d cumulative think tok "
-                             "this turn", step, turn_think_tokens, _tt_budget)
-                    levers.fired("turn_think_budget", step=step, decision="half")
-                    self.messages.append({"role": "tool", "name": "steer",
-                                          "content": guardrails.TURN_THINK_BUDGET_STEER})
-                elif _tt_decision == "exhausted":
-                    log.info("THINK-BUDGET exhausted at step %d: %d/%d cumulative think "
-                             "tok this turn — throttling <think> (one action step per "
-                             "%d further think tok)", step, turn_think_tokens,
-                             _tt_budget, guardrails.TURN_THINK_REARM_TOK)
-                    levers.fired("turn_think_budget", step=step, decision="exhausted")
-                    self._emit("info", "  [reasoning budget exhausted for this turn — "
-                                       "throttling further <think>]")
-
-            log.info("step %d: %d tok @ %.1f tok/s | prefill %d new + %d cached | "
-                     "accept %.2f", step, stats.generated_tokens, stats.tok_per_s,
-                     stats.prompt_tokens, stats.cached_tokens, self.accept_rate)
+            # Per-step first, turn-cumulative second. The cumulative ratio alone can't
+            # show a step where drafting actually paid: a run of span-heavy tool-call
+            # args is a few hundred tokens against a whole turn's proposals, so it moves
+            # the average by ~0.01 and reads as "drafting does nothing". `think` is the
+            # step's reasoning slice (_think_delta above), which is what separates a slow
+            # step that reasoned from a slow step that decoded badly.
+            # `fwd` is the count of SPECULATIVE forwards only (the plain S=1 steps
+            # around them aren't counted), so accepted/fwd is the per-verify yield —
+            # the quantity that decides whether a wide verify paid for itself, and the
+            # one thing the accept ratio alone can't give: the same ratio is a win at a
+            # wide draft and a loss at a narrow one.
+            log.info("step %d: %d tok @ %.1f tok/s (think %d) | prefill %d new + %d "
+                     "cached | accept %.2f step (%d/%d over %d fwd) / %.2f turn",
+                     step, stats.generated_tokens, stats.tok_per_s, _think_delta,
+                     stats.prompt_tokens, stats.cached_tokens, stats.accept_rate,
+                     stats.draft_accepted, stats.draft_proposed, stats.forwards,
+                     self.accept_rate)
             # Env-gated per-step prefill telemetry (one row per prefill event).
             # Guarded so an unset trace pays only this truthiness check — no string/dict/IO.
             # sync_kind names *why* this step prefilled what it did, derived purely from
@@ -1388,7 +1231,6 @@ class Agent:
                     # the max_gen value. A salvaged step already injected the closing tag, so
                     # this is naturally False for it.
                     "reasoning_length_stop": hit_cap and "</think>" not in text,
-                    "deadline_abort": deadline_fired[0],  # 103: wall-clock hard wrap-up cut
                     "peak_ctx": len(prompt_ids),
                     # Loop overhead outside the engine: chat-template re-tokenization
                     # and compaction wall time this step, plus the tools the *previous*
@@ -1408,32 +1250,6 @@ class Agent:
                 log.warning("CACHE DIVERGENCE at step %d: full re-prefill of %d tokens "
                             "(non-trimmable cache reset — see prior turn for a truncated "
                             "generation)", step, stats.prompt_tokens)
-
-            # Hard wrap-up abort (103): the wall deadline cut this generation mid-stream.
-            # The partial turn is already normalized + appended (close_unclosed_think
-            # above) with its tokens in the KV cache. Force ONE time-boxed, no-think
-            # landing turn so the model writes its best artifacts to the exact paths before
-            # the harness kills the turn at the wall — instead of dying mid-token with
-            # nothing landed. landing_no_think makes the landing (and any step after it)
-            # no-think so it can't re-open a spiral; the latch disarms _deadline_stop, so
-            # the landing generation runs to its token box, not another abort. deadline_fired
-            # is exclusive with rep_fired / the think-cap below (it is checked first in
-            # stop_condition). Complete tool calls in the CUT text are dropped, not honored:
-            # the abort almost always lands mid-<think> (the failure mode being fixed), so
-            # there is rarely one, and partial-tool-call surgery is not worth its risk here.
-            if deadline_fired[0] and not hard_wrapup_fired:
-                hard_wrapup_fired = True
-                landing_no_think = True
-                _remaining = self._turn_budget_s - (time.monotonic() - turn_start)
-                levers.fired("hard_wrapup", step=step,
-                             remaining_s=int(_remaining))
-                log.info("HARD-WRAPUP abort at step %d: %.0fs left, gen was %d tok",
-                         step, _remaining, stats.generated_tokens)
-                self._emit("info", "  [wall deadline reached — landing the best answer now]")
-                self.messages.append(
-                    {"role": "tool", "name": "steer",
-                     "content": guardrails.wrapup_landing_steer(_remaining)})
-                continue
 
             # Degenerate-repetition stop fired: the step's output locked into repeating
             # one short string (see guardrails.degenerate_tail) and was cut off early —
@@ -1478,30 +1294,15 @@ class Agent:
                          think_cap, think_cap_hits)
                 continue
 
-            calls = parse_tool_calls(text)
+            calls = [alias_to_bash(n, a) for n, a in parse_tool_calls(text)]
             if not calls:
-                # No-think escalation bookkeeping: a step that hit the gen
-                # cap or was salvaged yet emitted NO tool call is the think-spiral signature.
-                # Count consecutive such stalls; after 2, arm a one-shot no-think render for
-                # the NEXT step to force an action. Gated by the lever AND the ceiling being
-                # armed, so default chad (no CHAD_THINK_CEILING) is byte-identical. A stall
-                # that is neither capped nor salvaged is a different pathology (the nudges
-                # below own it) and resets the streak.
-                if hit_cap or stats.salvaged:
-                    capped_stall_streak += 1
-                    if (self.think_ceiling and self.thinking and capped_stall_streak >= 2
-                            and levers.enabled("no_think_escalation")):
-                        levers.fired("no_think_escalation", step=step)
-                        no_think_next = True
-                else:
-                    capped_stall_streak = 0
                 # No tool call this step. Decide whether this is a genuine final answer
                 # or a stall to push past. Three stalls telemetry caught, in priority
-                # order: (1) TRUNCATED — generation hit the token cap mid-thought, so it
-                # isn't an answer at all; (2) ANSWERED ON PAPER — produced code / described
-                # an edit but never applied it (the demonstrated "write test cases" bug:
-                # the old keyword gate missed "write" entirely); (3) UNVERIFIED EDIT — it
-                # edited but never ran the check. Each nudge is bounded so real answers and
+                # order: (1) TRUNCATED/GARBLED — generation hit the token cap mid-
+                # thought or a tool-call attempt parsed to nothing, so it isn't an
+                # answer at all; (2) ANSWERED ON PAPER — produced code / described an
+                # edit but never applied it; (3) UNVERIFIED EDIT — it edited but never
+                # ran the check. Each nudge is bounded so real answers and
                 # genuinely-stuck cases still escape.
                 has_code = "```" in text
                 # A CLOSED tool-call block that still parsed to nothing is a garbled
@@ -1513,32 +1314,11 @@ class Agent:
                            or "</function>" in _stripped_for_markers
                            or "<function=" in _stripped_for_markers
                            or _has_open_tool_call(text))
-                if garbled:
-                    consecutive_garbles += 1
-                    # From the 2nd consecutive garble, scrub the PREVIOUS garbled
-                    # assistant body: the wrong dialect must not stay in context as a
-                    # few-shot example (repeated garbles in a row each condition on the
-                    # last). Costs one prefix-cache invalidation on this rare path.
-                    if (levers.enabled("garble_never_final")
-                            and consecutive_garbles >= 2 and last_garble_idx is not None):
-                        levers.fired("garble_never_final", step=step, action="scrub")
-                        self.messages[last_garble_idx]["content"] = \
-                            guardrails.GARBLE_SCRUBBED
-                        log.info("GARBLE scrub at step %d: previous garbled message "
-                                 "body removed from context (consecutive=%d)",
-                                 step, consecutive_garbles)
-                    last_garble_idx = len(self.messages) - 1
-                else:
-                    consecutive_garbles = 0
                 kind, nudge = guardrails.nudge_for_no_calls(
                     text, hit_cap, made_edit, unverified_edit, read_only_intent,
                     action_task or run_task, truncation_nudges, answer_nudges,
-                    verify_nudges, _has_open_tool_call(text), garbled_call=garbled,
-                    garble_nudges=garble_nudges,
-                    consecutive_garbles=consecutive_garbles)
-                if kind == "garble":
-                    garble_nudges += 1
-                elif kind == "truncated":
+                    verify_nudges, _has_open_tool_call(text), garbled_call=garbled)
+                if kind == "truncated":
                     truncation_nudges += 1
                 elif kind == "no-edit":
                     answer_nudges += 1
@@ -1550,22 +1330,6 @@ class Agent:
                              has_code, action_task, run_task)
                     self.messages.append({"role": "tool", "name": "edit", "content": nudge})
                     continue
-                # Invariant: a step whose text contains tool-call markers is NEVER a
-                # final answer — the model was trying to act, not to finish. With the
-                # nudge budget spent, hard-stop with a banked note instead of accepting
-                # the garble (otherwise a run of garbles can burn the shared counter and
-                # the audit latch, and the last one ships as the answer with most of the
-                # wall budget still unspent).
-                if garbled and levers.enabled("garble_never_final"):
-                    levers.fired("garble_never_final", step=step, action="hard-stop")
-                    self.budget_note = guardrails.progress_note(self.messages)
-                    log.info("END step %d: GARBLE hard-stop (%d garble nudges spent) — "
-                             "a garbled tool call is never a final answer",
-                             step, garble_nudges)
-                    self._emit("info", "  [turn stopped: repeated malformed tool calls "
-                                       "— progress note banked; say 'continue' to retry]")
-                    return ("[stopped: the model kept emitting malformed tool calls "
-                            "— say 'continue' to resume]")
                 # Did-nothing gate: in auto/headless mode a turn that ends having
                 # executed ZERO real tools is never a legitimate completion — the keyword
                 # intent classifier misses tasks like "extract the secret and save it"
@@ -1577,42 +1341,6 @@ class Agent:
                                and not read_only_intent and not did_work)
                 if (action_task and not read_only_intent
                         and (not made_edit or unverified_edit)) or did_nothing:
-                    # Churn→audit handoff: this hard stop used to fire with the
-                    # audit still silent — the turn ends, a progress note carrying
-                    # the model's own completion claim gets banked, and each
-                    # relaunch re-dones into the same stop until the continue
-                    # allowance is exhausted. Hand the ending to the audit ONCE
-                    # instead: quoted requirements + path facts land IN CONTEXT
-                    # with the turn's work. A further empty-diff ending still
-                    # hard-stops exactly as below (churn capped, not replaced);
-                    # latch shared with the accept-path audit.
-                    if self.mode != "plan" and not self._subagent \
-                            and levers.enabled("done_audit") \
-                            and levers.enabled("audit_churn_handoff") \
-                            and not done_audit_fired:
-                        audit_task = guardrails.audit_task_text(user_text)
-                        audit = guardrails.done_audit(audit_task, {
-                            "turn_start_epoch": turn_start_epoch,
-                            "wall_s": time.monotonic() - turn_start,
-                            "wall_budget_s": self._turn_budget_s,
-                            "step_walls": step_walls,
-                        }, entry="handoff")
-                        if audit:
-                            done_audit_fired = True
-                            done_audit_bounces += 1
-                            levers.fired("done_audit", step=step, entry="churn-handoff")
-                            levers.fired("audit_churn_handoff", step=step)
-                            audit_absent_list = guardrails.audit_absent_paths(audit_task)
-                            _runway = ((self._turn_budget_s
-                                        - (time.monotonic() - turn_start))
-                                       if self._turn_budget_s else float("inf"))
-                            log.info("DONE-AUDIT bounce (churn-handoff, "
-                                     "final-answer): paths=%s runway=%.0fs",
-                                     guardrails.audit_extract_paths(audit_task),
-                                     _runway)
-                            self.messages.append({"role": "tool", "name": "edit",
-                                                  "content": audit})
-                            continue
                     # Iter-2 no-empty-diff gate: an action task may not END on a prose
                     # "final answer" while no change landed (or the change is
                     # unverified) — the demonstrated failures: 49–97s bails accepted
@@ -1631,81 +1359,46 @@ class Agent:
                                        "— progress note banked; say 'continue' to retry]")
                     return ("[stopped: the turn ended without applying a verified "
                             "change — say 'continue' to resume]")
-                # Done-audit, final-answer twin: a prose final answer on an action
-                # task is a `done` in all but name, and this accept path bypassed every
-                # done gate — in the measured set several wrong-dones exited here with
-                # the lever ON but never engaged. Same lever, same
-                # guards, same once-per-turn latch as the done-tool branch below; the
-                # steer's "call done again" converts a prose-ender into a done-caller,
-                # which the latch then accepts.
-                if self.mode != "plan" and not self._subagent \
-                        and levers.enabled("done_audit") \
-                        and did_work and not read_only_intent and not done_audit_fired:
-                    audit_task = guardrails.audit_task_text(user_text)
-                    audit = guardrails.done_audit(audit_task, {
-                        "turn_start_epoch": turn_start_epoch,
-                        "wall_s": time.monotonic() - turn_start,
-                        "wall_budget_s": self._turn_budget_s,
-                        "step_walls": step_walls,
-                    })
-                    if audit:
-                        done_audit_fired = True
-                        done_audit_bounces += 1
-                        levers.fired("done_audit", step=step, entry="final-answer")
-                        audit_absent_list = guardrails.audit_absent_paths(audit_task)
-                        _runway = ((self._turn_budget_s
-                                    - (time.monotonic() - turn_start))
-                                   if self._turn_budget_s else float("inf"))
-                        log.info("DONE-AUDIT bounce (final-answer): paths=%s "
-                                 "runway=%.0fs",
-                                 guardrails.audit_extract_paths(audit_task), _runway)
-                        self.messages.append({"role": "tool", "name": "edit",
-                                              "content": audit})
-                        continue
-                # Absent-path re-bounce: the first audit stat'ed task-named paths as
-                # ABSENT and promised acceptance anyway; if they are STILL absent with
-                # runway to spare, bounce one final time (cap 2/turn) — otherwise a
-                # task-named deliverable the audit already flagged absent can go
-                # unwritten and the accept still goes through.
-                if self.mode != "plan" and not self._subagent \
-                        and done_audit_fired and done_audit_bounces < 2 \
-                        and audit_absent_list:
-                    _runway = ((self._turn_budget_s
-                                - (time.monotonic() - turn_start))
-                               if self._turn_budget_s else None)
-                    rebounce = guardrails.audit_rebounce(audit_absent_list, _runway)
-                    if rebounce:
-                        done_audit_bounces += 1
-                        audit_absent_list = []
-                        log.info("DONE-AUDIT rebounce (final-answer): still-absent "
-                                 "task paths, runway=%s", _runway)
-                        self.messages.append({"role": "tool", "name": "edit",
-                                              "content": rebounce})
-                        continue
                 log.info("END step %d: model produced a FINAL ANSWER, no tool calls "
                          "(did_work=%s, made_edit=%s, unverified_edit=%s)",
                          step, did_work, made_edit, unverified_edit)
                 return strip_think(text).strip()
             log.info("step %d: model emitted %d tool call(s): %s",
                      step, len(calls), ", ".join(n for n, _ in calls))
-            # The step acted — the spiral broke on its own, so clear the no-think escalation
-            # streak: escalation is only for consecutive capped/salvaged stalls.
-            capped_stall_streak = 0
-            consecutive_garbles = 0  # a parsed call ends the garble streak
-            last_garble_idx = None
 
             # Terminal tool -> end the turn cleanly, but enforce verify-before-done
             # (forge's prerequisite idea): if files were changed and nothing has been
             # run since, send the model back to actually test its work.
             terminal = next((a for n, a in calls if n in TERMINAL), None)
             if terminal is not None:
+                # A `write_todos` sharing the step with `done` is the model's habitual
+                # last bookkeeping call. The short-circuit below returns before the
+                # execute loop, so that final update used to be dropped and the recorded
+                # plan always ended a step stale — every item the model just marked
+                # `[x]` was thrown away. Run it here: it touches no files, needs no
+                # confirmation, and counts as no work under any of the done-gates, so
+                # nothing below changes. It matters on the reject paths too, where the
+                # turn continues and the model must see its own plan.
+                for _n, _a in calls:
+                    if _n == "write_todos" and isinstance(_a, dict) and "todos" in _a:
+                        render_tool_start(self._emit, _n, _a)
+                        planned_this_turn = True
+                        _res = tool_write_todos(_a["todos"])
+                        render_tool_result(self._emit, _n, _a, _res)
+                        self.messages.append({"role": "tool", "name": _n, "content": _res})
                 # Don't accept `done` if the model only narrated/planned without running
                 # any real tool (the markdown-code-fence failure mode).
                 log.info("step %d: model says DONE (summary=%r) | did_work=%s "
                          "unverified_edit=%s", step, terminal.get("summary"),
                          did_work, unverified_edit)
+                # Only the plan the model wrote THIS turn can hold up this turn's
+                # `done`. A plan is module state that spans turns on purpose; without
+                # this guard a leftover item from an earlier request would ambush an
+                # unrelated one.
+                open_todos = unfinished_todos() if planned_this_turn else []
                 rejection = guardrails.done_rejection(
-                    did_work, unverified_edit, empty_done_nudges, verify_nudges)
+                    did_work, unverified_edit, empty_done_nudges, verify_nudges,
+                    open_todos=len(open_todos), todo_nudges=todo_nudges)
                 if self.mode == "plan" and rejection == "verify":
                     # Writing the plan file marks unverified_edit, but in plan mode the
                     # plan IS the deliverable — there is nothing to run/verify. Accept.
@@ -1726,50 +1419,29 @@ class Agent:
                     log.info("DONE rejected: edits not verified -> nudge #%d", verify_nudges)
                     self.messages.append({
                         "role": "tool", "name": "done",
-                        # The session-ledger facts (what changed, what last ran) ride
-                        # the bounce when the lever is on — the model's stale state
-                        # model IS the wrong-verify bug.
                         "content": "[not done yet: you changed files but have not run anything "
                                    "to verify them. Run the project's tests (or the code) with "
                                    "bash, check the output is correct, then call done. If a test "
-                                   "fails, fix the code first.]"
-                                   + ("" if self._subagent else
-                                      ambient.ledger_suffix(step=step, force=True)),
+                                   "fails, fix the code first.]",
+                    })
+                    continue
+                if rejection == "todos":
+                    todo_nudges += 1
+                    log.info("DONE questioned: %d open todo(s) -> nudge #%d (%s)",
+                             len(open_todos), todo_nudges, open_todos[:3])
+                    left = "\n".join(f"  - {c}" for c in open_todos[:8])
+                    self.messages.append({
+                        "role": "tool", "name": "done",
+                        "content": ("[your plan still has unfinished items:\n" + left +
+                                    "\nIf you have actually run something that shows each "
+                                    "of these works, set it to `completed` with "
+                                    "write_todos and call done again. If you have not, "
+                                    "verify it first — writing the code for a step is not "
+                                    "finishing it.]"),
                     })
                     continue
                 if action_task and not read_only_intent and self.mode != "plan" \
                         and (not made_edit or unverified_edit):
-                    # Churn→audit handoff, done-tool twin (see the final-answer
-                    # site above): one audit bounce before the hard stop; the
-                    # next empty-diff done stops exactly as below.
-                    if not self._subagent \
-                            and levers.enabled("done_audit") \
-                            and levers.enabled("audit_churn_handoff") \
-                            and not done_audit_fired:
-                        audit_task = guardrails.audit_task_text(user_text)
-                        audit = guardrails.done_audit(audit_task, {
-                            "turn_start_epoch": turn_start_epoch,
-                            "wall_s": time.monotonic() - turn_start,
-                            "wall_budget_s": self._turn_budget_s,
-                            "step_walls": step_walls,
-                        }, entry="handoff")
-                        if audit:
-                            done_audit_fired = True
-                            done_audit_bounces += 1
-                            levers.fired("done_audit", step=step,
-                                         entry="churn-handoff-done")
-                            levers.fired("audit_churn_handoff", step=step)
-                            audit_absent_list = guardrails.audit_absent_paths(audit_task)
-                            _runway = ((self._turn_budget_s
-                                        - (time.monotonic() - turn_start))
-                                       if self._turn_budget_s else float("inf"))
-                            log.info("DONE-AUDIT bounce (churn-handoff): paths=%s "
-                                     "runway=%.0fs",
-                                     guardrails.audit_extract_paths(audit_task),
-                                     _runway)
-                            self.messages.append({"role": "tool", "name": "done",
-                                                  "content": audit})
-                            continue
                     # Same no-empty-diff gate as the prose-final-answer path: `done`
                     # with nothing landed (or landed-unverified after the verify
                     # nudges ran out) becomes a resumable hard stop, not a success
@@ -1785,92 +1457,14 @@ class Agent:
                                        "progress note banked; say 'continue' to retry]")
                     return ("[stopped: `done` was called without a landed+verified "
                             "change — say 'continue' to resume]")
-                # Done-audit: the largest measured fail bucket (20/43)
-                # was dones whose claimed verification was a WEAKER predicate than the
-                # task's own wording — and the generic recheck below was ON for all of
-                # them. On a done every gate above would accept, bounce ONCE with the
-                # task statement's own requirement lines quoted plus stat facts for each
-                # path it names; the NEXT done is accepted unconditionally (the
-                # anti-spiral latch — the model is told so, which keeps the steer
-                # credible). Supersedes done_spec_recheck while enabled: stacking both
-                # would force two bounces per turn. Post-audit edits deliberately do NOT
-                # arm the recheck spiral cap — by hypothesis the work here is wrong and
-                # a real fix may take several edits; the governor/wall bound the damage.
-                # Scope is did_work (the recheck's predicate), NOT action_task: replayed
-                # against the 20 real wrong-dones, classify_intent misses 2 of them
-                # ("Ensure the LaTeX document compiles…", "make the query as efficient
-                # as possible…" name no action verb); the anchors requirement inside
-                # done_audit (concrete paths / imperative requirement lines) is the
-                # task-text-derived action detector.
-                # Not in sub-agents (a measured bounce fired inside one at
-                # runway=inf — sub-agents carry no wall budget, so the runway
-                # guard is inert there, and their delegated prompt is not the task
-                # statement the audit should quote). audit_task strips the harness
-                # appendices (progress note / review-pass preamble) a relaunched
-                # turn's user text carries — see guardrails.audit_task_text.
-                if self.mode != "plan" and not self._subagent \
-                        and levers.enabled("done_audit"):
-                    if did_work and not read_only_intent and not done_audit_fired:
-                        audit_task = guardrails.audit_task_text(user_text)
-                        audit = guardrails.done_audit(audit_task, {
-                            "turn_start_epoch": turn_start_epoch,
-                            "wall_s": time.monotonic() - turn_start,
-                            "wall_budget_s": self._turn_budget_s,
-                            "step_walls": step_walls,
-                        })
-                        if audit:
-                            done_audit_fired = True
-                            done_audit_bounces += 1
-                            levers.fired("done_audit", step=step, entry="done")
-                            audit_absent_list = guardrails.audit_absent_paths(audit_task)
-                            _runway = ((self._turn_budget_s
-                                        - (time.monotonic() - turn_start))
-                                       if self._turn_budget_s else float("inf"))
-                            log.info("DONE-AUDIT bounce: paths=%s runway=%.0fs",
-                                     guardrails.audit_extract_paths(audit_task), _runway)
-                            self.messages.append({
-                                "role": "tool", "name": "done",
-                                # Session-ledger facts ride the audit bounce
-                                "content": audit
-                                + ambient.ledger_suffix(step=step, force=True)})
-                            continue
-                    # Absent-path re-bounce (see the final-answer twin above): a
-                    # still-absent task-named path at accept time gets ONE more bounce,
-                    # then the next done is accepted unconditionally.
-                    if done_audit_fired and done_audit_bounces < 2 and audit_absent_list:
-                        _runway = ((self._turn_budget_s
-                                    - (time.monotonic() - turn_start))
-                                   if self._turn_budget_s else None)
-                        rebounce = guardrails.audit_rebounce(audit_absent_list, _runway)
-                        if rebounce:
-                            done_audit_bounces += 1
-                            audit_absent_list = []
-                            log.info("DONE-AUDIT rebounce: still-absent task paths, "
-                                     "runway=%s", _runway)
-                            self.messages.append({"role": "tool", "name": "done",
-                                                  "content": rebounce})
-                            continue
-                # Iter-3 deliverable recheck (levers.done_spec_recheck): one last self-check
-                # that the required outputs actually exist at the right path/format before
-                # we accept done — the hidden container-end-state verifier gives no second
-                # chance. Fires at most once per turn; a task that re-checks and is genuinely
-                # complete just calls done again next step.
-                elif levers.enabled("done_spec_recheck") and self.mode != "plan" \
-                        and guardrails.done_spec_recheck(
-                            did_work, unverified_edit, done_recheck_done, read_only_intent):
-                    done_recheck_done = True
-                    levers.fired("done_spec_recheck", step=step)
-                    log.info("DONE deferred for deliverable recheck (step %d)", step)
-                    self.messages.append({"role": "tool", "name": "done",
-                                          "content": guardrails.DONE_SPEC_RECHECK})
-                    continue
                 log.info("END step %d: DONE accepted | summary=%r", step,
                          terminal.get("summary"))
                 return terminal.get("summary") or text or "Done."
 
             # Loop guard: count identical tool-call sets across the whole turn (not a
-            # sliding window) so alternating cycles like read A / read B / read A are
-            # caught too. 3rd identical occurrence -> nudge; if nudges don't help, abort.
+            # sliding window) so alternating cycles like `sed -n A` / `sed -n B` /
+            # `sed -n A` are caught too. 3rd identical occurrence -> nudge; if nudges
+            # don't help, abort.
             sig = guardrails.loop_signature(calls)
             seen_before = recent_sigs.count(sig)
             recent_sigs.append(sig)
@@ -1939,55 +1533,21 @@ class Agent:
                     log.info("VALIDATE %s coerced: %s -> %s", name,
                              args_preview(args), args_preview(coerced))
                 args = coerced
-                # Subagent/Task tool: run a scoped sub-agent on a quarantined
-                # cache and feed its condensed return back as this call's result. Handled
-                # here (not via DISPATCH) because it needs the engine + a fresh Agent. Only
-                # a top-level agent dispatches it; a sub-agent never sees `task` in its
-                # schema, so if one somehow emits it we fall through to the unknown-tool
-                # repair path rather than nesting.
-                if name == "task" and not self._subagent:
-                    # Anti-respawn: a sub-agent is expensive and runs on a
-                    # quarantined cache, so re-spawning the SAME (description, prompt) is
-                    # almost always waste. The demonstrated failure: a localization
-                    # sub-agent hit its step cap returning nothing usable, and the model
-                    # re-ran the identical one, which capped out again — half the turn's
-                    # budget gone. Refuse the duplicate and push the model to act directly.
-                    _sub_sig = (str(args.get("description", "")).strip(),
-                                str(args.get("prompt", "")).strip())
-                    if _sub_sig in subagent_sigs and levers.enabled("subagent_no_respawn"):
-                        levers.fired("subagent_no_respawn", step=step)
-                        result = ("[you already ran this exact sub-agent this turn — do NOT "
-                                  "re-run it. Use what it returned, or do the work yourself "
-                                  "now with grep/read to locate the code and edit to change "
-                                  "it. Re-spawning the same task will not produce more.]")
-                        render_tool_result(self._emit, name, args, result)
-                        self.messages.append({"role": "tool", "name": name, "content": result})
-                        continue
-                    subagent_sigs.add(_sub_sig)
-                    result = self._run_subagent(
-                        args.get("description", ""), args.get("prompt", ""),
-                        args.get("tools", "read-only"))
-                    render_tool_result(self._emit, name, args, result)
-                    # This branch `continue`s past the shared TOOL log below, so log here
-                    # too — otherwise the whole sub-agent path is invisible in session.log.
-                    log.info("TOOL task(%s) -> %s", args_preview(args), result_preview(result))
-                    self.messages.append({"role": "tool", "name": name, "content": result})
-                    did_work = True  # exploration counts as work (like a read), not an edit
-                    if self._should_stop():
-                        self.interrupted = True
-                        self._emit("info", "  [interrupted]")
-                        return "[interrupted]"
-                    continue
+                if name == "write_todos":
+                    # Arms the open-todo question on this turn's `done`. Set here rather
+                    # than at the `done` branch's own write_todos call because the plan
+                    # is usually written in an ordinary earlier step, not alongside it.
+                    planned_this_turn = True
                 # Plan mode is read-only EXCEPT for writing the plan file itself:
                 # write/edit are allowed only under ./plans/. Every other mutating
-                # tool (bash, symbol edits) and any write outside ./plans/ is blocked.
+                # tool (bash) and any write outside ./plans/ is blocked.
                 plan_write = (self.mode == "plan" and name in ("write", "edit")
                               and _under_plans(args.get("path", "")))
                 _tool_s = 0.0  # stays 0 when the tool is blocked/denied (fn never ran)
                 if self.mode == "plan" and is_mutating(name) and not plan_write:
                     result = ("[plan mode: only writing the plan file under ./plans/ is "
                               "allowed. Do not edit project files or run commands. "
-                              "Investigate with read/grep/glob/repo_map, then write your "
+                              "Investigate with read-only bash, then write your "
                               "plan to ./plans/NNN-title.md.]")
                 elif not plan_write and not self._confirm(name, args):
                     # A plan write is the expected action in plan mode, so it skips the
@@ -2001,16 +1561,12 @@ class Agent:
                     self.tool_dispatches += 1
                     # A snapshot happens AFTER approval, immediately before the tool
                     # runs — a denied edit must not leave a checkpoint claiming it ran.
-                    if (name in AUTO_EDIT_TOOLS
-                            and levers.enabled("edit_checkpoint")):
-                        _ref = checkpoint.snapshot(
+                    if name in AUTO_EDIT_TOOLS:
+                        checkpoint.snapshot(
                             os.getcwd(), f"before {name} {args.get('path', '')}".strip())
-                        if _ref:
-                            levers.fired("edit_checkpoint", step=step, ref=_ref)
                     # Seatbelt context is scoped to exactly this dispatch: `active`
-                    # reflects the mode of the agent actually executing, so a
-                    # sub-agent's yolo loop is confined inside a normal-mode parent
-                    # turn, and the context can't leak to the `!cmd` passthrough.
+                    # reflects the mode of the agent actually executing, so the
+                    # context can't leak to the `!cmd` passthrough.
                     seatbelt.set_context(self.mode == "yolo", os.getcwd())
                     try:
                         result = fn(args, self._should_stop)
@@ -2025,25 +1581,13 @@ class Agent:
                     # whole — several calls in one step stack into one prefill, so later
                     # results only get what's left of the step budget (floor-protected).
                     result = _clip_tool_result(result, cap=_step_tool_cap(step_tool_chars))
-                    # Duplicate read-only output: if this (clipped) result is
-                    # byte-identical to a tool message still in the transcript, append a
-                    # short pointer instead of paying the body's prefill again — see
-                    # guardrails.elide_duplicate_result for the safety argument.
-                    _elided = guardrails.elide_duplicate_result(name, result, self.messages)
-                    if _elided is not None:
-                        log.info("TOOL %s duplicate result elided (%d chars)",
-                                 name, len(result))
-                        result = _elided
-                    # Ambient state: fold this result into the session
-                    # ledger and append whatever fact lines the enabled levers owe it
-                    # (session_ledger on landed mutations, bash_read_skeleton on file
-                    # content surfacing through bash/read). After the clip cap on
+                    # Ambient state: fold this result into the session state and
+                    # append whatever fact lines the enabled levers owe it
+                    # (bash_read_skeleton on file content surfacing through bash,
+                    # bash_empty_diagnose on empty results, …). After the clip cap on
                     # purpose — a clipped result must still carry its facts; the
-                    # appended text is bounded in ambient.py. Main agent only: a
-                    # sub-agent's transcript folds away and must not pollute the
-                    # parent's ledger.
-                    if not self._subagent:
-                        result = ambient.annotate(name, args, result, step=step)
+                    # appended text is bounded in ambient.py.
+                    result = ambient.annotate(name, args, result, step=step)
                     step_tool_chars += len(result)
                     if _PREFILL_TRACE:
                         self._trace_tools_pending.append([name, round(_tool_s, 4)])
@@ -2051,44 +1595,11 @@ class Agent:
                 log.info("TOOL %s(%s) -> %s [%.2fs]", name, args_preview(args),
                          result_preview(result), _tool_s)
                 self.messages.append({"role": "tool", "name": name, "content": result})
-                # Plan-then-review, delivered as two messages instead of one instruction.
-                # The plan-mode preamble already demands a Context section, exact paths,
-                # numbered steps and verify commands, and the model still ships plans that
-                # skip half of it — a standing rule in the preamble washes out by the time
-                # the plan is being written. Asking for the review AFTER the artifact
-                # exists puts the ask next to the thing it is about, which is the same
-                # placement lesson as the keep-reading notice in `read`'s return value.
-                if (plan_write and result.startswith("[wrote") and not plan_reviews
-                        and levers.enabled("plan_review")):
-                    plan_reviews += 1
-                    levers.fired("plan_review", step=step)
-                    log.info("PLAN REVIEW nudge for %s", self.last_plan_path)
-                    self.messages.append({"role": "tool", "name": "read", "content": (
-                        f"[plan written to {self.last_plan_path}. Before you call `done`, "
-                        f"review it: `read` the file back and check it has (1) a Context "
-                        f"section saying why, (2) exact file paths with current-state code "
-                        f"excerpts, (3) numbered step-by-step changes, (4) the exact verify "
-                        f"commands to run, (5) repo conventions, (6) explicit out-of-scope. "
-                        f"An executor will follow this file WITHOUT access to this "
-                        f"conversation, so anything only you know must be on the page. If "
-                        f"any item is missing or vague, fix the file now with `edit`. Then "
-                        f"call `done`.]")})
                 # Update the guardrail bookkeeping flags (did_work / made_edit /
                 # unverified_edit) for this tool result — see guardrails.update_work_flags.
                 did_work, made_edit, unverified_edit = guardrails.update_work_flags(
                     name, args, result, did_work, made_edit, unverified_edit)
-                # Track consecutive edits that DIDN'T land (no-op / unmatched
-                # `old`), so the model gets pushed to read-then-replace instead of looping
-                # on variations of a broken edit. A landed edit of any kind resets it.
-                # replace_lines/insert_lines were missing from this set for a while:
-                # their rejects never fed the streak, so dogfooding burned ~40 steps
-                # of line-edit churn with only the (much slower) identical-call loop
-                # detector escalating.
-                if name in ("edit", "write", "replace_lines", "insert_lines",
-                            "replace_symbol", "insert_symbol", "rename_symbol"):
-                    noop_edit_streak = (noop_edit_streak + 1
-                                        if guardrails.edit_failed_to_land(result) else 0)
-                    last_edit_fail_kind = guardrails.edit_fail_kind(result)
+                if name in ("edit", "write"):
                     if not guardrails.edit_failed_to_land(result):
                         recent_sigs.clear()  # a landed change resets the identical-call
                                              # loop guard: re-running the same verify
@@ -2100,25 +1611,6 @@ class Agent:
                                 edited_syntax_watch[_wp] = os.path.getmtime(_wp)
                             except OSError:
                                 pass
-                        # Recheck spiral cap: a landed edit AFTER the
-                        # deliverable recheck fired. The recheck is a verify-then-done
-                        # pass; a real fix is one or two targeted edits. A run of them
-                        # is the model re-editing already-correct output into a thrash
-                        # (poly_two_bucket: 3 edits / 16k tok / 621s after the recheck
-                        # on an answer that had already passed the verify gate). Stop
-                        # and keep the result that was ship-ready when the recheck fired.
-                        if done_recheck_done:
-                            recheck_fix_edits += 1
-                            if guardrails.recheck_spiral(recheck_fix_edits):
-                                log.info("END step %d: recheck edit-spiral (%d "
-                                         "post-recheck landed edits) — accepting the "
-                                         "completed work", step, recheck_fix_edits)
-                                self._emit("info", "  [deliverable recheck kept "
-                                           "re-editing already-finished work — stopping "
-                                           "and keeping the result]")
-                                return ("Done (stopped a post-recheck edit spiral; the "
-                                        "deliverable was already complete before the "
-                                        "extra edits).")
                 elif name == "bash":
                     # Re-check syntax of watched files a bash command rewrote — the
                     # sed -i escape hatch around the edit-tool syntax gate.
@@ -2143,72 +1635,6 @@ class Agent:
             if (made_edit and not _gov_prev_made) or (_gov_prev_unverified and not unverified_edit):
                 gov_progress = True
                 landed_in_window = True  # also earns a step-cap extension (same signal)
-
-            # Edit loop-break: after ~2 consecutive edits that failed to land,
-            # stop the model re-trying variations and send it to read-then-replace.
-            brk = guardrails.edit_loop_break(noop_edit_streak, break_nudges,
-                                             last_edit_fail_kind)
-            if brk:
-                break_nudges += 1
-                noop_edit_streak = 0  # give the escalation a clean slate
-                log.info("EDIT-LOOP-BREAK at step %d (streak reset) -> nudge #%d",
-                         step, break_nudges)
-                self.messages.append({"role": "tool", "name": "edit", "content": brk})
-
-            # Investigation->edit gate: a step that ran substantive tools but
-            # landed no edit is investigation; a long run of it on an action task means the
-            # model is exploring instead of acting (it named the fix but grep-looped into an
-            # empty patch). Steer it to edit before the loop-abort/step-cap kills the turn.
-            # read_only/explain asks are exempt (nothing to edit).
-            if made_edit and not _gov_prev_made:
-                readonly_streak = 0
-            elif did_work and not made_edit:
-                # A bash step that isn't provably read-only is ACTION, not
-                # investigation — `git merge`, `apt-get install`, redirects are ops
-                # progress. Otherwise the gate can count an entire git/ops workflow as
-                # "investigation" and demand an edit at a decision point where there is
-                # nothing to edit yet.
-                if levers.enabled("gate_ops_exempt") and any(
-                        n == "bash"
-                        and not guardrails.is_readonly_bash(str(a.get("command", "")))
-                        for n, a in calls):
-                    if readonly_streak:  # the exemption actually reset a live streak
-                        levers.fired("gate_ops_exempt", step=step,
-                                     streak=readonly_streak)
-                    readonly_streak = 0
-                else:
-                    readonly_streak += 1
-            if not read_only_intent:
-                gate = guardrails.investigation_gate(readonly_streak, made_edit, gate_nudges)
-                if gate:
-                    gate_nudges += 1
-                    readonly_streak = 0
-                    log.info("INVESTIGATION-GATE at step %d (streak, no edit) -> nudge #%d",
-                             step, gate_nudges)
-                    self.messages.append({"role": "tool", "name": "edit", "content": gate})
-
-            # Convergence gate (verification-matrix design): count exploratory-
-            # bash steps since the last landed edit — unlike readonly_streak/
-            # investigation_gate this keeps counting AFTER an edit lands, which is where
-            # the demonstrated thrash lives (write early, then probe 60 more times
-            # without calling done). A NEW edit this step resets it; a bash-only step
-            # advances it. When it bites, the model gets the task's real requirements as
-            # a matrix to close by evidence-or-unverified, not an open-ended "keep going".
-            if made_edit and not _gov_prev_made:
-                explore_streak = 0
-            elif any(n == "bash" for n, _ in calls):
-                explore_streak += 1
-            if not read_only_intent:
-                matrix = guardrails.verification_matrix(
-                    guardrails.audit_task_text(user_text),
-                    explore_streak, made_edit, explore_gate_fires)
-                if matrix:
-                    explore_gate_fires += 1
-                    explore_streak = 0
-                    log.info("VERIFICATION-MATRIX gate at step %d (bash-streak, no "
-                             "change) -> nudge #%d", step, explore_gate_fires)
-                    self.messages.append(
-                        {"role": "tool", "name": "bash", "content": matrix})
 
             # Break a flailing-probe run (e.g. guessing the test runner, repeated
             # `python -c import` checks) that the exact-call loop guard can't see because
@@ -2236,6 +1662,26 @@ class Agent:
                            "say 'continue' to resume]")
         return ("[stopped: hit the step cap before finishing — say 'continue' to "
                 "resume, or re-scope the ask smaller (docs/troubleshooting.md)]")
+
+
+def token_len(engine, text: str) -> int:
+    """`text` in tokens of the model's own tokenizer, with a chars/4 fallback if the
+    engine has no usable one. The fallback exists for cosmetic call sites only — a
+    number on screen must never break the command that printed it."""
+    try:
+        return len(engine.tok.encode(text, add_special_tokens=False))
+    except Exception:  # noqa: BLE001 - a cosmetic number must never break the command
+        return len(text) // 4
+
+
+def skill_token_cost(engine, text: str) -> int:
+    """What loading this skill actually costs, in tokens.
+
+    Reported at the point of load because the number is the whole decision: a gstack
+    skill body can run past 40k tokens, which is most of the usable window on a 24 GB
+    box, and a user who types `/name` deserves to see that happen rather than discover
+    it as an unexplained compaction three turns later."""
+    return token_len(engine, text)
 
 
 def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = None,
@@ -2296,11 +1742,25 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             continue
         if line == "/help":
             print(f"{C_DIM}/init /skills /mcp /mcp trust /mcp login <server> /reset /clear "
-                  f"/compact /model /mode /exit · !cmd runs a shell command · "
+                  f"/compact /model /mode /exit · /<skill> runs an installed skill "
+                  f"(/skills lists them) · !cmd runs a shell command · "
                   f"@path attaches a file/dir{C_RST}")
             continue
         if line == "/init":
             agent.run_turn(INIT_PROMPT)
+            agent.save()
+            continue
+        # `/<skill>` — checked after every builtin, so a builtin always wins the name.
+        # The skill body becomes the turn itself (see skills.load); its token cost is
+        # printed because a large skill can be most of the window.
+        from . import skills
+        hit = skills.is_skill_command(line)
+        if hit:
+            name, task = hit
+            text = skills.load(name, task)
+            print(f"{C_DIM}loaded skill {name} "
+                  f"({skill_token_cost(engine, text):,} tokens){C_RST}")
+            agent.run_turn(text)
             agent.save()
             continue
         if line.startswith("!"):  # shell passthrough — run directly, don't call the model

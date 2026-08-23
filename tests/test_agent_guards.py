@@ -21,13 +21,9 @@ Run: `uv run python tests/test_agent_guards.py`
 """
 
 from chad.guardrails import (
-    GARBLE_NUDGE_CAP,
     GOV_HARD_FRAC,
     GOV_SOFT_FRAC,
     STEP_CAP_CEILING,
-    TOOLCALL_EXEMPLAR,
-    WRAPUP_FRAC,
-    WRAPUP_MIN_S,
     advance_governor,
     bash_result_verifies,
     bash_thrash_nudge,
@@ -35,16 +31,11 @@ from chad.guardrails import (
     budget_fraction,
     degenerate_tail,
     done_rejection,
-    edit_fail_kind,
     edit_failed_to_land,
-    edit_loop_break,
     extend_step_cap,
-    investigation_gate,
     is_destructive_bash,
     is_readonly_bash,
     is_repeat_loop,
-    land_margin,
-    landing_max_tokens,
     landing_nudge,
     loop_should_abort,
     loop_signature,
@@ -56,13 +47,8 @@ from chad.guardrails import (
     review_pass_should_fire,
     think_budget,
     turn_governor,
-    turn_think_budget,
-    turn_think_budget_check,
-    turn_think_throttle,
     update_thrash,
     update_work_flags,
-    wrapup_landing_steer,
-    wrapup_window_nudge,
 )
 
 PASS = 0
@@ -120,6 +106,25 @@ def test_done_rejection():
     check("accept when work done and verified",
           done_rejection(did_work=True, unverified_edit=False,
                          empty_done_nudges=0, verify_nudges=0) is None)
+    # Open todos -> ask ONCE, then accept. Deliberately weaker than the other two:
+    # measured on 113 TB2.1 trials, only 6 of the 75 turns reaching `done` had an open
+    # item and those 6 averaged reward 0.833, while 10 of the 12 done-and-scored-zero
+    # turns had every box ticked. Worth one question, not a refusal.
+    check("open todos ask once",
+          done_rejection(did_work=True, unverified_edit=False, empty_done_nudges=0,
+                         verify_nudges=0, open_todos=2, todo_nudges=0) == "todos")
+    check("open todos never asked twice",
+          done_rejection(did_work=True, unverified_edit=False, empty_done_nudges=0,
+                         verify_nudges=0, open_todos=2, todo_nudges=1) is None)
+    check("no open todos accepts",
+          done_rejection(did_work=True, unverified_edit=False, empty_done_nudges=0,
+                         verify_nudges=0, open_todos=0, todo_nudges=0) is None)
+    check("verify takes priority over todos",
+          done_rejection(did_work=True, unverified_edit=True, empty_done_nudges=0,
+                         verify_nudges=0, open_todos=2, todo_nudges=0) == "verify")
+    check("todos default off for callers that do not pass a plan",
+          done_rejection(did_work=True, unverified_edit=False,
+                         empty_done_nudges=0, verify_nudges=0) is None)
 
 
 def test_update_work_flags():
@@ -160,25 +165,6 @@ def test_update_work_flags():
     check("write_todos is not did_work", dw4 is False)
     check("write_todos leaves edit flags clean", me4 is False and ue4 is False)
 
-    # A clean working-tree REVERT un-lands the edit: made_edit AND unverified_edit both
-    # go False so the no-empty-diff gate re-fires (the measured empty-diff hole).
-    for cmd in ("git checkout .", "git checkout -- foo/bar.py", "git restore .",
-                "git reset --hard HEAD", "git stash", "git checkout src/mod/x.py"):
-        _, me_r, ue_r = update_work_flags(
-            "bash", {"command": cmd}, "[no output]",
-            did_work=True, made_edit=True, unverified_edit=False)
-        check(f"revert un-sets made_edit: {cmd}", me_r is False, cmd)
-    # A FAILED revert (nonzero exit) did not touch the tree — the edit still stands.
-    _, me_rf, _ = update_work_flags(
-        "bash", {"command": "git checkout ."}, "[exit 1] error: pathspec",
-        did_work=True, made_edit=True, unverified_edit=False)
-    check("failed revert keeps made_edit", me_rf is True)
-    # Restoring commands (branch switch / stash pop) are NOT reverts of edits.
-    for cmd in ("git checkout -b feature", "git stash pop", "git status"):
-        _, me_n, _ = update_work_flags(
-            "bash", {"command": cmd}, "[no output]",
-            did_work=True, made_edit=True, unverified_edit=False)
-        check(f"non-revert keeps made_edit: {cmd}", me_n is True, cmd)
 
 
 def test_loop_guard():
@@ -271,101 +257,23 @@ def test_nudge_for_no_calls():
     check("genuine final answer -> no nudge", kind6 is None and nudge6 is None)
 
     # A CLOSED but unparseable tool-call block (garbled_call) -> malformed nudge,
-    # never a final answer (the prose-quit class). Garbles carry their OWN kind +
-    # counter (see test_garble_invariant_nudges for the full behavior).
+    # never a final answer (the prose-quit class).
     kind6g, nudge6g = nudge_for_no_calls(
         '<tool_call>{"name": "bash", …</parameter></function></tool_call>',
         hit_cap=False, garbled_call=True, **base)
-    check("garbled closed block -> garble kind", kind6g == "garble")
-    check("garbled nudge text", "did not contain one valid JSON" in nudge6g)
-    # …and it is bounded by its own counter, NOT the truncation counter.
-    b6h = dict(base); b6h["truncation_nudges"] = 2
-    kind6h, _ = nudge_for_no_calls("<tool_call>garbage</tool_call>", hit_cap=False,
-                                   garbled_call=True, **b6h)
-    check("garble nudge survives spent truncation counter", kind6h == "garble")
-    kind6i, _ = nudge_for_no_calls("<tool_call>garbage</tool_call>", hit_cap=False,
-                                   garbled_call=True, garble_nudges=6, **base)
-    check("garble nudge capped by its own counter", kind6i != "garble")
+    check("garbled closed block -> truncated kind", kind6g == "truncated")
+    check("garbled nudge text", "did not contain one valid tool call" in nudge6g)
 
     # Counter caps: truncation already nudged twice -> falls through to next branch.
     b7 = dict(base); b7["truncation_nudges"] = 2; b7["action_task"] = True
     kind7, _ = nudge_for_no_calls("```code```", hit_cap=True, **b7)
     check("truncation cap falls through to no-edit", kind7 == "no-edit")
 
-    # Bare stall — model thought then stopped with EMPTY content after </think>, no tool
-    # call (the llama.cpp early-EOS bail; action_task False, as long bug-report prose
-    # often classifies). Must be pushed to act, not accepted as an empty final answer.
-    bail = "<think>Let me find where execute_sql_flush is defined.</think>\n\n"
-    kind8, nudge8 = nudge_for_no_calls(bail, hit_cap=False, **base)
-    check("empty-after-think bail -> no-edit nudge", kind8 == "no-edit")
-    check("bail nudge text", "without taking any action" in nudge8)
-
-    # Bare stall — dangling intent preamble in CONTENT (no think, no code, no tool call).
-    kind9, _ = nudge_for_no_calls("Let me look at the failing test first.",
-                                  hit_cap=False, **base)
-    check("dangling-intent preamble -> no-edit nudge", kind9 == "no-edit")
-
-    # read_only intent exempts the bare-stall nudge (an explain-only ask may answer briefly).
-    b10 = dict(base); b10["read_only_intent"] = True
-    kind10, nudge10 = nudge_for_no_calls("<think>hm</think>\n", hit_cap=False, **b10)
-    check("read_only exempts bare-stall nudge", kind10 is None and nudge10 is None)
-
-    # Bounded: after two answer nudges the bail falls through (turn can end).
-    b11 = dict(base); b11["answer_nudges"] = 2
-    kind11, _ = nudge_for_no_calls("<think>x</think>\n", hit_cap=False, **b11)
-    check("bare-stall nudge is bounded by answer_nudges", kind11 is None)
-
-    # A genuine final answer that merely mentions the user is NOT a bail ("let me know").
-    kind12, nudge12 = nudge_for_no_calls("The bug is a missing None check; let me know "
-                                         "if you want the patch.", hit_cap=False, **base)
-    check("'let me know' answer is not a bail", kind12 is None and nudge12 is None)
-
-
-def test_garble_invariant_nudges():
-    """Garbled tool calls get their own nudge budget (a step-0 cap-hit must not spend
-    it), an exemplar once the model is stuck in a wrong dialect, and — with the lever
-    off — exactly the legacy shared-counter behavior (the ablation arm that reproduces
-    the shared-counter garble-accept failure)."""
-    import os
-    base = dict(made_edit=True, unverified_edit=False, read_only_intent=False,
-                action_task=True, truncation_nudges=2, answer_nudges=0,
-                verify_nudges=0, open_tool_call=False)
-    garble = '<tool_call>\n<function=write"\n</parameter>\n</tool_call>'
-
-    # Own counter: nudges keep coming with the truncation budget fully spent…
-    for n in range(GARBLE_NUDGE_CAP):
-        kind, nudge = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
-                                         garble_nudges=n, **base)
-        check(f"garble nudge #{n + 1} available", kind == "garble" and nudge)
-    # …and stop at the cap.
-    kind, _ = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
-                                 garble_nudges=GARBLE_NUDGE_CAP, **base)
-    check("garble nudges stop at cap", kind is None)
-
-    # From the 2nd consecutive garble the nudge embeds the canonical exemplar.
-    _, n1 = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
-                               garble_nudges=0, consecutive_garbles=1, **base)
-    check("first garble: no exemplar", TOOLCALL_EXEMPLAR not in n1)
-    _, n2 = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
-                               garble_nudges=1, consecutive_garbles=2, **base)
-    check("second consecutive garble: exemplar shown", TOOLCALL_EXEMPLAR in n2)
-    check("exemplar shows the JSON contract", '"arguments"' in n2)
-
-    # Legacy arm (lever off): shared counter, kind counted as truncation — the OFF
-    # state must reproduce the legacy behavior exactly for the ablation to price it.
-    os.environ["CHAD_DISABLE"] = "garble_never_final"
-    try:
-        kind, _ = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
-                                     garble_nudges=0, **base)
-        check("lever off: spent truncation counter kills the garble nudge",
-              kind is None)
-        b = dict(base); b["truncation_nudges"] = 0
-        kind2, _ = nudge_for_no_calls(garble, hit_cap=False, garbled_call=True,
-                                      garble_nudges=99, **b)
-        check("lever off: garble nudge rides the truncation counter",
-              kind2 == "truncated")
-    finally:
-        del os.environ["CHAD_DISABLE"]
+    # A prose answer with no pending edit falls through (no bare-stall nudge in the
+    # lean harness — the no-empty-diff gate in run_turn owns the empty-answer case).
+    kind8, nudge8 = nudge_for_no_calls("Let me look at the failing test first.",
+                                       hit_cap=False, **base)
+    check("dangling-intent preamble is not nudged here", kind8 is None and nudge8 is None)
 
 
 def test_is_readonly_bash():
@@ -493,7 +401,6 @@ def test_destructive_bash_guard():
 
 
 def test_destructive_guard_scoped_rm():
-    import os
     # scoped_destructive_guard ON (default): a recursive delete of a DEEP absolute
     # path is a scoped delete, not a catastrophe — the measured false-positive class
     # (152 '[denied by user]' results across 26 container trials, every real path
@@ -529,15 +436,6 @@ def test_destructive_guard_scoped_rm():
     # A recursive flag on one rm must not condemn a different, non-recursive rm.
     check("non-recursive rm of / does not fire (no -r)",
           not is_destructive_bash("rm -f /tmp/x"))
-
-    # Lever OFF restores the legacy any-absolute-path shape exactly.
-    os.environ["CHAD_DISABLE"] = "scoped_destructive_guard"
-    try:
-        check("lever OFF: /tmp delete fires again",
-              is_destructive_bash("rm -rf /tmp/test-deploy"))
-        check("lever OFF: home still fires", is_destructive_bash("rm -rf ~"))
-    finally:
-        del os.environ["CHAD_DISABLE"]
 
 
 def test_think_budget():
@@ -585,21 +483,11 @@ def test_degenerate_tail():
           not degenerate_tail(unit40 + "x" * 300 + " and now a completely new thought."))
     code = "\n".join(f"def helper_{i}(x):\n    return x + {i}\n" for i in range(120))
     check("templated code ok", not degenerate_tail(code))
-    # A unit longer than REPEAT_MAX_PERIOD but under the coarse window stays out of scope
-    # (too little text to be sure it's a loop, not legitimate repeated structure).
+    # A unit longer than REPEAT_MAX_PERIOD stays out of scope (too little certainty
+    # that it's a loop rather than legitimate repeated structure).
     big_unit = ("x" * 300 + " different filler words here ") * 20
-    check("over-long short-text unit out of scope", not degenerate_tail(big_unit))
-    # Coarse tier: a block whose period is BETWEEN the fine cap (256) and the coarse cap
-    # (3072), repeated to fill the 12KB+ tail, IS caught — the measured reasoning-loop
-    # the fine tier was blind to. The block has no short internal period, so only the
-    # coarse tier can see it.
-    block = " ".join(f"clause {i} of one paragraph with no short internal repeat"
-                     for i in range(24))  # ~1.2KB, period > 256, < 3072
-    check("coarse block-scale loop detected", degenerate_tail(block * 12))
-    check("same block below coarse window does not fire (too little text)",
-          not degenerate_tail(block * 2))
-    # A large body whose blocks all VARY (real long output) never trips either tier, even
-    # well past the coarse window.
+    check("over-long unit out of scope", not degenerate_tail(big_unit))
+    # A large body whose blocks all VARY (real long output) never trips it.
     varied = " ".join(f"Paragraph {i} discusses a genuinely distinct part of the system."
                       for i in range(400))
     check("varied long output ok", not degenerate_tail(varied))
@@ -758,10 +646,6 @@ def test_progress_note():
     check("note names first edited file", "parser.py" in note, note)
     check("note names second edited file", "util.py" in note, note)
     check("note names the command run", "pytest -q" in note, note)
-    check("note surfaces the last error", "AssertionError" in note, note)
-    check("note carries the working hypothesis", "tokenizer eats" in note, note)
-    check("note keeps hypothesis prose but not the think block", "long reasoning" not in note, note)
-    check("note records what was already examined", "def parse" in note, note)
     check("note is bounded to max_lines", len(note.splitlines()) <= 24, note)
     # An empty/idle transcript yields a note that says nothing was recorded (still safe
     # to seed a retry with).
@@ -769,14 +653,6 @@ def test_progress_note():
                            {"role": "user", "content": "do x"}])
     check("empty transcript -> explicit 'nothing recorded'",
           "nothing" in empty.lower() or "no edits" in empty.lower(), empty)
-    # A degenerate (looping) final reasoning is NOT carried forward — it would only
-    # re-seed the loop in the relaunch.
-    loopy = [{"role": "user", "content": "x"},
-             {"role": "assistant",
-              "content": "the same broken thought again. " * 200
-              + '<tool_call>{"name": "read", "arguments": {"path": "z.py"}}</tool_call>'}]
-    ln = progress_note(loopy)
-    check("degenerate reasoning not carried as hypothesis", "hypothesis" not in ln.lower(), ln)
     # Rejected-completion-claim path (the long-build poisoning
     # loop: the banked note carried "the build is already complete and verified" as its
     # leading hypothesis, and all 6 relaunches re-confirmed it and re-done'd).
@@ -792,127 +668,9 @@ def test_progress_note():
     check("rejected claim -> warning present", "REJECTED" in rejected, rejected)
     check("rejected claim text is quoted (clipped)",
           "already built" in rejected, rejected)
-    check("completion-claim hypothesis is dropped",
-          "already complete and verified" not in rejected, rejected)
-    # A genuine (non-completion) diagnosis survives even on the rejected path.
-    diagnosed = list(poisoned)
-    diagnosed[1] = {"role": "assistant",
-                    "content": ("The linker fails because unix.c is missing from build/.\n"
-                                '<tool_call>{"name": "bash", "arguments": '
-                                '{"command": "ls build"}}</tool_call>')}
-    kept = progress_note(diagnosed, rejected_claim="done")
-    check("real diagnosis survives the rejected path",
-          "unix.c is missing" in kept, kept)
-    # FP class the first regex dropped (eng-review outside-voice F1): a diagnosis that
-    # merely CONTAINS a success-ish substring is not a completion claim and must survive.
-    # "rebuild is failing" once matched bare `build\s+is\s`; "successfully reproduced"
-    # once matched the standalone verified/successful branch.
-    for diag_text, needle in (
-        ("The rebuild is failing because unix.c is missing from the target list.",
-         "rebuild is failing"),
-        ("I successfully reproduced the crash: it is an off-by-one in the parse loop.",
-         "off-by-one in the parse loop"),
-        ("Verified the repro; the bug is a null deref in frame_alloc.",
-         "null deref in frame_alloc"),
-    ):
-        d = list(poisoned)
-        d[1] = {"role": "assistant",
-                "content": (diag_text + '\n<tool_call>{"name": "bash", "arguments": '
-                            '{"command": "ls build"}}</tool_call>')}
-        note = progress_note(d, rejected_claim="task is done")
-        check(f"diagnosis survives rejected path: {needle!r}", needle in note, note)
     # Without rejected_claim the note is unchanged from the old contract: no warning.
     check("no rejected claim -> no warning line",
           "REJECTED" not in progress_note(poisoned), progress_note(poisoned))
-
-
-def test_bash_result_verifies_ignores_trivial_checks():
-    # A real test run clears unverified_edit.
-    check("real test run verifies", bash_result_verifies("5 passed", "pytest tests/"))
-    check("clean no-output run verifies", bash_result_verifies("[no output]", "python repro.py"))
-    # Error sentinels never verify.
-    check("nonzero exit does not verify", not bash_result_verifies("[exit 1]", "pytest"))
-    check("timeout does not verify", not bash_result_verifies("[timed out]", "pytest"))
-    # Trivial syntax/compile/version probes must NOT verify — the 14559 fake-verify hole.
-    check("compile() check does not verify",
-          not bash_result_verifies("Syntax OK", "python -c \"compile(open('f').read(),'f','exec')\""))
-    check("py_compile does not verify",
-          not bash_result_verifies("[no output]", "python -m py_compile foo.py"))
-    check("--version does not verify",
-          not bash_result_verifies("Python 3.11", "python --version"))
-    # No command passed (back-compat) still verifies on a clean result.
-    check("no command arg still verifies clean", bash_result_verifies("ok"))
-
-
-def test_bash_result_verifies_requires_executing_command():
-    """Iter-2: only a command that plausibly RUNS code can clear
-    unverified_edit. The measured false-green: `sed -n '307,308p' std.py | cat -A`
-    exited 0 with output and 'verified' an edit that didn't even parse — disarming
-    the verify nudge, the done rejection AND the landing nudge at once."""
-    # Display/plumbing commands never verify, however cleanly they exit.
-    check("sed|cat display does not verify",
-          not bash_result_verifies("std = cast(...)", "sed -n '307,308p' std.py | cat -A"))
-    check("ls does not verify", not bash_result_verifies("f.py", "ls -la"))
-    check("grep does not verify", not bash_result_verifies("x: hit", "grep -rn foo ."))
-    check("git diff does not verify", not bash_result_verifies("diff --git", "git diff"))
-    check("echo does not verify", not bash_result_verifies("ok", "echo ok"))
-    # Executing commands verify.
-    check("pytest verifies", bash_result_verifies("1 passed", "python -m pytest -q tests/"))
-    check("script run verifies", bash_result_verifies("ok", "./runtests.sh --all"))
-    check("make verifies", bash_result_verifies("ok", "make test"))
-    check("chained executing command verifies",
-          bash_result_verifies("ok", "cd /tmp && python repro.py"))
-    check("piped-out executing command verifies",
-          bash_result_verifies("ok", "python -m pytest tests/ 2>&1 | tail -20"))
-    # Installs are env repair, not verification.
-    check("pip install does not verify",
-          not bash_result_verifies("Successfully installed", "pip install -e ."))
-    check("python -m pip install does not verify",
-          not bash_result_verifies("Successfully installed", "python -m pip install pytest"))
-
-
-def test_investigation_gate():
-    # Below threshold: no nudge.
-    check("no gate below threshold", investigation_gate(3, made_edit=False, gate_nudges=0) is None)
-    # At/over threshold with no edit yet: fires and tells the model to edit.
-    g = investigation_gate(6, made_edit=False, gate_nudges=0)
-    check("gate fires at threshold with no edit", g is not None and "no edit" in g)
-    check("gate says stop searching", "STOP searching" in g)
-    # An edit already landed -> suppressed (it's acting, not stalling).
-    check("gate suppressed once edit landed",
-          investigation_gate(20, made_edit=True, gate_nudges=0) is None)
-    # Bounded.
-    check("gate bounded by gate_nudges", investigation_gate(20, made_edit=False, gate_nudges=2) is None)
-
-
-def test_verification_matrix():
-    from chad.guardrails import verification_matrix
-    task = (
-        "Write /app/out.html so it still triggers alert() after /app/filter.py runs.\n"
-        "The output must be valid HTML and must not require user interaction.\n")
-    # Below threshold: silent.
-    check("no matrix below threshold",
-          verification_matrix(task, 4, made_edit=False, gate_fires=0) is None)
-    # At/over threshold: fires with the evidence-or-unverified matrix.
-    g = verification_matrix(task, 8, made_edit=False, gate_fires=0)
-    check("matrix fires at threshold", g is not None)
-    check("matrix offers the evidence path", g is not None and "EVIDENCE" in g)
-    check("matrix offers the honest-unverified escape",
-          g is not None and "UNVERIFIED" in g)
-    check("matrix ends at done", g is not None and "`done`" in g)
-    # Reuses the requirement extractor: the task's own predicate lines appear as rows.
-    check("matrix quotes a real requirement line",
-          g is not None and "out.html" in g)
-    # The whole point vs investigation_gate: it STILL fires after an edit landed
-    # (the break-filter thrash shape — write early, probe forever).
-    check("matrix fires even after an edit landed",
-          verification_matrix(task, 12, made_edit=True, gate_fires=0) is not None)
-    # A task with no extractable requirement lines still fires (generic close-out).
-    check("matrix fires with no extractable requirements",
-          verification_matrix("do the thing", 8, made_edit=False, gate_fires=0) is not None)
-    # Re-armable but bounded by the firing cap.
-    check("matrix bounded by cap",
-          verification_matrix(task, 30, made_edit=True, gate_fires=6) is None)
 
 
 def test_edit_failed_to_land():
@@ -924,41 +682,6 @@ def test_edit_failed_to_land():
     check("landed symbol replace did not fail", not edit_failed_to_land("[replaced foo]"))
 
 
-def test_edit_fail_kind():
-    check("noop classified", edit_fail_kind("[no-op edit: old and new are identical]") == "noop")
-    check("not-found classified nomatch",
-          edit_fail_kind("[old string not found; no change made.]") == "nomatch")
-    check("ambiguous classified nomatch", edit_fail_kind("[old string appears 3 times]") == "nomatch")
-    check("landed edit has no fail kind", edit_fail_kind("[edited foo.py]") is None)
-    # An indentation revert is its OWN kind: re-quoting whitespace is what keeps failing,
-    # so the remedy must switch tools, not re-read (workstream C).
-    check("indent-reject classified indent",
-          edit_fail_kind("[edit rejected: it would break e.py — unexpected indent...]") == "indent")
-
-
-def test_edit_loop_break():
-    check("no break below 2", edit_loop_break(1, 0) is None)
-    b = edit_loop_break(2, 0)
-    check("break fires at streak 2", b is not None and "changed nothing" in b)
-    check("break suggests read + replace_symbol", "replace_symbol" in b and "read" in b)
-    check("break bounded", edit_loop_break(5, 2) is None)
-    # No-op failures get the tailored remedy (make new differ), NOT "re-read and paste" —
-    # that's exactly what already failed (pytest-10356).
-    nb = edit_loop_break(2, 0, kind="noop")
-    check("noop break says old and new are identical", "identical" in nb, nb)
-    check("noop break tells it to make new differ", "must differ" in nb or "MODIFIED" in nb, nb)
-    check("noop break does NOT tell it to paste verbatim", "verbatim" not in nb, nb)
-    # A not-found failure still gets the re-read remedy.
-    mb = edit_loop_break(2, 0, kind="nomatch")
-    check("nomatch break says re-read", "read" in mb and "verbatim" in mb, mb)
-    # An indent-reject loop must switch tools (replace_symbol / insert_lines), NOT re-quote.
-    ib = edit_loop_break(2, 0, kind="indent")
-    check("indent break switches to replace_symbol", "replace_symbol" in ib, ib)
-    check("indent break offers insert_lines", "insert_lines" in ib, ib)
-    check("indent break forbids another hand-indented edit",
-          "another hand-indented edit" in ib or "STOP hand-indenting" in ib, ib)
-
-
 def test_reject_escalation():
     # Loop breaker: appended when the SAME call is rejected twice back-to-back. Must tell
     # the model to stop re-emitting AND forbid fabricating the tool's result.
@@ -968,88 +691,17 @@ def test_reject_escalation():
           generic)
     check("escalation forbids fabricating output",
           "Do NOT invent" in generic or "not invent" in generic.lower(), generic)
-    # activate_skill gets the extra anti-confabulation clause — the trace's failure mode.
-    sk = reject_escalation("activate_skill")
-    check("skill escalation says skill NOT loaded", "NOT loaded" in sk, sk)
-    check("skill escalation forbids proceeding from memory",
-          "from memory" in sk or "fabricate" in sk, sk)
 
 
 def test_reject_loop_signature_resets_on_change():
     # The rejection loop breaker keys on (name, args): a *different* attempt at the same
     # tool must reset the counter (it's a new try, not a repeat), while an identical
     # re-emit matches.
-    a = loop_signature([("activate_skill", {"name": "widgets"})])
-    b = loop_signature([("activate_skill", {"name": "widgets"})])
-    c = loop_signature([("activate_skill", {"name": "gadgets"})])
+    a = loop_signature([("edit", {"path": "a.py", "old": "x", "new": "y"})])
+    b = loop_signature([("edit", {"path": "a.py", "old": "x", "new": "y"})])
+    c = loop_signature([("edit", {"path": "a.py", "old": "x", "new": "z"})])
     check("identical rejected call -> same sig", a == b, (a, b))
     check("changed arg -> different sig (counter resets)", a != c, (a, c))
-
-
-def test_wrapup_window_nudge():
-    # No wall budget configured -> never fires (interactive / unmetered runs).
-    check("no wall budget -> None", wrapup_window_nudge(500, None, False) is None)
-    check("zero wall budget -> None", wrapup_window_nudge(500, 0, False) is None)
-    # A 900s budget: threshold = max(120, 0.15*900) = 135s of remaining time. Outside the
-    # window (plenty of runway) -> None; inside -> a nudge.
-    check("outside the window (600/900, 300s left) -> None",
-          wrapup_window_nudge(600, 900, False) is None)
-    nudge = wrapup_window_nudge(800, 900, False)  # 100s left, < 135 threshold
-    check("inside the window -> a nudge", isinstance(nudge, str) and "left" in nudge, nudge)
-    check("nudge reports the remaining seconds", "100s" in nudge, nudge)
-    # One-shot: once it has fired, it never fires again this turn.
-    check("already fired -> None", wrapup_window_nudge(850, 900, True) is None)
-    # The 120s floor dominates on a SMALL budget: for a 300s budget, 0.15*300 = 45 < 120,
-    # so the window opens at 120s remaining (not 45s).
-    check("floor dominates: 200/300 (100s left) is inside",
-          isinstance(wrapup_window_nudge(200, 300, False), str))
-    check("floor dominates: 170/300 (130s left) still inside (<=120? no, 130>120) -> None",
-          wrapup_window_nudge(170, 300, False) is None)
-    # Right at the exact boundary (remaining == threshold) fires (<=, not <).
-    check("boundary remaining == threshold fires",
-          isinstance(wrapup_window_nudge(900 - 135, 900, False), str))
-
-
-def test_hard_wrapup_margins():
-    # land_margin (103): max(90s, 10% of budget).
-    check("floor dominates small budget", land_margin(300) == 90.0, land_margin(300))
-    check("frac dominates large budget", land_margin(3600) == 360.0, land_margin(3600))
-    check("exactly at the crossover (900 -> 90)", land_margin(900) == 90.0)
-    check("1200 -> 120 (frac)", land_margin(1200) == 120.0)
-    # Never a negative / nonsense margin when no budget is configured.
-    check("no budget -> the floor, not negative", land_margin(None) == 90.0)
-    check("zero budget -> the floor", land_margin(0) == 90.0)
-
-    # The load-bearing INVARIANT: 103's abort margin sits INSIDE 085's soft-nudge window
-    # (max(120s, 15%)) for every budget, so the soft nudge always has the first chance to
-    # fire at a step boundary before the hard abort cuts a generation. If this flips, the
-    # two mechanisms race and the abort can pre-empt the gentler nudge.
-    for b in (200, 300, 900, 1200, 1800, 2400, 3600, 7200):
-        window = max(WRAPUP_MIN_S, WRAPUP_FRAC * b)
-        check(f"abort margin inside soft window (budget={b})",
-              land_margin(b) <= window, f"{land_margin(b)} vs {window}")
-
-    # landing_max_tokens (103): min(1024, remaining*tps*0.5), floored at 256.
-    check("ample runway -> capped at 1024",
-          landing_max_tokens(90, 80) == 1024, landing_max_tokens(90, 80))
-    # 40s left at 40 tok/s -> 40*40*0.5 = 800, inside the band, used as-is.
-    check("mid-range used as-is", landing_max_tokens(40, 40) == 800,
-          landing_max_tokens(40, 40))
-    # Wall already blown (negative remaining) -> the 256 floor, never <=0 (an engine with
-    # max_tokens<=0 would generate nothing / error).
-    check("blown wall -> the floor, positive", landing_max_tokens(-5, 80) == 256)
-    check("zero remaining -> the floor", landing_max_tokens(0, 80) == 256)
-    # No decode-speed signal yet -> tps floored at 1.0 so the box is still a sane positive.
-    check("no tps signal -> still positive", landing_max_tokens(120, 0) == 256,
-          landing_max_tokens(120, 0))
-
-    # wrapup_landing_steer reuses 085's text verbatim (write to the exact path, call done)
-    # and clamps the seconds to a non-negative int.
-    steer = wrapup_landing_steer(42.7)
-    check("steer names the deadline", "42s left" in steer, steer)
-    check("steer says write to the exact path + call done",
-          "EXACT path" in steer and "call done" in steer, steer)
-    check("negative remaining clamps to 0s", "0s left" in wrapup_landing_steer(-3))
 
 
 def test_relaunch_budget():
@@ -1068,86 +720,16 @@ def test_relaunch_budget():
     check("zero budget -> None", relaunch_budget(0, 0) is None)
 
 
-def test_turn_think_budget():
-    # No wall budget / no decode-speed signal yet -> falls back to the HI clamp, never a
-    # tighter bind than the mechanism's own ceiling.
-    check("no wall budget -> HI", turn_think_budget(None, 80.0) == 24000)
-    check("no decode-speed signal yet -> HI", turn_think_budget(900, 0.0) == 24000)
-    # 900s budget, 80 tok/s, frac=0.35 -> 0.35*900*80 = 25200, clamped down to HI=24000.
-    check("clamped to the HI ceiling", turn_think_budget(900, 80.0) == 24000)
-    # 300s budget, 40 tok/s -> 0.35*300*40 = 4200, clamped UP to LO=8000 (a turn budget
-    # must clear the passes' own median think spend, ~10.7k, comfortably).
-    check("clamped to the LO floor", turn_think_budget(300, 40.0) == 8000)
-    # A budget that lands inside the clamp is used as-is: 1200s, 40 tok/s ->
-    # 0.35*1200*40 = 16800.
-    check("mid-range value used as-is", turn_think_budget(1200, 40.0) == 16800,
-          turn_think_budget(1200, 40.0))
-
-
-def test_turn_think_budget_check():
-    # Below half: no decision, state untouched.
-    d, half, exh = turn_think_budget_check(1000, 8000, False, False)
-    check("below half -> no decision", d is None and not half and not exh)
-    # Crosses half: fires ONCE.
-    d, half, exh = turn_think_budget_check(4000, 8000, False, False)
-    check("at half -> fires", d == "half" and half and not exh)
-    # Already fired half, still below budget -> no re-fire.
-    d, half, exh = turn_think_budget_check(5000, 8000, True, False)
-    check("half already fired, below budget -> no re-decision", d is None and half and not exh)
-    # Crosses the full budget -> exhausted (a single big jump can skip straight past half,
-    # like advance_governor crediting a two-band jump).
-    d, half, exh = turn_think_budget_check(9000, 8000, False, False)
-    check("jump straight to exhausted", d == "exhausted" and half and exh)
-    # Once exhausted, it is STICKY: always returns (None, half, True) — nothing further to
-    # escalate, unlike no_think_escalation's one-shot which resets after one action.
-    d, half, exh = turn_think_budget_check(50000, 8000, True, True)
-    check("exhausted is sticky", d is None and half and exh)
-
-
-def test_turn_think_throttle():
-    # Below budget: never throttled, regardless of paid count.
-    check("below budget -> no throttle", turn_think_throttle(7999, 8000, 0) is False)
-    # Crossing the budget owes exactly ONE no-think step until paid.
-    check("at budget, unpaid -> throttle", turn_think_throttle(8000, 8000, 0) is True)
-    check("at budget, paid -> restored", turn_think_throttle(8000, 8000, 1) is False)
-    # Every further `rearm` think tokens owes one more: 8000 + 2*3000 = 3 owed total.
-    check("2 rearm chunks past budget, 2 paid -> still owes one",
-          turn_think_throttle(14000, 8000, 2) is True)
-    check("2 rearm chunks past budget, 3 paid -> restored",
-          turn_think_throttle(14000, 8000, 3) is False)
-    # A model that keeps burning reasoning is throttled toward always-off; one that
-    # stops spending accrues no new debt and keeps its thinking once paid up.
-    check("huge overshoot, few paid -> throttle",
-          turn_think_throttle(50000, 8000, 5) is True)
-    # rearm=0 must not divide by zero (guarded to 1).
-    check("zero rearm guarded", turn_think_throttle(9000, 8000, 10**6, rearm=0) is False)
-
-
 def test_replenish_continue():
-    import os
-    # More than half the wall unspent and under the cap -> grant (either lever state).
+    # More than half the wall unspent and under the cap -> grant.
     check("early giveup, wall mostly unspent -> grant",
           replenish_continue(12000, 637, 2) is True)
-    # late_continue_replenish ON (default): extras keep flowing down to the quarter-
-    # wall line — the measured stranding was step-capped tasks ending with 12-50% of
-    # wall unspent once the old half-wall line passed.
-    check("44% remaining -> grant (late replenish)",
-          replenish_continue(900, 500, 2) is True)
-    check("30% remaining -> grant (late replenish)",
-          replenish_continue(1000, 700, 2) is True)
-    # Exactly at the quarter boundary is NOT more-than -> no grant.
-    check("exact quarter boundary -> no grant", replenish_continue(1000, 750, 2) is False)
-    check("under a quarter left -> no grant", replenish_continue(1000, 800, 2) is False)
-    # Lever OFF restores the half-wall threshold exactly.
-    os.environ["CHAD_DISABLE"] = "late_continue_replenish"
-    try:
-        check("lever OFF: more than half spent -> no grant",
-              replenish_continue(900, 500, 2) is False)
-        check("lever OFF: exact half boundary -> no grant",
-              replenish_continue(1000, 500, 2) is False)
-    finally:
-        del os.environ["CHAD_DISABLE"]
-    # An explicit frac bypasses the lever entirely (pure-parameter callers).
+    # Half-wall threshold: past it, no more extras.
+    check("more than half spent -> no grant",
+          replenish_continue(900, 500, 2) is False)
+    check("exact half boundary -> no grant",
+          replenish_continue(1000, 500, 2) is False)
+    # An explicit frac overrides the default threshold.
     check("explicit frac honored", replenish_continue(1000, 700, 2, frac=0.5) is False)
     # Absolute cap: never more than AUTO_CONTINUE_TOTAL_CAP total relaunches.
     check("at the total cap -> no grant", replenish_continue(12000, 100, 6) is False)
@@ -1227,18 +809,12 @@ if __name__ == "__main__":
     test_reject_escalation()
     test_reject_loop_signature_resets_on_change()
     test_bash_result_verifies()
-    test_bash_result_verifies_ignores_trivial_checks()
-    test_bash_result_verifies_requires_executing_command()
-    test_investigation_gate()
-    test_verification_matrix()
     test_edit_failed_to_land()
-    test_edit_loop_break()
     test_done_rejection()
     test_update_work_flags()
     test_loop_guard()
     test_loop_guard_resets_on_landed_edit()
     test_nudge_for_no_calls()
-    test_garble_invariant_nudges()
     test_is_readonly_bash()
     test_landing_nudge()
     test_extend_step_cap()
@@ -1251,75 +827,9 @@ if __name__ == "__main__":
     test_turn_governor()
     test_governor_two_band_jump_credits_progress()
     test_progress_note()
-    test_wrapup_window_nudge()
-    test_hard_wrapup_margins()
     test_relaunch_budget()
-    test_turn_think_budget()
-    test_turn_think_budget_check()
     test_review_pass_should_fire()
     test_classify_sync_kind()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
 
-
-def test_dup_result_elide():
-    # A read-only result byte-identical to a tool message
-    # still in the transcript is elided to a short pointer; anything that breaks
-    # byte-equality (changed file, different args, compaction rewrite) flows through.
-    from chad.guardrails import DUP_ELIDE_MIN_CHARS, elide_duplicate_result
-    body = "1  line\n" * 200  # comfortably over the threshold
-    check("dup: body over threshold", len(body) >= DUP_ELIDE_MIN_CHARS)
-    msgs = [{"role": "tool", "name": "read", "content": body}]
-    hit = elide_duplicate_result("read", body, msgs)
-    check("dup: identical read elided", hit is not None and "elided" in hit, hit)
-    check("dup: pointer is short", hit is not None and len(hit) < 300, hit)
-    check("dup: changed content flows through",
-          elide_duplicate_result("read", body + "x", msgs) is None)
-    check("dup: name mismatch flows through",
-          elide_duplicate_result("grep", body, msgs) is None)
-    check("dup: bash never elided",
-          elide_duplicate_result(
-              "bash", body, [{"role": "tool", "name": "bash", "content": body}]) is None)
-    check("dup: short result flows through",
-          elide_duplicate_result(
-              "read", "[empty]", [{"role": "tool", "name": "read", "content": "[empty]"}]) is None)
-    # a compaction rewrite (head/tail collapse) breaks equality -> full result again
-    collapsed = body[:100] + "\n[...collapsed...]\n" + body[-50:]
-    check("dup: collapsed prior flows through",
-          elide_duplicate_result(
-              "read", body, [{"role": "tool", "name": "read", "content": collapsed}]) is None)
-
-
-def test_dup_result_elide_lever_off(monkeypatch):
-    from chad.guardrails import elide_duplicate_result
-    monkeypatch.setenv("CHAD_DISABLE", "dup_result_elide")
-    body = "y" * 500
-    check("dup lever off: no elision",
-          elide_duplicate_result(
-              "read", body, [{"role": "tool", "name": "read", "content": body}]) is None)
-
-
-def test_subagent_evidence_warning():
-    # A confident report with zero tool dispatches is the answered-from-memory
-    # tell; it gets a verify warning appended. Real work, failure sentinels (the salvage
-    # path owns those), and empty results are left alone.
-    from chad.guardrails import SUBAGENT_EVIDENCE_WARNING, subagent_evidence_warning
-    report = "The bug is in utils.py line 40: off-by-one in the loop bound."
-    warned = subagent_evidence_warning(report, 0)
-    check("evidence: zero-dispatch report is warned",
-          warned == report + SUBAGENT_EVIDENCE_WARNING, warned)
-    check("evidence: real work passes clean",
-          subagent_evidence_warning(report, 3) is None)
-    check("evidence: failure sentinel untouched",
-          subagent_evidence_warning("[task returned nothing]", 0) is None)
-    check("evidence: stopped sentinel untouched",
-          subagent_evidence_warning("[stopped: loop]", 0) is None)
-    check("evidence: empty result untouched",
-          subagent_evidence_warning("   ", 0) is None)
-
-
-def test_subagent_evidence_warning_lever_off(monkeypatch):
-    from chad.guardrails import subagent_evidence_warning
-    monkeypatch.setenv("CHAD_DISABLE", "subagent_evidence_warn")
-    check("evidence lever off: no warning",
-          subagent_evidence_warning("confident memory answer", 0) is None)

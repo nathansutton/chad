@@ -73,6 +73,19 @@ def test_banner_handles_unknown_context():
     assert "context tbd" in banner("m", None)
 
 
+def test_banner_advertises_the_window_the_box_gives():
+    # The headline number is what the session ACTUALLY gets. When the RAM governor is
+    # what bound it, both numbers are named — "84k" alone reads as the wrong model
+    # having loaded, "262k" alone is context the run can never spend.
+    limited = banner("Qwen3.8-27B", 84_300, native_ctx=262_144, version="0.1.0")
+    assert "84k of 262k context" in limited
+    # Governor not binding (big-RAM box): no second number to explain, so don't add one.
+    roomy = banner("Qwen3.8-27B", 260_096, native_ctx=262_144, version="0.1.0")
+    assert "260k context" in roomy and " of " not in roomy.split("\n")[1]
+    # No native window known (config unreadable) -> the plain form, never a crash.
+    assert "84k context" in banner("m", 84_300)
+
+
 def _stub_tui(finalize):
     # A TUI shell exercising just the background-load handoff, without a real engine/app.
     import threading
@@ -84,6 +97,7 @@ def _stub_tui(finalize):
     tui.ctx_limit = 8192  # provisional, set pre-load
     tui.agent = SimpleNamespace(ctx_limit=8192)
     tui.engine = SimpleNamespace(effective_ctx=262144)
+    tui.native_ctx = 262144
     tui._emit = lambda kind, text: None
     tui._finalize = finalize
     return tui
@@ -145,14 +159,6 @@ def test_is_err_ignores_legitimate_output():
     check("bracketed non-error not flagged", _is_err("[replaced foo (3 lines)]") is False)
 
 
-def test_render_read_of_bracket_content_is_not_error():
-    # Snapshot: reading a file that starts with `[` and mentions 'error' downstream shows
-    # a line count (muted), NOT the red error line.
-    content = '[\n  {"status": "error"},\n  {"status": "ok"}\n]'
-    events = _emits("read", {}, content)
-    check("read snapshot is a line count", events == [("muted", "  ⎿ 4 lines")], repr(events))
-
-
 def test_render_real_error_uses_error_style():
     # Snapshot: a genuine error result emits a single 'error' event with the first line.
     events = _emits("read", {}, "[no such file: /x/y.py]")
@@ -160,27 +166,9 @@ def test_render_real_error_uses_error_style():
           events == [("error", "  ⎿ no such file: /x/y.py")], repr(events))
 
 
-def test_render_glob_no_matches_is_zero_files():
-    # "[no matches]" is one line of text but zero files — it used to render "1 file".
-    events = _emits("glob", {}, "[no matches]")
-    check("glob no-matches shows 0 files", events == [("muted", "  ⎿ 0 files")], repr(events))
-
-
-def test_render_grep_notice_lines_not_counted():
-    # The truncation notice contains a ":" but is not a match; only path:line: hits count.
-    result = ("./a.py:1: NEEDLE\n./a.py:2: NEEDLE\n"
-              "[results truncated: 2/500 lines — narrow the pattern or add a path]")
-    events = _emits("grep", {}, result)
-    check("grep summary excludes notices",
-          events == [("muted", "  ⎿ 2 matches in 1 file")], repr(events))
-
-
 if __name__ == "__main__":
     test_is_err_flags_real_diagnostics()
     test_is_err_ignores_legitimate_output()
-    test_render_read_of_bracket_content_is_not_error()
     test_render_real_error_uses_error_style()
-    test_render_glob_no_matches_is_zero_files()
-    test_render_grep_notice_lines_not_counted()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

@@ -7,7 +7,7 @@ out by hand from the live docstring (longest match wins, ties broken by recency,
 what followed). Contexts are kept tiny so a reviewer can re-derive each one.
 
 Tier 2 (model-gated, self-skipping): loads a small *trimmable, draft-less* model
-(Qwen2.5-Coder-0.5B-Instruct-4bit — NOT Ornith, which is non-trimmable so PLD never
+(Qwen2.5-Coder-0.5B-Instruct-4bit — NOT the shipped hybrid, which is non-trimmable so PLD never
 engages) and asserts PLD produces output byte-identical to plain greedy decoding. The
 engine returns decoded text (not raw ids), so equivalence is asserted on the full
 decoded output string — the user-observable signal a corruption bug would break — plus a
@@ -64,8 +64,9 @@ def _is_quantized(model_dir):
     logit grid produces exact argmax ties (top1==top2) where the winner is decided by
     sub-ULP FP noise from how tokens are batched into forward passes — so even two
     legitimate greedy decodes of the same model can disagree at a tie. (Verified 2026-06:
-    the strict test below passes on bf16 Ornith-9B and on quantized trimmable Qwen, but
-    'fails' on 4-bit AWQ Ornith purely at margin-0.0 ties — not a rollback bug.) So when
+    the strict test below passed on the bf16 dense model of the day and on quantized
+    trimmable Qwen, but 'failed' on a 4-bit AWQ hybrid purely at margin-0.0 ties — not a
+    rollback bug.) So when
     the env var points at quantized weights we SKIP rather than fail spuriously; the
     corruption guard stays strict for the bf16 run where it is meaningful."""
     import json
@@ -304,16 +305,49 @@ def test_draft_length():
     check("draft truncated near end of context", got2 == [1, 2], repr(got2))
 
 
+def test_wide_gate_demands_the_full_ngram():
+    """The wide-PLD gate is `min_ngram == ngram_max`, so the matcher accepts ONE
+    match length and rejects everything shorter. This is the evidence bar that keeps
+    a wide verify from firing on weak recurrence: an S=32 verify costs ~7.5 plain
+    steps, so a match that yields fewer accepted tokens than that is a net loss, and
+    short matches in a large code context are exactly that case (measured 6.50
+    accepted/verify at a 6-gram bar vs 11.22 at a 16-gram bar).
+    """
+    import numpy as np
+
+    from chad.engine import Engine, prompt_lookup_draft_arr
+
+    # a 6-token recurrence, with the shipped 16-token bar applied to it
+    ctx = np.array([7, 8, 9, 10, 11, 12, 40, 41, 7, 8, 9, 10, 11, 12], dtype=np.int32)
+    d, ng = prompt_lookup_draft_arr(ctx, len(ctx), 32, 16, 16)
+    check("6-gram recurrence is rejected by the 16-gram bar", d == [] and ng == 0,
+          repr((d, ng)))
+
+    # the same matcher still finds a recurrence that DOES clear the bar, and copies
+    # what followed it (here: the 99 sentinel after the first run of 20 tokens)
+    run = list(range(100, 120))          # 20 distinct tokens
+    ctx2 = np.array(run + [99, 55] + run, dtype=np.int32)
+    d2, ng2 = prompt_lookup_draft_arr(ctx2, len(ctx2), 32, 16, 16)
+    check("20-token recurrence clears the 16-gram bar", ng2 == 16, repr(ng2))
+    check("draft copies what followed the earlier occurrence", d2[:2] == [99, 55],
+          repr(d2[:2]))
+
+    # and the shipped defaults are the ones just characterized
+    check("shipped gate is a single exact length",
+          Engine.pld_wide_ngram == Engine.pld_wide_min_ngram == 16,
+          f"{Engine.pld_wide_ngram}/{Engine.pld_wide_min_ngram}")
+
+
 # === Tier 2: PLD == plain-greedy equivalence (model-gated, self-skipping) =====
 
-# A small dense Qwen2.5-Coder is trimmable; Ornith is not (so PLD never engages).
+# A small dense Qwen2.5-Coder is trimmable; the qwen3_5 hybrid is not (PLD never engages).
 TIER2_MODEL = "mlx-community/Qwen2.5-Coder-0.5B-Instruct-4bit"
 
 
 def _build_engine(model_id=TIER2_MODEL, enable_pld_hybrid=False):
     """Load a small draft-less PLD engine, or return None to SKIP.
 
-    `enable_pld_hybrid` opts into the hybrid (qwen3_5/Ornith) recurrent-snapshot
+    `enable_pld_hybrid` opts into the hybrid (qwen3_5) recurrent-snapshot
     rollback path (off by default; see Engine.enable_pld_hybrid).
     """
     try:
@@ -391,7 +425,7 @@ def test_pld_equals_greedy():
 
 # === Tier 2-hybrid: hybrid-PLD == plain-greedy equivalence (real hybrid weights, self-skipping) ===
 # The trimmable PLD path above is pinned bit-exact. This is its analogue for the
-# HIGHEST-corruption-risk code in the repo: the hybrid (qwen3_5/Ornith) recurrent-
+# HIGHEST-corruption-risk code in the repo: the hybrid (qwen3_5) recurrent-
 # snapshot rollback (engine.py: _snap_recurrent -> _restore_recurrent -> _trim_kv ->
 # re-feed the accepted prefix). On a rejected speculative draft that sequence must land
 # the recurrent DeltaNet state and the attention KV at EXACTLY y_val+draft[:n_acc]; one
@@ -399,11 +433,10 @@ def test_pld_equals_greedy():
 #
 # A hybrid (non-trimmable) model is required to exercise this; CI runners are weightless,
 # so the test reads the model dir from CHAD_TEST_HYBRID_MODEL and self-skips when unset.
-# It must NOT hardcode a path (the local Ornith weights live in the private workshop, not
-# the public repo). The bit-equality guard requires UNQUANTIZED (bf16) weights — on a
+# It must NOT hardcode a path (bf16 hybrid weights are not something the repo ships). The bit-equality guard requires UNQUANTIZED (bf16) weights — on a
 # quantized hybrid model the coarse logit grid yields exact argmax ties that bit-equality
 # can't survive, so the test self-skips on quantized dirs (see _is_quantized). To run it:
-#   CHAD_TEST_HYBRID_MODEL=<path-to-bf16-ornith-dir> uv run pytest \
+#   CHAD_TEST_HYBRID_MODEL=<path-to-a-bf16-qwen3_5-dir> uv run pytest \
 #       tests/test_engine.py::test_pld_hybrid_equals_greedy -q
 
 def test_pld_hybrid_equals_greedy():
@@ -417,7 +450,8 @@ def test_pld_hybrid_equals_greedy():
                     "CHAD_TEST_HYBRID_MODEL unset (no hybrid weights in test env)")
     # Quantized weights make bit-exact greedy equivalence undefined (margin-0.0 argmax
     # ties decided by FP batching noise — see _is_quantized). Point this at the bf16
-    # source weights (e.g. a local bf16 Ornith-1.0-9B checkout) to exercise the guard.
+    # source weights (an unquantized qwen3_5 checkout) to exercise the guard. The shipped
+    # 27B is 3-bit, so pointing this at it lands here rather than running.
     if _is_quantized(model_id):
         return skip("pld_hybrid_equals_greedy",
                     f"{model_id} is quantized; bit-equality is undefined under "
@@ -660,7 +694,7 @@ def test_push_pop_bit_exact():
     if os.environ.get("CHAD_FAST_TESTS"):
         return skip("push_pop_bit_exact", "CHAD_FAST_TESTS set (fast gate)")
     # push/pop is model-agnostic (RAM-tuple stash + optional disk spill); the trimmable
-    # default is the CI path. A run on the real hybrid (bf16 Ornith) is also wanted,
+    # default is the CI path. A run on a real bf16 hybrid is also wanted,
     # so CHAD_TEST_HYBRID_MODEL — when set — points THIS test at those weights.
     model_id = os.environ.get("CHAD_TEST_HYBRID_MODEL", TIER2_MODEL)
     eng = _build_engine(model_id=model_id)
@@ -1139,6 +1173,95 @@ def test_keyed_sampler_default_off_is_full_support():
     s = _KeyedSampler(1.0, seed=7)  # min_p=0.0, top_p=0.0 defaults
     draws = [int(s(logits).item()) for _ in range(300)]
     check("low-prob tail token still reachable with filters off", 1 in draws, set(draws))
+
+
+def test_top_k_keeps_exactly_the_top_k():
+    """top_k is the one filter in Qwen3.8's recipe that mlx_lm does not ship, so
+    it lives in engine.py. The trap it was written around: mx.topk returns its
+    block ASCENDING, so taking the last element as the cutoff keeps only the
+    maximum — a silently-greedy sampler. Pin the actual survivor set."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        skip("top_k", "mlx not installed")
+        return
+    from chad.engine import apply_top_k
+
+    s = mx.array([1.0, 5.0, 3.0, 2.0, 4.0])
+    kept2 = [i for i, v in enumerate(apply_top_k(s, 2).tolist()) if v != -float("inf")]
+    check("top_k=2 keeps the two largest (not just the max)", kept2 == [1, 4], kept2)
+    kept3 = [i for i, v in enumerate(apply_top_k(s, 3).tolist()) if v != -float("inf")]
+    check("top_k=3 keeps the three largest", kept3 == [1, 2, 4], kept3)
+    check("top_k=0 is a no-op", apply_top_k(s, 0).tolist() == s.tolist())
+    check("top_k >= vocab is a no-op", apply_top_k(s, 99).tolist() == s.tolist())
+    # batched rows (the verify forward's shape) filter independently
+    b = mx.array([[1.0, 5.0, 3.0], [2.0, 0.0, 1.0]])
+    check("batched top_k filters per row",
+          apply_top_k(b, 2).tolist() == [[-float("inf"), 5.0, 3.0],
+                                         [2.0, -float("inf"), 1.0]],
+          apply_top_k(b, 2).tolist())
+
+
+def test_presence_penalty_is_presence_not_frequency():
+    """Once-seen is once-penalized, however many times it appeared. If duplicates
+    stacked, this would silently become a FREQUENCY penalty — a much harsher
+    filter than the model card's recipe asks for, and one that would escalate
+    without bound inside a long generation."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        skip("presence penalty", "mlx not installed")
+        return
+    from chad.engine import apply_presence_penalty
+
+    s = mx.array([1.0, 5.0, 3.0])
+    once = apply_presence_penalty(s, [1], 1.5).tolist()
+    thrice = apply_presence_penalty(s, [1, 1, 1], 1.5).tolist()
+    check("a token seen 3x is penalized the same as seen 1x", once == thrice,
+          (once, thrice))
+    check("penalty is subtracted once", once == [1.0, 3.5, 3.0], once)
+    check("unseen tokens untouched", once[0] == 1.0 and once[2] == 3.0, once)
+    check("penalty 0 is a no-op", apply_presence_penalty(s, [1], 0.0).tolist()
+          == s.tolist())
+    check("empty history is a no-op", apply_presence_penalty(s, [], 1.5).tolist()
+          == s.tolist())
+
+
+def test_spec_scaled_penalizes_each_verify_row_against_its_own_prefix():
+    """The speculative-exactness contract. Rejection sampling preserves whatever
+    target p it is given, so p at verify row j must equal the p a PLAIN step
+    would have built at that position — i.e. penalized against the committed
+    history PLUS the drafts before j. If every row shared the pre-forward
+    history, speculative output would drift from plain output inside every
+    accepted run,
+    silently breaking the 'exact at any temp' property."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        skip("spec_scaled rows", "mlx not installed")
+        return
+    from chad.engine import Engine
+
+    eng = object.__new__(Engine)
+    eng.temp, eng.top_p, eng.min_p, eng.top_k = 1.0, 0.0, 0.0, 0
+    eng.presence_penalty = 1.5
+    eng._seen_ids = [0]                     # token 0 already committed
+    logits = mx.zeros((3, 4))               # 3 verify rows, vocab 4
+    draft = [1, 2]                          # rows predict after [], [1], [1,2]
+
+    rows = [eng._seen + draft[:j] for j in range(3)]
+    out = eng._spec_scaled(logits, seen_rows=rows)
+    base = eng._spec_scaled(mx.zeros((4,)))  # single-row reference (history only)
+
+    # row 0 sees {0}; row 1 sees {0,1}; row 2 sees {0,1,2}
+    r = out.tolist()
+    check("row 0 penalizes only the committed history",
+          r[0][0] < r[0][1] and r[0][1] == r[0][2], r[0])
+    check("row 1 also penalizes the first draft", r[1][1] < r[1][2], r[1])
+    check("row 2 also penalizes the second draft", r[2][2] < r[2][3], r[2])
+    check("row 0 matches a plain step's distribution at that position",
+          [round(v, 5) for v in r[0]] == [round(v, 5) for v in base.tolist()],
+          (r[0], base.tolist()))
 
 
 def test_make_sampler_argmax_unchanged_by_min_p_top_p():

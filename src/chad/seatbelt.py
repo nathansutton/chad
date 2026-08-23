@@ -1,4 +1,4 @@
-"""macOS Seatbelt confinement for yolo-mode bash commands (lever: yolo_seatbelt).
+"""macOS Seatbelt confinement for yolo-mode bash commands.
 
 The destructive-command denylist in guardrails.py is pattern-matching, not a
 boundary — it says so itself. This module is the boundary: in yolo mode (the one
@@ -14,8 +14,7 @@ inside a Seatbelt profile is not something to gamble a session on. tool_bash ask
 `wrap_argv()` for an argv at spawn time; everything else here is profile plumbing.
 
 The active/workspace context is set by the agent immediately before each tool
-dispatch and cleared after, so nested agents (a sub-agent's yolo loop inside a
-normal-mode parent turn) and the `!cmd` passthrough each get exactly the
+dispatch and cleared after, so the `!cmd` passthrough gets exactly the
 confinement of the agent/mode that is actually executing.
 """
 
@@ -28,7 +27,7 @@ import sys
 import tempfile
 from typing import Optional
 
-from . import levers
+from . import config
 
 log = logging.getLogger("chad")
 
@@ -59,7 +58,7 @@ _profiles: dict = {}
 def set_context(active: bool, workspace: Optional[str]) -> None:
     """Called by the agent around each tool dispatch. `active` is 'the executing
     agent is in yolo mode'; whether wrapping actually happens still depends on the
-    lever and platform (see wrap_argv)."""
+    platform (see wrap_argv)."""
     _ctx["active"] = active
     _ctx["workspace"] = workspace
 
@@ -170,8 +169,8 @@ def profile_text(workspace: str) -> str:
       Only chad's own (never-sandboxed) process legitimately writes there, so
       this deny is unconditional and costs real commands nothing.
     * the workspace's git metadata (`.git`, and for a worktree checkout its
-      external gitdir + shared common dir) — gated by the `seatbelt_protect_git`
-      lever, its own opt-in tier rather than part of the base profile: it makes
+      external gitdir + shared common dir) — gated by the
+      CHAD_PROTECT_GIT flag, its own opt-in tier rather than part of the base profile: it makes
       project history un-destroyable from inside the sandbox (`rm -rf .git`
       EPERMs), but any git command that writes — commit, add, checkout — fails
       with it. Sized statically against 91,910 real session commands: at most
@@ -181,7 +180,7 @@ def profile_text(workspace: str) -> str:
       git command writes through them."""
     home = os.path.expanduser("~")
     ws = os.path.realpath(workspace)
-    protect_git = levers.enabled("seatbelt_protect_git")
+    protect_git = config.flag("CHAD_PROTECT_GIT")
     gitdirs = _worktree_gitdirs(ws)
     write_paths = [ws]
     if workspace != ws:
@@ -223,7 +222,7 @@ def _profile_path(workspace: str) -> str:
     # Keyed on the git-protection tier as well as the workspace: the profile body
     # differs, and lever state can change between calls within one process.
     ws = os.path.realpath(workspace)
-    key = (ws, levers.enabled("seatbelt_protect_git"))
+    key = (ws, config.flag("CHAD_PROTECT_GIT"))
     path = _profiles.get(key)
     if path and os.path.exists(path):
         return path
@@ -237,10 +236,10 @@ def _profile_path(workspace: str) -> str:
 
 def wrap_argv(command: str) -> Optional[list]:
     """The argv to spawn `command` sandboxed, or None to run it unconfined.
-    None whenever the lever is off, the executing agent is not in yolo mode, or
-    the platform can't do Seatbelt — tool_bash falls through to its normal
-    shell=True spawn, byte-identical behavior to before this module existed."""
-    if not levers.enabled("yolo_seatbelt"):
+    None whenever the executing agent is not in yolo mode or the platform can't
+    do Seatbelt — tool_bash falls through to its normal shell=True spawn.
+    CHAD_NO_SEATBELT opts out entirely."""
+    if config.flag("CHAD_NO_SEATBELT"):
         return None
     if not _ctx["active"] or not probe():
         return None
@@ -252,4 +251,4 @@ def wrap_argv(command: str) -> Optional[list]:
         # but killing every bash call is worse — log loudly and run unconfined.
         log.warning("SEATBELT profile write failed (%s) — running unconfined", e)
         return None
-    return [SANDBOX_EXEC, "-f", profile, "/bin/sh", "-c", command]
+    return [SANDBOX_EXEC, "-f", profile, config.shell_path(), "-c", command]

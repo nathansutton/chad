@@ -1,4 +1,4 @@
-"""Shadow-git checkpoints for file edits (lever: edit_checkpoint).
+"""Shadow-git checkpoints for file edits.
 
 Auto-approved edits are justified as "a diff you can read and revert" — this
 module supplies the revert. Before each file-mutating tool lands, the workspace
@@ -9,8 +9,7 @@ shadow repo has its own GIT_DIR and treats the workspace purely as a work tree.
 
 Failure policy: never raise. An edit must not die because the checkpoint
 machinery hiccuped — snapshot() returns None on any failure and the tool call
-proceeds unprotected (logged, and visible in `chad levers` firing counts as the
-absence of a fire).
+proceeds unprotected (logged).
 
 Restore policy (deliberately conservative): `git restore --source=<ref>` puts
 every snapshotted file back to its snapshotted content. Files *created after*
@@ -137,7 +136,7 @@ def restore(workspace: str, ref: str = "HEAD") -> str:
             have = snapshots(workspace, limit=1)
             return (f"no checkpoint named {ref!r}" if have else
                     "no checkpoints exist for this workspace yet — snapshots are "
-                    "taken before file edits when the edit_checkpoint lever is on")
+                    "taken before file edits")
         changed = _git(workspace, "diff", "--name-only", ref)
         n = len([ln for ln in changed.stdout.splitlines() if ln.strip()])
         r = _git(workspace, "restore", "--worktree", f"--source={ref}", "--", ".")

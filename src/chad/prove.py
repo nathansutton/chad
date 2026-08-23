@@ -8,8 +8,8 @@ are the ones your machine produces: time-to-first-token, decode speed, and
 wall-clock per task.
 
 Contract (devex design 2026-07-11, decisions D22/D24/D27):
-- Pins the validated Ornith-9B on every machine (a 32 GB Mac runs the 35B
-  day-to-day; the smoke test still runs the 9B — the copy says so).
+- Pins the shipped model on every machine, ignoring --model/CHAD_MODEL: prove
+  answers "does what I am about to run work here", which a stand-in cannot.
 - Offline guard engages only AFTER the model cache check/download: HF_HUB_OFFLINE
   plus a socket guard in this process (children only inherit the env var — the
   scorecard claims "library level", nothing stronger).
@@ -302,9 +302,13 @@ def run(args):
     except SystemExit:
         return 2
     if os.environ.get("CHAD_MODEL") or getattr(args, "model", None):
-        sys.stderr.write("[prove pins the validated 9B — CHAD_MODEL and --model are "
+        sys.stderr.write("[prove pins the shipped model — CHAD_MODEL and --model are "
                          "ignored for this run]\n")
-    model_id = cli._HF_9B
+    # Pinned to the shipped default rather than a smaller stand-in: prove exists to
+    # answer "does the thing I am about to run actually work on this machine", and a
+    # smoke test of weights the user will never load cannot answer it. It costs no
+    # extra download in the normal case — this is the model chad was going to fetch.
+    model_id = cli._HF_MODEL
     invoking_dir = os.getcwd()
 
     from huggingface_hub import try_to_load_from_cache
@@ -323,9 +327,9 @@ def run(args):
 
     big_ram_note = None
     ram = cli._detect_ram_gb()
-    if ram is not None and ram >= cli._BIG_RAM_GB:
-        big_ram_note = ("smoke test runs the validated 9B; your machine runs "
-                        "the 35B day-to-day")
+    if ram is not None and ram < cli._MIN_RAM_GB:
+        big_ram_note = (f"{ram:.0f} GB RAM is below the ~{cli._MIN_RAM_GB:.0f} GB chad "
+                        "targets; timings here will be pessimistic")
         sys.stderr.write(f"[{big_ram_note}]\n")
 
     from .engine import Engine
@@ -335,7 +339,7 @@ def run(args):
     eng = Engine(model_id=model_id,
                  cache_dir=os.path.expanduser("~/.cache/chad/kv"))
     sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} "
-                     "[prove: pinned 9B] ...\n")
+                     "[prove: pinned to the shipped model] ...\n")
     try:
         load_s = eng.load()
     except Exception as e:  # noqa: BLE001 — same guidance path as the main CLI

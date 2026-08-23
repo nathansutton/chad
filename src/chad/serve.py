@@ -463,9 +463,9 @@ class ServerState:
             live = cli.ram_aware_ctx_limit(
                 pinned, mx.device_info()["max_recommended_working_set_size"],
                 active_floor, kv_per_token,
-                reserve_gb=cli._env_float("CHAD_CTX_RESERVE_GB") or 1.5,
+                safety=cli._env_float("CHAD_CTX_SAFETY") or 0.975,
                 host_avail_bytes=cli._host_avail_bytes(),
-                slope_factor=cli._env_float("CHAD_CTX_SLOPE_FACTOR") or 1.75,
+                slope_factor=cli._env_float("CHAD_CTX_SLOPE_FACTOR") or 1.0,
                 floor=SAFE_CTX_FLOOR, gen_margin=0)
         except Exception:  # noqa: BLE001 — a guard that can crash is worse than no guard
             live = None

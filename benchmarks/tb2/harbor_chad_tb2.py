@@ -80,6 +80,9 @@ Agent kwargs (--ak key=value):
     chad_disable=<a,b>       comma list subtracted from chad_enable (CHAD_DISABLE) —
                              with chad_enable=all this is the leave-one-out OFF arm.
                              Unknown names fail loudly at startup.
+    chad_max_context=<n>     pin chad's context window (CHAD_MAX_CONTEXT). Unset (default) =
+                             auto: chad reads the server's own /props n_ctx, the wall it
+                             actually enforces. Pin only to run UNDER that wall on purpose.
     chad_project=<path>      chad checkout to upload (default: the repo this file lives in)
     chad_workdir=<dir>       container dir to run chad in (default: auto via `pwd`, else /app)
 """
@@ -118,6 +121,7 @@ class ChadAgent(BaseAgent):
         chad_review_pass: str | bool = False,
         chad_enable: str | None = None,
         chad_disable: str | None = None,
+        chad_max_context: str | int | None = None,
         chad_project: str | None = None,
         chad_workdir: str | None = None,
         **kwargs,
@@ -147,6 +151,11 @@ class ChadAgent(BaseAgent):
         # error at chad startup (by design), so typos fail loudly.
         self._enable = (chad_enable or "").strip()
         self._disable = (chad_disable or "").strip()
+        # Context window: default AUTO. A non-zero CHAD_MAX_CONTEXT pins
+        # CompletionEngine.effective_ctx and skips its /props n_ctx probe, so a pinned
+        # value above the server's -c makes chad compact too late and run into the
+        # server wall instead. Only an explicit kwarg pins it.
+        self._max_context = int(chad_max_context) if chad_max_context not in (None, "") else None
         self._project = chad_project or _REPO_ROOT
         self._workdir = chad_workdir
         self._installed = False
@@ -481,16 +490,15 @@ class ChadAgent(BaseAgent):
             "CHAD_TEMP": self._temp,        # TB2 reference sampling temperature
             "CHAD_MIN_P": self._min_p,      # quant-tail filter; "0" = OFF (default)
             "CHAD_TOP_P": self._top_p,      # nucleus parity; "0" = OFF (default)
-            # Ornith's real window. Without this the remote-backend default is a
-            # conservative 32k, which makes the in-container chad compact at ~30k — and
-            # every client-side
-            # compaction rewrites the transcript, which costs a FULL re-prefill on the
-            # warm-prefix server. The server's own memory clamps bound the KV growth;
-            # the client should use the window (its ctx-limit fallback caps at 120k).
-            "CHAD_MAX_CONTEXT": "262144",
             "PYTHONUNBUFFERED": "1",
             "HOME": home,
         }
+        # Context window is AUTO unless pinned: with CHAD_MAX_CONTEXT unset the llama
+        # backend sizes its window from the server's /props n_ctx (the wall it enforces),
+        # so compaction fires before the server refuses the prompt. The old hardcoded
+        # 262144 was Ornith's window and silently skipped that probe on every server.
+        if self._max_context:
+            env["CHAD_MAX_CONTEXT"] = str(self._max_context)
         if self._enable:
             env["CHAD_ENABLE"] = self._enable
         if self._disable:

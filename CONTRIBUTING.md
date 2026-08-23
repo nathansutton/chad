@@ -44,7 +44,7 @@ Python is 3.11+; dependency and venv management is [uv](https://docs.astral.sh/u
 
 Two areas corrupt more than the line you touched, so lean on the existing tests:
 
-- **`engine.py` and `compaction.py`** — Ornith's hybrid SSM/attention cache is
+- **`engine.py` and `compaction.py`** — the shipped model's hybrid SSM/attention cache is
   **non-trimmable**: any change to the prefix forces a full re-prefill, and a bug here
   corrupts every later turn. Run `test_engine.py` / `test_compaction.py`.
 - **the `run_turn` loop in `agent.py`** — the heart of the agent; guarded by

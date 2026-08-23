@@ -10,6 +10,7 @@ the current contract so a refactor can't drift it.
 Run: `uv run python tests/test_cli.py`
 """
 
+import json
 import os
 
 import pytest
@@ -66,65 +67,70 @@ def test_pick_model_override(monkeypatch):
     # signal, and a shell that exports CHAD_MODEL globally must not pin every run.
     model, _ = cli._pick_model("/flag/model")
     check("--model beats CHAD_MODEL", model == "/flag/model", model)
-    # `--model auto` is the explicit spelling of "ignore the override, use RAM".
+    # `--model auto` is the explicit spelling of "ignore the override, use the default".
     monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    model, why = cli._pick_model("auto")
-    check("auto falls through to the RAM default", model == cli._HF_9B, model)
-
-
-def test_pick_model_aliases(monkeypatch):
-    """`--model 9b` / `--model 35b` are the discoverable spelling of the shipped pair —
-    the point of the flag is that choosing small-or-large needs no repo id."""
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)   # no local build -> HF repos
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 8.0)  # tiny box: alias must win
-    for spec, expect in (("9b", cli._HF_9B), ("35b", cli._HF_35B),
-                         ("9B", cli._HF_9B), ("35B", cli._HF_35B)):
-        model, why = cli._pick_model(spec)
-        check(f"--model {spec} -> shipped repo", model == expect, model)
-        check(f"--model {spec} reason says requested", "requested" in why, why)
-    # Anything not an alias is passed through untouched (HF repo id or local dir).
-    model, _ = cli._pick_model("mlx-community/Whatever-4bit")
-    check("unknown spec passes through", model == "mlx-community/Whatever-4bit", model)
-
-
-def test_pick_model_ram_thresholds(monkeypatch):
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    # No local dirs anywhere -> HF repo ids.
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-
-    # RAM below the big-box threshold -> 9B HF repo (the safe fallback).
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 16.0)
-    model, why = cli._pick_model()
-    check("low RAM -> 9B HF repo", model == cli._HF_9B, model)
-    check("low RAM reason mentions 9B", "9B" in why, why)
-
-    # A 24 GB Mac gets the 35B. It did NOT before the fused attention kernel and the
-    # 8-bit-from-the-start KV cache cut the per-token cost — the floor was 32 GB and a
-    # 24 GB box silently got the small model. This is the case the threshold exists for,
-    # so it is pinned rather than left to the 16/64 pair either side of it.
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 24.0)
-    model, why = cli._pick_model()
-    check("24 GB -> 35B HF repo", model == cli._HF_35B, model)
-
-    # RAM at/above the threshold -> 35B HF repo (the default).
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    model, why = cli._pick_model()
-    check("big RAM -> 35B HF repo", model == cli._HF_35B, model)
-    check("big RAM reason mentions 35B", "35B" in why, why)
+    model, why = cli._pick_model("auto")
+    check("auto falls through to the shipped default", model == cli._HF_MODEL, model)
 
-    # RAM unreadable (None) -> the SAFE smaller model, never a surprise 12 GB
-    # download on unknown hardware (devex review T3: the old fall-through to the
-    # 35B branch contradicted _detect_ram_gb's "safe (smaller) model" contract).
+
+def test_pick_model_no_size_shorthands(monkeypatch):
+    """2.0.0 retired the Ornith pair and with it `--model 35b` / `--model 9b`.
+
+    The shorthands must not silently resolve to anything: they are now ordinary specs,
+    passed through as literal HF repo ids. Pinned because the failure mode of a
+    half-removed alias table is that `--model 9b` quietly loads the *default* model and
+    the user never learns their flag stopped meaning anything.
+    """
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
+    for spec in ("9b", "35b", "27b", "mlx-community/Whatever-4bit"):
+        model, why = cli._pick_model(spec)
+        check(f"--model {spec} passes through literally", model == spec, model)
+        check(f"--model {spec} reason says requested", "requested" in why.lower(), why)
+
+
+def test_pick_model_one_model_every_box(monkeypatch):
+    """One model, whatever the RAM: there is no smaller tier to fall back to."""
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)   # no local build -> HF repo
+    for ram in (16.0, 24.0, 64.0, None):
+        monkeypatch.setattr(cli, "_detect_ram_gb", lambda ram=ram: ram)
+        model, why = cli._pick_model()
+        check(f"RAM {ram} -> the shipped repo", model == cli._HF_MODEL, model)
+        check(f"RAM {ram} reason is a default", "default" in why, why)
+
+
+def test_pick_model_small_box_warns(monkeypatch, capsys):
+    """Below the 24 GB target chad warns and proceeds — it advises, it does not gate.
+
+    Retiring the 9B removed the safe fallback, so this warning is the only thing
+    standing between a 16 GB Mac and a silently unusable context window.
+    """
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 16.0)
+    model, _ = cli._pick_model()
+    err = capsys.readouterr().err
+    check("small box still served", model == cli._HF_MODEL, model)
+    check("small box warns", "below the" in err, err)
+    check("warning names the RAM read", "16 GB" in err, err)
+
+    # RAM unreadable: same warning path, named as undetectable rather than a number.
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: None)
-    model, why = cli._pick_model()
-    check("unknown RAM -> safe 9B HF repo", model == cli._HF_9B, model)
-    check("unknown RAM reason says undetectable", "undetectable" in why, why)
+    cli._pick_model()
+    check("unknown RAM warns 'undetectable'", "undetectable" in capsys.readouterr().err)
+
+    # At/above the target: silent.
+    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 24.0)
+    cli._pick_model()
+    check("24 GB box does not warn", capsys.readouterr().err == "")
 
 
 def test_model_download_gb():
-    check("35B repo -> ~12 GB", cli._model_download_gb(cli._HF_35B) == 12.0)
-    check("9B repo -> ~5 GB", cli._model_download_gb(cli._HF_9B) == 5.0)
+    check("shipped repo -> ~13 GB", cli._model_download_gb(cli._HF_MODEL) == 13.2)
 
 
 def test_free_disk_gb():
@@ -145,11 +151,11 @@ def test_ensure_model_disk_preflight(monkeypatch, capsys):
                         lambda *a, **k: None)
     monkeypatch.setattr(cli, "_free_disk_gb", lambda path: 1.0)
     with pytest.raises(SystemExit) as e:
-        cli._ensure_model(cli._HF_9B)
+        cli._ensure_model(cli._HF_MODEL)
     check("preflight exits 1", e.value.code == 1, e.value.code)
     err = capsys.readouterr().err
     check("names the shortfall", "not enough free disk" in err, err)
-    check("names required space", "~5 GB" in err, err)
+    check("names required space", "~13 GB" in err, err)
     check("points at cache GC", "hf cache" in err, err)
 
 
@@ -165,88 +171,98 @@ def test_ensure_model_disk_preflight_unreadable(monkeypatch):
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda *a: "n")
     with pytest.raises(SystemExit) as e:
-        cli._ensure_model(cli._HF_9B)
+        cli._ensure_model(cli._HF_MODEL)
     # Exit came from the user's "n" at the prompt, not the disk preflight.
     check("unreadable disk does not block", e.value.code == 1, e.value.code)
 
 
+def test_cached_weights_complete(monkeypatch, tmp_path):
+    """The guard must read WEIGHTS, not metadata. An interrupted first download leaves
+    config.json + tokenizer in the snapshot and no tensors; treating that as a cache hit
+    is what sent the load into mlx_lm's `No safetensors found` with no way back."""
+    import huggingface_hub
+    snap = tmp_path / "snapshots" / "abc"
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+    index = snap / "model.safetensors.index.json"
+
+    def fake_cache(repo, filename, **kw):
+        f = snap / filename
+        return str(f) if f.exists() else None
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", fake_cache)
+
+    # metadata only — the exact state a ctrl-c'd first run leaves behind
+    check("metadata alone is not complete",
+          cli._cached_weights_complete("repo/x") is False)
+
+    # sharded, index present but a shard still missing
+    index.write_text(json.dumps({"weight_map": {
+        "a": "model-00001-of-00002.safetensors", "b": "model-00002-of-00002.safetensors"}}))
+    (snap / "model-00001-of-00002.safetensors").write_text("x")
+    check("missing shard is not complete",
+          cli._cached_weights_complete("repo/x") is False)
+
+    (snap / "model-00002-of-00002.safetensors").write_text("x")
+    check("all shards present is complete",
+          cli._cached_weights_complete("repo/x") is True)
+
+    # a corrupt index must re-fetch rather than crash
+    index.write_text("{not json")
+    check("unreadable index is not complete",
+          cli._cached_weights_complete("repo/x") is False)
+
+    # single-file layout
+    index.unlink()
+    (snap / "model.safetensors").write_text("x")
+    check("single-file layout is complete",
+          cli._cached_weights_complete("repo/x") is True)
+
+
+def test_ensure_model_resumes_partial_cache(monkeypatch, capsys):
+    """A partial cache must NOT be reported as a fresh download: the message names the
+    interrupted download, so a re-fetch on a machine that 'already has' the model does
+    not read as a bug."""
+    import huggingface_hub
+    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    # config.json cached, no weights anywhere — the interrupted-download state.
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache",
+                        lambda repo, filename, **kw: "/c/config.json"
+                        if filename == "config.json" else None)
+    monkeypatch.setattr(cli, "_free_disk_gb", lambda path: 500.0)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    with pytest.raises(SystemExit):
+        cli._ensure_model("repo/x")
+    err = capsys.readouterr().err
+    check("names the incomplete cache", "incomplete" in err, err)
+    check("says it resumes", "Resuming" in err, err)
+
+
 def test_pick_model_prefers_local_dir(monkeypatch):
+    # A dev clone that already built the weights uses them instead of re-downloading.
     monkeypatch.delenv("CHAD_MODEL", raising=False)
-
-    # Small box AND the locally-built 9B dir exists -> use the local path, not the repo.
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 16.0)
-    monkeypatch.setattr(os.path, "isdir", lambda p: p == cli._LOCAL_9B)
-    model, _ = cli._pick_model()
-    check("local 9B preferred over HF repo", model == cli._LOCAL_9B, model)
-
-    # Big box AND the locally-built 35B dir exists -> use the local path.
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    monkeypatch.setattr(os.path, "isdir", lambda p: p == cli._LOCAL_35B)
+    monkeypatch.setattr(os.path, "isdir", lambda p: p == cli._LOCAL_MODEL)
     model, _ = cli._pick_model()
-    check("local 35B preferred over HF repo", model == cli._LOCAL_35B, model)
+    check("local build preferred over HF repo", model == cli._LOCAL_MODEL, model)
+    # `--model auto` takes the same path (it means "the default", not "ignore local").
+    model, _ = cli._pick_model("auto")
+    check("auto also prefers the local build", model == cli._LOCAL_MODEL, model)
 
 
 def test_pick_model_flag_auto_ignores_env(monkeypatch):
-    # '--model auto' forces the RAM pick even when CHAD_MODEL is set: the env must NOT
-    # win. Big box + no local dirs -> the 35B default, not the env value.
+    # '--model auto' forces the default even when CHAD_MODEL is set: the env must NOT win.
     monkeypatch.setenv("CHAD_MODEL", "/env/repo")
     monkeypatch.setattr(os.path, "isdir", lambda p: False)
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
     model, why = cli._pick_model("auto")
-    check("--model auto ignores env, RAM-picks 35B", model == cli._HF_35B, model)
+    check("--model auto ignores env", model == cli._HF_MODEL, model)
     check("--model auto reason is a default", "default" in why, why)
 
 
-def test_pick_model_flag_9b_both_ram(monkeypatch, capsys):
-    # Forcing 9B yields 9B on a big box AND a small box, and NEVER warns (9B is always
-    # safe). No local dirs -> HF repo.
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    for ram in (16.0, 64.0):
-        monkeypatch.setattr(cli, "_detect_ram_gb", lambda ram=ram: ram)
-        model, why = cli._pick_model("9b")
-        check(f"--model 9b -> 9B at {ram} GB", model == cli._HF_9B, model)
-        check("--model 9b reason names source", "--model" in why, why)
-    check("forcing 9B never warns", capsys.readouterr().err == "")
-
-
-def test_pick_model_flag_35b_big_no_warn(monkeypatch, capsys):
-    # Forcing 35B on a big box is exactly what the RAM pick would do -> no warning.
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    model, why = cli._pick_model("35b")
-    check("--model 35b -> 35B HF repo", model == cli._HF_35B, model)
-    check("35B on big box does not warn", capsys.readouterr().err == "")
-
-
-def test_pick_model_flag_35b_small_warns(monkeypatch, capsys):
-    # Forcing 35B under the RAM threshold still honors the override BUT warns (2A): the
-    # harness advises, the caller decides.
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 16.0)
-    model, _ = cli._pick_model("35b")
-    check("--model 35b honored on small box", model == cli._HF_35B, model)
-    err = capsys.readouterr().err
-    check("small-box 35B warns", "35b forced" in err, err)
-    check("warning names the OOM risk", "OOM" in err, err)
-
-
-def test_pick_model_flag_35b_ram_none_warns(monkeypatch, capsys):
-    # RAM undetectable + forced 35B: warn (we can't vouch for the memory) and proceed.
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: None)
-    model, _ = cli._pick_model("35b")
-    check("--model 35b honored on unknown RAM", model == cli._HF_35B, model)
-    check("unknown-RAM 35B warns 'undetectable'",
-          "undetectable" in capsys.readouterr().err)
-
-
 def test_pick_model_flag_repo_passthrough(monkeypatch):
-    # A non-alias value is a literal repo id / local dir, passed through unchanged (the
-    # CLI twin of CHAD_MODEL). RAM is irrelevant.
+    # A spec is a literal repo id / local dir, passed through unchanged (the CLI twin of
+    # CHAD_MODEL). RAM is irrelevant.
     monkeypatch.delenv("CHAD_MODEL", raising=False)
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 8.0)
     model, why = cli._pick_model("/some/local/model")
@@ -260,18 +276,9 @@ def test_pick_model_flag_beats_env(monkeypatch):
     monkeypatch.setenv("CHAD_MODEL", "/env/repo")
     monkeypatch.setattr(os.path, "isdir", lambda p: False)
     monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    model, why = cli._pick_model("9b")
-    check("--model beats CHAD_MODEL", model == cli._HF_9B, model)
+    model, why = cli._pick_model("/flag/repo")
+    check("--model beats CHAD_MODEL", model == "/flag/repo", model)
     check("winner reason names --model", "--model" in why, why)
-
-
-def test_pick_model_flag_prefers_local_dir(monkeypatch):
-    # A forced size prefers the locally-built dir, same as the RAM path.
-    monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    monkeypatch.setattr(os.path, "isdir", lambda p: p == cli._LOCAL_35B)
-    model, _ = cli._pick_model("35b")
-    check("forced 35B prefers local dir", model == cli._LOCAL_35B, model)
 
 
 def test_pick_model_default_equals_auto(monkeypatch):
@@ -285,60 +292,96 @@ def test_pick_model_default_equals_auto(monkeypatch):
 
 def test_ram_aware_ctx_limit():
     GB = 1e9
-    # Measured 24 GB M4 Pro numbers: 19.07 GB working set, 12.06 GB resident after
-    # load, 20,578 B/token KV, 262 k window. The divisor is kv × slope_factor (1.75,
-    # the 2026-07-12 ram_safety_check all-in fit: peak grows 35.7 KB/token, not the
-    # KV-only 20.5) — the raw-KV pick of ~175k extrapolated to 102.9% of budget.
-    n = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                reserve_gb=1.5, safety=0.90)
-    check("24GB box: below the window", n < 262144 - 2048, n)
-    check("24GB box: in the safe ~100k range", 90_000 < n < 110_000, n)
-    # The measured worst case (peak ≈ active + 1.0 GB + 35.7 KB/tok × (ctx + 8k gen))
-    # must stay under the working-set budget at the picked trigger.
-    worst = 12.06 * GB + 1.0 * GB + 35_700 * (n + 8192)
-    check("24GB box: worst-case peak under budget", worst < 19.07 * GB, worst / GB)
-    # slope_factor=1.0 recovers the old raw-KV behavior (env override escape hatch).
-    raw = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                  slope_factor=1.0)
-    check("slope_factor=1.0 recovers raw-KV pick", 150_000 < raw < 200_000, raw)
+    # Measured on a 24 GB M4 Pro running the 27B (q3, 8-bit KV, memory clamp on, ONE
+    # load — load/teardown cycling panics the GPU): 19.07 GB Metal working set, 12.329 GB
+    # resident after load, 34,816 B/token KV, 262 k window. Peak memory over ctx:
+    #   8k 14.59 GB | 16k 15.60 | 32k 16.82 | 49k 18.35 | 65k 18.91
+    # The gap between peak and active — the prefill transient — climbs to 4.15 GB by 49k
+    # and is FLAT from there (the adaptive chunker shrinks the chunk as the free band
+    # closes), and past that point peak grows 33,936 B/token against a 34,816 B/token
+    # cache. So the cost model is a fixed transient plus KV at its raw rate, which is
+    # what the governor subtracts and divides by.
+    BUDGET, ACTIVE, KV, TRANSIENT = 19.07 * GB, 12.329 * GB, 34_816, 4.3 * GB
+
+    def peak_at(ctx):
+        """The measured cost model, extrapolated to a candidate trigger."""
+        return ACTIVE + TRANSIENT + KV * ctx
+
+    n = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV)
+    check("27B on 24GB: below the window", n < 262144 - 2048, n)
+    # This is the assertion that keeps the defaults honest: whatever trigger the governor
+    # picks, the measured peak at that trigger must stay inside the Metal budget. It is
+    # the reason `safety` alone cannot be the whole story — the 4.3 GB transient and the
+    # 12.3 GB of weights spend 87% of the budget before the first cached token.
+    check("27B: measured peak at the trigger is under budget", peak_at(n) < BUDGET,
+          peak_at(n) / GB)
+    check("27B: and is not leaving the box idle", peak_at(n) > 0.95 * BUDGET,
+          peak_at(n) / GB)
+
+    # `safety` is the single headroom lever: tightening it strictly shrinks the window,
+    # and it is the ONLY knob that does (the flat reserve_gb it replaced is gone).
+    tighter = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV, safety=0.80)
+    check("tighter safety shrinks window", tighter < n, (tighter, n))
+    check("default safety holds back 2.5%",
+          cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV, safety=0.975) == n)
+
+    # The transient is a FIXED subtraction, not a per-token slope. A model that ignores
+    # it (transient_bytes=0) over-picks by exactly its worth in tokens, which on this box
+    # is the difference between 97% of budget and walking over the wall.
+    blind = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV, transient_bytes=0)
+    check("ignoring the transient over-picks", blind > n, (blind, n))
+    check("...and that over-pick busts the budget", peak_at(blind) > BUDGET,
+          peak_at(blind) / GB)
+    check("transient costs exactly its worth in tokens",
+          abs((blind - n) - TRANSIENT / KV) <= 1, (blind - n, TRANSIENT / KV))
 
     # Tight box (less working set) compacts sooner — strictly smaller window.
-    tight = cli.ram_aware_ctx_limit(262144, 10.0 * GB, 8.0 * GB, 20578)
+    tight = cli.ram_aware_ctx_limit(262144, 10.0 * GB, 8.0 * GB, KV)
     check("tight box compacts sooner", tight < n, (tight, n))
 
     # Huge box is capped at the model window minus the gen margin, never above it.
-    huge = cli.ram_aware_ctx_limit(262144, 400.0 * GB, 12.0 * GB, 20578)
+    huge = cli.ram_aware_ctx_limit(262144, 400.0 * GB, ACTIVE, KV)
     check("huge box capped at window-margin", huge == 262144 - 2048, huge)
 
     # Degenerate inputs -> None so the caller keeps the old fixed cap.
     check("no KV cost -> None", cli.ram_aware_ctx_limit(262144, 19 * GB, 12 * GB, 0) is None)
-    check("no budget -> None", cli.ram_aware_ctx_limit(262144, 0, 12 * GB, 20578) is None)
-
-    # Reserve eats into the budget: a bigger scratch reserve -> a smaller window.
-    big_reserve = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                          reserve_gb=4.0)
-    check("bigger reserve shrinks window", big_reserve < n, (big_reserve, n))
+    check("no budget -> None", cli.ram_aware_ctx_limit(262144, 0, 12 * GB, KV) is None)
 
     # Over-subscribed (model already past the safe budget) -> floor, never negative.
-    floored = cli.ram_aware_ctx_limit(262144, 14 * GB, 18 * GB, 20578)
+    floored = cli.ram_aware_ctx_limit(262144, 14 * GB, 18 * GB, KV)
     check("over-subscribed -> floor", floored == 8192, floored)
 
     # Host physical pressure: when the host's reclaimable band is
     # tighter than the Metal band, IT binds — Docker/harbor pressure the Metal
     # budget cannot see must shrink the window.
-    baseline = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578)
-    pressured = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                        host_avail_bytes=3.0 * GB)
-    check("tight host band binds below the Metal band", pressured < baseline,
-          (pressured, baseline))
+    pressured = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
+                                        host_avail_bytes=1.5 * GB)
+    check("tight host band binds below the Metal band", pressured < n, (pressured, n))
     check("tight host band still floored, never negative",
-          cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                  host_avail_bytes=0.5 * GB) == 8192)
+          cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
+                                  host_avail_bytes=0.02 * GB) == 8192)
     # A roomy host band changes nothing — the Metal band stays the binding one.
-    roomy = cli.ram_aware_ctx_limit(262144, 19.07 * GB, 12.06 * GB, 20578,
-                                    host_avail_bytes=200 * GB)
-    check("roomy host band leaves the Metal result", roomy == baseline,
-          (roomy, baseline))
+    roomy = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV, host_avail_bytes=200 * GB)
+    check("roomy host band leaves the Metal result", roomy == n, (roomy, n))
+
+
+def test_host_band_is_a_guard_not_the_primary_constraint():
+    GB = 1e9
+    BUDGET, ACTIVE, KV = 19.07 * GB, 12.329 * GB, 34_816
+    metal = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV)
+    # Measured right after a 12.3 GB load the reclaimable band reads 3.9 GB — the weights
+    # took it and nothing has been reclaimed yet. The host branch must NOT bind there:
+    # it is a soft pressure signal the OS compresses around, so it sizes the resident KV
+    # cache only and never charges the short-lived prefill transient against it. Charging
+    # it there put a box with room to spare on the 8192 floor.
+    just_loaded = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
+                                          host_avail_bytes=3.936 * GB)
+    check("band right after load does not bind", just_loaded == metal,
+          (just_loaded, metal))
+    # It still bites when the box is genuinely oversubscribed by another process.
+    squeezed = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
+                                       host_avail_bytes=1.2 * GB)
+    check("real pressure still binds", squeezed < metal, (squeezed, metal))
 
 
 def test_host_avail_bytes():
@@ -413,6 +456,7 @@ def test_home_dir_note_absent_in_project(monkeypatch, capsys):
 
 if __name__ == "__main__":
     test_ram_aware_ctx_limit()
+    test_host_band_is_a_guard_not_the_primary_constraint()
     with pytest.MonkeyPatch.context() as mp:
         test_env_float(mp)
     with pytest.MonkeyPatch.context() as mp:
@@ -420,7 +464,9 @@ if __name__ == "__main__":
     with pytest.MonkeyPatch.context() as mp:
         test_pick_model_override(mp)
     with pytest.MonkeyPatch.context() as mp:
-        test_pick_model_ram_thresholds(mp)
+        test_pick_model_one_model_every_box(mp)
+    with pytest.MonkeyPatch.context() as mp:
+        test_pick_model_no_size_shorthands(mp)
     with pytest.MonkeyPatch.context() as mp:
         test_pick_model_prefers_local_dir(mp)
     with pytest.MonkeyPatch.context() as mp:
@@ -544,3 +590,23 @@ def test_backend_failure_reports_problem_cause_fix(capsys):
     check("names the unreachable url", "http://10.0.0.5:8081" in out, out)
     check("offers a fix", "fix:" in out, out)
     check("no traceback", "Traceback" not in out, out)
+
+
+# --- DFlash2 drafter consent/download (rides _ensure_model) ---------------------
+
+def test_drafter_bundle_resolution(monkeypatch, tmp_path):
+    """The drafter ships INSIDE the weights dir: found when `dflash/` is there,
+    None when it isn't (decode runs serial, no download), and CHAD_DFLASH_PATH
+    overrides both."""
+    from chad import mlx_dflash
+    monkeypatch.delenv("CHAD_DFLASH_PATH", raising=False)
+    mdir = tmp_path / "model"
+    mdir.mkdir(parents=True)
+    check("no bundle -> None", mlx_dflash.bundle_dir(str(mdir)) is None)
+    bundle = mdir / "dflash"
+    bundle.mkdir()
+    (bundle / "config.json").write_text("{}")
+    check("bundle found", mlx_dflash.bundle_dir(str(mdir)) == str(bundle))
+    monkeypatch.setenv("CHAD_DFLASH_PATH", str(tmp_path / "elsewhere"))
+    check("env overrides the bundle",
+          mlx_dflash.bundle_dir(str(mdir)) == str(tmp_path / "elsewhere"))

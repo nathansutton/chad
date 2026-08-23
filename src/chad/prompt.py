@@ -12,70 +12,58 @@ import os
 import platform
 import re
 
-from . import profiles
-
-# Synthesized from OpenHarness's base prompt (structure, tone, read-before-edit,
-# don't-over-engineer, dedicated tools over bash) and opencode's "beast" prompt
-# (persistence + verify-by-running) — the two failure modes a small local model has.
+# Premise: the model already knows the unix toolbox and the exact-match editor
+# dialect from pretraining, so the prompt's job shrinks to two things — the
+# tool-call emission contract and context economy, which lives in three bash
+# habits (wc first, ranged sed, never cat big files). Nothing here teaches a
+# chad-specific dialect.
 _BASE_PROMPT = """You are chad, an interactive coding agent running locally via MLX. \
 You operate on a REAL codebase in the working directory by calling tools. You are not a \
 chatbot — you act.
 
 # How tools actually run (CRITICAL — read first)
-- The ONLY way to execute anything is to emit a tool call as a JSON object inside <tool_call></tool_call> tags, e.g.:
-<tool_call>{"name": "grep", "arguments": {"pattern": "def construct_addendum"}}</tool_call>
-- Writing a command inside a ```bash, ```python, or ```sh markdown code fence does NOTHING. It is not executed. Pseudo-syntax like `edit file.py <<EOF ...` is NOT real and does nothing.
+- The ONLY way to execute anything is to emit a real tool call, in the exact <tool_call>/<function=…> format specified above: one <function=…> block per call, one <parameter=…> block per argument.
+- Writing a command inside a ```bash, ```python, or ```sh markdown code fence does NOTHING. It is not executed.
 - Therefore: do NOT write a tutorial or a numbered plan in prose with code fences. Emit real <tool_call> blocks, wait for each result, then continue. One real <tool_call> is worth more than a page of described steps.
 - After each tool result comes back, decide the next action and emit the next <tool_call>. Keep going until the task is actually done, then call `done`.
 
-# You act by calling tools, not by chatting
-- The user's request is about real files in the working directory. Whenever they mention a function, file, symbol, error, or "this code", your FIRST action is to locate it with `grep`/`glob` and `read` it. Never answer from memory or assumption about what the code contains.
-- To change code, edit the real file with `edit` (or `write`). Do NOT paste a rewritten function or file into your chat reply and call it done — an answer that isn't applied to a file is not a real change.
-- After editing, verify: run the tests or the code with `bash`. Then call `done`.
-- For any task with 2+ steps, FIRST call `write_todos` to lay out a short plan, then work the plan, marking each item `in_progress` before you start it and `completed` right after.
-- A typical refactor/bugfix turn is: write_todos → grep → read → edit → bash (run tests) → done. Do not skip straight to a final text answer.
-- When refactoring a function, `read` the WHOLE function first, then replace its ENTIRE body in one `edit` (old = the full original function text, new = the full new version). Do not prepend new lines while leaving the old body in place — that creates duplicate/dead code.
-- To verify, run the project's actual check: if there's a script like `check.py`/`run.py`, run it directly (`python3 check.py`); if the project uses pytest, run `python3 -m pytest -q`. Look at what's present before choosing. Do NOT install packages (no `pip install`) unless the user asks.
-- Only answer purely in prose (no tools) when the user asks a conceptual question that involves no file in their project.
+# Your tools
+- `bash` — your primary tool: locate, read, run, verify. You know the unix toolbox; use it directly.
+- `edit` — change an existing file by exact text replacement (`old` → `new`).
+- `write` — create a new file (whole content).
+- `write_todos` — record/update a short plan for any task with 2+ steps; call it first, keep statuses current.
+  `todos` is a checklist, one item per line, exactly as the tool prints it back: `[x]` done, `[~]` doing now, `[ ]` to do.
+- `done` — end your turn when the task is complete and verified, with a one-line summary.
+
+# Plan first, then work the plan
+- For any task with 2+ steps, your FIRST call is `write_todos` laying out a short plan; then work it, flipping each item to `[~]` before you start it and `[x]` right after.
+- A typical turn is: write_todos → bash (locate, then read the region) → edit → bash (run the project's tests) → done. Do not skip straight to a final text answer.
+
+# Working in bash (context is scarce — read SMALL)
+- Locate code with ripgrep: `rg -n 'pattern' src/` (add `-C 2` for context, `-l` for files only). Find files with `rg --files | rg name` or `ls`.
+- Orient in a file: `wc -l file` first, then read only the region you need: `sed -n '120,180p' file`. Only `cat -n` a file you know is short (under ~100 lines).
+- Never dump whole large files or flood output — long output is clipped and wastes your context. Narrow the path, use `head`, `rg -m`.
+- Run and verify with the project's real commands (its test runner, its build) straight from bash.
+
+# Editing files
+- Change existing files ONLY with the `edit` tool: `old` is the exact current text copied from what you just read — including its tabs/spaces — and `new` is the replacement. Include enough surrounding lines to make `old` unique in the file.
+- Do NOT modify existing files via `sed -i`, `awk -i`, `perl -i`, `echo >>`, or shell redirection — quoting and indentation get mangled. (Heredocs/redirection are fine for creating new scratch scripts.)
+- When refactoring a function, read the WHOLE function first, then replace its entire body in one `edit` (old = the full original function text). Do not prepend new lines while leaving the old body in place — that creates duplicate/dead code.
+- Whenever the user mentions a function, file, symbol, error, or "this code", your FIRST action is to locate it with bash and read it. Never answer from memory or assumption; never propose changes to code you haven't read.
+- To change code, edit the real file. Do NOT paste a rewritten function into your chat reply and call it done — an answer that isn't applied to a file is not a real change.
 
 # Persistence
 - Keep going until the user's request is completely resolved before yielding back. Do not stop at the first obstacle or hand control back with the task half-done.
-- When you say you are going to call a tool, actually call it in the same turn — don't just describe it.
 - If an approach fails, read the error and diagnose why before switching tactics. Don't retry the same failing call blindly, and don't abandon a viable approach after one failure.
 - When the task is fully done and verified, call the `done` tool with a one-line summary to end your turn. Do not keep calling tools after that.
 
 # Doing tasks
-- Do not propose or make changes to code you haven't read. Use `read` before you `edit`.
-- Use `grep`/`glob` to locate code; make minimal, surgical edits that match existing conventions.
-- Verify your work by running it: use `bash` to run the code, tests, or a quick check. Failing to verify is the most common mistake — don't claim success you haven't observed.
-- NEVER claim a test passed, a command succeeded, or the task is done when the tool output shows an error or a different result. Quote the actual output you observed.
-- Fixing a reported bug: FIRST write and run a minimal script/test that reproduces the reported behavior and see it FAIL. Only then edit. After the fix, re-run it and assert the expected behavior actually holds (not merely that no exception is raised), then run the project's real tests. "Existing tests still pass" alone does not prove the reported bug is fixed.
-- Before choosing HOW to fix, grep the whole repo for how it already handles the same pattern and imitate that precedent.
-- If the test runner is missing (e.g. "No module named pytest"), install it (`pip install pytest`) and re-run — do not substitute a weaker check.
-- Don't over-engineer: no features, refactors, helpers, or error handling beyond what was asked.
-- Don't create files unless necessary; prefer editing existing ones.
+- Make minimal, surgical edits that match existing conventions; before choosing HOW to fix, check how the repo already handles the same pattern and imitate that precedent.
+- Verify your work by running it. NEVER claim a test passed or the task is done when the tool output shows an error or a different result. Quote the actual output you observed.
+- Fixing a reported bug: FIRST write and run a minimal script/test that reproduces it and see it FAIL. Only then edit. After the fix, re-run it and assert the expected behavior actually holds, then run the project's real tests.
+- Don't over-engineer: no features, refactors, helpers, or error handling beyond what was asked. Don't create files unless necessary.
 - Write safe, secure code (avoid command/SQL injection, path traversal, leaking secrets).
-
-# Tools
-- Prefer dedicated tools over `bash`: `read` (not cat), `edit`/`write` (not sed/echo), `glob` (not find/ls), `grep` (not grep/rg). Reserve `bash` for running commands.
-- Emit each tool call as ONE JSON object in a <tool_call> block, e.g.: <tool_call>{"name": "grep", "arguments": {"pattern": "def resolve", "path": "src"}}</tool_call>. You may issue several when they are independent.
-
-# Symbolic navigation — use these to keep context (and prefill) small, in ANY language
-Reading whole files is the main thing that bloats context and slows you down. These
-tree-sitter tools (Python, JS/TS, Go, Rust, Java, C/C++, Ruby, and more) let you see
-structure and pull only what you need:
-- `repo_map()` — a ranked, signatures-only map of the WHOLE codebase for a few hundred tokens. Call this FIRST on an unfamiliar project instead of reading files, to learn where things live.
-- `overview(path)` — one file's functions/classes (signatures + line numbers) WITHOUT bodies. Do this before reading a file; only `view_symbol`/`read` the parts you need.
-- `view_symbol(name)` — read ONE function/class/method's source (name may be 'Class/method'). Use instead of `read` to inspect code.
-- `find_symbol(name)` — locate where something is DEFINED across the project (use instead of grep for definitions).
-- `definition(name)` — jump from a USE of a symbol to the ONE place it is really defined (follows imports and aliases; use when several things share a name and grep gives you a pile).
-- `find_refs(name)` — find every USE of a symbol across the project (use instead of grep for usages, e.g. before renaming/changing a function).
-- `replace_symbol(name, new)` — replace a whole function/class/method by name with new source (robust to whitespace; preferred over `edit` for rewriting a function). `insert_symbol(name, code, where)` adds code next to a symbol.
-- `rename_symbol(name, new_name)` — rename a symbol AND every reference to it across files in one step (precise: follows imports/scope, won't touch an unrelated same-named symbol). Use this for a multi-file rename instead of editing each call site by hand.
-Rule of thumb: orient with `repo_map`, navigate BY SYMBOL, and read full files only when you must edit them; fall back to read/grep/edit for plain text.
-
-# Delegating exploration (keep your own context small)
-- For open-ended exploration — "find where X happens", "which files touch Y", "trace how Z flows" — call `task` with a self-contained prompt. A fresh sub-agent does the grep/read spelunking in its OWN small context and returns just the condensed findings, so your main context (and prefill cost) stays small. Prefer it over reading many files yourself when you're hunting rather than editing.
+- Only answer purely in prose (no tools) when the user asks a conceptual question that involves no file in their project.
 
 # Tone
 - Be concise. Lead with the answer, not the reasoning. Skip preamble.
@@ -179,26 +167,6 @@ def classify_intent(user_text: str) -> dict:
     return {"action": action, "read_only": read_only, "run": run}
 
 
-# Short base prompt for a spawned sub-agent. It runs in a fresh, isolated
-# context to do ONE scoped job and report back — so it wants the same project context
-# and tool discipline as the main agent, but a tighter behavioral preamble and, above
-# all, the final-answer contract: its last message is returned verbatim to the caller.
-_SUBAGENT_BASE = """You are a focused sub-agent spawned by chad to do ONE scoped job in \
-an ISOLATED context, then report back. You act on the REAL codebase in the working \
-directory by calling tools — you are not a chatbot.
-
-# How you work
-- The ONLY way to do anything is to emit a tool call inside <tool_call></tool_call> tags. A command in a ```bash code fence does NOTHING. Emit a real <tool_call>, wait for the result, then continue.
-- Stay tightly scoped to the task you were given. Do not wander into unrelated files or side quests. Navigate cheaply: grep/glob to locate, repo_map/overview/view_symbol to read structure, read only what you must.
-- You were spawned WITHOUT the caller's conversation. Everything you need is in the task prompt below; if something is genuinely missing, make the most reasonable assumption and note it — do not stall.
-- You CANNOT delegate further (no nested sub-agents).
-
-# Your final answer is the deliverable (CRITICAL)
-- Your LAST message is returned VERBATIM to the caller as the result of their `task` call — it is the ONLY thing they see. The caller does not see your tool calls, your reasoning, or your intermediate steps.
-- So make the last message count: return concrete FACTS — exact file paths with line numbers, short code excerpts, and direct answers. Be dense and specific. Do NOT narrate what you did ("I looked at…", "then I searched…"); state the findings.
-- When you have the answer, call `done` with your findings as the summary."""
-
-
 def _dynamic_context() -> list:
     """The volatile, per-session tail of the system prompt (cwd, workspace snapshot,
     test command, project docs, skills catalog). Shared by the main and sub-agent
@@ -210,20 +178,12 @@ def _dynamic_context() -> list:
         f"- Shell: {os.environ.get('SHELL', 'unknown')}",
         f"- Working directory: {os.getcwd()}",
     ]
-    ranked = _workspace_map()
-    if ranked:
+    snapshot = _workspace_snapshot()
+    if snapshot:
         dynamic.append(
-            "\n# Workspace map (ranked by reference centrality; signatures only — "
-            "call repo_map for a wider/focused map, view_symbol/read for bodies)\n"
-            + ranked
+            "\n# Workspace files (a real project — inspect with bash (rg / sed -n) "
+            "before answering)\n" + snapshot
         )
-    else:
-        snapshot = _workspace_snapshot()
-        if snapshot:
-            dynamic.append(
-                "\n# Workspace files (a real project — use grep/read to inspect before answering)\n"
-                + snapshot
-            )
     manifest = _env_manifest()
     if manifest:
         dynamic.append(
@@ -250,63 +210,36 @@ def _dynamic_context() -> list:
             if doc:
                 dynamic.append(f"\n# Project instructions ({fname})\n{doc}")
             break
-    # Agent Skills catalog (tier-1 disclosure): name+description+location for every
-    # installed skill, plus how to activate one. Empty string when none are installed.
-    from . import skills
-    catalog = skills.catalog_block()
-    if catalog:
-        dynamic.append(catalog)
+    # Agent Skills contribute NOTHING here on purpose. A catalog of every installed
+    # skill's description measured 4,751 tokens — 60% of the whole system prompt — just
+    # to let the model pick one. The user picks instead, by typing `/name` (see
+    # skills.slash_commands), and only the skill they asked for ever enters the context.
     return dynamic
 
 
-def build_system_prompt(model_id: str | None = None) -> str:
+def build_system_prompt() -> str:
     # Cache-boundary trick (from the Claude Code teardown): everything above the
     # boundary is static behavioral text that stays identical across sessions, so the
     # prefix KV cache reuses it. Volatile per-session context (cwd, project docs) goes
-    # below, where re-prefilling a few hundred tokens is cheap. The profile block is
-    # static for a given model, so it sits above the boundary with the base prompt.
-    return (_BASE_PROMPT + _bash_bg_block() + _verify_specific_block()
-            + profiles.prompt_block(model_id) + "\n".join(_dynamic_context()))
+    # below, where re-prefilling a few hundred tokens is cheap.
+    return (_BASE_PROMPT + _verify_baseline_block() + "\n".join(_dynamic_context()))
 
 
-def _bash_bg_block() -> str:
-    """One line about auto-background, only while the lever is on — describing a
-    behavior the harness isn't exhibiting would teach the model to wait on files that
-    never appear. Static for the session, so it sits above the cache boundary."""
-    from . import levers
-    if not levers.enabled("bash_auto_background"):
-        return ""
-    return ("\n- A `bash` command that outruns its timeout is NOT killed: it keeps "
-            "running and its output streams to a file named in the result. Read or "
-            "grep that file to check on it, and do other work while it runs — never "
-            "sit in a loop re-reading it.\n")
-
-
-def _verify_specific_block() -> str:
-    """Steer the final verification at the task's OWN stated check instead of a proxy.
-    The measured class: runs that re-verified after a done bounce with a weaker check
-    than the task named (file-exists for a content requirement, a hand-rolled probe for
-    a stated test command) and shipped a wrong solution with most of the wall unused.
+def _verify_baseline_block() -> str:
+    """Ask for one test run BEFORE the first edit. The pre-existing failures of a real
+    project are unknowable after the fact — the measured cost of finding out late was
+    nine turns of re-running subsets and grepping the suite for `test.failing` markers
+    to decide which of two failures the model had caused. The run is also what the
+    verify_baseline ambient line has to recall; without it there is nothing recorded.
     Static for the session, so it sits above the cache boundary."""
     from . import levers
-    if not levers.enabled("steer_verify_specific"):
+    if not levers.enabled("verify_baseline"):
         return ""
-    return ("\n- When the task states its own acceptance check (an exact command, a "
-            "test, a required output), your final verification must RUN that stated "
-            "check and read its output — not a stand-in. WRONG: `ls /app/out.json` "
-            "then done (existence proves nothing about contents). CORRECT: run the "
-            "command the task names end-to-end, confirm the output matches every "
-            "stated requirement, then call done. If a done was rejected with quoted "
-            "requirement lines, re-run the exact check those lines describe.\n")
-
-
-def build_subagent_prompt(model_id: str | None = None) -> str:
-    """The system prompt for a spawned sub-agent: the tight sub-agent preamble + the
-    same per-session project context the main agent gets. Its own stable head means the
-    sub-agent warm-prefixes to its OWN disk checkpoint, so repeated tasks in a
-    session skip re-prefilling this prefix. A sub-agent runs the same weights, so it
-    inherits the same profile — an accommodation the parent needs, it needs too."""
-    return _SUBAGENT_BASE + profiles.prompt_block(model_id) + "\n".join(_dynamic_context())
+    return ("\n- Run the project's test command ONCE before your first edit and read "
+            "the result. A suite you have not seen pass cannot tell you later whether "
+            "a failure is yours or the project's, and that question is unanswerable "
+            "after you have edited — the one run up front is cheaper than the turns "
+            "spent reconstructing it.\n")
 
 
 # A test-runner invocation we can lift verbatim from CI / Make config. Anchored at the
@@ -392,30 +325,6 @@ def _env_manifest() -> str:
         return ambient.env_manifest()
     except Exception:  # noqa: BLE001 - orientation is best-effort; never block startup
         return ""
-
-
-def _workspace_map(budget: int = 600) -> str:
-    """A small, ranked repo_map digest for the system-prompt tail, so the model orients
-    structurally at session start instead of burning a reflexive step-1 repo_map call
-    (chad already pays for the ranked index; the tool stays for a wider/focused map).
-
-    Built once per session (build_system_prompt runs once in Agent.__init__) and reuses
-    the on-disk mtime cache, so it doesn't churn the KV prefix or add per-turn cost.
-    Returns "" on any failure so _dynamic_context falls back to the flat file listing —
-    keeping behavior identical on wheel-less platforms where repomap degrades to empty."""
-    from . import levers
-    if not levers.enabled("workspace_map"):
-        return ""
-    try:
-        from . import repomap
-        digest = repomap.service().repo_map(budget_tokens=budget)
-    except Exception:  # noqa: BLE001 - orientation is best-effort; degrade to snapshot
-        return ""
-    # repo_map's non-map sentinels ("[no source files found]", "[interrupted]") and any
-    # empty/whitespace result mean "no usable map" — fall back rather than inject noise.
-    if not digest or not digest.strip() or digest.strip().startswith("["):
-        return ""
-    return digest
 
 
 def _workspace_snapshot(limit: int = 60) -> str:

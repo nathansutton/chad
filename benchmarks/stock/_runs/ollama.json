@@ -1,0 +1,11 @@
+{
+  "engine": "ollama",
+  "version": "ollama version is 0.32.15",
+  "model": "Qwen3.8-27B-UD-Q3_K_XL.gguf (Modelfile: FROM only)",
+  "prompt_tokens": 515,
+  "gen_tokens": 128,
+  "prefill_tps": 96.3,
+  "decode_tps": 10.9,
+  "reps": 3,
+  "flags": "num_ctx 2048, temperature 0, otherwise Ollama defaults"
+}

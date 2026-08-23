@@ -15,21 +15,11 @@ if _SRC not in sys.path:
 
 
 @pytest.fixture(autouse=True)
-def _levers_all_on(monkeypatch):
-    """Levers default OFF (1.10.0), but the suite runs with everything ON so each
-    lever's behavior tests keep exercising their code paths without 40 per-file env
-    preambles. The shipped bare default is asserted explicitly in test_levers.py,
-    which removes this env var. Per-test CHAD_DISABLE monkeypatches still subtract
-    from this, so leave-one-out style tests are unaffected."""
-    monkeypatch.setenv("CHAD_ENABLE", "all")
-
-
-@pytest.fixture(autouse=True)
 def _checkpoint_tmpdir(tmp_path, monkeypatch):
     """Point edit-checkpoint shadow repos (checkpoint._history_root) at a per-test
-    tmp dir. The suite runs CHAD_ENABLE=all, so any test that drives run_turn
-    through a file-mutating tool takes a real snapshot — of the pytest CWD, into
-    the developer's ~/.chad, at ~300ms per shot — unless redirected here."""
+    tmp dir. Any test that drives run_turn through a file-mutating tool takes a
+    real snapshot — of the pytest CWD, into the developer's ~/.chad, at ~300ms
+    per shot — unless redirected here."""
     monkeypatch.setenv("CHAD_CHECKPOINT_DIR", str(tmp_path / "checkpoints"))
 
 
@@ -44,9 +34,9 @@ def _spill_tmpdir(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _fresh_ambient(monkeypatch):
     """Isolate ambient session state between tests, and stub the
-    env-manifest builder: with the suite's CHAD_ENABLE=all, every Agent/prompt
-    construction would otherwise spawn a dozen real `--version` subprocesses per
-    test. test_ambient.py un-stubs it explicitly to test the real builder."""
+    env-manifest builder: every Agent/prompt construction would otherwise spawn
+    a dozen real `--version` subprocesses per test. test_ambient.py un-stubs it
+    explicitly to test the real builder."""
     from chad import ambient
     ambient.reset()
     monkeypatch.setattr(ambient, "_build_manifest",
@@ -55,12 +45,4 @@ def _fresh_ambient(monkeypatch):
     ambient.reset()
 
 
-@pytest.fixture(autouse=True)
-def _fresh_file_seen():
-    """Isolate the per-session freshness bookkeeping (tools._FILE_SEEN)
-    between tests — a leftover seen-hash from one test must not make another test's
-    line edit look stale."""
-    from chad import tools
-    tools._FILE_SEEN.clear()
-    yield
-    tools._FILE_SEEN.clear()
+

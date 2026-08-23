@@ -18,9 +18,18 @@ Mirrors the fake-engine style of test_completion_engine.py; hermetic via `tmp_pa
 """
 
 import json
+import shlex
+import sys
 
+from chad import tools
 from chad.agent import Agent
 from chad.base_engine import BaseEngine, GenStats
+
+# The interpreter running the tests, not whatever `python` PATH happens to hold.
+# A bare `python` does not exist on a stock macOS (only `python3`), so these bash
+# steps exited 127 and the scripted engine ran dry — a launcher-dependent failure
+# that looked like a loop bug.
+PY = shlex.quote(sys.executable)
 
 
 class _FakeTok:
@@ -132,16 +141,13 @@ def test_template_ids_unwraps_batchencoding():
 # --- Step 3: drive a multi-step task end to end ------------------------------
 
 def test_agent_loop_writes_file_reads_it_back_then_terminates(tmp_path, monkeypatch):
-    """write → read → done: two real tool dispatches through a real run_turn, a real
+    """write → bash → done: two real tool dispatches through a real run_turn, a real
     filesystem effect, and clean termination (no spin to max_steps)."""
-    # This test is about the loop's parse→dispatch→terminate spine, not the
-    # deliverable recheck (which would defer the first done); disable that lever here.
-    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck,done_audit")
     target = tmp_path / "note.txt"       # .txt: a doc write, so no verify-before-done nudge
     body = "hello from the scripted loop\n"
     script = [
         _tool_call("write", path=str(target), content=body),
-        _tool_call("read", path=str(target)),
+        _tool_call("bash", command="cat " + str(target)),
         _tool_call("done", summary="wrote and read back the file"),
     ]
     agent = _agent(script, max_steps=10)
@@ -153,112 +159,12 @@ def test_agent_loop_writes_file_reads_it_back_then_terminates(tmp_path, monkeypa
     assert target.read_text() == body
     # the loop fed the tool results back as role:"tool" turns (parse→dispatch→feed-back)
     tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
-    assert [m["name"] for m in tool_turns] == ["write", "read"]
+    assert [m["name"] for m in tool_turns] == ["write", "bash"]
     assert tool_turns[0]["content"].startswith("[wrote")
-    assert body.strip() in tool_turns[1]["content"]   # `read` observed what `write` wrote
+    assert body.strip() in tool_turns[1]["content"]   # bash observed what `write` wrote
     # the loop terminated on `done` — it did not run out of steps or drain the script
     assert result == "wrote and read back the file"
     assert agent.engine._i == len(script)
-
-
-def test_done_spec_recheck_defers_first_done_then_accepts(tmp_path, monkeypatch):
-    """Iter-3: the first `done` of an action turn is deferred once for a deliverable
-    recheck (the hidden container-verifier gives no second chance), then the next `done`
-    is accepted. A real code write makes it an action turn (not read-only). The
-    done-audit supersedes the recheck while enabled, so it is disabled here to reach
-    the recheck path."""
-    monkeypatch.setenv("CHAD_DISABLE", "done_audit")
-    f = tmp_path / "out.py"
-    script = [
-        _tool_call("write", path=str(f), content="print('hi')\n"),
-        _tool_call("bash", command=f"python {f}"),          # verify -> clears unverified
-        _tool_call("done", summary="first done"),           # deferred for recheck
-        _tool_call("done", summary="rechecked and complete"),  # accepted
-    ]
-    agent = _agent(script, max_steps=10)
-
-    result = agent.run_turn("write out.py that prints hi")
-
-    assert result == "rechecked and complete"
-    assert agent.engine._i == len(script)   # the recheck consumed the second done
-    # the recheck message was injected exactly once, as a role:"tool" done turn
-    recheck_turns = [m for m in agent.messages
-                     if m.get("role") == "tool" and m.get("name") == "done"
-                     and "every concrete deliverable" in m.get("content", "")]
-    assert len(recheck_turns) == 1
-
-
-def test_wrapup_window_injects_one_steer_in_final_stretch(tmp_path, monkeypatch):
-    """With a wall budget set, a productive-but-slow turn (a change lands +
-    verifies in each budget band, so the governor never hard-stops) gets exactly ONE
-    wrap-up steer injected once its wall clock enters the final stretch. Fake clock
-    (advanced per generate) drives the timing; assert the steer lands in the transcript
-    exactly once. The recheck lever is disabled so the single `done` terminates cleanly."""
-    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck,done_audit")
-    m = tmp_path / "m.py"
-    # turn_budget_s=1000 -> wrap-up threshold = max(120, 0.15*1000) = 150s remaining.
-    # Clock read at each step's governor check (BEFORE that step's generate):
-    #   step0: 0    (band 0, no governor, no wrap)
-    #   step1: 600  (crossing into band 1 — suppressed by step0's landed edit)
-    #   step2: 870  (crossing into band 2 — suppressed by step1's verify — AND inside the
-    #                wrap-up window: remaining 130 <= 150, so the steer fires here)
-    schedule = [600.0, 870.0, 870.0]   # clock value set AFTER generate #1, #2, #3
-    clock = {"now": 0.0}
-    monkeypatch.setattr("chad.agent.time.monotonic", lambda: clock["now"])
-
-    class ClockEngine(ScriptedEngine):
-        def generate(self, *a, **kw):
-            out = super().generate(*a, **kw)
-            i = self._i - 1
-            if i < len(schedule):
-                clock["now"] = schedule[i]
-            return out
-
-    script = [
-        _tool_call("write", path=str(m), content="x = 1\n"),   # step0: land an edit
-        _tool_call("bash", command=f"python3 {m}"),            # step1: verify -> progress
-        _tool_call("done", summary="done"),                    # step2: after the wrap-up fires
-    ]
-    agent = Agent(ClockEngine(script), mode="yolo", thinking=False, turn_budget_s=1000.0)
-    agent.run_turn("do the thing")
-
-    steers = [msg for msg in agent.messages
-              if msg.get("name") == "steer" and "force-stopped" in msg.get("content", "")]
-    assert len(steers) == 1, f"expected exactly one wrap-up steer, got {len(steers)}"
-    assert "STOP exploring" in steers[0]["content"]
-    assert agent.engine._i == len(script)   # the turn terminated on `done`, no spin
-
-
-def test_done_spec_recheck_spiral_is_capped(tmp_path, monkeypatch):
-    """If the deliverable recheck drives repeated post-recheck edits (the
-    model re-'fixing' already-correct output into a thrash), the turn stops and keeps
-    the result instead of spiralling — the poly_two_bucket regression (3 edits / 16k
-    gen tokens / 621s after the recheck on an answer that already passed the verify
-    gate). With RECHECK_MAX_FIX_EDITS=2, the 3rd post-recheck landed edit ends it.
-    done_audit is disabled (it supersedes the recheck while enabled). NOTE: tmp_path
-    embeds this test's name, so `"spiral" in result` alone can pass vacuously via a
-    banked progress note quoting the path — assert the recheck's own message too."""
-    monkeypatch.setenv("CHAD_DISABLE", "done_audit")
-    f = tmp_path / "out.py"
-    script = [
-        _tool_call("write", path=str(f), content="print('hi')\n"),
-        _tool_call("bash", command=f"python {f}"),               # verify -> clears unverified
-        _tool_call("done", summary="first done"),                # deferred for recheck
-        _tool_call("write", path=str(f), content="print('hi')  # 1\n"),  # post-recheck edit 1
-        _tool_call("write", path=str(f), content="print('hi')  # 2\n"),  # edit 2 (allowed)
-        _tool_call("write", path=str(f), content="print('hi')  # 3\n"),  # edit 3 -> spiral cap
-        _tool_call("done", summary="should never be reached"),
-    ]
-    agent = _agent(script, max_steps=20)
-
-    result = agent.run_turn("write out.py that prints hi")
-
-    assert "spiral" in result.lower()
-    # The recheck actually fired (guards against the vacuous tmp_path match above).
-    assert any("every concrete deliverable" in m.get("content", "")
-               for m in agent.messages)
-    # Stopped on the 3rd post-recheck write; the trailing `done` is never consumed.
-    assert agent.engine._i == 6
 
 
 def test_agent_loop_terminates_on_a_plain_final_answer(tmp_path):
@@ -275,7 +181,10 @@ def test_agent_loop_terminates_on_a_plain_final_answer(tmp_path):
     result = agent.run_turn("what's in data.txt?")
 
     assert result == "The file contains the number 42."
-    assert [m["name"] for m in agent.messages if m.get("role") == "tool"] == ["read"]
+    # `read` is not an exposed tool; tools.alias_to_bash rewrites it to the `bash` that
+    # reads the file, so the recorded tool message is the bash it became.
+    assert [m["name"] for m in agent.messages if m.get("role") == "tool"] == ["bash"]
+    assert "42" in agent.messages[-2]["content"]
 
 
 def test_agent_loop_surfaces_a_real_dispatch_failure(tmp_path, monkeypatch):
@@ -285,7 +194,6 @@ def test_agent_loop_surfaces_a_real_dispatch_failure(tmp_path, monkeypatch):
     as the tool result rather than pretending the file was written. (The churn
     handoff would rightly bounce the empty-diff done first — disabled here; this test
     is about dispatch, and the handoff has its own coverage in test_done_audit.py.)"""
-    monkeypatch.setenv("CHAD_DISABLE", "audit_churn_handoff")
     not_a_dir = tmp_path / "file.txt"
     not_a_dir.write_text("i am a file, not a directory\n")
     doomed = not_a_dir / "child.txt"     # parent is a file -> os.makedirs / open fails
@@ -362,7 +270,6 @@ def test_step_cap_extends_while_turn_lands_verified_changes(tmp_path, monkeypatc
     window re-earns its extension with an edit+verify, so the loop reaches `done`."""
     # Orthogonal to the deliverable recheck (it would add a step and skew the cap
     # accounting this test pins); disable that lever here.
-    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck,done_audit")
     f = tmp_path / "f.py"
     # Distinct args per step — identical repeated calls would (correctly) trip the
     # repeat-loop guard instead of exercising the cap.
@@ -371,7 +278,7 @@ def test_step_cap_extends_while_turn_lands_verified_changes(tmp_path, monkeypatc
         # The verify step must be an EXECUTING command (python …) — a display command
         # like `echo` no longer clears unverified_edit (bash_result_verifies).
         script += [_tool_call("write", path=str(f), content=f"x = {i}\n"),
-                   _tool_call("bash", command=f"python {f} && echo ok{i}")]
+                   _tool_call("bash", command=f"{PY} {f} && echo ok{i}")]
     script.append(_tool_call("done", summary="finished the long task"))
     agent = _agent(script, max_steps=4)
 
@@ -408,7 +315,6 @@ def test_no_empty_diff_gate_blocks_prose_end_on_action_task(monkeypatch):
     hard stop with a progress note — never as a silent success. (This test is about
     the GATE; the churn handoff would insert one audit bounce first — its own
     coverage lives in test_done_audit.py.)"""
-    monkeypatch.setenv("CHAD_DISABLE", "audit_churn_handoff")
     script = [
         "Let me find where the bug is defined.",   # bail 1 -> nudge
         "Let me search for the relevant code.",    # bail 2 -> nudge (budget exhausted)
@@ -429,7 +335,6 @@ def test_no_empty_diff_gate_blocks_done_with_unverified_edit(tmp_path, monkeypat
     no guard fired) becomes a resumable hard stop. (Gate-focused: the
     churn handoff — one audit bounce before this stop — is disabled here and
     covered in test_done_audit.py.)"""
-    monkeypatch.setenv("CHAD_DISABLE", "audit_churn_handoff")
     f = tmp_path / "m.py"
     f.write_text("x = 1\n")
     script = [
@@ -468,14 +373,13 @@ def test_bash_mutation_triggers_syntax_recheck(tmp_path, monkeypatch):
     unparseable and nothing said so. A bash step that mutates a file edited this
     turn must get a parse warning appended to its result."""
     # Not about the deliverable recheck (it would defer done here); disable it.
-    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck,done_audit")
     f = tmp_path / "m.py"
     f.write_text("x = 1\n")
-    breaker = f"python -c \"open(r'{f}','w').write('def f(:\\n')\""
+    breaker = f"{PY} -c \"open(r'{f}','w').write('def f(:\\n')\""
     script = [
         _tool_call("edit", path=str(f), old="x = 1", new="x = 2"),
         _tool_call("bash", command=breaker),      # bash breaks the watched file
-        _tool_call("bash", command=f"python {f}"),  # (fails; keeps turn alive)
+        _tool_call("bash", command=f"{PY} {f}"),  # (fails; keeps turn alive)
         _tool_call("done", summary="attempted"),
     ]
     agent = _agent(script, max_steps=10)
@@ -510,52 +414,6 @@ class _FlakyEngine(ScriptedEngine):
         return super().generate(prompt_ids, **kw)
 
 
-def test_transient_backend_error_is_retried_and_the_turn_completes(monkeypatch):
-    monkeypatch.setattr("chad.agent.time.sleep", lambda *_: None)   # no backoff in tests
-    eng = _FlakyEngine(["all done"], n_fail=1, transient=True)
-    agent = Agent(eng, mode="yolo", thinking=False)
-    agent.run_turn("do the thing")
-    assert eng.calls == 2, "the failed step should have been re-issued exactly once"
-    assert agent.messages[-1]["content"] == "all done"
-
-
-def test_transient_backend_errors_give_up_after_the_retry_budget(monkeypatch):
-    monkeypatch.setattr("chad.agent.time.sleep", lambda *_: None)
-    import pytest
-
-    from chad.base_engine import BackendError
-    eng = _FlakyEngine(["unreachable"], n_fail=99, transient=True)
-    agent = Agent(eng, mode="yolo", thinking=False)
-    with pytest.raises(BackendError):
-        agent.run_turn("do the thing")
-    # 3 retries + the original attempt: a server that is genuinely down must surface,
-    # not silently eat the task's whole budget.
-    assert eng.calls == 4
-
-
-def test_non_transient_backend_error_is_not_retried(monkeypatch):
-    monkeypatch.setattr("chad.agent.time.sleep", lambda *_: None)
-    import pytest
-
-    from chad.base_engine import BackendError
-    eng = _FlakyEngine(["unreachable"], n_fail=99, transient=False)
-    agent = Agent(eng, mode="yolo", thinking=False)
-    with pytest.raises(BackendError):
-        agent.run_turn("do the thing")
-    assert eng.calls == 1, "a 4xx is the prompt's fault; re-rolling it is wasted budget"
-
-
-def test_backend_retry_budget_resets_per_turn(monkeypatch):
-    monkeypatch.setattr("chad.agent.time.sleep", lambda *_: None)
-    eng = _FlakyEngine(["first", "second"], n_fail=1, transient=True)
-    agent = Agent(eng, mode="yolo", thinking=False)
-    agent.run_turn("one")
-    eng.n_fail, eng.calls = 3, 0      # a fresh transient fault on the next turn
-    eng._i = 1                        # replay from "second"
-    agent.run_turn("two")
-    assert eng.calls == 4             # 3 failures re-rolled, 4th succeeds
-
-
 # --- Mid-run steering (improve 01) -------------------------------------------
 # User text typed while a turn runs is drained between steps and injected as a
 # synthetic `role:"tool", name:"steer"` message — a pure append, so the warm KV
@@ -583,7 +441,6 @@ def test_steering_injects_between_steps_and_run_continues(tmp_path, monkeypatch)
     """The steer lands in `messages` after step 0's tool result and before step 1's
     assistant turn, framed as an overriding tool-role message; the run continues to
     `done` (interrupted stays False)."""
-    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck,done_audit")
     target = tmp_path / "note.txt"
     steer_text = "actually, stop — the OTHER file is the target"
     script = [
@@ -620,7 +477,6 @@ def test_steering_injects_between_steps_and_run_continues(tmp_path, monkeypatch)
 def test_no_drain_hook_means_no_injection(tmp_path, monkeypatch):
     """drain_steering=None (headless / bench / sub-agent) keeps today's transcript
     byte-identical — no steer messages, no behavior change (zero benchmark risk)."""
-    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck,done_audit")
     target = tmp_path / "note.txt"
     script = [
         _tool_call("write", path=str(target), content="v1\n"),
@@ -651,7 +507,6 @@ def test_steering_keeps_the_render_prefix_stable(tmp_path, monkeypatch):
     right after the injection — is a pure EXTENSION of the previous render (common
     prefix == the whole previous prompt). A steer that rewrote or reordered history
     would break this and force a full re-prefill on Ornith's non-trimmable cache."""
-    monkeypatch.setenv("CHAD_DISABLE", "done_spec_recheck,done_audit")
     target = tmp_path / "note.txt"
     script = [
         _tool_call("write", path=str(target), content="v1\n"),
@@ -736,26 +591,6 @@ def _run_escalation(monkeypatch, *, ablated: bool):
     return tok.flags
 
 
-def test_no_think_escalation_disables_think_after_two_capped_stalls(monkeypatch):
-    flags = _run_escalation(monkeypatch, ablated=False)
-    # The first two stalls still render WITH <think> (no premature escalation) ...
-    assert flags[:2] == [True, True], flags
-    # ... then a step renders with <think> OFF (the mechanical "act now").
-    assert False in flags, flags
-    # One-shot, not a latch: thinking is still used on other steps (it restores after each
-    # escalation step), so the run is a MIX of thinking and no-think renders.
-    assert True in flags and False in flags, flags
-
-
-def test_no_think_escalation_is_gone_when_ablated(monkeypatch):
-    flags = _run_escalation(monkeypatch, ablated=True)
-    # With the lever off, the spiral is never broken by a no-think render.
-    assert flags, "the turn should have taken at least one step"
-    assert False not in flags, flags
-
-
-# === turn-level cumulative think budget ==========================
-
 class _BigThinkEngine(ScriptedEngine):
     """Every scripted turn is (almost) entirely a `<think>` block and reports a large
     `generated_tokens`, so the turn's CUMULATIVE think spend crosses the turn-level budget
@@ -786,49 +621,6 @@ def _run_turn_think_budget(monkeypatch, *, ablated: bool, script=None,
     return tok.flags
 
 
-def test_turn_think_budget_throttles_no_think_while_overspending(monkeypatch):
-    flags = _run_turn_think_budget(monkeypatch, ablated=False)
-    # Each stall's ~14.7k-token think delta clears HALF (12k) on step 0 and EXHAUSTS
-    # (24k) by step 1 — so step 0/1 still render thinking (the mechanism only acts on
-    # steps AFTER the threshold is crossed). The scripted engine keeps burning ~14.7k
-    # think tokens on EVERY later step too, so the throttle's debt (one no-think step
-    # per 3k further think tokens) grows faster than it is paid — every remaining step
-    # renders no-think, converging on the old persistent behavior for a model that
-    # never stops over-spending.
-    assert flags[:2] == [True, True], flags
-    assert flags[2:] and all(f is False for f in flags[2:]), flags
-
-
-def test_turn_think_budget_restores_thinking_once_debt_paid(monkeypatch):
-    # Two big-think stalls exhaust the budget (~29.4k vs 24k -> debt = 1 + 5.4k//3k
-    # = 2 no-think steps owed); the model then STOPS thinking (plain tool-call turns
-    # accrue zero think delta), so after the two owed steps are paid, thinking must
-    # RESTORE — the fix over the v1.0.0 persistent mute, which stayed off for
-    # the rest of the turn (break-filter-js: 26 straight no-think steps, garbled
-    # landing calls, regressed a run1 pass).
-    stall = "<think>" + "reasoning " * 50 + "</think>"
-    tc = _tool_call("bash", command="echo ok")
-    flags = _run_turn_think_budget(
-        monkeypatch, ablated=False,
-        script=[stall, stall, tc, tc, tc, "All set — the config value is updated."])
-    assert flags[:2] == [True, True], flags
-    assert flags[2:4] == [False, False], flags       # paying the two owed steps
-    assert flags[4:] and all(f is True for f in flags[4:]), flags  # restored
-
-
-def test_turn_think_budget_inert_below_min_wall(monkeypatch):
-    # A short relaunch tail (wall budget under TURN_THINK_MIN_WALL_S=300) must leave
-    # the mechanism entirely inert — on the v1.0.0 run a 200s-class relaunch clamped
-    # to the LO budget and half-fired on its FIRST step, churning against the hard
-    # wrap-up landing (regex-log). The governor/wrapup paths may also act on such a
-    # short wall, so keep the script tiny.
-    stall = "<think>" + "reasoning " * 50 + "</think>"
-    flags = _run_turn_think_budget(monkeypatch, ablated=False,
-                                   script=[stall] * 3, turn_budget_s=200)
-    assert flags, "the turn should have taken at least one step"
-    assert False not in flags, flags
-
-
 def _run_capped_think(monkeypatch, *, ablated: bool):
     """Drive a turn whose every generation ends INSIDE <think> at the raw token cap:
     no closing tag, and no stop CONDITION fired (the raw cap is not one). Faithful to
@@ -843,42 +635,112 @@ def _run_capped_think(monkeypatch, *, ablated: bool):
     eng = _BigThinkEngine([truncated] * 6)
     tok = _ThinkFlagTok()
     eng.tok = tok
+    # think_ceiling pinned OFF so this stays a clean A/B of `capped_think_credit`.
+    # The ceiling is defaulted ON in production, and arming it also arms
+    # `no_think_escalation` (which flips the very same thinking flag these arms read,
+    # after two capped stalls) — leaving it at the default would let that lever, not
+    # the one under test, decide the OFF arm's result.
     agent = Agent(eng, mode="yolo", thinking=True, max_gen_tokens=15000,
-                  turn_budget_s=1e9)
+                  turn_budget_s=1e9, think_ceiling=0)
     agent.run_turn("change the config value")
     return tok.flags
 
 
-def test_capped_think_is_credited_so_the_budget_engages(monkeypatch):
-    """A generation truncated mid-reasoning is the LARGEST kind there is (one full
-    token cap each). Credited, its cumulative spend crosses the budget and the
-    throttle engages exactly as it does for closed thinks."""
-    flags = _run_capped_think(monkeypatch, ablated=False)
-    assert flags[:2] == [True, True], flags          # thresholds cross on steps 0-1
-    assert flags[2:] and all(f is False for f in flags[2:]), flags
+
+def test_final_plan_update_paired_with_done_is_not_dropped(tmp_path, monkeypatch):
+    """`write_todos` + `done` in ONE step: the terminal short-circuit returns before the
+    execute loop, so the model's last plan update — the step where it marks everything
+    `[x]` — used to be silently discarded. It is the model's habitual closing move, so
+    the recorded plan ended every turn a step stale."""
+    from chad import tools
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "note.txt"
+    script = [
+        _tool_call("write_todos", todos=[{"content": "Write the note", "status": "in_progress"},
+                                     {"content": "Read it back", "status": "pending"}]),
+        _tool_call("write", path=str(target), content="hi\n"),
+        _tool_call("bash", command="cat " + str(target)),
+        # The closing step: plan update and done together.
+        _tool_call("write_todos", todos=[{"content": "Write the note", "status": "completed"},
+                                     {"content": "Read it back", "status": "completed"}])
+        + "\n" + _tool_call("done", summary="wrote and read back the note"),
+    ]
+    agent = _agent(script)
+    agent.run_turn("write a note and read it back")
+
+    assert [t["status"] for t in tools._TODOS] == ["completed", "completed"], tools._TODOS
+    # The result is in the transcript too, so a `done` that gets rejected replays the
+    # turn with the model's own plan visible rather than a hole where the call was.
+    plan_results = [m for m in agent.messages
+                    if m.get("role") == "tool" and m.get("name") == "write_todos"]
+    assert len(plan_results) == 2, [m.get("content") for m in plan_results]
+    assert "[x] Read it back" in plan_results[-1]["content"]
 
 
-def test_capped_think_uncredited_leaves_the_budget_blind(monkeypatch):
-    """OFF arm — the defect this lever closes: identical over-spending, but because
-    the generations never closed their think block the budget counts ZERO and the
-    throttle never engages, no matter how much reasoning the turn burns."""
-    flags = _run_capped_think(monkeypatch, ablated=True)
-    assert flags, "the turn should have taken at least one step"
-    assert False not in flags, flags
+def test_done_with_an_open_todo_is_questioned_once_then_accepted(tmp_path, monkeypatch):
+    """The plan the model wrote this turn holds up `done` for exactly one question.
+
+    Measured on a full TB2.1 run, this is a nudge and not a gate on purpose: of the 75
+    turns that reached `done`, only 6 still had an open item and those 6 scored as well
+    as the rest, while 10 of the 12 turns that called `done` and scored zero had every
+    box ticked. One question is affordable; refusing a healthy run is not.
+    """
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "data.txt"
+    target.write_text("42\n")
+    tools.clear_todos()
+    script = [
+        _tool_call("write_todos", todos=[{"content": "look at the file", "status": "in_progress"},
+                                     {"content": "report the number", "status": "pending"}]),
+        _tool_call("bash", command=f"cat {target}"),
+        _tool_call("done", summary="read it"),                       # -> questioned
+        _tool_call("write_todos", todos=[{"content": "look at the file", "status": "completed"},
+                                     {"content": "report the number", "status": "completed"}]),
+        _tool_call("done", summary="read it, the number is 42"),     # -> accepted
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn("what does data.txt contain?")
+
+    assert result == "read it, the number is 42"
+    nudges = [m["content"] for m in agent.messages
+              if m.get("role") == "tool" and m.get("name") == "done"]
+    assert len(nudges) == 1, "the open-todo question must fire exactly once"
+    assert "report the number" in nudges[0]     # names the item that is still open
+    assert agent.engine._i == len(script)
+    tools.clear_todos()
 
 
-def test_closed_think_accounting_is_unchanged_by_the_lever(monkeypatch):
-    """Negative control: the lever adds a branch BELOW the two existing ones, so a
-    turn whose thinks close normally throttles identically with it on or off."""
-    on = _run_turn_think_budget(monkeypatch, ablated=False)
-    monkeypatch.setenv("CHAD_DISABLE", "capped_think_credit")
-    off = _run_turn_think_budget(monkeypatch, ablated=False)
-    assert on == off, (on, off)
+def test_done_is_not_questioned_when_every_todo_is_ticked(tmp_path, monkeypatch):
+    """Negative control: a finished plan must not cost a step."""
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "data.txt"
+    target.write_text("42\n")
+    tools.clear_todos()
+    script = [
+        _tool_call("write_todos", todos=[{"content": "look at the file", "status": "completed"}]),
+        _tool_call("bash", command=f"cat {target}"),
+        _tool_call("done", summary="read it"),
+    ]
+    agent = _agent(script, max_steps=10)
+
+    assert agent.run_turn("what does data.txt contain?") == "read it"
+    assert not [m for m in agent.messages
+                if m.get("role") == "tool" and m.get("name") == "done"]
+    tools.clear_todos()
 
 
-def test_turn_think_budget_is_gone_when_ablated(monkeypatch):
-    flags = _run_turn_think_budget(monkeypatch, ablated=True)
-    # With the lever off, cumulative think spend is never enforced — every step keeps
-    # thinking on regardless of how much reasoning the turn burns.
-    assert flags, "the turn should have taken at least one step"
-    assert False not in flags, flags
+def test_a_stale_plan_from_an_earlier_turn_does_not_ambush_done(tmp_path, monkeypatch):
+    """A plan spans turns by design; only the plan written THIS turn gates this turn."""
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "data.txt"
+    target.write_text("42\n")
+    tools.tool_write_todos("[ ] something left over from a previous request")
+    agent = _agent([_tool_call("bash", command=f"cat {target}"),
+                    _tool_call("done", summary="unrelated task finished")], max_steps=10)
+
+    assert agent.run_turn("what does data.txt contain?") == "unrelated task finished"
+    assert not [m for m in agent.messages
+                if m.get("role") == "tool" and m.get("name") == "done"]
+    tools.clear_todos()

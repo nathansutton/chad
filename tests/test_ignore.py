@@ -15,10 +15,7 @@ EXPECTED_REPOMAP_NAMES = frozenset(EXPECTED_BARE + (".cache", "models", "site-pa
 
 def test_ignore_sets_unchanged():
     assert tools.IGNORE_DIRS == EXPECTED_BARE
-    assert tools._SKIP_DIRS == tuple(f"/{d}/" for d in EXPECTED_BARE)
     assert skills._SKIP_DIRS == set(EXPECTED_BARE)
-    # symbols no longer walks the tree at all — it resolves through repomap's
-    # file scan, so repomap's skip set is the symbol editor's skip set too
     assert repomap._SKIP_NAMES == EXPECTED_REPOMAP_NAMES
 
 

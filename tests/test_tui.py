@@ -529,3 +529,45 @@ def test_confirm_panel_shows_full_command_and_flags_destructive():
     # The status row carries only the question + keys; the body lives in the panel.
     status = "".join(t for _, t in tui._status_fragments())
     assert "approve bash?" in status and "[y]es" in status and "rm -rf" not in status
+
+
+# ---------------------------------------------------------------------------
+# /ctx — the context breakdown gauge. Read-only and tokenizer-only, so unlike
+# /compact it takes no busy guard; it must also never take the session down when
+# the engine can't price the prompt.
+# ---------------------------------------------------------------------------
+
+def test_ctx_command_prints_a_breakdown():
+    from chad.agent import Agent
+    from test_agent_e2e import ScriptedEngine
+    tui, _ = _worker_tui()
+    tui.agent = Agent(ScriptedEngine(["done"]), mode="yolo", thinking=False)
+    tui.agent.messages += [
+        {"role": "user", "content": "do a thing"},
+        {"role": "tool", "name": "bash", "content": "o" * 400},
+    ]
+    tui._model_ready.set()
+    tui._on_accept(_Buff("/ctx"))
+    out = "".join(tui._pending)
+    assert "context total" in out, out
+    assert "tool schemas" in out and "think residue" in out, out
+    assert "compact at" in out, out
+
+
+def test_ctx_command_survives_an_unpriceable_prompt():
+    # The fake engine has no tokenizer at all — the gauge must degrade to one line,
+    # not raise out of the key handler and kill the UI.
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    tui._on_accept(_Buff("/ctx"))
+    assert "context breakdown unavailable" in "".join(tui._pending), tui._pending
+
+
+def test_ctx_is_not_swallowed_as_steering_midturn():
+    # "why is this session compacting already?" is asked WHILE the turn runs. /ctx
+    # mutates nothing, so it must execute instead of queueing as a steer.
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    tui._busy = True
+    tui._on_accept(_Buff("/ctx"))
+    assert list(tui._steer_queue) == [] and list(tui._queue) == []

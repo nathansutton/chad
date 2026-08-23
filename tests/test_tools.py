@@ -1,20 +1,19 @@
 """Characterization battery for the filesystem tools in `tools.py`:
-`tool_edit` (uniqueness/no-corruption truth table), `tool_grep`, `tool_glob`,
-`tool_write`. Pure filesystem in a temp dir — no model load.
+`tool_edit` (uniqueness/no-corruption truth table) and `tool_write`. Pure filesystem
+in a temp dir — no model load.
 
 The KEY invariant: `tool_edit` rewrites the file ONLY on a genuinely-unique match and
 leaves it BYTE-FOR-BYTE untouched in every reject/ambiguous case. `test_edit.py` already
 covers the recovery cascade (literal \\n, indent drift, ws-flexible ambiguity); this file
-focuses on the plan's grep/glob/write tables plus the core edit truth table.
+focuses on the write table plus the core edit truth table.
 
 Run: `.venv/bin/python test_tools.py`
 """
 
-import glob as _glob
+import json
 import os
 import sys
 import tempfile
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -22,6 +21,28 @@ from chad import tools  # noqa: E402
 
 PASS = 0
 FAIL = 0
+
+
+def _with_lever_off(name):
+    """Run a test with one lever subtracted from the suite's CHAD_ENABLE=all — for
+    tests that pin the legacy (lever-OFF) output shape while the rest of the suite
+    exercises everything ON."""
+    import functools
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **k):
+            old = os.environ.get("CHAD_DISABLE")
+            os.environ["CHAD_DISABLE"] = f"{old},{name}" if old else name
+            try:
+                return fn(*a, **k)
+            finally:
+                if old is None:
+                    os.environ.pop("CHAD_DISABLE", None)
+                else:
+                    os.environ["CHAD_DISABLE"] = old
+        return wrapper
+    return deco
 
 
 def check(name, cond, detail=""):
@@ -94,6 +115,10 @@ def test_edit_truth_table():
 
 # --- tool_bash ----------------------------------------------------------------
 
+# Line clipping ablated: every oversized fixture here is one 40k-char blob, and
+# this test pins the head/tail budget's shape on it. test_bash_line_clip covers the
+# clip path, including that a blob is what it exists for.
+@_with_lever_off("bash_line_clip")
 def test_bash():
     # short output passes through untouched
     check("bash: short echo", tools.tool_bash("printf hi") == "hi")
@@ -105,30 +130,19 @@ def test_bash():
     res = tools.tool_bash("printf oops; exit 3")
     check("bash: exit prefix", res.startswith("[exit 3]\n") and "oops" in res, res)
 
-    # The timeout-KILL path. Since bash_auto_background landed, the default timeout
-    # behavior is to background instead (test_bash_auto_background covers that), so
-    # these assertions ablate the lever. The kill path is still very much live: an
-    # interrupt takes it, so does a timeout once the background slots are full.
-    old_dis = os.environ.get("CHAD_DISABLE")
-    os.environ["CHAD_DISABLE"] = "bash_auto_background"
-    try:
-        # timeout with no output before the kill -> bare sentinel (0s deadline fires
-        # immediately, before `sleep` prints anything)
-        check("bash: timeout no output", tools.tool_bash("sleep 5", timeout=0)
-              == "[timed out after 0s; no output before it was killed]")
+    # The timeout-KILL path: timeout with no output before the kill -> bare
+    # sentinel (0s deadline fires immediately, before `sleep` prints anything).
+    check("bash: timeout no output", tools.tool_bash("sleep 5", timeout=0)
+          == "[timed out after 0s; no output before it was killed]")
 
-        # timeout WITH partial output -> the output the process printed before the kill
-        # is preserved (the whole point: a killed build/train still printed how far it
-        # got). Print a marker, then sleep past a short deadline so the kill lands
-        # mid-run.
-        partial = tools.tool_bash("printf 'PROGRESS_50_PERCENT\\n'; sleep 5", timeout=1)
-        check("bash: timeout keeps partial", "PROGRESS_50_PERCENT" in partial, partial)
-        check("bash: timeout names the kill", partial.startswith("[timed out after 1s;"),
-              partial[:60])
-    finally:
-        os.environ.pop("CHAD_DISABLE", None)
-        if old_dis is not None:
-            os.environ["CHAD_DISABLE"] = old_dis
+    # timeout WITH partial output -> the output the process printed before the kill
+    # is preserved (the whole point: a killed build/train still printed how far it
+    # got). Print a marker, then sleep past a short deadline so the kill lands
+    # mid-run.
+    partial = tools.tool_bash("printf 'PROGRESS_50_PERCENT\\n'; sleep 5", timeout=1)
+    check("bash: timeout keeps partial", "PROGRESS_50_PERCENT" in partial, partial)
+    check("bash: timeout names the kill", partial.startswith("[timed out after 1s;"),
+          partial[:60])
 
     # interrupt (should_stop) also preserves partial output
     stop = {"n": 0}
@@ -162,6 +176,43 @@ def _spill_path_from(result):
     return result.split("FULL output saved to ", 1)[1].split(";", 1)[0]
 
 
+@_with_lever_off("bash_trim_keep_failures")
+def test_bash_line_clip():
+    """One absurdly long line is capped instead of eating the whole budget, and the
+    full text stays recoverable. The measured case: a search that reached a gitignored
+    build directory returned a 92k-char .js.map line, and head+tail handed back 20k
+    chars sliced out of the middle of base64 — ~5k tokens of prefill, no information."""
+    old = os.environ.get("CHAD_SPILL_DIR")
+    d = tempfile.mkdtemp(prefix="clip_")
+    os.environ["CHAD_SPILL_DIR"] = d
+    try:
+        blob = "M" * 92000
+        out = tools._bash_headtail(f"head.js.map:1:{blob}\nreal line\n")
+        check("clip: result is small", len(out) < 1200, len(out))
+        check("clip: keeps the line's start", out.startswith("head.js.map:1:MMM"), out[:40])
+        check("clip: marks the line", "…[line clipped]" in out, out[:800])
+        check("clip: other lines intact", "real line" in out, out)
+        check("clip: names the amount", "chars clipped from over-long lines" in out, out)
+        with open(_spill_path_from(out)) as f:
+            full = f.read()
+        check("clip: spill holds the UNCLIPPED original", blob in full, len(full))
+
+        # a small clip is not worth a file; the notice just says what happened
+        small = tools._bash_headtail("x" * (tools.BASH_LINE_CHARS + 50) + "\n")
+        check("clip: small clip has no spill", "saved to" not in small, small[-120:])
+        check("clip: small clip still marked", "…[line clipped]" in small, small[-120:])
+
+        # normal line-shaped output is byte-identical
+        plain = "line one\nline two\n"
+        check("clip: normal output untouched", tools._bash_headtail(plain) == plain)
+    finally:
+        if old is None:
+            os.environ.pop("CHAD_SPILL_DIR", None)
+        else:
+            os.environ["CHAD_SPILL_DIR"] = old
+
+
+@_with_lever_off("bash_line_clip")  # single-blob fixtures; see test_bash
 def test_bash_spill():
     """Truncation spills the FULL output to a session-scoped file: the
     omitted middle is a `grep <path>` away instead of a full re-run away."""
@@ -197,18 +248,9 @@ def test_bash_spill():
 
         # killed command with a large partial -> same spill, and the [timed out
         # prefix guardrails.py keys on stays FIRST (the notice lives mid-string).
-        # Lever ablated: the kill path is what this asserts, and the default timeout
-        # path now backgrounds instead (test_bash_auto_background covers that).
-        old_dis = os.environ.get("CHAD_DISABLE")
-        os.environ["CHAD_DISABLE"] = "bash_auto_background"
-        try:
-            killed = tools.tool_bash(
-                "head -c 15000 /dev/zero | tr '\\0' 'x'; printf 'KILLED_MID'; "
-                "head -c 15000 /dev/zero | tr '\\0' 'y'; sleep 5", timeout=1)
-        finally:
-            os.environ.pop("CHAD_DISABLE", None)
-            if old_dis is not None:
-                os.environ["CHAD_DISABLE"] = old_dis
+        killed = tools.tool_bash(
+            "head -c 15000 /dev/zero | tr '\\0' 'x'; printf 'KILLED_MID'; "
+            "head -c 15000 /dev/zero | tr '\\0' 'y'; sleep 5", timeout=1)
         check("spill: killed keeps prefix", killed.startswith("[timed out after 1s;"),
               killed[:60])
         check("spill: killed gets a path", "FULL output saved to " in killed, killed[:400])
@@ -226,7 +268,7 @@ def test_bash_spill():
         stale = os.path.join(d, "99999999")
         os.makedirs(stale)
         os.utime(stale, (0, 0))
-        tools._SPILL_SWEPT = False
+        tools.spill._SWEPT = False
         tools._bash_headtail("s" * (tools.BASH_MAX_CHARS + 1))
         check("spill: stale session swept", not os.path.exists(stale))
 
@@ -240,241 +282,6 @@ def test_bash_spill():
             os.environ.pop("CHAD_SPILL_DIR", None)
         else:
             os.environ["CHAD_SPILL_DIR"] = old
-
-
-# --- tool_grep ----------------------------------------------------------------
-
-def test_grep():
-    cwd = os.getcwd()
-    try:
-        _seed({
-            "a.py": "import os\nNEEDLE here\nbye\n",
-            "b.txt": "no match in here\n",
-            "__pycache__/c.py": "NEEDLE in a skip dir\n",
-        })
-
-        # bad regex
-        check("grep: bad regex", tools.tool_grep("(").startswith("[bad regex"))
-
-        # a hit -> path:line: form
-        out = tools.tool_grep("NEEDLE")
-        check("grep: hit has path:line: form", "a.py:2:" in out, out)
-        check("grep: hit shows the line text", "NEEDLE here" in out, out)
-
-        # _SKIP_DIRS pruning: the __pycache__ copy must NOT appear
-        check("grep: skip-dir pruned", "__pycache__" not in out, out)
-
-        # no matches
-        check("grep: no matches",
-              tools.tool_grep("ZZZ_no_such_token").startswith("[no matches for"))
-    finally:
-        os.chdir(cwd)
-
-
-def test_grep_default_byte_identical():
-    """Default-args output must stay byte-for-byte what the original code emitted:
-    `path:line: text` lines joined by \\n, no notices when no cap binds."""
-    cwd = os.getcwd()
-    try:
-        _seed({"a.py": "import os\nNEEDLE here\nalso NEEDLE\nbye\n"})
-        out = tools.tool_grep("NEEDLE")
-        check("grep: default byte-identical",
-              out == "./a.py:2: NEEDLE here\n./a.py:3: also NEEDLE", repr(out))
-    finally:
-        os.chdir(cwd)
-
-
-def test_grep_line_cap():
-    """A match inside a huge single line is clipped so it can't blow up the transcript."""
-    cwd = os.getcwd()
-    try:
-        _seed({"big.js": "x" * 50000 + "NEEDLE" + "y" * 50000 + "\n"})
-        out = tools.tool_grep("NEEDLE")
-        check("grep: single output line", "\n" not in out, len(out))
-        check("grep: line clipped to <=600", len(out) <= 600, len(out))
-        check("grep: clip marker present", "…[line clipped]" in out, out)
-    finally:
-        os.chdir(cwd)
-
-
-def test_grep_truncation_notices():
-    """The 200-line output cap announces itself with shown/total counts."""
-    cwd = os.getcwd()
-    try:
-        _seed({"m.txt": "".join(f"NEEDLE line {i}\n" for i in range(500))})
-        out = tools.tool_grep("NEEDLE")
-        lines = out.splitlines()
-        check("grep: capped at 200 + notice", len(lines) == 201, len(lines))
-        check("grep: truncation notice text",
-              lines[-1] == "[results truncated: 200/500 lines — narrow the pattern "
-                           "or add a path]", lines[-1])
-    finally:
-        os.chdir(cwd)
-
-
-def test_grep_path_is_file():
-    """A file passed as `path` is searched directly — the old dir-walk treatment made
-    it silently match nothing, and the model passes file paths constantly."""
-    cwd = os.getcwd()
-    try:
-        _seed({"a.py": "NEEDLE here\n", "b.py": "NEEDLE too\n"})
-        out = tools.tool_grep("NEEDLE", path="a.py")
-        check("grep: file path searches the file", "a.py:1:" in out, out)
-        check("grep: file path scoped to that file", "b.py" not in out, out)
-
-        # naming the file explicitly overrides the skip list, like `read` does
-        _seed({"__pycache__/c.py": "NEEDLE in a skip dir\n"})
-        out = tools.tool_grep("NEEDLE", path="__pycache__/c.py")
-        check("grep: explicit file beats skip list", "c.py:1:" in out, out)
-    finally:
-        os.chdir(cwd)
-
-
-def test_grep_path_not_found():
-    """A nonexistent `path` announces itself instead of reading as a clean no-match."""
-    cwd = os.getcwd()
-    try:
-        _seed({"a.py": "NEEDLE\n"})
-        out = tools.tool_grep("NEEDLE", path="no/such/dir")
-        check("grep: missing path is loud",
-              out == "[path not found: no/such/dir]", out)
-    finally:
-        os.chdir(cwd)
-
-
-def test_grep_dirs_do_not_starve_file_cap():
-    """The GREP_MAX_FILES budget must count only files we'd actually SEARCH — not the
-    directories (and skipped blobs) the walk passes through. The demonstrated
-    starvation: a dir-heavy tree exhausted the cap on directories before the walk
-    reached the file holding the target symbol. Here we seed many empty subdirs ahead of
-    the one real match and shrink the cap below the dir count: the match must still land,
-    and truncation must NOT be reported (no real file was dropped)."""
-    cwd = os.getcwd()
-    saved = tools.GREP_MAX_FILES
-    try:
-        d = _seed({"hit.py": "NEEDLE lives here\n"})
-        # Many EMPTY dirs the walk yields (before files, at each level) but that hold
-        # nothing to search. There is exactly ONE real file, so walk order is irrelevant.
-        for i in range(30):
-            os.makedirs(os.path.join(d, f"empty{i:03d}"), exist_ok=True)
-        tools.GREP_MAX_FILES = 3  # far below the dir count; before the fix, dirs ate it
-        out = tools.tool_grep("NEEDLE")
-        check("grep: dirs don't consume the file budget", "hit.py:1:" in out, out)
-        check("grep: one real file is not reported truncated", "searched first" not in out, out)
-    finally:
-        tools.GREP_MAX_FILES = saved
-        os.chdir(cwd)
-
-
-def test_grep_ignore_case_and_context():
-    cwd = os.getcwd()
-    try:
-        _seed({"a.py": "alpha\nBETA match\ngamma\ndelta\n"})
-
-        # ignore_case: lowercase pattern finds the uppercase line
-        ci = tools.tool_grep("beta", ignore_case=True)
-        check("grep: ignore_case hits", "a.py:2:" in ci and "BETA match" in ci, ci)
-        check("grep: case-sensitive misses",
-              tools.tool_grep("beta").startswith("[no matches for"))
-
-        # context: N lines before/after, match uses ':' and context uses '-'
-        c1 = tools.tool_grep("BETA", context=1)
-        check("grep: context before", "a.py:1- alpha" in c1, c1)
-        check("grep: context match sep", "a.py:2: BETA match" in c1, c1)
-        check("grep: context after", "a.py:3- gamma" in c1, c1)
-        check("grep: no stray group sep for single group", "--" not in c1, c1)
-
-        # two non-adjacent matches -> two groups separated by --
-        _seed({"b.py": "one\nHIT\nx\nx\nx\nx\nHIT\nend\n"})
-        c2 = tools.tool_grep("HIT", context=1)
-        check("grep: two groups separated", "\n--\n" in c2, c2)
-
-        # context clamps to 0-5 (6 is treated as 5, still valid output)
-        check("grep: context clamp doesn't error",
-              "b.py:" in tools.tool_grep("HIT", context=6))
-    finally:
-        os.chdir(cwd)
-
-
-# --- tool_glob ----------------------------------------------------------------
-
-def test_glob():
-    cwd = os.getcwd()
-    try:
-        _seed({
-            "b.py": "x\n",
-            "a.py": "x\n",
-            "__pycache__/c.py": "x\n",
-            ".venv/d.py": "x\n",
-        })
-
-        # sorted top-level .py
-        out = tools.tool_glob("*.py")
-        check("glob: sorted .py", out == "a.py\nb.py", out)
-
-        # recursive glob prunes skip dirs
-        rec = tools.tool_glob("**/*.py")
-        check("glob: skip-dir pruned",
-              "__pycache__" not in rec and ".venv" not in rec, rec)
-        check("glob: recursive still finds top-level",
-              "a.py" in rec and "b.py" in rec, rec)
-
-        # no matches
-        check("glob: no matches", tools.tool_glob("*.nosuchext") == "[no matches]")
-    finally:
-        os.chdir(cwd)
-
-
-def test_walk_fast_path_matches_glob():
-    """The pruned-walk fast path (plan: profiling pass) must return the same set as
-    glob for the basename-only patterns it claims, dirs included, dotfiles excluded;
-    structured patterns must decline (None) so callers fall back."""
-    cwd = os.getcwd()
-    try:
-        _seed({
-            "a.py": "x\n", "sub/b.py": "x\n", "sub/deep/c.txt": "x\n",
-            ".hidden/d.py": "x\n", ".dotfile.py": "x\n",
-            "node_modules/e.py": "x\n",
-        })
-        for pat in ("**/*", "**/*.py", "**/b.py"):
-            fast = sorted(tools._walk_glob(".", pat))
-            # one deliberate difference: glob+_skip kept the ignored dir ITSELF as an
-            # entry ("./node_modules" has no trailing slash for _skip to see); the
-            # walker prunes it entirely, so drop those from the parity expectation
-            slow = sorted(h for h in _glob.glob(os.path.join(".", pat), recursive=True)
-                          if not tools._skip(h)
-                          and os.path.basename(h) not in tools.IGNORE_DIRS)
-            check(f"walk fast path == glob for {pat}", fast == slow, (pat, fast, slow))
-        for pat in ("*.py", "sub/*.py", "sub/**/*.py", "**/deep/*.txt"):
-            check(f"structured pattern {pat} falls back", tools._walk_glob(".", pat) is None)
-    finally:
-        os.chdir(cwd)
-
-
-def test_grep_prescreen_edge_patterns():
-    """Patterns the whole-file prescreen can't mirror (lookarounds, \\A/\\Z) must skip
-    it and still match per-line; anchored patterns must survive the MULTILINE probe."""
-    cwd = os.getcwd()
-    try:
-        _seed({"a.py": "foo here\nbar\nfoo\n"})
-        check("negative lookahead still matches",
-              "a.py:3:" in tools.tool_grep(r"foo(?! here)"), tools.tool_grep(r"foo(?! here)"))
-        check("^ anchor matches mid-file", "a.py:2:" in tools.tool_grep(r"^bar$"))
-        check(r"\A pattern skips prescreen, matches line 1",
-              "a.py:1:" in tools.tool_grep(r"\Afoo"))
-    finally:
-        os.chdir(cwd)
-
-
-def test_grep_big_file_streams():
-    """Files over GREP_FULLREAD_MAX skip the prescreen read and stream line-by-line."""
-    cwd = os.getcwd()
-    try:
-        _seed({"big.txt": "pad\n" * (tools.GREP_FULLREAD_MAX // 4) + "NEEDLE end\n"})
-        out = tools.tool_grep("NEEDLE")
-        check("grep: match found past the full-read cap", "NEEDLE end" in out, out[:120])
-    finally:
-        os.chdir(cwd)
 
 
 # --- tool_write ---------------------------------------------------------------
@@ -492,182 +299,144 @@ def test_write():
         os.chdir(cwd)
 
 
-# --- auto-background on timeout (lever: bash_auto_background) --------------------
+# --- write_todos: the wire format ---------------------------------------------
+# The tool's format is a markdown checklist — the same text it prints back — because
+# that is what a model writes unprompted. Every other shape it has been observed to
+# emit still has to land, since a mis-shaped plan used to cost a repair round-trip.
 
-def _bg_env(armed=True):
-    """Give auto-background a private spill dir; `armed=False` ablates the lever (the
-    only off-switch — levers default ON). Returns the dir."""
-    d = tempfile.mkdtemp(prefix="bgspill_")
-    os.environ["CHAD_SPILL_DIR"] = d
-    if armed:
-        os.environ.pop("CHAD_DISABLE", None)
-    else:
-        os.environ["CHAD_DISABLE"] = "bash_auto_background"
-    return d
+def test_write_todos_formats():
+    expected = [("Read the spec", "completed"),
+                ("Implement the parser", "in_progress"),
+                ("Run the tests", "pending")]
+    structured = [{"content": c, "status": s} for c, s in expected]
+
+    def statuses(v):
+        return [(t["content"], t["status"]) for t in tools.parse_todos(v)]
+
+    check("todos: structured list", statuses(structured) == expected, statuses(structured))
+    # The shape the served model actually emits: the same list as JSON text, because the
+    # XML tool-call transport makes every parameter a string.
+    check("todos: JSON-string of objects", statuses(json.dumps(structured)) == expected)
+    check("todos: single object is a one-item plan",
+          statuses({"content": "a", "status": "completed"}) == [("a", "completed")])
+    # Status words vary in the wild; none of these should read as anything else.
+    check("todos: status synonyms",
+          statuses([{"content": "a", "status": "DONE"},
+                    {"content": "b", "status": "wip"}])
+          == [("a", "completed"), ("b", "in_progress")])
+    # An unreadable status must fall to pending — never to finished.
+    check("todos: unknown status is pending",
+          statuses([{"content": "a", "status": "?"}]) == [("a", "pending")])
+    check("todos: missing status is pending",
+          statuses([{"content": "a"}]) == [("a", "pending")])
+    # Bare strings stay tolerated by the parser (the schema is stricter — see
+    # test_write_todos_validation); they are a plan nothing has started.
+    check("todos: list of bare strings", statuses(["a", "b"])
+          == [("a", "pending"), ("b", "pending")])
+    check("todos: empty content dropped",
+          statuses([{"content": "  ", "status": "completed"},
+                    {"content": "b", "status": "pending"}]) == [("b", "pending")])
+    check("todos: unparseable -> nothing",
+          statuses("") == [] and statuses(7) == [] and statuses("[x] a checklist") == [])
+    # Nothing parseable is a repair message, never a silent empty plan.
+    msg = tools.tool_write_todos("")
+    check("todos: empty input explains the format",
+          msg.startswith("[no todos found") and '"status"' in msg, msg)
 
 
-def _bg_path_from(result):
-    return result.split("stream to ", 1)[1].split(" —", 1)[0]
+def test_write_todos_validation():
+    """One shape, so a wrong field is named precisely instead of blurring into
+    'some alternative did not match'."""
+    from chad.validate import coerce_and_validate
+
+    for label, value in [("structured", [{"content": "a", "status": "pending"}]),
+                         ("JSON-string", '[{"content": "a", "status": "pending"}]')]:
+        _, errs = coerce_and_validate("write_todos", {"todos": value})
+        check(f"todos validate: {label} accepted", not errs, [str(e) for e in errs])
+
+    _, errs = coerce_and_validate("write_todos", {"todos": [{"content": "x", "status": "doing"}]})
+    check("todos validate: bad status named precisely",
+          any("status" in e.path and "doing" in e.got for e in errs), [str(e) for e in errs])
+    _, errs = coerce_and_validate("write_todos", {"todos": ["a", "b"]})
+    check("todos validate: bare strings rejected with a field-level error",
+          errs and all("content" in e.path or "status" in e.path or "object" in e.expected
+                       for e in errs), [str(e) for e in errs])
+    _, errs = coerce_and_validate("write_todos", {})
+    check("todos validate: missing required reported",
+          any(e.got == "missing" for e in errs), [str(e) for e in errs])
 
 
-def test_bash_auto_background():
-    """A timed-out command is handed to the background with its output streaming to a
-    file, instead of being killed and its work thrown away."""
-    old_spill = os.environ.get("CHAD_SPILL_DIR")
-    old_dis = os.environ.get("CHAD_DISABLE")
+# ---------------------------------------------------------------------------
+# Read-ish aliases: names the model reaches for that the lean surface does not
+# expose. Measured on TB2.1, 4 of 113 trials opened with `read_file` and burned a
+# step on the unknown-tool rejection before recovering with bash.
+# ---------------------------------------------------------------------------
+
+
+def test_alias_rewrites_a_read_call_into_the_bash_it_meant():
+    assert tools.alias_to_bash("read_file", {"path": "/app/x.py"}) == (
+        "bash", {"command": "cat -n /app/x.py"})
+
+
+def test_alias_quotes_paths_with_spaces():
+    name, args = tools.alias_to_bash("view_file", {"filename": "my notes.txt"})
+    assert name == "bash" and args["command"] == "cat -n 'my notes.txt'"
+
+
+def test_alias_honors_offset_and_limit():
+    assert tools.alias_to_bash("read", {"file": "a.py", "offset": 10, "limit": 5})[1] == {
+        "command": "sed -n '10,14p' a.py | cat -n"}
+    assert tools.alias_to_bash("read", {"file": "a.py", "start_line": 3, "end_line": 9})[1] == {
+        "command": "sed -n '3,9p' a.py | cat -n"}
+    assert tools.alias_to_bash("read", {"file": "a.py", "limit": 20})[1] == {
+        "command": "head -n 20 a.py | cat -n"}
+
+
+def test_alias_leaves_a_pathless_call_alone_for_the_normal_repair_path():
+    # Nothing to read -> don't invent a command; let the unknown-tool repair run.
+    assert tools.alias_to_bash("read_file", {}) == ("read_file", {})
+    assert tools.alias_to_bash("read_file", {"path": "  "}) == ("read_file", {"path": "  "})
+
+
+def test_alias_never_shadows_a_real_dispatch():
+    """An MCP server may legitimately expose `read`; that tool must win over the shim."""
+    tools.DISPATCH["read"] = lambda a, ss=None: "from the real tool"
     try:
-        _bg_env(armed=True)
-        res = tools.tool_bash(
-            "printf 'BUILD_STEP_1\n'; sleep 1.5; printf 'BUILD_STEP_2\n'", timeout=1)
-        check("bg: says backgrounded", res.startswith("[still running after 1s"), res[:80])
-        check("bg: not the kill result", not res.startswith("[timed out"), res[:120])
-        path = _bg_path_from(res)
-        check("bg: path absolute", os.path.isabs(path), path)
-        check("bg: partial output shown", "BUILD_STEP_1" in res, res[:300])
-        check("bg: registered while live", len(tools._bg_live) == 1, tools._bg_live)
-
-        # The command keeps running and finishes on its own; the footer is the
-        # completion signal the model greps for — no polling API needed.
-        deadline = time.time() + 10
-        while tools._bg_live and time.time() < deadline:
-            time.sleep(0.05)
-        check("bg: deregistered on exit", not tools._bg_live, tools._bg_live)
-        with open(path) as f:
-            full = f.read()
-        check("bg: pre-timeout output kept", "BUILD_STEP_1" in full, full)
-        check("bg: post-timeout output captured", "BUILD_STEP_2" in full, full)
-        check("bg: exit footer written", "[exit 0 at" in full, full)
-        check("bg: spill file is 0600", os.stat(path).st_mode & 0o777 == 0o600,
-              oct(os.stat(path).st_mode))
-
-        # A stalled command re-read twice returns byte-identical text — the signal the
-        # loop guard keys on, so polling a file that never grows still trips it.
-        a = tools.tool_read(path)
-        b = tools.tool_read(path)
-        check("bg: stalled re-read is identical", a == b)
+        assert tools.alias_to_bash("read", {"path": "/a.py"}) == ("read", {"path": "/a.py"})
     finally:
-        tools.bash_shutdown()
-        for k, v in (("CHAD_DISABLE", old_dis), ("CHAD_SPILL_DIR", old_spill)):
-            os.environ.pop(k, None)
-            if v is not None:
-                os.environ[k] = v
+        del tools.DISPATCH["read"]
 
 
-def test_bash_auto_background_bounds():
-    """The lifecycle bounds: a concurrency cap, and no survivors after shutdown."""
-    old_spill = os.environ.get("CHAD_SPILL_DIR")
-    old_dis = os.environ.get("CHAD_DISABLE")
-    try:
-        _bg_env(armed=True)
-        pgids = []
-        for _ in range(tools.BASH_BG_MAX):
-            r = tools.tool_bash("sleep 30", timeout=1)
-            check("bg cap: within cap backgrounds", r.startswith("[still running"), r[:60])
-            pgids.append(int(r.split("pgid ", 1)[1].split(")", 1)[0]))
-        check("bg cap: at cap", len(tools._bg_live) == tools.BASH_BG_MAX, tools._bg_live)
-
-        # One past the cap is killed as before, and the result says why.
-        over = tools.tool_bash("sleep 30", timeout=1)
-        check("bg cap: past cap is killed", over.startswith("[timed out after 1s"), over[:80])
-        check("bg cap: says why", "running in the background" in over, over[:160])
-        check("bg cap: cap not exceeded", len(tools._bg_live) == tools.BASH_BG_MAX,
-              tools._bg_live)
-
-        # Shutdown must leave nothing running — a coding agent that leaks builds is
-        # worse than one that kills them.
-        tools.bash_shutdown()
-        check("bg: registry empty after shutdown", not tools._bg_live, tools._bg_live)
-        time.sleep(0.3)
-        for pgid in pgids:
-            try:
-                os.killpg(pgid, 0)
-                alive = True
-            except OSError:
-                alive = False
-            check("bg: no orphaned process group", not alive, pgid)
-    finally:
-        tools.bash_shutdown()
-        for k, v in (("CHAD_DISABLE", old_dis), ("CHAD_SPILL_DIR", old_spill)):
-            os.environ.pop(k, None)
-            if v is not None:
-                os.environ[k] = v
+def test_alias_passes_exposed_tools_through_untouched():
+    assert tools.alias_to_bash("bash", {"command": "ls"}) == ("bash", {"command": "ls"})
 
 
-def test_bash_auto_background_ceiling():
-    """The absolute lifetime bound: a backgrounded command that never finishes is
-    killed and says so in its own log, so it cannot outlive the session unnoticed."""
-    old_spill = os.environ.get("CHAD_SPILL_DIR")
-    old_dis = os.environ.get("CHAD_DISABLE")
-    old_ceiling = tools.BASH_BG_CEILING_S
-    try:
-        _bg_env(armed=True)
-        tools.BASH_BG_CEILING_S = 1
-        res = tools.tool_bash("sleep 60", timeout=1)
-        check("ceiling: backgrounded first", res.startswith("[still running"), res[:60])
-        path = _bg_path_from(res)
-        pgid = int(res.split("pgid ", 1)[1].split(")", 1)[0])
-        deadline = time.time() + 10
-        while tools._bg_live and time.time() < deadline:
-            time.sleep(0.05)
-        check("ceiling: deregistered", not tools._bg_live, tools._bg_live)
-        try:
-            os.killpg(pgid, 0)
-            alive = True
-        except OSError:
-            alive = False
-        check("ceiling: process group killed", not alive, pgid)
-        with open(path) as f:
-            check("ceiling: footer names the reason",
-                  "[killed: background ceiling]" in f.read(), path)
-    finally:
-        tools.BASH_BG_CEILING_S = old_ceiling
-        tools.bash_shutdown()
-        for k, v in (("CHAD_DISABLE", old_dis), ("CHAD_SPILL_DIR", old_spill)):
-            os.environ.pop(k, None)
-            if v is not None:
-                os.environ[k] = v
+def test_aliases_are_not_advertised_to_the_model():
+    """Accepting a name is free; naming it costs prompt tokens on every request."""
+    exposed = {s["function"]["name"] for s in tools.SCHEMAS}
+    assert not (exposed & tools.READ_ALIASES)
 
 
-def test_bash_auto_background_off_is_unchanged():
-    """The OFF arm (ablation): the kill-and-advise path, verbatim — including the
-    advice to background by hand, which is only honest while chad isn't doing it."""
-    old_spill = os.environ.get("CHAD_SPILL_DIR")
-    old_dis = os.environ.get("CHAD_DISABLE")
-    try:
-        _bg_env(armed=False)
-        res = tools.tool_bash("printf 'X\n'; sleep 5", timeout=1)
-        check("bg off: killed as before", res.startswith("[timed out after 1s;"), res[:80])
-        check("bg off: advises backgrounding", "background it" in res, res[:200])
-        check("bg off: nothing registered", not tools._bg_live, tools._bg_live)
-        # The prompt must not describe a behavior the harness isn't exhibiting.
-        from chad import prompt
-        check("bg off: prompt says nothing", prompt._bash_bg_block() == "")
-        _bg_env(armed=True)
-        check("bg on: prompt describes it", "streams to a file" in prompt._bash_bg_block())
-    finally:
-        tools.bash_shutdown()
-        for k, v in (("CHAD_DISABLE", old_dis), ("CHAD_SPILL_DIR", old_spill)):
-            os.environ.pop(k, None)
-            if v is not None:
-                os.environ[k] = v
+# ---------------------------------------------------------------------------
+# Plan state read by the `done` guardrail.
+# ---------------------------------------------------------------------------
 
 
-if __name__ == "__main__":
-    test_edit_truth_table()
-    test_bash()
-    test_bash_auto_background()
-    test_bash_auto_background_bounds()
-    test_bash_auto_background_ceiling()
-    test_bash_auto_background_off_is_unchanged()
-    test_grep()
-    test_grep_default_byte_identical()
-    test_grep_line_cap()
-    test_grep_truncation_notices()
-    test_grep_path_is_file()
-    test_grep_path_not_found()
-    test_grep_dirs_do_not_starve_file_cap()
-    test_grep_ignore_case_and_context()
-    test_glob()
-    test_write()
-    print(f"\n{PASS} passed, {FAIL} failed")
-    raise SystemExit(1 if FAIL else 0)
+def test_unfinished_todos_lists_only_open_items():
+    tools.tool_write_todos([{"content": "done one", "status": "completed"},
+                            {"content": "doing this", "status": "in_progress"},
+                            {"content": "later", "status": "pending"}])
+    assert tools.unfinished_todos() == ["doing this", "later"]
+    tools.tool_write_todos([{"content": c, "status": "completed"}
+                            for c in ("done one", "doing this", "later")])
+    assert tools.unfinished_todos() == []
+    tools.clear_todos()
+    assert tools.unfinished_todos() == []
+
+
+def test_unfinished_todos_reads_json_text_from_the_xml_transport():
+    """The shape this model actually sends, arriving as JSON text over the XML transport."""
+    tools.tool_write_todos('[{"content": "a", "status": "completed"}, '
+                           '{"content": "b", "status": "pending"}]')
+    assert tools.unfinished_todos() == ["b"]
+    tools.clear_todos()

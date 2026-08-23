@@ -1,42 +1,32 @@
-"""Tree-sitter repo map + multi-language symbol intelligence for chad.
+"""Tree-sitter tags extraction for the bash-route ambient levers.
 
-The dominant cost of a local coding model is *prefill*: every token of context the
-model has never seen must be encoded before it can answer, and on Ornith's
-non-trimmable cache a bloated transcript is expensive forever. The cheapest way to
-keep prefills small is to never put a whole file in the transcript — give the model
-a ranked *skeleton* (signatures only) to navigate by, and let it pull the one
-symbol it actually needs.
+chad's tool surface is bash-first, so nothing here is a model-facing tool. What
+survives of the 1.x symbolic layer is exactly what the result channel needs:
 
-This is the aider "repo map" idea, built in-process on tree-sitter:
+* `lang_for` — extension→language detection (also used by the syntax warning);
+* `RepoMap._extract` — per-file definition Tags (name, kind, line span, scope),
+  mtime-cached in memory and on disk, feeding the one-line skeleton appended the
+  first time a file's content comes back through bash;
+* `RepoMap._find_defs` — cross-file definition lookup, feeding the
+  "this came back empty; `x` is defined at rel:line" pointer when a bash grep
+  for a known symbol returns nothing.
 
-* `tree-sitter-language-pack` ships ~300 grammars (downloaded + cached on first use)
-  AND the `tags.scm` queries that mark every definition/reference — so symbol
-  extraction is **language-agnostic** with no language-server subprocess to install
-  (the precision layer sits behind this same surface, via chad's own LSP client).
-* `repo_map()` ranks definitions with personalized PageRank (rustworkx) over the
-  file→symbol reference graph and renders the most central ones as elided signatures
-  within a token budget. Whole-repo tag extraction is mtime-cached on disk per repo
-  and sharded across subprocess workers on a cold scan (see `_extract_all`).
-* `overview` / `find_symbol` / `view_symbol` / `find_refs` are the per-symbol read
-  tools, multi-language. Qualified paths ("Engine/generate") resolve in every
-  language via each Tag's scope chain — span containment plus receiver/impl
-  context (see `Tag`). `symbols.py` (the `replace_symbol`/`insert_symbol` editor)
-  resolves through the same `_find_defs`, so what the model views is what an edit
-  replaces, in any language.
+`tree-sitter-language-pack` ships ~300 grammars (downloaded + cached on first
+use) AND the `tags.scm` queries that mark every definition/reference — so
+extraction is language-agnostic with no language-server subprocess. Whole-repo
+extraction is mtime-cached on disk per repo and sharded across subprocess
+workers on a cold scan (see `_extract_all`).
 """
 
 import hashlib
 import logging
 import os
 import pickle
-import re
 import subprocess
 import sys
 import threading
 import time
-from collections import Counter, defaultdict, namedtuple
-
-import rustworkx as rx
+from collections import namedtuple
 
 # tree-sitter-language-pack ships native (maturin/pyo3) wheels. On a platform with no
 # matching wheel — e.g. a container running emulated amd64 — uv falls back to a Rust
@@ -63,19 +53,6 @@ _SKIP_NAMES = frozenset(IGNORE_DIRS + REPOMAP_EXTRA)
 
 _MAX_FILE_BYTES = 1_000_000   # skip anything bigger than ~1MB (generated/minified)
 _MAX_FILES = 20000
-_CHARS_PER_TOK = 4            # rough token estimate without coupling to the tokenizer
-
-# Total wall-clock allowed for the decorative "used by …" annotations in one
-# disambiguation listing; candidates past the deadline render un-annotated.
-_DISAMBIG_BUDGET_S = 3.0
-
-# An identifier defined in more files than this (__init__, get, main, forward, …) says
-# nothing about which file matters, so it's excluded from the rank graph. Without the
-# cutoff a generic name fans out definers × referencers: on a 11k-file repo `__init__`
-# alone produced 11M edges of a 32M-edge/10GB graph — enough to stall the tool for
-# minutes and push a machine already holding model weights into Metal OOM.
-_MAX_DEFINERS = 16
-
 # -- whole-repo extraction scaling -----------------------------------------------
 # The tree-sitter parse loop is the dominant cost of a cold scan (measured 17.5s of a
 # 19s repo_map on an 11k-file repo) and py-tree-sitter never releases the GIL, so
@@ -268,43 +245,6 @@ def _qual_parts(name: str):
     return [p for p in name.replace(".", "/").split("/") if p]
 
 
-def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // _CHARS_PER_TOK)
-
-
-def _build_edges(defines, references):
-    """The rank graph's edge weights: {(referencer rel, definer rel): weight}, ONE
-    aggregated edge per file pair. The naive form (an edge object per raw reference)
-    is definers × references per ident — measured 32M edges / 10 GB on an 11k-file
-    repo, which OOMs the machine out from under the model. sqrt damps mega-callers
-    so one hub file doesn't drown the ranking, and idents defined in more than
-    _MAX_DEFINERS files are excluded (no ranking signal, all of the blowup)."""
-    edge_w = defaultdict(float)
-    for ident, definers in defines.items():
-        refcounts = references.get(ident)
-        if not refcounts or len(definers) > _MAX_DEFINERS:
-            continue
-        for referencer, cnt in refcounts.items():
-            w = cnt ** 0.5
-            for definer in definers:
-                if referencer != definer:
-                    edge_w[(referencer, definer)] += w
-    return edge_w
-
-
-def _rank_files(rels, edge_w, seeds):
-    """Personalized PageRank over the file graph via rustworkx — a native, maintained
-    implementation in place of the hand-rolled power iteration it replaced (validated
-    on a real 421k-edge graph: identical top-50, spearman 0.999, 0.79s -> 0.04s)."""
-    g = rx.PyDiGraph()
-    idx = dict(zip(rels, g.add_nodes_from(list(rels))))
-    g.add_edges_from([(idx[u], idx[v], w) for (u, v), w in edge_w.items()])
-    pers = {idx[r]: w for r, w in seeds.items()} if seeds else None
-    ranks = rx.pagerank(g, alpha=0.85, weight_fn=float, personalization=pers,
-                        tol=1.0e-6, max_iter=100)
-    return {rel: ranks[i] for rel, i in idx.items()}
-
-
 class RepoMap:
     """Tree-sitter symbol intelligence rooted at a project directory."""
 
@@ -315,8 +255,6 @@ class RepoMap:
         self._files = None   # memoized completed _code_files() result; None = uncomputed
         self._files_at = 0.0  # when that walk completed (staleness retry guard)
         self._disk_checked = False  # the on-disk tags cache is loaded at most once
-        self._agg = None     # incremental rank-graph tables; see _aggregates()
-        self._refsum_cache = {}  # (path, row, col, mtime) -> disambig note
 
     # -- persistent tags cache ---------------------------------------------
     # Parsing is the dominant cost of a whole-repo scan and the in-memory cache dies
@@ -589,120 +527,7 @@ class RepoMap:
         self._cache[path] = (mtime, defs, refs)
         return defs, refs
 
-    # -- repo map (ranked skeleton) --------------------------------------
-
-    def _aggregates(self, files, should_stop=None):
-        """(file_defs, defines, references) for the rank graph, maintained
-        incrementally: only files whose cached tags changed since the last call are
-        re-folded. Rebuilding from scratch was the warm-path majority (measured
-        0.39s per repo_map over 1.2M raw references on an 11k-file repo) and it
-        re-ran on every call even when nothing had changed. Interruption is safe:
-        contributions fold per file, so a stopped pass just leaves the remaining
-        files for the next call."""
-        if self._agg is None:
-            # contrib: path -> (mtime folded in, [def names], {name: ref count})
-            self._agg = ({}, {}, defaultdict(set), defaultdict(Counter))
-        contrib, file_defs, defines, references = self._agg
-        for f in files:
-            if should_stop and should_stop():
-                break
-            defs, refs = self._extract(f)
-            mtime = self._cache.get(f, (None,))[0]
-            old = contrib.get(f)
-            if old and old[0] == mtime:
-                continue
-            rel = self._rel(f)
-            if old:  # subtract the file's previous contribution before re-folding
-                for name in old[1]:
-                    s = defines.get(name)
-                    if s:
-                        s.discard(rel)
-                        if not s:
-                            del defines[name]
-                for name in old[2]:
-                    c = references.get(name)
-                    if c:
-                        c.pop(rel, None)
-                        if not c:
-                            del references[name]
-            def_names = []
-            for d in defs:
-                if d.name:
-                    defines[d.name].add(rel)
-                    def_names.append(d.name)
-            ref_counts = Counter()
-            for name, _rrel, _ln in refs:  # every ref in `refs` is from this file
-                ref_counts[name] += 1
-            for name, cnt in ref_counts.items():
-                references[name][rel] += cnt
-            file_defs[rel] = defs
-            contrib[f] = (mtime, def_names, ref_counts)
-        return file_defs, defines, references
-
-    def repo_map(self, budget_tokens: int = 1500, focus=None, should_stop=None) -> str:
-        """A PageRank-ranked, signature-only map of the codebase within a token
-        budget. `focus` (list of path substrings) personalizes the ranking toward
-        the files the agent is working on, the way aider biases toward chat files."""
-        files = self._code_files(should_stop)
-        if not files:
-            return "[no source files found]"
-        self._extract_all(files, should_stop)
-        file_defs, defines, references = self._aggregates(files, should_stop)
-        if should_stop and should_stop():
-            return "[interrupted]"
-
-        # Personalize ranking toward the files the agent is working on (focus) and, by
-        # default, likely entrypoints (check.py / main / conftest / app). Tasks usually
-        # live in test-reachable code, so a seed on the entrypoint flows rank along its
-        # imports to the module under test — surfacing it even in a big, noisy repo.
-        seeds = {}
-        for rel in file_defs:
-            base = os.path.basename(rel).lower()
-            if base.startswith(("check", "main", "conftest", "__main__")) or base == "app.py":
-                seeds[rel] = 1.0
-        if focus:
-            for rel in file_defs:
-                if any(fp in rel for fp in focus):
-                    seeds[rel] = 1.0
-        try:
-            ranks = _rank_files(file_defs, _build_edges(defines, references), seeds)
-        except Exception:  # noqa: BLE001 - rank failure degrades to def-count order
-            ranks = {}
-        # Files with no edges still deserve a spot; rank them by definition count.
-        ordered = sorted(file_defs,
-                         key=lambda r: (ranks.get(r, 0.0), len(file_defs[r])),
-                         reverse=True)
-
-        out, used = [], 0
-        header = (f"repo map ({len(files)} files, ranked by reference centrality; "
-                  f"signatures only — use view_symbol/read to see bodies)\n")
-        used += _estimate_tokens(header)
-        for rel in ordered:
-            defs = file_defs[rel]
-            if not defs:
-                continue
-            block = [f"\n{rel}"]
-            for d in sorted(defs, key=lambda t: t.line):
-                indent = "  " if d.kind in ("method",) else "  "
-                block.append(f"{indent}{d.line}: {d.sig}")
-            chunk = "\n".join(block)
-            cost = _estimate_tokens(chunk)
-            if used + cost > budget_tokens and out:
-                # Name the most-central omitted files (rank-ordered) so the model can
-                # find_symbol/overview into them — but only a handful: dumping every
-                # path on a big repo is itself a prefill cost we measured biting back.
-                remaining = [r for r in ordered[ordered.index(rel):] if file_defs[r]]
-                listed = ", ".join(remaining[:12])
-                tail = f" (+{len(remaining) - 12} more)" if len(remaining) > 12 else ""
-                out.append(f"\n[{len(remaining)} more files omitted to fit budget="
-                           f"{budget_tokens}; raise budget= or find_symbol/overview into "
-                           f"one. Top: {listed}{tail}]")
-                break
-            out.append(chunk)
-            used += cost
-        return header + "".join(out)
-
-    # -- per-symbol reads (multi-language) -------------------------------
+    # -- definition lookup ------------------------------------------------
 
     def _find_defs(self, name, path=None, should_stop=None):
         """Definition Tags matching `name` — a bare identifier or a qualified path
@@ -746,360 +571,17 @@ class RepoMap:
         self._files = None
         return self._code_files() != before
 
-    def _refsum_key(self, h):
-        return (h.path, h.name_row, h.name_col, self._cache.get(h.path, (None,))[0])
-
-    def _ref_summary(self, h, timeout=None):
-        """A short 'used by …' hint for one definition, so the model can tell same-named
-        candidates apart by who calls them (e.g. the validate on the signup path vs the
-        widely-used schema validator). Precise via the language server; silent if it's
-        unavailable (we don't want to imply precision we don't have). Decorative, so it
-        goes through `references_decorative` (never starts a non-Python server) and is
-        cached per (definition site, file mtime) — a repeated view_symbol on the same
-        ambiguous name used to re-pay every LSP lookup (measured 79s on a repeat)."""
-        key = self._refsum_key(h)
-        cached = self._refsum_cache.get(key)
-        if cached is not None:
-            return cached
-        try:
-            from . import lsp
-            locs = lsp.service().references_decorative(h.rel, h.name_row, h.name_col,
-                                                       timeout=timeout)
-        except Exception:
-            locs = None
-        if not locs:
-            note = ""
-        else:
-            files = []
-            for rel, _ln, _col in locs:
-                if rel != h.rel and rel not in files:
-                    files.append(rel)
-            if not files:
-                note = "  — no external refs"
-            else:
-                more = f" (+{len(files) - 1} more)" if len(files) > 1 else ""
-                note = f"  — used by {files[0]}{more}"
-        if len(self._refsum_cache) > 512:  # bound a very long session's cache
-            self._refsum_cache.clear()
-        self._refsum_cache[key] = note
-        return note
-
-    def _disambig(self, name, hits):
-        # Annotate the first few candidates with who references them, under a shared
-        # wall-clock budget: per-candidate LSP lookups are cheap warm, but a cold or
-        # slow server must not turn a disambiguation list into a minutes-long stall
-        # (measured 86s on an 11k-file mixed-language repo before the budget). Each
-        # lookup gets only the budget's remaining time, and candidates the budget
-        # never reached are cached blank for this mtime generation — otherwise a
-        # repeated lookup re-pays the slow pass one candidate at a time.
-        rows = []
-        deadline = time.monotonic() + _DISAMBIG_BUDGET_S
-        for i, h in enumerate(hits[:50]):
-            note = ""
-            if i < 8:
-                remaining = deadline - time.monotonic()
-                if remaining > 0.25:
-                    note = self._ref_summary(h, timeout=remaining)
-                else:
-                    self._refsum_cache.setdefault(self._refsum_key(h), "")
-            rows.append(f"  {h.rel}:{h.line}  {h.kind} {h.sig}{note}")
-        return (f"[{len(hits)} symbols named '{name}'; pass path= to disambiguate "
-                f"(pick by who uses each):]\n" + "\n".join(rows))
-
-    def overview(self, path: str, should_stop=None) -> str:
-        if not os.path.isfile(path):
-            return f"[no such file: {path}]"
-        defs, _ = self._extract(path)
-        if not defs:
-            if not self.lang_for(path):
-                return "[no tree-sitter grammar for this file type; use read]"
-            return "[no functions or classes]"
-        lines = []
-        for d in sorted(defs, key=lambda t: t.line):
-            indent = "  " if d.kind == "method" else ""
-            lines.append(f"{d.line}: {indent}{d.sig}")
-        return "\n".join(lines)
-
-    def find_symbol(self, name: str, should_stop=None) -> str:
-        hits = self._find_defs(name, None, should_stop)
-        if not hits:
-            return f"[no definition found for '{name}']"
-        out = [f"{h.rel}:{h.line}  {h.kind}  {h.sig}" for h in hits]
-        return "\n".join(out[:100])
-
-    def _use_site(self, name: str, path=None, should_stop=None):
-        """A (rel, row0, col0) position where `name` is USED, or None.
-
-        `definition` needs a use site, not a definition site: asking the language
-        server go-to-definition at the definition itself answers with the
-        definition (or, for some servers, nothing). Cached reference Tags carry
-        (name, rel, line) but no column — tree-sitter's reference captures are
-        recorded per line — so the column is recovered by finding the identifier
-        as a whole word in that line's text. Prefers a use in `path` when given,
-        and never returns a line inside the symbol's own definition span (a
-        recursive call resolves to the def either way, but a same-file use
-        elsewhere is a better question to ask)."""
-        target = _qual_parts(name)[-1] if _qual_parts(name) else name
-        word = re.compile(rf"\b{re.escape(target)}\b")
-        files = ([os.path.join(self.root, path)] if path and not os.path.isabs(path)
-                 else ([path] if path else self._code_files(should_stop)))
-        if not path:
-            self._extract_all(files, should_stop)
-        spans = [(d.rel, d.line, d.end_line)
-                 for d in self._find_defs(name, path, should_stop)]
-        best = None
-        for f in files:
-            if should_stop and should_stop():
-                break
-            _defs, refs = self._extract(f)
-            lines = None
-            for rname, rel, ln in refs:
-                if rname != target:
-                    continue
-                inside = any(r == rel and a <= ln <= b for r, a, b in spans)
-                if inside and best is not None:
-                    continue
-                if lines is None:
-                    try:
-                        with open(f, errors="replace") as fh:
-                            lines = fh.read().splitlines()
-                    except OSError:
-                        break
-                if not 0 < ln <= len(lines):
-                    continue
-                m = word.search(lines[ln - 1])
-                if not m:
-                    continue
-                site = (rel, ln - 1, m.start())
-                if not inside:
-                    return site
-                best = best or site
-        return best
-
-    def definition(self, name: str, path=None, should_stop=None) -> str:
-        """Where a symbol is really DEFINED, resolved from one of its use sites.
-
-        The difference from `find_symbol`, and the only reason this exists: the
-        language server follows imports, aliases and scope, so when several
-        symbols share a name it answers with THE one this code actually means,
-        not the candidate list. Degrades to the tree-sitter name match — labelled
-        as such, never silently — when no server is available for the language."""
-        site = self._use_site(name, path, should_stop)
-        if site is not None:
-            rel, row, col = site
-            from . import lsp  # lazy: don't weigh servers until precision is asked for
-            try:
-                locs = lsp.service().definition(rel, row, col)
-            except Exception:  # noqa: BLE001 - a dead server falls back, never raises
-                locs = None
-            if locs:
-                out = []
-                for drel, dline in locs[:20]:
-                    out.append(f"{drel}:{dline}  {self._def_sig(drel, dline)}".rstrip())
-                head = (f"[{len(out)} definition{'s' if len(out) != 1 else ''}, precise "
-                        f"(language server, resolved from the use at {rel}:{row + 1})]\n")
-                return head + "\n".join(out)
-        # fallback: tree-sitter name match — same data find_symbol shows, but the
-        # degraded precision is stated (no server, or no use site to ask from).
-        hits = self._find_defs(name, path, should_stop)
-        if not hits:
-            return f"[no definition found for '{name}']"
-        rows = [f"{h.rel}:{h.line}  {h.kind}  {h.sig}" for h in hits[:100]]
-        head = (f"[{len(hits)} candidate definition{'s' if len(hits) != 1 else ''} — "
-                f"NAME-MATCH ONLY (no language server for this file type); may include "
-                f"unrelated same-named symbols, verify before editing]\n")
-        return head + "\n".join(rows)
-
-    def _def_sig(self, rel, line):
-        """`kind sig` for the definition at rel:line, or "" — decoration for a
-        precise hit, matched by span so a server pointing at the body's first line
-        still names the enclosing symbol."""
-        try:
-            defs, _ = self._extract(os.path.join(self.root, rel))
-        except Exception:  # noqa: BLE001
-            return ""
-        for d in defs:
-            if d.line == line:
-                return f"{d.kind}  {d.sig}"
-        for d in defs:
-            if d.line <= line <= d.end_line:
-                return f"in {d.kind} {d.sig}"
-        return ""
-
-    def view_symbol(self, name: str, path=None, should_stop=None) -> str:
-        hits = self._find_defs(name, path, should_stop)
-        if not hits:
-            return f"[symbol not found: {name}]"
-        if len(hits) > 1 and path is None:
-            return self._disambig(name, hits)
-        h = hits[0]
-        try:
-            with open(h.path, errors="replace") as f:
-                lines = f.read().splitlines()
-        except OSError:
-            return f"[could not read {h.rel}]"
-        a, b = h.line, h.end_line
-        width = len(str(b))
-        body = "\n".join(f"{i:>{width}}  {lines[i-1]}"
-                         for i in range(a, b + 1) if 0 < i <= len(lines))
-        return f"{h.rel}:{a}-{b}\n{body}"
-
-    def hover(self, name: str, path=None, should_stop=None) -> str:
-        """Type signature / resolved type / docs for ONE symbol, via the language
-        server — the model reads a type in ~30 tokens instead of opening the
-        defining file. Name may be qualified ('Engine/process'); degrades to a
-        pointer at view_symbol when no server is available for the language."""
-        hits = self._find_defs(name, path, should_stop)
-        if not hits:
-            return f"[symbol not found: {name}]"
-        if len(hits) > 1 and path is None:
-            return self._disambig(name, hits)
-        h = hits[0]
-        from . import lsp
-        txt = lsp.service().hover(h.rel, h.name_row, h.name_col)
-        if not txt:
-            return ("[no hover info — no language server available for this file "
-                    "type; use view_symbol]")
-        return f"{h.rel}:{h.line}\n{txt[:1200]}"
-
-    def find_refs(self, name: str, path=None, should_stop=None) -> str:
-        """Every USE of a symbol across the project. Precise when a language server
-        is available (follows imports, respects scope, won't confuse same-named
-        symbols); falls back to tree-sitter name-matching otherwise."""
-        # Locate the definition first — gives the exact identifier position the LSP
-        # needs, and reuses disambiguation when several symbols share a name.
-        hits = self._find_defs(name, path, should_stop)
-        if hits and not (len(hits) > 1 and path is None):
-            h = hits[0]
-            from . import lsp  # lazy: only start weighing servers when refs are requested
-            locs = lsp.service().references(h.rel, h.name_row, h.name_col)
-            if locs is not None:
-                if not locs:
-                    return "[no references]"
-                return self._format_refs([(rel, ln) for rel, ln, _col in locs],
-                                         tag="precise")
-        elif len(hits) > 1 and path is None:
-            return self._disambig(name, hits)
-        # fallback: tree-sitter name match across the project
-        return self._find_refs_treesitter(name, should_stop)
-
-    def _find_refs_treesitter(self, name: str, should_stop=None) -> str:
-        target = name.replace(".", "/").split("/")[-1]
-        out = []
-        self._extract_all(self._code_files(should_stop), should_stop)
-        for f in self._code_files(should_stop):
-            if should_stop and should_stop():
-                return "[interrupted by user]"
-            _defs, refs = self._extract(f)
-            for rname, rel, ln in refs:
-                if rname == target:
-                    out.append((rel, ln))
-        if not out:
-            return "[no references]"
-        return self._format_refs(out, tag="name-match")
-
-    def _format_refs(self, pairs, tag="") -> str:
-        by_file = defaultdict(list)
-        for rel, ln in pairs:
-            by_file[rel].append(ln)
-        lines_out = []
-        for rel in sorted(by_file):
-            try:
-                with open(os.path.join(self.root, rel), errors="replace") as f:
-                    src_lines = f.read().splitlines()
-            except OSError:
-                src_lines = []
-            for ln in sorted(set(by_file[rel])):
-                code = src_lines[ln - 1].strip() if 0 < ln <= len(src_lines) else ""
-                lines_out.append(f"{rel}:{ln}: {code}")
-        n = len(lines_out)
-        if tag == "name-match":
-            # No language server: these are bare name matches and MAY include unrelated
-            # same-named symbols. Make the degraded precision visible, not silent.
-            head = (f"[{n} reference{'s' if n != 1 else ''} — NAME-MATCH ONLY (no language "
-                    f"server); may include unrelated same-named symbols, verify before "
-                    f"editing]\n")
-        else:
-            head = f"[{n} reference{'s' if n != 1 else ''}{', ' + tag if tag else ''}]\n"
-        return head + "\n".join(lines_out[:200])
-
-
-    # -- precise rename (refs-driven, position-safe) ---------------------
-
-    def rename_symbol(self, name: str, new_name: str, path=None, should_stop=None) -> str:
-        """Rename a symbol and every precise reference to it in one shot. Sites come
-        from the language server's find-all-references (follows imports, respects scope),
-        so an unrelated same-named method/function is never touched — and we rewrite
-        ONLY the exact identifier token at each (line, col), never a blind text replace.
-        Refuses (returns the disambiguation list) when the name is ambiguous, and refuses
-        rather than guess when no precise language server is available."""
-        hits = self._find_defs(name, path, should_stop)
-        if not hits:
-            return f"[no definition found for '{name}']"
-        if len(hits) > 1 and path is None:
-            return (f"[ambiguous: {len(hits)} symbols named '{name}'. Pass path= to choose "
-                    f"one before renaming:]\n{self._disambig(name, hits)}")
-        h = hits[0]
-        target = h.name
-        from . import lsp  # lazy: only pay the client import when a rename is requested
-        locs = lsp.service().references(h.rel, h.name_row, h.name_col)
-        if locs is None:
-            return ("[rename needs the precise language server (find-all-references), which "
-                    "is unavailable for this file type here. Use find_refs to locate the "
-                    "sites and edit each, or rename with edit.]")
-        # Always include the definition's own identifier; dedupe across refs.
-        sites = {(h.rel, h.name_row + 1, h.name_col + 1)}
-        for rel, ln, col in locs:
-            sites.add((rel, ln, col))
-
-        by_file = defaultdict(list)
-        for rel, ln, col in sites:
-            by_file[rel].append((ln, col))
-
-        changed, total, skipped = [], 0, 0
-        for rel in sorted(by_file):
-            p = os.path.join(self.root, rel)
-            try:
-                with open(p, errors="replace") as f:
-                    lines = f.read().splitlines(keepends=True)
-            except OSError:
-                continue
-            n_here = 0
-            # right-to-left within the file so earlier offsets stay valid after splicing
-            for ln, col in sorted(by_file[rel], reverse=True):
-                if not (0 < ln <= len(lines)):
-                    continue
-                c = col - 1
-                line = lines[ln - 1]
-                if line[c:c + len(target)] != target:
-                    skipped += 1  # position didn't land on the identifier — skip safely
-                    continue
-                lines[ln - 1] = line[:c] + new_name + line[c + len(target):]
-                n_here += 1
-            if n_here:
-                try:
-                    with open(p, "w") as f:
-                        f.write("".join(lines))
-                except OSError:
-                    continue
-                self._cache.pop(p, None)   # force re-extract on next read
-                changed.append((rel, n_here))
-                total += n_here
-
-        if not total:
-            return f"[no occurrences of '{target}' rewritten]"
-        detail = ", ".join(f"{rel} ×{n}" for rel, n in changed)
-        note = f" ({skipped} stale position(s) skipped)" if skipped else ""
-        return (f"[renamed '{target}' → '{new_name}' at {total} site(s) across "
-                f"{len(changed)} file(s){note}: {detail}]")
-
-
 _SERVICE = None
 
 
 def service() -> RepoMap:
-    """Lazily-bound, cwd-rooted repo map (the project the agent is operating in)."""
+    """Lazily-bound, cwd-rooted tags service (the project the agent is operating in)."""
     global _SERVICE
     if _SERVICE is None or _SERVICE.root != os.path.abspath(os.getcwd()):
         _SERVICE = RepoMap(os.getcwd())
     return _SERVICE
+
+
+def lang_for(path) -> str | None:
+    """Module-level language detection (extension-based, root-independent)."""
+    return service().lang_for(path)

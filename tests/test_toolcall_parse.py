@@ -94,8 +94,8 @@ def test_parse():
     # 8. `parameters` alias instead of `arguments`.
     eq(
         "8 parameters alias",
-        parse_tool_calls('<tool_call>{"name":"grep","parameters":{"pattern":"foo"}}</tool_call>'),
-        [("grep", {"pattern": "foo"})],
+        parse_tool_calls('<tool_call>{"name":"bash","parameters":{"command":"foo"}}</tool_call>'),
+        [("bash", {"command": "foo"})],
     )
 
     # 9. Two independent calls, in order.
@@ -129,7 +129,7 @@ def test_salvage_garbled_tool_name():
     from chad.toolcall_parse import salvage_tool_name
 
     # Pure helper.
-    eq("s1 xml garble", salvage_tool_name("grep</argstr"), "grep")
+    eq("s1 xml garble", salvage_tool_name("bash</argstr"), "bash")
     eq("s2 trailing quote", salvage_tool_name('edit"'), "edit")
     eq("s3 known name untouched", salvage_tool_name("replace_symbol"), "replace_symbol")
     eq("s4 unknown garbage untouched", salvage_tool_name("zzz</argstr"), "zzz</argstr")
@@ -137,15 +137,15 @@ def test_salvage_garbled_tool_name():
     # Through the XML dialect (the observed pytest-6202 shape).
     eq(
         "s5 xml call salvaged",
-        _parse_xml_calls("<function=grep</argstr><parameter=pattern>foo</parameter></function>"),
-        [("grep", {"pattern": "foo"})],
+        _parse_xml_calls("<function=bash</argstr><parameter=command>foo</parameter></function>"),
+        [("bash", {"command": "foo"})],
     )
 
     # Through the JSON dialect.
     eq(
         "s6 json call salvaged",
-        parse_tool_calls('<tool_call>{"name": "grep\\"", "arguments": {"pattern": "x"}}</tool_call>'),
-        [("grep", {"pattern": "x"})],
+        parse_tool_calls('<tool_call>{"name": "bash\\"", "arguments": {"command": "x"}}</tool_call>'),
+        [("bash", {"command": "x"})],
     )
 
 
@@ -188,8 +188,8 @@ def test_hybrid_name_parameter_dialect():
        [("bash", {"command": "pwd"}), ("bash", {"command": "ls"})])
 
     # 6. Garbled tool name on the hybrid path is salvaged too.
-    h6 = '{"name": "grep\\"" <parameter=pattern> foo </parameter>'
-    eq("h6 salvaged name", parse_tool_calls(h6), [("grep", {"pattern": "foo"})])
+    h6 = '{"name": "bash\\"" <parameter=command> foo </parameter>'
+    eq("h6 salvaged name", parse_tool_calls(h6), [("bash", {"command": "foo"})])
 
 
 def test_salvage_closed_block_unclosed_json():
@@ -221,10 +221,44 @@ def test_salvage_closed_block_unclosed_json():
        [("glob", {"pattern": "*.py"})])
 
 
+def test_text_param_first_line_indent_preserved():
+    """A multi-line old/new/content value keeps its first line's leading whitespace.
+    The wholesale .strip() ate the opening tab of every indented edit block (the value
+    starts on the line after the tag), which forced correct calls through the
+    whitespace-flexible recovery and made a whitespace-only edit unexpressible
+    (old == new after the strip). Framing newlines around the value still go;
+    single-line values keep the legacy full strip (inline space padding is common)."""
+    t1 = ("<tool_call><function=edit><parameter=path>a.ts</parameter>"
+          "<parameter=old>\n\tfoo();\n\tbar();\n</parameter>"
+          "<parameter=new>\n\t\tfoo();\n\t\tbar();\n</parameter></function></tool_call>")
+    eq("t1 tabs survive", parse_tool_calls(t1),
+       [("edit", {"path": "a.ts", "old": "\tfoo();\n\tbar();",
+                  "new": "\t\tfoo();\n\t\tbar();"})])
+
+    # Whitespace-only change stays a change after parsing.
+    t2 = ("<tool_call><function=edit><parameter=path>a.ts</parameter>"
+          "<parameter=old>\n'fetch' | 'prefix'\n</parameter>"
+          "<parameter=new>\n\t'fetch' | 'prefix'\n</parameter></function></tool_call>")
+    (name, args), = parse_tool_calls(t2)
+    check("t2 ws-only edit not collapsed", args["old"] != args["new"],
+          f"old={args['old']!r} new={args['new']!r}")
+
+    # Indented closing tag: its indentation belongs to the frame, not the value.
+    t3 = ("<tool_call><function=write><parameter=path>b.py</parameter>"
+          "<parameter=content>\n\tx = 1\n\t</parameter></function></tool_call>")
+    eq("t3 closing-tag indent dropped", parse_tool_calls(t3),
+       [("write", {"path": "b.py", "content": "\tx = 1"})])
+
+    # Single-line value: legacy strip still applies.
+    t4 = "<tool_call><function=bash><parameter=command> ls / </parameter></function></tool_call>"
+    eq("t4 single-line strip", parse_tool_calls(t4), [("bash", {"command": "ls /"})])
+
+
 if __name__ == "__main__":
     test_parse()
     test_salvage_garbled_tool_name()
     test_hybrid_name_parameter_dialect()
     test_salvage_closed_block_unclosed_json()
+    test_text_param_first_line_indent_preserved()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

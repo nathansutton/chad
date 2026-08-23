@@ -16,7 +16,13 @@ import tempfile
 
 import pytest
 
-from chad.agent import _has_open_tool_call, close_unclosed_think, expand_mentions
+from chad.agent import (
+    Agent,
+    _has_open_tool_call,
+    close_unclosed_think,
+    expand_mentions,
+    split_inline_reasoning,
+)
 
 PASS = 0
 FAIL = 0
@@ -100,6 +106,81 @@ def test_close_unclosed_think():
     check("empty untouched", close_unclosed_think("", True) == "")
 
 
+def test_split_inline_reasoning():
+    # A normal completed turn: reasoning up to </think>, action after it. chad stores the
+    # stream verbatim (the generation prompt emitted the opening tag), so there is no
+    # leading <think> to strip.
+    m = {"role": "assistant", "content": "weighing it up\n</think>\n\ncall the tool"}
+    out = split_inline_reasoning(m)
+    check("reasoning lifted", out["reasoning_content"] == "weighing it up", out)
+    check("content is the action", out["content"] == "call the tool", out)
+    check("input not mutated", m["content"].startswith("weighing"), m)
+    # An explicit opening <think> (some backends re-emit it) is dropped from the
+    # reasoning, matching the recovery Ornith's template does.
+    out = split_inline_reasoning({"role": "assistant", "content": "<think>\nwhy\n</think>\n\nans"})
+    check("opening tag stripped", out["reasoning_content"] == "why", out)
+    # No </think> at all: a --no-think / no-think-escalation turn, whose generation prompt
+    # already carried the empty block. Untouched, so its render still matches the cache.
+    nothink = {"role": "assistant", "content": "<tool_call>...</tool_call>"}
+    check("no-think turn untouched", split_inline_reasoning(nothink) is nothink)
+    # Non-assistant turns never carry reasoning.
+    tool = {"role": "tool", "name": "bash", "content": "x\n</think>\ny"}
+    check("tool turn untouched", split_inline_reasoning(tool) is tool)
+    check("user turn untouched",
+          split_inline_reasoning({"role": "user", "content": "a</think>b"})["content"] == "a</think>b")
+
+
+def test_reasoning_split_probe_classifies_templates():
+    """The probe must turn the split ON only for templates that need it. Ornith-class
+    templates (which recover inline `</think>` themselves) must stay OFF so their
+    rendered prompt is byte-identical to before this change; non-thinking templates
+    (which would DROP the reasoning) must stay off too."""
+    class FakeTok:
+        def __init__(self, kind):
+            self.kind = kind
+
+        def apply_chat_template(self, msgs, add_generation_prompt=False,
+                                enable_thinking=True, tokenize=False, **kw):
+            out = []
+            for m in msgs:
+                if m["role"] != "assistant":
+                    out.append(m["content"])
+                    continue
+                r, c = m.get("reasoning_content", ""), m["content"]
+                if self.kind == "ornith" and not r and "</think>" in c:
+                    r, _, c = c.partition("</think>")   # template recovers it itself
+                if self.kind == "plain":
+                    out.append(c)                       # ignores reasoning_content
+                else:
+                    out.append(f"<think>{r.strip()}</think>{c.strip()}")
+            return "|".join(out)
+
+    def probe(kind):
+        a = Agent.__new__(Agent)
+        a.engine = type("E", (), {"tok": FakeTok(kind)})()
+        return a._reasoning_split_supported()
+
+    check("qwen-class template -> split ON", probe("qwen") is True)
+    check("ornith-class template -> split off", probe("ornith") is False)
+    check("non-thinking template -> split off (would lose reasoning)", probe("plain") is False)
+
+    # The verdict is resolved once and cached (it renders two probe transcripts).
+    a = Agent.__new__(Agent)
+    a.engine = type("E", (), {"tok": FakeTok("qwen")})()
+    a._reasoning_split_supported()
+    a.engine = type("E", (), {"tok": FakeTok("ornith")})()
+    check("verdict cached", a._reasoning_split_supported() is True)
+
+    # An exotic template that raises must fall back to OFF (pre-existing behavior),
+    # never break the turn.
+    class Boom:
+        def apply_chat_template(self, *a, **k):
+            raise ValueError("no user query found in messages")
+    a = Agent.__new__(Agent)
+    a.engine = type("E", (), {"tok": Boom()})()
+    check("unprobeable template -> off", a._reasoning_split_supported() is False)
+
+
 if __name__ == "__main__":
     with pytest.MonkeyPatch.context() as mp:
         with tempfile.TemporaryDirectory() as d:
@@ -115,5 +196,60 @@ if __name__ == "__main__":
             test_expand_mentions_dedupes(mp, d)
     test_has_open_tool_call()
     test_close_unclosed_think()
+    test_split_inline_reasoning()
+    test_reasoning_split_probe_classifies_templates()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
+
+
+# --- /ctx: where the window actually went -------------------------------------
+
+def test_ctx_spans_splits_a_transcript():
+    """`context N` says how full the window is and nothing about why. The split is
+    what a user can act on — a 40k skill body, an eager MCP server's schemas and a
+    transcript of think blocks all read identically on the bare gauge."""
+    from chad.agent import _ctx_spans
+    msgs = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "<think>" + "t" * 40 + "</think>answer"},
+        {"role": "tool", "name": "bash", "content": "o" * 100},
+        {"role": "assistant", "content": "no thinking here"},
+        {"role": "tool", "name": "bash", "content": "r" * 30},
+        {"role": "tool", "name": "bash", "content": "r" * 20},
+    ]
+    think, tools, recent = _ctx_spans(msgs, len)   # 1 char == 1 "token"
+    check("think residue counts only <think> spans", think == 40, think)
+    check("tool results count every tool message", tools == 150, tools)
+    check("trailing run is the last step's results only", recent == 50, recent)
+
+    # No trailing tool run (the transcript ends on an assistant turn) -> 0, not "all".
+    _, _, none_recent = _ctx_spans(msgs[:-2], len)
+    check("no trailing tool run reports 0", none_recent == 0, none_recent)
+    # An unterminated <think> is not a span: half a block must not be priced as one.
+    open_think, _, _ = _ctx_spans([{"role": "assistant", "content": "<think>abc"}], len)
+    check("unterminated think block counts 0", open_think == 0, open_think)
+
+
+def test_ctx_breakdown_adds_up():
+    """The parts must reconcile to the total — `chat` is the remainder on purpose, so
+    template scaffolding lands there instead of being attributed to content that did
+    not produce it."""
+    from chad.agent import Agent, format_ctx_breakdown
+    from test_agent_e2e import ScriptedEngine
+    agent = Agent(ScriptedEngine(["done"]), mode="yolo", thinking=False)
+    agent.messages += [
+        {"role": "user", "content": "do a thing"},
+        {"role": "assistant", "content": "<think>" + "t" * 400 + "</think>ok"},
+        {"role": "tool", "name": "bash", "content": "o" * 800},
+    ]
+    bd = agent.ctx_breakdown()
+    check("system + schemas + history == total",
+          bd["system"] + bd["schemas"] + bd["history"] == bd["total"], bd)
+    check("history decomposes exactly",
+          bd["think"] + bd["tools"] + bd["chat"] == bd["history"], bd)
+    check("every part is non-negative", all(v >= 0 for v in bd.values()), bd)
+    check("the limit shown is the compaction trigger", bd["limit"] == agent.ctx_limit, bd)
+    lines = format_ctx_breakdown(bd)
+    check("formats one line per part", len(lines) >= 7, lines)
+    check("names the compaction trigger", f"{bd['limit']:,}" in lines[0], lines[0])

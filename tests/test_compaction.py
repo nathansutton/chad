@@ -22,6 +22,9 @@ a fake token-renderer instead of loading a model. No model, runs in the fast gat
   │  tool (recent)   │  pass4 hard-truncate remainder
   └─────────────────┘
 """
+import os
+
+from chad import spill
 from chad.compaction import _COLLAPSED, _headtail, compact_if_needed
 
 passed = 0
@@ -74,7 +77,8 @@ def test_compaction():
     check("_headtail char-caps a giant single line", len(ht_blob) < 9000,
           f"len={len(ht_blob)}")
     check("_headtail char-cap keeps head and tail bytes",
-          ht_blob.startswith("x") and ht_blob.endswith("x") and _COLLAPSED in ht_blob)
+          ht_blob.startswith("x") and "x" * 100 in ht_blob.split(_COLLAPSED)[-1]
+          and _COLLAPSED in ht_blob)
 
 
     # === compact_if_needed: no-op below the limit ===============================
@@ -338,9 +342,189 @@ def test_overlimit_latch():
     check("stateless call still works (legacy path)", len(out) > ctx, len(out))
 
 
+def test_low_yield_compaction_latches():
+    """A compaction that lands just BARELY under the limit is a treadmill, and must
+    latch exactly like one that failed to get under at all.
+
+    The cost of compacting is fixed and large (the whole transcript past the stable
+    prefix is re-prefilled); the benefit is only the runway it buys. As the protected
+    recent window fills, each pass reclaims less while the re-prefill grows — measured
+    on a completed ky session: five passes freed 20,253 tokens and paid 73,220 tokens
+    of re-prefill, the last one freeing 884 for a cost of 17,667 (20x). Landing under
+    the limit with no runway left is the signature; only the runway test catches it,
+    because `len(new_ids) > ctx_limit` is false every time."""
+    from chad.compaction import _OVERLIMIT_REARM
+
+    # A big protected system prompt sits just under ctx_limit, and the droppable
+    # middle is what pushes it over. Compaction therefore SUCCEEDS (lands under the
+    # limit) but lands with almost no runway — the degenerate case the old
+    # `len(new_ids) > ctx_limit` test cannot see.
+    ctx = 4000
+    KEEP_RECENT = 6                  # matches compaction's trailing protected window
+    msgs = ([{"role": "system", "content": "S" * (ctx - 100)}]
+            + [{"role": "user", "content": "q"}]
+            + [{"role": "tool", "name": "read", "content": "d" * 500}
+               for _ in range(10)]                      # droppable middle
+            + [{"role": "tool", "name": "read", "content": "r" * 5}
+               for _ in range(KEEP_RECENT)])            # protected recent window
+    render = make_render(msgs)
+    state = {}
+
+    out = compact_if_needed(msgs, render, noop_emit, ctx, render(), state=state)
+    check("low-yield compaction lands under the limit", len(out) <= ctx, str(len(out)))
+    check("low-yield compaction leaves less than the rearm margin of runway",
+          ctx - len(out) < _OVERLIMIT_REARM, str(ctx - len(out)))
+    check("low-yield compaction still latches a floor",
+          state.get("overlimit_floor"), str(state))
+
+    # ...and the latch actually suppresses the next attempt, which is the whole point:
+    # without it the next over-limit step re-prefills the entire transcript again.
+    msgs.append({"role": "tool", "name": "read", "content": "x" * 200})
+    snapshot = [dict(m) for m in msgs]
+    compact_if_needed(msgs, render, noop_emit, ctx, render(), state=state)
+    check("latched: low-yield transcript not re-compacted",
+          [dict(m) for m in msgs] == snapshot)
+
+    # A compaction that DOES buy real runway must not latch — otherwise the guard
+    # would suppress the healthy first pass too (only pass #1 paid for itself above).
+    roomy = ([{"role": "system", "content": "s"}, {"role": "user", "content": "q"}]
+             + [{"role": "tool", "name": "read", "content": "d" * 800}
+                for _ in range(6)]                      # droppable
+             + [{"role": "tool", "name": "read", "content": "r" * 5}
+                for _ in range(KEEP_RECENT)])           # small protected window
+    r4 = make_render(roomy)
+    st2 = {}
+    out4 = compact_if_needed(roomy, r4, noop_emit, ctx, r4(), state=st2)
+    check("high-yield compaction leaves real runway",
+          ctx - len(out4) >= _OVERLIMIT_REARM, str(ctx - len(out4)))
+    check("high-yield compaction does NOT latch",
+          "overlimit_floor" not in st2, str(st2))
+
+
+def test_trim_carries_a_spill_pointer():
+    """A clip is a loan, not a deletion.
+
+    Compaction was the one path that destroyed bytes outright: bash has spilled its
+    omitted middle since it shipped, but a tool result the compactor head/tail-trimmed
+    was simply gone, and the only route back was to issue the identical call again —
+    a dead turn plus a full re-prefill. Every trim now writes the original to a spill
+    file and names it in the trimmed message."""
+    body = "\n".join(f"line {i} MIDDLE_MARKER" if i == 50 else f"line {i}"
+                     for i in range(100))
+    out = _headtail(body, head=12, tail=8)
+    path = spill.path_in(out)
+    check("trim names a spill file", path is not None, out[-200:])
+    check("trim's pointer is absolute", os.path.isabs(path), path)
+    check("spill file is 0600", os.stat(path).st_mode & 0o777 == 0o600,
+          oct(os.stat(path).st_mode))
+    check("dropped middle is gone from the transcript", "MIDDLE_MARKER" not in out)
+    with open(path) as f:
+        full = f.read()
+    check("spill holds the complete original", full == body, len(full))
+
+    # An untrimmed body is a loan of nothing — it must not touch the disk.
+    before = sorted(os.listdir(spill.session_dir()))
+    check("short text unchanged", _headtail("a\nb\nc") == "a\nb\nc")
+    check("untrimmed text writes no file",
+          sorted(os.listdir(spill.session_dir())) == before)
+
+
+def test_trim_reuses_an_existing_spill():
+    """A bash result that already carries a pointer (its own head/tail overflowed)
+    re-points at that file rather than writing the same bytes a second time — one
+    body, one file, whichever cap bites first."""
+    path = spill.write("the original bash output", "bash")
+    body = ("\n".join(f"line {i}" for i in range(60))
+            + f"\n[… FULL output saved to {path}; grep/sed that file …]\n"
+            + "\n".join(f"tail {i}" for i in range(60)))
+    before = sorted(os.listdir(spill.session_dir()))
+    out = _headtail(body, head=12, tail=8)
+    check("re-trim points at the existing spill", spill.path_in(out) == path, out[-200:])
+    check("re-trim writes no second file",
+          sorted(os.listdir(spill.session_dir())) == before,
+          os.listdir(spill.session_dir()))
+
+
+def test_tighter_rung_does_not_respill():
+    """Pass 4 escalates through three tighter rungs, but `trunc_tools` skips
+    already-collapsed results — so a message is trimmed (and spilled) exactly once,
+    however many rungs run."""
+    msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "ACTIVE"}]
+    for i in range(6):
+        msgs.append({"role": "tool", "name": "bash",
+                     "content": "\n".join(f"r{i} line {j}" for j in range(400))})
+    render = make_render(msgs)
+    n_before = len(os.listdir(spill.session_dir())) if os.path.isdir(spill.session_dir()) else 0
+    compact_if_needed(msgs, render, noop_emit, ctx_limit=len(render()) // 20,
+                      prompt_ids=render())
+    trimmed = [m for m in msgs if m.get("role") == "tool" and _COLLAPSED in m["content"]]
+    written = len(os.listdir(spill.session_dir())) - n_before
+    check("every trimmed result kept a pointer",
+          all(spill.path_in(m["content"]) for m in trimmed),
+          [m["content"][-120:] for m in trimmed])
+    check("one spill per trimmed result, not one per rung",
+          written == len(trimmed), f"written={written} trimmed={len(trimmed)}")
+
+
+def test_trim_spill_lever_off(monkeypatch):
+    """CHAD_DISABLE=trim_spill leaves the trim itself (a reclaim path, not a lever)
+    and drops only the pointer — the leave-one-out arm."""
+    monkeypatch.setenv("CHAD_DISABLE", "trim_spill")
+    out = _headtail("\n".join(f"line {i}" for i in range(100)), head=12, tail=8)
+    check("lever off: still trimmed", _COLLAPSED in out and "line 50" not in out)
+    check("lever off: no pointer", "saved to" not in out, out[-160:])
+
+
+def test_compact_now():
+    """/compact, the manual reclaim path, had NO test — which is how it shipped
+    filtering on a module constant that does not exist and raising AttributeError the
+    moment a session had one uncollapsed tool result. It runs only the lossless-ish
+    passes: strip old <think>, head/tail older tool outputs, never drop a message."""
+    from chad.agent import Agent
+    from test_agent_e2e import ScriptedEngine
+
+    agent = Agent(ScriptedEngine(["done"]), mode="yolo", thinking=False)
+    agent.messages += [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "<think>" + ("reason " * 300) + "</think>A1"},
+        {"role": "tool", "name": "bash", "content": "\n".join(f"old {i}" for i in range(300))},
+        {"role": "assistant", "content": "<think>t2</think>A2"},
+        {"role": "assistant", "content": "<think>t3</think>A3"},
+        {"role": "tool", "name": "bash", "content": "recent-1"},
+        {"role": "tool", "name": "bash", "content": "recent-2"},
+        {"role": "tool", "name": "bash", "content": "recent-3"},
+        {"role": "tool", "name": "bash", "content": "recent-4"},
+    ]
+    n_before = len(agent.messages)
+    before, after = agent.compact_now()
+    check("compact_now reclaimed tokens", after < before, f"{before}->{after}")
+    check("compact_now drops no messages", len(agent.messages) == n_before)
+    check("compact_now strips the oldest thinking",
+          "<think>" not in agent.messages[2]["content"], agent.messages[2]["content"][:40])
+    check("compact_now keeps the last 2 thinking turns",
+          "<think>" in agent.messages[4]["content"]
+          and "<think>" in agent.messages[5]["content"])
+    check("compact_now trims the old tool output",
+          _COLLAPSED in agent.messages[3]["content"], agent.messages[3]["content"][:80])
+    check("compact_now's trim carries a pointer",
+          spill.path_in(agent.messages[3]["content"]) is not None,
+          agent.messages[3]["content"][-160:])
+    check("compact_now keeps the last 4 tool outputs verbatim",
+          [m["content"] for m in agent.messages[-4:]]
+          == ["recent-1", "recent-2", "recent-3", "recent-4"])
+    # Idempotent: a second pass has nothing uncollapsed left to trim and must not raise.
+    b2, a2 = agent.compact_now()
+    check("compact_now is safe to re-run", a2 >= b2 - 1, f"{b2}->{a2}")
+
+
 if __name__ == "__main__":
     test_compaction()
     test_subagent_compaction()
     test_overlimit_latch()
+    test_low_yield_compaction_latches()
+    test_trim_carries_a_spill_pointer()
+    test_trim_reuses_an_existing_spill()
+    test_tighter_rung_does_not_respill()
+    test_compact_now()
     print(f"\n{passed} passed, {failed} failed")
     raise SystemExit(1 if failed else 0)

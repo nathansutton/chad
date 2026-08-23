@@ -13,7 +13,7 @@ import subprocess
 
 import pytest
 
-from chad import levers, seatbelt, tools
+from chad import config, seatbelt, tools
 
 
 @pytest.fixture(autouse=True)
@@ -29,8 +29,8 @@ def _force_capable(monkeypatch, ok=True):
 
 # -- wrap gating --------------------------------------------------------------
 
-def test_no_wrap_when_lever_off(monkeypatch):
-    monkeypatch.setenv("CHAD_DISABLE", "yolo_seatbelt")
+def test_no_wrap_when_opted_out(monkeypatch):
+    monkeypatch.setenv("CHAD_NO_SEATBELT", "1")
     _force_capable(monkeypatch)
     seatbelt.set_context(True, os.getcwd())
     assert seatbelt.wrap_argv("echo hi") is None
@@ -54,7 +54,10 @@ def test_wrap_argv_shape(monkeypatch, tmp_path):
     argv = seatbelt.wrap_argv("echo hi > f.txt")
     assert argv is not None
     assert argv[0] == seatbelt.SANDBOX_EXEC and argv[1] == "-f"
-    assert argv[3:] == ["/bin/sh", "-c", "echo hi > f.txt"]
+    # The shell is bash where one exists (process substitution is a syntax error
+    # under /bin/sh), falling back to /bin/sh on a host without it.
+    assert argv[3:] == [config.shell_path(), "-c", "echo hi > f.txt"]
+    assert os.path.basename(argv[3]) in ("bash", "sh")
     with open(argv[2], encoding="utf-8") as fh:
         assert str(tmp_path.resolve()) in fh.read()
 
@@ -107,29 +110,30 @@ def _worktree_fixture(tmp_path):
 
 
 def test_profile_worktree_gitdir_carveout(tmp_path, monkeypatch):
-    monkeypatch.setenv("CHAD_DISABLE", "seatbelt_protect_git")
+    monkeypatch.delenv("CHAD_PROTECT_GIT", raising=False)
     ws, gitdir, common = _worktree_fixture(tmp_path)
     head, tail = _split_at_deny_tail(seatbelt.profile_text(str(ws)))
     assert str(gitdir) in head and str(common) in head
     assert str(gitdir) not in tail and str(common) not in tail
 
 
-def test_profile_protect_git_flips_worktree_gitdirs_to_deny(tmp_path):
-    # the suite runs CHAD_ENABLE=all, so the protection tier is on here
+def test_profile_protect_git_flips_worktree_gitdirs_to_deny(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHAD_PROTECT_GIT", "1")
     ws, gitdir, common = _worktree_fixture(tmp_path)
     head, tail = _split_at_deny_tail(seatbelt.profile_text(str(ws)))
     assert str(gitdir) in tail and str(common) in tail
     assert str(gitdir) not in head and str(common) not in head
 
 
-def test_profile_protect_git_denies_workspace_dotgit(tmp_path):
+def test_profile_protect_git_denies_workspace_dotgit(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHAD_PROTECT_GIT", "1")
     _head, tail = _split_at_deny_tail(seatbelt.profile_text(str(tmp_path)))
     ws = tmp_path.resolve()
     assert f'(subpath "{ws / ".git"}")' in tail
 
 
 def test_profile_checkpoints_denied_even_without_git_tier(tmp_path, monkeypatch):
-    monkeypatch.setenv("CHAD_DISABLE", "seatbelt_protect_git")
+    monkeypatch.delenv("CHAD_PROTECT_GIT", raising=False)
     text = seatbelt.profile_text(str(tmp_path))
     head, tail = _split_at_deny_tail(text)
     ckpt = os.path.join(os.path.expanduser("~"), ".chad", "checkpoints")
@@ -142,8 +146,9 @@ def test_profile_checkpoints_denied_even_without_git_tier(tmp_path, monkeypatch)
 def test_profile_cache_distinguishes_git_tier(monkeypatch, tmp_path):
     _force_capable(monkeypatch)
     seatbelt.set_context(True, str(tmp_path))
+    monkeypatch.setenv("CHAD_PROTECT_GIT", "1")
     with_tier = seatbelt.wrap_argv("true")[2]
-    monkeypatch.setenv("CHAD_DISABLE", "seatbelt_protect_git")
+    monkeypatch.delenv("CHAD_PROTECT_GIT")
     without_tier = seatbelt.wrap_argv("true")[2]
     assert with_tier != without_tier
     with open(with_tier, encoding="utf-8") as fh:
@@ -227,20 +232,15 @@ def test_bash_env_strips_credential_shaped_names(monkeypatch):
 
 
 def test_bash_env_off_means_inherit(monkeypatch):
-    monkeypatch.setenv("CHAD_DISABLE", "bash_env_guard")
+    monkeypatch.setenv("CHAD_NO_ENV_GUARD", "1")
     assert tools._bash_env() is None
 
 
-def test_bash_env_guard_fires_only_when_something_dropped(monkeypatch):
-    for k in list(os.environ):
-        if tools._ENV_SECRET_RE.search(k):
-            monkeypatch.delenv(k)
-    before = levers.fire_counts().get("bash_env_guard", 0)
-    assert tools._bash_env() is not None
-    assert levers.fire_counts().get("bash_env_guard", 0) == before
+def test_bash_env_guard_always_filters(monkeypatch):
+    monkeypatch.delenv("CHAD_NO_ENV_GUARD", raising=False)
     monkeypatch.setenv("SOME_API_KEY", "k")
-    tools._bash_env()
-    assert levers.fire_counts().get("bash_env_guard", 0) == before + 1
+    env = tools._bash_env()
+    assert env is not None and "SOME_API_KEY" not in env
 
 
 def test_bash_env_guard_end_to_end(monkeypatch):
@@ -262,24 +262,20 @@ def test_tool_bash_unwrapped_runs_plain_shell(monkeypatch):
 
 def test_tool_bash_denial_note_and_fire(monkeypatch):
     """A wrapped command whose output shows the EPERM marker gets the explanatory
-    note appended and fires the lever exactly once."""
+    note appended."""
     fake = ["/bin/sh", "-c", "echo 'x: Operation not permitted'; exit 1"]
     monkeypatch.setattr(seatbelt, "wrap_argv", lambda cmd: fake)
-    before = levers.fire_counts().get("yolo_seatbelt", 0)
     out = tools.tool_bash("anything")
     assert "Operation not permitted" in out
     assert "seatbelt:" in out
-    assert levers.fire_counts().get("yolo_seatbelt", 0) == before + 1
 
 
 def test_tool_bash_wrapped_clean_run_no_note(monkeypatch):
     fake = ["/bin/sh", "-c", "echo all good"]
     monkeypatch.setattr(seatbelt, "wrap_argv", lambda cmd: fake)
-    before = levers.fire_counts().get("yolo_seatbelt", 0)
     out = tools.tool_bash("anything")
     assert "all good" in out
     assert "seatbelt:" not in out
-    assert levers.fire_counts().get("yolo_seatbelt", 0) == before
 
 
 def test_unwrapped_denial_output_gets_no_note(monkeypatch):
@@ -323,7 +319,8 @@ def test_e2e_enforcement_probe_green():
 
 
 @pytest.mark.skipif(not _can_sandbox, reason="Seatbelt cannot apply here")
-def test_e2e_protect_git_denies_gitdir_write(tmp_path):
+def test_e2e_protect_git_denies_gitdir_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHAD_PROTECT_GIT", "1")
     (tmp_path / ".git").mkdir()
     seatbelt.set_context(True, str(tmp_path))
     argv = seatbelt.wrap_argv(f"touch {tmp_path}/.git/droppings")

@@ -1,25 +1,25 @@
-"""Agent Skills support (https://agentskills.io) — discovery, parsing, disclosure, activation.
+"""Agent Skills (https://agentskills.io) — discovery, parsing, and user-driven loading.
 
 A *skill* is a directory containing a `SKILL.md` file: YAML frontmatter (at minimum
 `name` + `description`) followed by a markdown body of instructions, optionally
-bundling `scripts/`, `references/`, and `assets/`. This module implements the four
-client-side responsibilities from the spec's "adding skills support" guide:
+bundling `scripts/`, `references/`, and `assets/`. chad discovers and loads them:
 
-  1. Discover  — scan project- and user-level skill dirs for `SKILL.md` files.
-  2. Parse     — leniently extract frontmatter + body (warn, don't crash, on cosmetic
-                 issues; skip only when there's no usable description / unparseable YAML).
-  3. Disclose  — `catalog_block()` lists name+description+location for the system prompt
-                 (tier 1: ~50-100 tokens/skill, loaded at session start).
-  4. Activate  — `activate(name)` returns the full body wrapped in <skill_content> with a
-                 bundled-resource listing (tier 2: loaded only when the model asks).
+  1. Discover — scan project- and user-level skill dirs for `SKILL.md` files.
+  2. Parse    — leniently extract frontmatter + body (warn, don't crash, on cosmetic
+                issues; skip only when there's no usable description / unparseable YAML).
+  3. Dispatch — `slash_commands()` puts every skill in the TUI's `/` menu.
+  4. Load     — `load(name, task)` returns the body as text to submit as a USER turn.
 
-Progressive disclosure means the base context stays small: the model sees the catalog
-always, pulls a skill's instructions only when a task matches, and reads bundled
-resources (scripts/refs) on demand via the normal `read` tool.
+chad deliberately does NOT implement the spec's tier-1 disclosure, where a catalog of
+every skill's description rides in the system prompt so the model can select one. That
+catalog measured 4,751 tokens against 62 installed skills — 60% of the entire system
+prompt, permanently, on a box whose usable window is ~50k. The completion menu shows
+the same names to the person who already knows which one they want, for nothing. So
+selection is the user's (`/ship`), and only what they ask for reaches the model.
 
-State (the cwd-keyed registry and the set of already-activated skills) lives at module
-level — same pattern as `tools._TODOS` — and is cleared by `reset_session()` when a new
-Agent / `/reset` starts so activations don't bleed across sessions.
+State (the cwd-keyed registry and the set of loaded skills) lives at module level — same
+pattern as `tools._TODOS` — and is cleared by `reset_session()` when a new Agent /
+`/reset` starts so one session's loads don't bleed into the next.
 """
 
 import os
@@ -33,8 +33,8 @@ _MAX_DEPTH = 4
 _MAX_DIRS = 2000
 # Directories never worth descending into during a skill scan (shared canonical set).
 _SKIP_DIRS = set(IGNORE_DIRS)
-# Cap the bundled-resource listing returned at activation — a large skill dir shouldn't
-# flood the activation result; the model reads specific files on demand anyway.
+# Cap the bundled-resource listing returned at load — a large skill dir shouldn't flood
+# the loaded turn; the model reads the specific files it needs on demand anyway.
 _MAX_RESOURCES = 50
 
 
@@ -196,14 +196,15 @@ def discover(cwd: str = None, home: str = None):
     """Scan all scopes and return (skills_by_name, order, warnings).
 
     `skills_by_name` maps name -> Skill with project-over-user precedence applied;
-    `order` is the de-duplicated catalog order (stable: discovery order); `warnings`
+    `order` is the de-duplicated menu order (stable: discovery order); `warnings`
     collects per-skill diagnostics plus shadow/collision notes for surfacing in /skills.
     """
-    # CHAD_NO_SKILLS=1 disables all skill discovery (no `# Skills` prompt section, no
-    # `activate_skill` tool). For controlled/benchmark runs where the host's personal
-    # `~/.claude/skills` must not leak into the prompt and skew results — a measured
-    # confound: ~50 user skills were injected into every prompt, differing from a clean
-    # environment and shifting a small model's greedy trajectory.
+    # CHAD_NO_SKILLS=1 disables discovery entirely, so `/name` resolves to nothing and
+    # the menu is bare. The prompt-confound this originally existed for — ~50 user
+    # skills injected into every system prompt, differing from a clean environment and
+    # shifting a small model's greedy trajectory — is now structurally impossible, since
+    # discovery reaches only the completion menu. It stays as the switch for a host that
+    # wants its personal skills unreachable from chad at all.
     if os.environ.get("CHAD_NO_SKILLS", "").strip().lower() in ("1", "true", "yes", "on"):
         return {}, [], []
     cwd = cwd or os.getcwd()
@@ -255,7 +256,7 @@ class _Registry:
 
 
 _registry = None      # cached _Registry for the current cwd
-_activated = set()    # names activated this session (for dedupe)
+_loaded = set()       # names loaded this session (a second copy is dead weight)
 
 
 def get_registry() -> "_Registry":
@@ -272,15 +273,15 @@ def get_registry() -> "_Registry":
 
 
 def reset_session():
-    """Clear per-session state (activations) and force re-discovery. Called when a new
-    Agent / `/reset` starts so a prior session's activated skills don't leak forward."""
-    global _registry, _activated
+    """Clear per-session state (loads) and force re-discovery. Called when a new Agent /
+    `/reset` starts so a prior session's loaded skills don't leak forward."""
+    global _registry, _loaded
     _registry = None
-    _activated = set()
+    _loaded = set()
 
 
 def skill_names():
-    """Names of all available skills (used to constrain the activate_skill tool enum)."""
+    """Names of all available skills."""
     return list(get_registry().order)
 
 
@@ -289,48 +290,45 @@ def has_skills() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Disclosure (tier 1) + activation (tier 2)
+# Dispatch (slash commands) + loading (the skill body as a user turn)
 # ---------------------------------------------------------------------------
 
-_CATALOG_INSTRUCTIONS = (
-    "# Skills\n"
-    "The following skills provide specialized instructions for specific tasks. Each "
-    "lists what it does and when to use it. When a task matches a skill's description, "
-    "call the `activate_skill` tool with the skill's `name` to load its full "
-    "instructions BEFORE proceeding — do not guess the procedure from the name alone. "
-    "A skill's instructions may reference bundled files (scripts/, references/, "
-    "assets/); read those on demand with the `read` tool, resolving relative paths "
-    "against the skill directory reported when you activate it.\n"
-)
+def slash_commands():
+    """`[(command, description)]` for the TUI's `/` menu — one row per installed skill.
+
+    This is the whole of chad's skill *discovery* surface. Skills are invoked by the
+    user typing `/name`; the model never selects one from a prompt catalog. The catalog
+    this replaced cost 4,751 tokens of every system prompt (60% of it) so a small model
+    could guess among dozens of descriptions — when the completion menu already puts the
+    same names in front of the person who knows which one they want. This costs nothing
+    in context because it never reaches the model.
+    """
+    reg = get_registry()
+    return [(f"/{name}", _one_line(reg.by_name[name].description)[:70])
+            for name in reg.order]
 
 
-def catalog_block(cwd: str = None) -> str:
-    """The tier-1 skills section for the system prompt: behavioral instructions plus a
-    compact <available_skills> catalog (name + description + location). Returns "" when
-    no skills are installed, so an empty block never confuses the model."""
-    reg = get_registry() if cwd is None else _Registry(cwd)
-    if not reg.order:
-        return ""
-    lines = ["\n\n" + _CATALOG_INSTRUCTIONS, "<available_skills>"]
-    for name in reg.order:
-        s = reg.by_name[name]
-        lines.append("  <skill>")
-        lines.append(f"    <name>{name}</name>")
-        lines.append(f"    <description>{_one_line(s.description)}</description>")
-        lines.append(f"    <location>{s.location}</location>")
-        lines.append("  </skill>")
-    lines.append("</available_skills>")
-    return "\n".join(lines)
+def is_skill_command(text: str):
+    """Split a typed line into `(skill_name, trailing_args)` when it names a skill, else
+    None. `/ship` -> ("ship", ""); `/investigate the flaky test` -> ("investigate", "the
+    flaky test"). Matches the leading token exactly, so a builtin like `/model` can
+    never be captured by a skill whose name merely starts the same way."""
+    if not text.startswith("/") or "\n" in text:
+        return None
+    head, _, rest = text[1:].partition(" ")
+    if head and head in get_registry().by_name:
+        return head, rest.strip()
+    return None
 
 
 def _one_line(text: str) -> str:
-    """Collapse whitespace so a multi-line description stays on one catalog line."""
+    """Collapse whitespace so a multi-line description stays on one menu line."""
     return " ".join(text.split())
 
 
 def _list_resources(base_dir: str, skill_md: str):
     """Relative paths of bundled files in the skill dir (excluding SKILL.md itself),
-    capped. These are surfaced to the model but NOT read — it loads them on demand."""
+    capped. These are listed for the model but NOT read — it opens them on demand."""
     files = []
     truncated = False
     for dirpath, dirnames, filenames in os.walk(base_dir):
@@ -349,25 +347,34 @@ def _list_resources(base_dir: str, skill_md: str):
     return sorted(files), truncated
 
 
-def activate(name: str) -> str:
-    """Tier-2 activation: return the named skill's instructions wrapped in identifying
-    tags, with its directory and a bundled-resource listing. Frontmatter is stripped
-    (the body is the actionable part). Already-activated skills return a short note
-    instead of re-injecting the same instructions."""
+def load(name: str, task: str = "") -> str:
+    """The text to submit as a USER turn when someone types `/name`: the skill's body,
+    its directory, and a listing of the files it bundles.
+
+    A user turn, not a tool result, is the whole point of the slash-command move. A
+    skill is guidance for one task, so it should live where the task lives — droppable
+    by compaction when the task is done, instead of welded into the system prompt for
+    the session. `task` is whatever the user typed after the command
+    (`/investigate the flaky test`) and becomes the concrete ask the instructions apply to.
+
+    Re-invoking a skill already loaded this session returns a short note instead of the
+    body: the instructions are still in the transcript, and on a 24 GB box a second copy
+    of a 40k-token skill is most of the window.
+    """
     reg = get_registry()
     skill = reg.by_name.get(name)
     if skill is None:
         avail = ", ".join(reg.order) or "none installed"
-        return (f"[no skill named {name!r}. Available skills: {avail}. "
-                f"Call activate_skill with one of those exact names.]")
-    if name in _activated:
-        return (f"[skill '{name}' is already active earlier in this conversation — its "
-                f"instructions are still in effect; no need to re-activate.]")
-    _activated.add(name)
-    log.info("skills: activated %s (%s)", name, skill.location)
+        return f"[no skill named {name!r}. Available skills: {avail}.]"
+    if name in _loaded:
+        note = (f"[the '{name}' skill's instructions were loaded earlier in this "
+                f"conversation and are still in effect.]")
+        return f"{note}\n\n{task}" if task else note
+    _loaded.add(name)
+    log.info("skills: loaded %s (%s)", name, skill.location)
 
     resources, truncated = _list_resources(skill.base_dir, skill.location)
-    parts = [f'<skill_content name="{name}">', skill.body, "",
+    parts = [f'<skill name="{name}">', skill.body, "",
              f"Skill directory: {skill.base_dir}",
              "Relative paths in this skill are relative to the skill directory; pass "
              "absolute paths to tools."]
@@ -377,27 +384,31 @@ def activate(name: str) -> str:
         if truncated:
             parts.append(f"  <note>listing capped at {_MAX_RESOURCES} files; more exist</note>")
         parts.append("</skill_resources>")
-    parts.append("</skill_content>")
+    parts.append("</skill>")
+    parts.append("")
+    parts.append(f"[I invoked the '{name}' skill. Follow the instructions above for "
+                 f"this task.]")
+    if task:
+        parts.append(task)
     return "\n".join(parts)
 
 
-# Marker that identifies an activated-skill tool result, so context compaction can
-# protect it from truncation/dropping (skill instructions are durable behavioral
-# guidance — silently losing them mid-session degrades the agent with no error).
-SKILL_CONTENT_MARKER = "<skill_content "
+# Marker identifying the user turn that carries a skill's instructions, so context
+# compaction can protect it from truncation/dropping (skill instructions are durable
+# behavioral guidance — silently losing them mid-session degrades the agent with no
+# error, and the user paid for them deliberately by typing the command).
+SKILL_CONTENT_MARKER = "<skill name="
 
 
 def is_skill_message(msg: dict) -> bool:
-    """True if a conversation message carries activated skill instructions."""
-    return (msg.get("role") == "tool"
-            and (msg.get("name") == "activate_skill"
-                 or SKILL_CONTENT_MARKER in msg.get("content", "")))
+    """True if a conversation message carries a loaded skill's instructions."""
+    return SKILL_CONTENT_MARKER in (msg.get("content") or "")
 
 
 def summary_lines():
-    """Human-readable lines for the `/skills` command: one row per skill (name, an
-    `*active*` marker if already loaded, and a trimmed description), plus a footer of
-    any discovery warnings. Empty list message when no skills are installed."""
+    """Human-readable lines for the `/skills` command: one row per skill (name, a
+    `*loaded*` marker if already pulled in this session, and a trimmed description), plus
+    a footer of any discovery warnings. Empty list message when no skills are installed."""
     reg = get_registry()
     if not reg.order:
         return ["no skills installed. Add a SKILL.md under .agents/skills/ (project) or "
@@ -408,7 +419,7 @@ def summary_lines():
         desc = _one_line(s.description)
         if len(desc) > 100:
             desc = desc[:97] + "…"
-        active = " *active*" if name in _activated else ""
+        active = " *loaded*" if name in _loaded else ""
         out.append(f"{name}{active} — {desc}")
     out += warn_footer(reg.warnings)
     return out

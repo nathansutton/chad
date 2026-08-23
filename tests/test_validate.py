@@ -9,7 +9,7 @@ Run: `uv run python tests/test_validate.py`
 
 import os
 
-from chad import skills
+from chad import skills, tools
 from chad.validate import (
     _param_schema,
     coerce_and_validate,
@@ -34,13 +34,13 @@ def check(name, cond, detail=""):
 # --- Stage 1: lenient JSON repair --------------------------------------------
 def test_repair():
     cases = [
-        ('{"name": "read", "arguments": {"path": "a.py"}}', {"name": "read"}),  # clean
-        ('{"name": "read", "arguments": {"path": "a.py",}}', {"name": "read"}),  # trailing comma
+        ('{"name": "write", "arguments": {"path": "a.py", "content": "x"}}', {"name": "write"}),  # clean
+        ('{"name": "write", "arguments": {"path": "a.py",}}', {"name": "write"}),  # trailing comma
         ("{'name': 'read', 'arguments': {'path': 'a.py'}}", None),  # single quotes (not handled) -> bare-key path
-        ('{name: "read", arguments: {path: "a.py"}}', {"name": "read"}),  # bare keys
+        ('{name: "write", arguments: {path: "a.py"}}', {"name": "write"}),  # bare keys
         ('{"name": "done", "arguments": {"summary": "ok", "x": True}}', {"name": "done"}),  # py const
-        ('{"name": "grep", "arguments": {"pattern": "def foo"', None),  # truncated -> balanced
-        ('```json\n{"name": "glob", "arguments": {"pattern": "*.py"}}\n```', {"name": "glob"}),  # fenced
+        ('{"name": "bash", "arguments": {"command": "ls"', None),  # truncated -> balanced
+        ('```json\n{"name": "bash", "arguments": {"command": "ls"}}\n```', {"name": "bash"}),  # fenced
     ]
     for raw, expect in cases:
         got = repair_json(raw)
@@ -56,30 +56,21 @@ def test_repair():
 # --- Stages 2+3: coercion (valid-but-loose calls should SUCCEED) -------------
 def test_coercion():
     # integer-as-string -> int
-    a, e = coerce_and_validate("read", {"path": "a.py", "offset": "10"})
-    check("coerce offset str->int", not e and a["offset"] == 10, f"a={a} e={[str(x) for x in e]}")
-    # number-as-string for budget
-    a, e = coerce_and_validate("repo_map", {"budget": "2000"})
-    check("coerce budget str->int", not e and a["budget"] == 2000, f"a={a}")
+    a, e = coerce_and_validate("bash", {"command": "ls", "timeout": "10"})
+    check("coerce timeout str->int", not e and a["timeout"] == 10, f"a={a} e={[str(x) for x in e]}")
     # enum already valid
-    a, e = coerce_and_validate("insert_symbol", {"name": "foo", "code": "x=1", "where": "before"})
+    a, e = coerce_and_validate(
+        "write_todos", {"todos": [{"content": "x", "status": "pending"}]})
     check("enum valid passes", not e, f"e={[str(x) for x in e]}")
     # whole arguments double-stringified
-    a, e = coerce_and_validate("grep", '{"pattern": "def foo"}')
-    check("double-stringified args", not e and a.get("pattern") == "def foo", f"a={a} e={[str(x) for x in e]}")
+    a, e = coerce_and_validate("bash", '{"command": "ls"}')
+    check("double-stringified args", not e and a.get("command") == "ls",
+          f"a={a} e={[str(x) for x in e]}")
     # nested array field double-stringified (write_todos.todos as a JSON string)
     a, e = coerce_and_validate(
         "write_todos", {"todos": '[{"content": "x", "status": "pending"}]'})
     check("nested array un-stringified", not e and isinstance(a["todos"], list)
           and a["todos"][0]["status"] == "pending", f"a={a} e={[str(x) for x in e]}")
-    # lone scalar where array<string> wanted (focus="agent.py" not ["agent.py"]) -> wrap
-    a, e = coerce_and_validate("repo_map", {"focus": "src/chad/agent.py"})
-    check("scalar->one-element array", not e and a["focus"] == ["src/chad/agent.py"],
-          f"a={a} e={[str(x) for x in e]}")
-    # a real shape mismatch (object where array wanted) still REJECTS, not wrapped
-    a, e = coerce_and_validate("repo_map", {"focus": {"path": "agent.py"}})
-    check("object->array still rejects", any(x.path == "$focus" for x in e),
-          f"a={a} e={[str(x) for x in e]}")
 
 
 # --- Stages 2+3: validation (broken calls should REJECT precisely) ----------
@@ -94,7 +85,7 @@ def test_validation():
     check("bad enum reported", any("status" in x.path and "doing" in x.got for x in e),
           f"e={[str(x) for x in e]}")
     # uncoercible type (object where string wanted)
-    a, e = coerce_and_validate("read", {"path": {"nested": 1}})
+    a, e = coerce_and_validate("write", {"path": {"nested": 1}, "content": "x"})
     check("uncoercible type reported", any(x.path == "$path" for x in e),
           f"e={[str(x) for x in e]}")
     # unknown tool
@@ -122,7 +113,7 @@ def test_render():
                          coerce_and_validate("grep</argstr", {})[1])
     check("render malformed name says malformed", "malformed tool call" in msg3)
     check("render malformed name shows exemplar",
-          '<tool_call>{"name": "grep"' in msg3, f"msg={msg3!r}")
+          "<tool_call><function=grep><parameter=pattern>" in msg3, f"msg={msg3!r}")
     check("render malformed name does not list tools", "Available tools" not in msg3)
 
 
@@ -132,22 +123,53 @@ def test_legacy_validate():
     check("legacy: unknown tool flagged",
           "unknown tool" in (legacy_validate("frobnicate", {}) or ""))
     check("legacy: non-dict args flagged",
-          "must be a JSON object" in (legacy_validate("read", "oops") or ""))
-    miss = legacy_validate("read", {}) or ""  # read requires `path`
+          "must be a JSON object" in (legacy_validate("write", "oops") or ""))
+    miss = legacy_validate("write", {}) or ""  # write requires `path`
     check("legacy: missing required arg flagged",
           "missing required argument" in miss and "path" in miss, f"msg={miss!r}")
     check("legacy: valid args pass (None)",
-          legacy_validate("read", {"path": "a.py"}) is None)
+          legacy_validate("write", {"path": "a.py", "content": "x"}) is None)
 
 
 # --- Dynamically-appended tools validate against the LIVE schema set ----------
-# Regression: `activate_skill` is appended to what the model sees by
-# tools.active_schemas() only when skills are installed. The validator used to read a
-# frozen import-time snapshot that never contained it, so a valid activate_skill call
-# validated as an "unknown tool" — while the same error listed it as available. An
-# unwinnable loop: no retry could pass. This asserts the validator now tracks the live
-# set, and that the enum guard (constraining `name` to real skills) actually reaches it.
-def test_dynamic_tool_validates(tmp_path, monkeypatch):
+# Regression: tools appended at runtime (a connected MCP server's) are visible to the
+# model via tools.active_schemas() but were absent from the validator's frozen
+# import-time snapshot, so a perfectly valid call validated as an "unknown tool" — while
+# the same error listed it as available. An unwinnable loop: no retry could pass. This
+# pins that both the validator and the repair hint read the live set.
+def test_dynamic_tool_validates(monkeypatch):
+    dynamic = {
+        "type": "function",
+        "function": {
+            "name": "mcp__demo__widgets",
+            "description": "Do a widget thing.",
+            "parameters": {
+                "type": "object",
+                "properties": {"kind": {"type": "string", "enum": ["round", "square"]}},
+                "required": ["kind"],
+            },
+        },
+    }
+    check("dynamic tool unknown before it is appended",
+          _param_schema("mcp__demo__widgets") is None)
+    monkeypatch.setattr(tools, "SCHEMAS", tools.SCHEMAS + [dynamic])
+    # ...now it is a known tool with a real param schema...
+    sch = _param_schema("mcp__demo__widgets")
+    check("dynamic tool has a live param schema", sch is not None, sch)
+    # ...so a valid call validates cleanly (the exact call the trace could never land).
+    _, e = coerce_and_validate("mcp__demo__widgets", {"kind": "round"})
+    check("valid dynamic call accepted (no errors)", e == [], [str(x) for x in e])
+    # ...and an out-of-enum value is rejected, not silently dispatched.
+    _, e2 = coerce_and_validate("mcp__demo__widgets", {"kind": "nope"})
+    check("out-of-enum value rejected", bool(e2), [str(x) for x in e2])
+    # The 'available tools' hint lists it (mirror source), so no contradictory message.
+    msg = render_repair("frobnicate", {}, coerce_and_validate("frobnicate", {})[1])
+    check("repair hint lists the live dynamic tool", "mcp__demo__widgets" in msg, msg)
+
+
+def test_installed_skills_add_no_tool(tmp_path, monkeypatch):
+    """Skills are invoked by the user typing `/name`, never by the model calling a tool,
+    so installing one must not change the validator's view of the tool surface."""
     empty_home = tmp_path / "_home"
     empty_home.mkdir()
     monkeypatch.setattr(os.path, "expanduser",
@@ -159,78 +181,13 @@ def test_dynamic_tool_validates(tmp_path, monkeypatch):
     monkeypatch.chdir(proj)
     skills.reset_session()
     try:
-        # activate_skill is now a known tool with a real param schema...
-        sch = _param_schema("activate_skill")
-        check("activate_skill has a live param schema", sch is not None, sch)
-        check("enum constrained to installed skills",
-              sch["properties"]["name"]["enum"] == ["widgets"], sch)
-        # ...so a valid call validates cleanly (the exact call the trace could never land).
-        _, e = coerce_and_validate("activate_skill", {"name": "widgets"})
-        check("valid activate_skill accepted (no errors)", e == [], [str(x) for x in e])
-        # ...and a hallucinated skill name is rejected by the enum, not silently dispatched.
-        _, e2 = coerce_and_validate("activate_skill", {"name": "nope"})
-        check("unknown skill name rejected via enum", bool(e2), [str(x) for x in e2])
-        # The 'available tools' hint lists it (mirror source), so no contradictory message.
-        msg = render_repair("frobnicate", {}, coerce_and_validate("frobnicate", {})[1])
-        check("repair hint lists the live activate_skill", "activate_skill" in msg, msg)
-    finally:
-        skills.reset_session()
-
-
-# --- Batched replace_lines schema (improve 04) -------------------------------
-# The batch form takes edits=[{start, end, new}, …]. The schema must (a) accept a
-# well-formed batch and coerce loose item types, and (b) fail LOUDLY on a half-parsed
-# array — the whole point is that a garbled batch feeds the self-repair path rather than
-# silently applying the items that happened to parse.
-def test_replace_lines_batch_schema():
-    # top-level `start/end/new` are optional now (only `path` required) so the single
-    # form still validates and the batch form isn't forced to send them.
-    sch = _param_schema("replace_lines")
-    check("replace_lines requires only path", sch.get("required") == ["path"], sch)
-    check("replace_lines exposes edits array",
-          sch["properties"]["edits"]["type"] == "array", sch)
-
-    # a well-formed batch validates clean, coercing "2"->2 in an item
-    a, e = coerce_and_validate("replace_lines", {
-        "path": "a.py",
-        "edits": [{"start": 1, "end": "2", "new": "x"}]})
-    check("batch: valid batch accepted", e == [], [str(x) for x in e])
-    check("batch: item int coerced", a["edits"][0]["end"] == 2, a)
-
-    # the single form still validates against the same schema
-    _, e = coerce_and_validate("replace_lines",
-                               {"path": "a.py", "start": 1, "end": 1, "new": "x"})
-    check("batch: single form still valid", e == [], [str(x) for x in e])
-
-    # a garbled item (missing `new`) is flagged on that item's field, not silently kept
-    _, e = coerce_and_validate("replace_lines", {
-        "path": "a.py",
-        "edits": [{"start": 1, "end": 1, "new": "x"}, {"start": 2, "end": 2}]})
-    check("batch: missing item field reported",
-          any("new" in x.path and x.got == "missing" for x in e),
-          [str(x) for x in e])
-
-    # a JSON-encoded edits string (the nested-container failure mode) un-stringifies
-    a, e = coerce_and_validate("replace_lines", {
-        "path": "a.py", "edits": '[{"start": 1, "end": 1, "new": "x"}]'})
-    check("batch: edits JSON-string un-stringified", e == [] and isinstance(a["edits"], list),
-          (a, [str(x) for x in e]))
-
-
-def test_dynamic_tool_absent_without_skills(tmp_path, monkeypatch):
-    # With no skills installed, activate_skill is NOT exposed to the model, so the
-    # validator must treat it as unknown (symmetry: the hint won't list it either).
-    empty_home = tmp_path / "_home"
-    empty_home.mkdir()
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(empty_home) if p == "~" or p.startswith("~/") else p)
-    proj = tmp_path / "proj"
-    proj.mkdir()
-    monkeypatch.chdir(proj)
-    skills.reset_session()
-    try:
-        check("activate_skill unknown when no skills installed",
+        check("installed skill is not a callable tool",
+              _param_schema("widgets") is None)
+        check("no activate_skill tool exists",
               _param_schema("activate_skill") is None)
+        check("skill name absent from the available-tools hint",
+              "widgets" not in render_repair(
+                  "frobnicate", {}, coerce_and_validate("frobnicate", {})[1]))
     finally:
         skills.reset_session()
 
@@ -241,6 +198,5 @@ if __name__ == "__main__":
     test_validation()
     test_render()
     test_legacy_validate()
-    test_replace_lines_batch_schema()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

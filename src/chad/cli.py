@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """chad — a local, MLX-backed, Claude-Code-style coding agent.
 
-One model (Ornith — 35B on most Macs, 9B on small), one entrypoint, run with uv:
+One model (Qwen3.8-27B, 3-bit, with its DFlash2 drafter), one entrypoint, run with uv:
 
     uv run chad                                # interactive full-screen TUI
     uv run chad "fix the bug in greet.py"      # one-shot, headless
     uv run chad -c                             # resume this directory's conversation
-    uv run chad --model 9b                     # force the small model
+    uv run chad --model <repo|dir>             # run different weights
 
 Plus three subcommands, each with its own `--help`: `chad serve`, `chad prove`,
 `chad levers`.
 
-Rare long-session knobs live in env vars — see README "Advanced".
+Rare long-session knobs live in env vars — see docs/configuration.md.
 """
 import argparse
 import json
@@ -25,6 +25,7 @@ import time
 from . import config, guardrails, levers
 from .agent import Agent, repl
 from .base_engine import BackendError
+from .diag import log
 from .engine import Engine
 
 # Package dir is src/chad/; the project root (two levels up) is the dev clone. If a
@@ -34,30 +35,32 @@ from .engine import Engine
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
-# The shipped models, on Hugging Face. Naming follows Unsloth's dynamic-quant
-# convention so the quant scheme is recognizable (UD = Unsloth Dynamic; Q2_K_XL =
-# 2-bit experts with a high-bit backbone/router), plus an -MLX suffix for format
-# discoverability. The quant itself is MLX group-64 affine, not llama.cpp Q2_K
+# The shipped model, on Hugging Face. Naming follows Unsloth's dynamic-quant
+# convention so the quant scheme is recognizable (UD = Unsloth Dynamic; Q3_K_XL =
+# a 3-bit body with extra bits where they pay), plus an -MLX suffix for format
+# discoverability. The quant itself is MLX group-64 affine, not llama.cpp Q3_K
 # k-quants — the model card says so; the tag is for recognition, not bit-for-bit
-# equivalence.
-_HF_35B = "nathansutton/Ornith-1.0-35B-UD-Q2_K_XL-MLX"   # default: 35B MoE, ~13.4 GB resident
-_HF_9B = "nathansutton/Ornith-1.0-9B-UD-Q4_K_XL-MLX"     # low-RAM fallback, ~5 GB resident
+# equivalence. The repo also carries the DFlash2 block drafter, pre-quantized, in
+# `dflash/` (~1.1 GB): one download gets the model and its speculative decoder,
+# with nothing built on first run (mlx_dflash.py).
+#
+# Qwen3.8-27B is `qwen3_5` — DENSE (64 layers: 48 GatedDeltaNet + 16 full attention),
+# so every parameter is on the critical path for every token and shrinking the model
+# is the only decode lever there is. The recipe (`q3_e3h5`) is 3-bit group-64
+# throughout, except lm_head at 5-bit: with vocab_size 248,320 and tie_word_embeddings
+# false, the head is a second full 1.27B-param tensor, and the calibrated GGUF builds
+# of this same checkpoint are unanimous that it is the tier worth protecting while
+# embed_tokens — a lookup table, whose per-row error never compounds through a matmul
+# — is the cheapest. ~12.1 GB resident.
+_HF_MODEL = "nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX"
 # A dev clone that already built the weights locally should use them rather than
-# re-download — prefer these dirs when present.
-_LOCAL_35B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-35B-dyn2-q2_down3")
-_LOCAL_9B = os.path.join(_PROJECT_ROOT, "models", "Ornith-1.0-9B-4bit-awq")
-# The 35B (2-bit experts, 3-bit expert down-projections, 6-bit backbone) is ~13.4 GB
-# resident + KV + runtime, and the KV grows across a long agentic turn. That used to
-# SIGKILL mid-turn on a 24 GB Mac, where the Metal wired limit (~2/3 RAM ≈ 16 GB) minus
-# the OS leaves little headroom — so the floor sat at 32 GB. The fused attention kernel
-# (mlx_qsdpa) plus the 8-bit-from-the-start KV cache it enables cut the per-token cache
-# cost enough to give that headroom back, and `ram_aware_ctx_limit` now sizes the
-# compaction trigger from the live Metal budget rather than a blind constant, so a
-# tight box self-limits its window instead of dying. 24 GB gets the 35B; 16 GB and
-# below still fall back to the 9B.
-_BIG_RAM_GB = 23.5
-# `--model` shorthands. Anything else is passed through as an HF repo id or local dir.
-_MODEL_ALIASES = {"35b": (_LOCAL_35B, _HF_35B), "9b": (_LOCAL_9B, _HF_9B)}
+# re-download — prefer this dir when present.
+_LOCAL_MODEL = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-q3_e3h5")
+# chad targets 24 GB Apple Silicon and nothing smaller. Below this the model still
+# loads, but the context governor has almost nothing left to spend after ~12.1 GB of
+# weights and the ~4.3 GB prefill transient, so the window collapses toward its floor.
+# We warn and proceed rather than refuse: the harness advises, the caller decides.
+_MIN_RAM_GB = 23.5
 
 
 # These are the STRICT siblings of config.env_int/env_float: a non-numeric value raises
@@ -83,7 +86,38 @@ def _env_float(name):
 # failure shape is that sibling settings drift ONE AT A TIME: a later fix honors the field
 # it touched, looks complete, and leaves its neighbours silently dead. There is one
 # function now, so a caller cannot honor `temp` and forget `min_p`.
-SAMPLER_ENV = (("temp", "CHAD_TEMP"), ("min_p", "CHAD_MIN_P"), ("top_p", "CHAD_TOP_P"))
+SAMPLER_ENV = (("temp", "CHAD_TEMP"), ("min_p", "CHAD_MIN_P"), ("top_p", "CHAD_TOP_P"),
+               ("top_k", "CHAD_TOP_K"), ("presence_penalty", "CHAD_PRESENCE_PENALTY"))
+
+# Qwen3.8's two published sampling recipes. The model card gives DIFFERENT settings
+# per mode, and the difference is not cosmetic: non-thinking mode has no reasoning
+# block to absorb a loop, so the card calls for a presence penalty ("adjust
+# presence_penalty between 0 and 2 to reduce endless repetition") and a tighter
+# nucleus. Running --no-think while silently inheriting the thinking recipe is the
+# configuration the card warns produces endless repetition — and degenerate
+# repetition is already this stack's known failure mode, so the preset is applied
+# rather than left to the operator to remember.
+#
+# Explicit CHAD_* env always wins over the preset (see apply_sampler_env).
+THINKING_SAMPLER = {"temp": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+                    "presence_penalty": 0.0}
+# presence_penalty stays 0.0 despite the card suggesting up to 1.5 for this mode.
+# The card's range is written for chat; CODE is inherently repetitive — identifiers,
+# keywords and punctuation must be reused — so a flat penalty on every already-emitted
+# token pushes the model off valid syntax. Measured on the ky task at 1.5: 45 steps of
+# pure exploration, zero edits, and visibly corrupted tool arguments
+# (`Search 'KyOptions|interface KyOptions!!'`). Treat it as a tunable to probe, not a
+# default to ship: CHAD_PRESENCE_PENALTY still sets it.
+NONTHINKING_SAMPLER = {"temp": 0.7, "top_p": 0.80, "top_k": 20, "min_p": 0.0,
+                       "presence_penalty": 0.0}
+
+
+def apply_sampler_preset(eng, thinking: bool):
+    """Apply the model-card sampling recipe for the active reasoning mode.
+
+    Call BEFORE apply_sampler_env so an explicit CHAD_* override still wins."""
+    for attr, val in (THINKING_SAMPLER if thinking else NONTHINKING_SAMPLER).items():
+        setattr(eng, attr, val)
 
 
 def apply_sampler_env(eng):
@@ -96,14 +130,22 @@ def apply_sampler_env(eng):
     should set e.g. CHAD_TEMP=0.7 (what the field harnesses run) so retries can take a
     different path.
 
-    CHAD_MIN_P / CHAD_TOP_P: quant-tail anti-confabulation knobs, off (0.0) by default —
-    trim the sub-noise-floor logit tail without touching temp."""
+    CHAD_MIN_P / CHAD_TOP_P / CHAD_TOP_K: quant-tail anti-confabulation knobs, off
+    (0.0 / 0) by default — trim the sub-noise-floor logit tail without touching temp.
+
+    CHAD_PRESENCE_PENALTY: flat score penalty on already-generated tokens; the
+    model card's anti-repetition knob for non-thinking mode (useful range 0-2).
+
+    Applied AFTER any mode preset, so an explicit env var always wins."""
     for attr, var in SAMPLER_ENV:
         raw = config.env_str(var)
         if not raw:
             continue
         try:
-            setattr(eng, attr, float(raw))
+            # top_k indexes a vocab axis and is passed to mx.topk — it must stay an
+            # int, where every other knob here is a float. Coercing the whole family
+            # to float would make CHAD_TOP_K=20 a TypeError deep in the sampler.
+            setattr(eng, attr, int(float(raw)) if attr == "top_k" else float(raw))
         except ValueError:
             sys.stderr.write(f"[ignoring {var}={raw!r}: not a number]\n")
 
@@ -151,41 +193,69 @@ def _host_avail_bytes():
         return None
 
 
+# Prefill/decode scratch that is live at the same moment the KV cache is: chunked
+# prefill materializes an attention transient sized by chunk x kv_len, and the adaptive
+# chunker shrinks the chunk as the free band closes, so it climbs with context and then
+# SATURATES rather than growing per-token. Measured on the 27B (q3, 8-bit KV, clamp on,
+# one load): 1.82 GB at 8k, 3.19 at 32k, 4.15 at 49k, 4.14 at 65k — flat by 49k, and past
+# that point peak grows at 33,936 B/token against a 34,816 B/token KV cache, i.e. the
+# marginal cost of a token IS its KV cost. Used as a floor only; `_compute_ctx_limit`
+# prefers the live `peak - active` once a real prefill has been through.
+PREFILL_TRANSIENT_BYTES = 4.3e9
+
+
 def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
-                        reserve_gb=1.5, safety=0.90, gen_margin=2048, floor=8192,
-                        host_avail_bytes=None, slope_factor=1.75):
+                        safety=0.975, gen_margin=2048, floor=8192,
+                        host_avail_bytes=None, slope_factor=1.0,
+                        transient_bytes=PREFILL_TRANSIENT_BYTES):
     """Largest prompt-token budget (= the compaction trigger) that keeps the
     growing KV cache inside a safe slice of the Metal *recommended working set*, given the
     model's already-resident footprint and the *measured* per-token KV cost. Pure +
-    measured — replaces the magic `CTX_CAP = 120_000`, which was an OOM guard set blind to
-    the real per-token cost (it over-compacts: on a 24 GB M4 Pro the 20 KiB/token hybrid
-    cache fits ~175 k tokens, not 120 k).
+    measured — replaces the magic `CTX_CAP = 120_000`, an OOM guard set blind to both the
+    real per-token cost and the real fixed cost, and so wrong in both directions depending
+    on the model.
 
-    `budget*safety` leaves a headroom band below Apple's recommendation; subtract the
-    resident model+SSM floor (`active_bytes`) and a scratch reserve for prefill/decode
-    buffers to get the bytes free for KV; divide by `kv_bytes_per_token` for the token
-    ceiling. Capped at `eff_ctx − gen_margin` (the model's real window) and floored so a
-    tight box still gets a usable window. Self-calibrates per machine (16 GB → small,
-    64 GB → near the window). Returns None if inputs are unusable so the caller can keep
-    the old fixed cap."""
+    `safety` is the ONLY headroom knob, and it holds back 2.5 %. It replaces a pair —
+    `safety=0.90` alongside a flat `reserve_gb=1.5` — that guarded one wall with two
+    numbers, neither derived from anything measured on the model being run. The rule now
+    is that a knob is the wrong home for anything measurable: what the percentage does not
+    cover is the prefill transient, and that gets *measured* and subtracted below rather
+    than tuned.
+
+    So: `budget*safety`, minus the resident model+SSM floor (`active_bytes`) and the
+    prefill transient live alongside the cache (`transient_bytes`), is the bytes free for
+    KV; divide by `kv_bytes_per_token` for the token ceiling. Capped at
+    `eff_ctx − gen_margin` (the model's real window) and floored so a tight box still gets
+    a usable window. Self-calibrates per machine (16 GB → small, 64 GB → near the window).
+    Returns None if inputs are unusable so the caller can keep the old fixed cap.
+
+    `slope_factor` multiplies the per-token cost and now defaults to 1.0, because the
+    measurement says a token's marginal cost is its KV cost and nothing more. It was 1.75,
+    which was the old way of paying for the transient: smear a fixed multi-gigabyte term
+    across the per-token divisor and it comes out roughly right at ONE context length on
+    ONE box, and wrong everywhere else — over-charging long windows, under-charging short
+    ones. The term is fixed, so it is subtracted like one. Kept as a knob for A/B only."""
     if not (budget_bytes and kv_bytes_per_token and active_bytes):
         return None
-    usable = budget_bytes * safety - active_bytes - reserve_gb * 1e9
+    usable = budget_bytes * safety - active_bytes - (transient_bytes or 0)
     # The Metal budget is blind to other processes' physical pressure (Docker VM,
     # harbor, browsers). When the host's reclaimable band is tighter than the Metal
     # band, IT is the binding constraint — the KV cache grows into physical pages
     # 1:1, and jetsam kills on physical pressure, not on Metal accounting.
     if host_avail_bytes:
-        usable = min(usable, host_avail_bytes * 0.85 - reserve_gb * 1e9)
+        # NOT symmetric with the Metal branch, on purpose: the transient is not charged
+        # here. Metal is a hard allocator wall — the scratch either fits or the allocation
+        # fails — whereas the host band is a soft pressure signal the OS can compress and
+        # evict around for a spike that lives for one prefill chunk. What it cannot absorb
+        # is the KV cache, which stays resident for the session, so that is what this
+        # branch sizes. Charging the transient here instead turns a guard meant to bite
+        # only under real pressure into the primary constraint: measured right after a
+        # 12.3 GB load the reclaimable band reads 3.9 GB (down from 11.4 — the weights
+        # just took it, and nothing has been reclaimed yet), and subtracting a 4.3 GB
+        # transient from that lands negative, i.e. the floor, on a box with room to spare.
+        usable = min(usable, host_avail_bytes * safety)
     if usable <= 0:
         return floor
-    # Peak memory grows FASTER than the KV cache alone: prefill/decode scratch also
-    # scales with resident context (2026-07-12 ram_safety_check fit on the 35B, fused
-    # wheel: 35.7 KB/token all-in vs 20.5 KB/token KV — the raw KV divisor picked a
-    # 175k trigger that extrapolated to 102.9% of budget — over the wall). The fixed
-    # `reserve_gb` cannot cover a term that grows per-token, so fold it into the
-    # divisor. 1.75 is the 35B measurement; unmeasured on the 9B, where it errs safe
-    # (over-compaction costs a re-prefill, undershoot costs a jetsam kill).
     ram_ctx = int(usable / (kv_bytes_per_token * slope_factor))
     return max(floor, min(eff_ctx - gen_margin, ram_ctx))
 
@@ -195,10 +265,10 @@ def _compute_ctx_limit(eng):
     cache, compaction forces a full body re-prefill (~79 % of all prefill), so
     we compact as rarely as RAM safely allows: size the trigger from the live Metal
     budget + the model's *measured* per-token KV cost instead of a blind 120 k
-    cap that over-compacts. CHAD_CTX_LIMIT still wins (used by tests); CHAD_CTX_RESERVE_GB
-    tunes the scratch headroom. Falls back to the old fixed cap if the memory APIs or the
-    KV measurement are unavailable. Needs eng.load() to have run (reads effective_ctx +
-    kv_bytes_per_token)."""
+    cap that over-compacts. CHAD_CTX_LIMIT still wins (used by tests); CHAD_CTX_SAFETY is
+    the single headroom knob (default 0.975 — hold back 2.5 % of the Metal budget). Falls
+    back to the old fixed cap if the memory APIs or the KV measurement are unavailable.
+    Needs eng.load() to have run (reads effective_ctx + kv_bytes_per_token)."""
     ctx_limit = _env_int("CHAD_CTX_LIMIT")
     if not ctx_limit:
         try:
@@ -212,14 +282,53 @@ def _compute_ctx_limit(eng):
                 eng.effective_ctx,
                 mx.device_info()["max_recommended_working_set_size"],
                 active_floor, eng.kv_bytes_per_token,
-                reserve_gb=_env_float("CHAD_CTX_RESERVE_GB") or 1.5,
+                safety=_env_float("CHAD_CTX_SAFETY") or 0.975,
                 host_avail_bytes=_host_avail_bytes(),
-                slope_factor=_env_float("CHAD_CTX_SLOPE_FACTOR") or 1.75)
+                slope_factor=_env_float("CHAD_CTX_SLOPE_FACTOR") or 1.0)
+            # The governor sets the shape of the whole session and used to explain
+            # nothing, which made a wrong pick indistinguishable from a tight box.
+            log.info("GOVERNOR ctx_limit=%s | budget=%.2f GB active=%.2f GB "
+                     "transient=%.2f GB host_avail=%.2f GB kv=%.0f B/tok",
+                     f"{ctx_limit:,}" if ctx_limit else ctx_limit,
+                     mx.device_info()["max_recommended_working_set_size"] / 1e9,
+                     active_floor / 1e9, PREFILL_TRANSIENT_BYTES / 1e9,
+                     (_host_avail_bytes() or 0) / 1e9, eng.kv_bytes_per_token)
         except Exception:  # noqa: BLE001 — never let memory probing break startup
             ctx_limit = None
     if not ctx_limit:
         ctx_limit = min(max(4096, eng.effective_ctx - 2048), 120_000)  # old fixed cap
     return ctx_limit
+
+
+def peek_ctx_limit(model_id, window):
+    """The compaction trigger estimated BEFORE the weights load, so the banner can
+    advertise the window this session actually gets instead of a native window the box
+    cannot hold. Same governor and the same live memory probes as `_compute_ctx_limit` —
+    only the two model-side inputs are config/disk estimates rather than measurements
+    (`engine.peek_kv_footprint`), and the measured value replaces this the moment load
+    returns. Returns None when the estimate isn't available, leaving the caller on the
+    old window-derived provisional."""
+    if not window:
+        return None
+    try:
+        import mlx.core as mx
+
+        from .engine import peek_kv_footprint
+        kv_bpt, weights = peek_kv_footprint(model_id)
+        if not (kv_bpt and weights):
+            return None
+        # The weights are not resident yet, so the host's reclaimable band still counts
+        # the pages they are about to take. Subtract them, or this reads the box as
+        # roomier than the session will ever see it.
+        avail = _host_avail_bytes()
+        return ram_aware_ctx_limit(
+            window, mx.device_info()["max_recommended_working_set_size"],
+            weights, kv_bpt,
+            safety=_env_float("CHAD_CTX_SAFETY") or 0.975,
+            host_avail_bytes=max(0, avail - weights) if avail else None,
+            slope_factor=_env_float("CHAD_CTX_SLOPE_FACTOR") or 1.0)
+    except Exception:  # noqa: BLE001 — never let a banner estimate break startup
+        return None
 
 
 def _preflight(backend="mlx"):
@@ -256,52 +365,36 @@ def _resolve(local, repo):
 def _pick_model(spec=None):
     """Resolve the model id and a human label for *why* it was chosen.
 
-    Order: explicit `--model` (`spec`) → CHAD_MODEL → RAM-aware default (35B unless the
-    box is small). A resolved shorthand prefers a locally-built models/ dir over the HF
-    repo when one exists; an arbitrary spec is passed through untouched.
+    Order: explicit `--model` (`spec`) → CHAD_MODEL → the shipped default. There are no
+    size shorthands any more — chad ships exactly one model (2.0.0 retired the Ornith
+    35B/9B pair and the RAM-aware pick that chose between them). `auto` still means "the
+    default"; anything else is passed through untouched as an HF repo id or local dir.
 
-    Forcing `35b` where the RAM check would not have chosen it (small or undetectable
-    RAM) is honored, but warns on stderr first: chad advises, the caller decides.
+    A box below the 24 GB target is warned about once, on stderr, and then served
+    anyway: chad advises, the caller decides.
     """
     # Name the winning source in the reason: it is only ever ambiguous when both the
     # flag and the env var are set, which is exactly when the user needs to be told.
     source = "--model" if spec is not None else "CHAD_MODEL"
     spec = spec or config.env_str("CHAD_MODEL")
     if spec and spec.strip().lower() != "auto":
-        key = spec.strip().lower()
-        alias = _MODEL_ALIASES.get(key)
-        if not alias:
-            return spec, f"explicitly requested ({source} override)"
-        local, repo = alias
-        if key == "35b":
-            ram = _detect_ram_gb()
-            if ram is None or ram < _BIG_RAM_GB:
-                got = "undetectable" if ram is None else f"{ram:.0f} GB"
-                sys.stderr.write(
-                    f"chad: 35b forced via {source} (RAM {got} < ~{_BIG_RAM_GB:.0f} GB "
-                    f"recommended); the 35B needs ~16 GB resident with its KV cache and "
-                    f"may OOM or thrash here. Proceeding as asked.\n")
-        return _resolve(local, repo), f"{key} (requested via {source})"
+        return spec, f"explicitly requested ({source} override)"
     ram = _detect_ram_gb()
-    if ram is None:
-        # RAM unreadable -> the safe (smaller) model: a wrong 9B costs capability, a
-        # wrong 35B costs a 12 GB download and possibly an OOM'd first session.
-        local, repo = _LOCAL_9B, _HF_9B
-        why = "9B (RAM undetectable — choosing the safe smaller model; " \
-              "set CHAD_MODEL or --model to override)"
-    elif ram < _BIG_RAM_GB:
-        local, repo = _LOCAL_9B, _HF_9B
-        why = f"9B (default; {ram:.0f} GB RAM < {_BIG_RAM_GB:.0f} GB, 35B would be tight)"
-    else:
-        local, repo = _LOCAL_35B, _HF_35B
-        why = "35B (default)"
-    return _resolve(local, repo), why
+    if ram is None or ram < _MIN_RAM_GB:
+        got = "undetectable" if ram is None else f"{ram:.0f} GB"
+        sys.stderr.write(
+            f"chad: RAM {got}, below the ~{_MIN_RAM_GB:.0f} GB chad is built for. The "
+            f"model needs ~12 GB resident plus its KV cache, so expect a small context "
+            f"window and possible thrashing. Proceeding.\n")
+    return _resolve(_LOCAL_MODEL, _HF_MODEL), "default"
 
 
 def _model_download_gb(model_id):
-    """Approximate download size in GiB for the shipped models (for the disk preflight
-    and the confirm prompt — display honesty, not accounting)."""
-    return 12.0 if "35B" in model_id else 5.0
+    """Approximate download size in GiB for the shipped model (for the disk preflight
+    and the confirm prompt — display honesty, not accounting): ~12.1 GB of weights
+    plus the ~1.1 GB bundled DFlash2 drafter. An arbitrary `--model` is unknowable
+    ahead of the resolve, so it gets the same figure."""
+    return 13.2
 
 
 def _free_disk_gb(path):
@@ -320,6 +413,39 @@ def _free_disk_gb(path):
         return None
 
 
+def _cached_weights_complete(model_id) -> bool:
+    """Whether the HF cache holds this repo's WEIGHTS, not merely its small files.
+
+    The cheap check ("is config.json cached?") is wrong in the one case that matters.
+    A download interrupted after the json/tokenizer blobs land — one ctrl-c on a first
+    run — leaves a snapshot that answers yes while holding no tensors at all, so the
+    guard returns, and the failure surfaces minutes later inside mlx_lm as a
+    FileNotFoundError naming an internal blob path. There is no way back from that
+    state except hand-deleting the cache. So verify what the loader will actually
+    read: every shard the index names, or a single-file/loose layout on disk.
+    """
+    from huggingface_hub import try_to_load_from_cache
+    cached = lambda f: isinstance(try_to_load_from_cache(model_id, f), str)  # noqa: E731
+    index = try_to_load_from_cache(model_id, "model.safetensors.index.json")
+    if isinstance(index, str):
+        try:
+            with open(index, encoding="utf-8") as f:
+                shards = set(json.load(f).get("weight_map", {}).values())
+        except (OSError, ValueError):
+            return False  # unreadable index: treat as incomplete, re-fetch resumes
+        return bool(shards) and all(cached(s) for s in shards)
+    if cached("model.safetensors"):
+        return True
+    # No index and no conventionally-named file: an unusual layout is not our business
+    # to second-guess, so accept any .safetensors already sitting in the snapshot (this
+    # is what mlx_lm globs for) rather than forcing a re-download of a working cache.
+    config_path = try_to_load_from_cache(model_id, "config.json")
+    if isinstance(config_path, str):
+        import glob
+        return bool(glob.glob(os.path.join(os.path.dirname(config_path), "*.safetensors")))
+    return False
+
+
 def _ensure_model(model_id):
     """If model_id is a HF repo id not yet in the local cache, confirm and download it
     into ~/.cache/huggingface (shared, resumable, paid once per machine). Local dirs
@@ -328,8 +454,8 @@ def _ensure_model(model_id):
     disk is the worst first-run outcome (devex review T2)."""
     if os.path.isdir(model_id):
         return  # a local path — nothing to fetch
-    from huggingface_hub import snapshot_download, try_to_load_from_cache
-    if isinstance(try_to_load_from_cache(model_id, "config.json"), str):
+    from huggingface_hub import snapshot_download
+    if _cached_weights_complete(model_id):
         return  # already in the HF cache
     need_gb = _model_download_gb(model_id)
     hf_home = os.environ.get("HF_HOME", "~/.cache/huggingface")
@@ -345,10 +471,18 @@ def _ensure_model(model_id):
             "         Or point CHAD_MODEL at a local model dir on another volume.\n")
         sys.exit(1)
     size = f"~{need_gb:.0f} GB"
+    # Say WHICH of the two situations this is. "Downloading again" on a machine the
+    # user believes already has the model reads as a bug unless the partial cache is
+    # named; only the completed blobs are re-used, so the second run is also shorter.
+    from huggingface_hub import try_to_load_from_cache
+    partial = isinstance(try_to_load_from_cache(model_id, "config.json"), str)
     sys.stderr.write(
-        f"\nchad needs the model '{model_id}' "
-        f"({size} — minutes on fast fiber, ~20 min on 100 Mbit; resumable).\n"
-        "It downloads once into ~/.cache/huggingface and is reused across projects.\n")
+        (f"\nchad: the cached copy of '{model_id}' is incomplete (an interrupted "
+         f"download left its metadata but not all of its weights).\nResuming — only "
+         f"the missing files are fetched, up to {size}.\n" if partial else
+         f"\nchad needs the model '{model_id}' "
+         f"({size} — minutes on fast fiber, ~20 min on 100 Mbit; resumable).\n"
+         "It downloads once into ~/.cache/huggingface and is reused across projects.\n"))
     if sys.stdin.isatty():
         ans = input("Download now? [Y/n] ").strip().lower()
         if ans and ans not in ("y", "yes"):
@@ -386,7 +520,8 @@ def _fail_model_load(model_id, err):
     else:
         sys.stderr.write(
             "  fix:   a partial/corrupt download or not enough free RAM. Re-run (the HF\n"
-            f"         download resumes), or try the smaller model: CHAD_MODEL={_HF_9B}\n")
+            "         download resumes). chad needs ~12 GB resident for weights alone,\n"
+            "         so close other memory-hungry apps before retrying.\n")
     sys.exit(1)
 
 
@@ -467,20 +602,22 @@ _resolved_base_url = None
 
 def _add_model_arg(ap):
     """`--model`, shared by the agent and `chad serve` — both load a local model and both
-    need the same escape hatch from the RAM-aware default."""
+    need the same escape hatch from the shipped default."""
     ap.add_argument("--model", default=None,
-                    help="which model to load: '35b' (big, default on most Macs), '9b' "
-                         "(small, low-RAM), 'auto' (choose by RAM), or any Hugging Face "
-                         "repo id / local model dir. Also CHAD_MODEL.")
+                    help="which model to load: 'auto' (the shipped default) or any "
+                         "Hugging Face repo id / local model dir. Other weights run "
+                         "through the same engine; the tuning is fitted to the shipped "
+                         "model, so expect to lose speed, not correctness. "
+                         "Also CHAD_MODEL.")
 
 
 def _agent_parser():
     ap = argparse.ArgumentParser(
         prog="chad",
-        description="Local MLX-backed coding agent (Ornith). Run with `uv run chad`.",
+        description="Local coding agent for a 24 GB Apple Silicon Mac (MLX, one model, no API key).",
         epilog="subcommands (each takes --help): chad serve · chad prove · chad levers. "
                "Long-session and unattended-run knobs live in CHAD_* env vars — "
-               "see README \"Advanced\".",
+               "see docs/configuration.md.",
     )
     ap.add_argument("--version", action="version", version=_version_string())
     ap.add_argument("task", nargs="?",
@@ -562,7 +699,7 @@ def _serve_parser():
 def _prove_parser():
     ap = argparse.ArgumentParser(
         prog="chad prove",
-        description="Run the bundled end-to-end smoke test against the pinned 9B model: "
+        description="Run the bundled end-to-end smoke test against the shipped model: "
                     "downloads it if needed, drives a real task, and reports what worked.",
     )
     ap.add_argument("--backend", choices=("mlx", "llama"), default="mlx",
@@ -575,15 +712,15 @@ def _levers_parser():
         prog="chad levers",
         description="Print the harness lever registry as JSON and exit. The ablation "
                     "driver enumerates this instead of hardcoding lever names. All "
-                    "levers default OFF; CHAD_ENABLE=a,b (or 'all') turns levers on, "
-                    "CHAD_DISABLE=a,b subtracts from that.",
+                    "levers default ON; CHAD_DISABLE=a,b (or 'all') switches levers "
+                    "off for a leave-one-out arm.",
     )
 
 
 def _run_levers():
     """No _preflight and no model: an ablation driver enumerating levers should not need
     an Apple-Silicon box or a loadable model just to read the registry."""
-    print(json.dumps({"levers": levers.as_dict(), "groups": levers.groups(),
+    print(json.dumps({"levers": levers.as_dict(),
                       "active": levers.active()}, indent=2))
     return 0
 
@@ -616,8 +753,8 @@ def _main(argv=None):
     if args.levers:  # deprecated spelling of `chad levers`
         sys.exit(_run_levers())
 
-    # Fail fast on a typo'd CHAD_ENABLE/CHAD_DISABLE, not mid-run: an unrecognized lever
-    # means the harness would run bare while an ablation reports the delta as "no effect".
+    # Fail fast on a typo'd CHAD_DISABLE, not mid-run: an unrecognized lever
+    # means the harness would run unmodified while an ablation reports "no effect".
     try:
         levers.validate_env()
     except levers.UnknownLever as e:
@@ -633,16 +770,15 @@ def _main(argv=None):
     # TASK deadline is left), not just per-turn enforcement.
     turn_budget_s = config.env_float("CHAD_TURN_BUDGET_S")
     task = args.task or args.prompt_flag
-    # Ornith. --model / CHAD_MODEL, else the RAM-aware default; local-dir-preferred,
-    # HF fallback.
+    # --model / CHAD_MODEL, else the shipped default; local-dir-preferred, HF fallback.
     model_id, why = _pick_model(args.model)
 
     # Advanced, rarely-touched knobs live in env vars to keep the CLI sane:
     #   CHAD_MAX_CONTEXT       YaRN-extend the window (e.g. 131072 for 128k)
     #   CHAD_CTX_LIMIT         prompt-token budget before old tool outputs compact
     #   CHAD_KV_BITS           KV cache quantization; default AUTO (8-bit where the
-    #                          fused kernel covers the model — both shipped Ornith
-    #                          models). 0 forces the fp16 cache.
+    #                          fused kernel covers the model, as it does the shipped
+    #                          one). 0 forces the fp16 cache.
     #   CHAD_KV_CACHE_MAX_GB   cap the on-disk KV cache (LRU-evict above it); 0 = unlimited
     # Unattended-run governor (harness-only; the matching flags are hidden):
     #   CHAD_THINK_CEILING  CHAD_TURN_BUDGET_TOKENS  CHAD_TURN_BUDGET_S
@@ -691,6 +827,10 @@ def _main(argv=None):
             kv_cache_max_bytes=kv_cache_max_bytes,
         )
 
+    # Mode preset first, explicit env second — so CHAD_* always wins. `--no-think`
+    # switches the whole recipe, not just the reasoning block: see NONTHINKING_SAMPLER
+    # for why running it on the thinking recipe is the documented repetition case.
+    apply_sampler_preset(eng, thinking=not args.no_think)
     apply_sampler_env(eng)
 
     # The full-screen TUI loads the 11 GB of weights on a BACKGROUND thread so the banner
@@ -859,7 +999,11 @@ def _main(argv=None):
         # shown instantly; `finalize` runs the real load on the TUI's background thread and
         # returns (load_s, ctx_limit) once weights are in.
         window = peek_context_window(model_id, max_context)
+        # The banner states the EFFECTIVE window — what the RAM governor will hand this
+        # session — not the model's native one. On a box where the two differ by 2.5x,
+        # advertising the native number is advertising context the run cannot spend.
         provisional = ctx_limit or _env_int("CHAD_CTX_LIMIT") \
+            or peek_ctx_limit(model_id, window) \
             or min(max(4096, (window or 32768) - 2048), 120_000)
 
         def finalize():
@@ -867,7 +1011,8 @@ def _main(argv=None):
             return load_s, _compute_ctx_limit(eng)
 
         run_tui(eng, provisional, mode=start_mode, thinking=thinking, resume=resume,
-                ctx_window=window, finalize=finalize, ctx_limit_fn=ctx_limit_fn)
+                ctx_window=provisional, native_ctx=window, finalize=finalize,
+                ctx_limit_fn=ctx_limit_fn)
 
 
 if __name__ == "__main__":

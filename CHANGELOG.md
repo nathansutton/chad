@@ -2,6 +2,385 @@
 
 Notable, user-visible changes.
 
+## [2.0.0] — 2026-08-23
+
+**The lean release, a new brain, and a faster one.** chad 2.0.0 is the drastic
+simplification the 1.x measurement program earned: every lever pack, alternate tool
+dialect, and scaffolding layer was measured against the bare model + tool loop with
+pre-registered paired contrasts, and nothing beat it. What survives is the bare loop plus
+the result-channel levers that make the bash route honest — now the default, all ON. Around
+that smaller harness the release changes the model chad runs (Qwen3.8-27B, dense, 3-bit)
+and lands a block-speculative decoder that roughly triples single-stream decode.
+
+**Two breaking changes to read before upgrading**: the default model is different (a fresh
+~13 GB download; the old weights can be deleted), and chad no longer supports Macs below
+24 GB.
+
+### The docs say what chad is, and quote nothing it can't reproduce on a Mac
+
+- **No benchmark scores, no comparisons to other agents or hosted models.** 1.x quoted a
+  Terminal-Bench 2.1 pass-rate and charted it against the paid leaderboard. Both are gone
+  from every page, and the release checklist now forbids them: the number was measured
+  with the weights served from another machine into Linux containers, which is not the
+  system chad is — a 24 GB laptop with the model in-process. The containerised harness
+  stays in `benchmarks/tb2/` as maintainer tooling for *paired* A/B runs, with no
+  published number.
+- **What replaces it is a stock-engine comparison on the same weights and the same Mac**
+  (`benchmarks/stock/`): llama.cpp and Ollama on Unsloth's `UD-Q3_K_XL` GGUF against chad
+  serial and chad default, each measured with its own benchmark. Serial decode lands in
+  the same place on every engine — the bandwidth wall — and the DFlash2 drafter is the
+  gap. The README leads with that table.
+- **The README is rewritten around the two things chad is for**: a Claude-Code-shaped
+  developer experience for one scoped task at a time, and a 24 GB MacBook Pro as the whole
+  machine. The engineering budget went to tokens per second and to context frugality;
+  everything else is deliberately plain. The "harness beats the model" framing of 1.x is
+  retired — the model got good, and the harness's job is to make it accessible.
+
+
+### `write_todos` takes a checklist
+
+The planning tool's wire format is now a markdown checklist — one item per line, the same
+text the tool prints back — instead of a list of `{content, status}` objects:
+
+```
+[x] a step that is finished
+[~] the step you are working on now
+[ ] a step still to do
+```
+
+Updating the plan is now copying your own last output forward and flipping a box, which
+is what a model writes unprompted. The nested-object form it does not: across a 44-task
+benchmark screen, **every one of 96 `write_todos` calls arrived mis-shaped** — the array
+double-encoded as a JSON string — and only landed because the validator's repair stage
+un-stringified each one. The tool worked, but entirely on the strength of a repair path,
+and the `CHAD_NO_VALIDATE` baseline had no such path.
+
+- The structured list is still accepted, as is either form double-encoded as a string, a
+  list of bare lines, markdown bullets, `1.` numbering, and word marks (`[done]`, `[wip]`).
+  Nothing that already worked stops working.
+- Unparseable input returns a message that shows the format, instead of a silent no-op plan.
+- The schema declares the shapes with `anyOf`, which the validator now understands: it
+  takes the first branch that validates cleanly, and on total failure reports the branch
+  that came closest, so a bad `status` still names the field and the enum rather than
+  degrading to "expected string".
+
+### A final plan update paired with `done` is no longer dropped
+
+A `write_todos` and a `done` emitted in the same step — the model's habitual closing move —
+lost the plan update: the terminal-tool short-circuit returned before the execute loop, so
+the step where every item gets marked `[x]` was discarded and the recorded plan ended each
+turn a step stale. The update now runs before the turn ends. It touches no files and counts
+as no work, so the verify-before-done gates are unaffected; on the paths where `done` is
+rejected and the turn continues, the model now sees its own plan instead of a hole.
+
+
+### DFlash2 block speculation replaces the MTP head
+
+*(The MTP self-speculative decoder described under [Decode speed](#decode-speed) below was built and measured inside this same release cycle and never shipped; DFlash2 superseded it before the tag.)*
+
+Decoding on the shipped model speculates with a **DFlash2 block drafter**, and the
+checkpoint's multi-token-prediction head is **gone** — head, sidecar loader, draft-schedule
+knobs and shortlist readout, ~900 lines and eight environment variables. The drafter (1.9B,
+converted from the DFlash2 release for this model) reads the main model's residual stream at
+five tapped layers and proposes a whole block of tokens in **one** forward, where the MTP
+head had to chain one step per token and its acceptance decayed past depth 3. It measured
+faster in every mode, so keeping a second, slower drafter alive only bought a fallback that
+nothing preferred.
+
+- Measured on an M4 Pro, shipped 3-bit quant, one load, same prompts, 384-token decodes,
+  medians: greedy serial 17.5 → **60.1 tok/s** (3.4×, MTP was 26.1); at the thinking
+  sampling preset 22.4 → **49–51** (MTP 22.4); non-thinking 23.7 → **52–54**; code 24 → 44.
+  (Before the matmul kernel below: 28.1 / 27.3 at width 4, the ladder's optimum; with its
+  first version 47.7 / 41.4.)
+- **The drafter ships inside the model repo**, pre-quantized, as `dflash/`. There is no
+  second download, no consent prompt, no 3.8 GB bf16 fetch and no local quantize step on
+  first run — one repo, ~13.2 GB, and the speculative decoder is simply there. Weights
+  outside a bundle still load via `CHAD_DFLASH_PATH`, and
+  `python -m chad.mlx_dflash <dir> --out <model_dir>/dflash` builds a bundle for another
+  target.
+- Verification, rollback and the exact-acceptance rule are unchanged: every emitted token
+  is the target's own choice for its position and sampled output keeps the true
+  distribution. Greedy output is identical to plain decoding *to kernel rounding*: the
+  batched verify forward and the serial step run different matmul/attention kernels, so a
+  greedy run follows serial until the first near-tie and can branch there (measured: 4/10
+  160-token generations bit-identical, the rest diverging 10–95 tokens in, with or without
+  the matmul kernel below and with or without cache reuse). The earlier "token-identical"
+  claim was a short run that never met a near-tie.
+- The drafter always proposes its full block of 7; a per-round schedule decides how many
+  of those proposals to verify, narrowing or skipping a round when recent acceptance drops.
+  It is the default on the **floor**: a full-block round costs ~2.2 serial steps whatever it
+  commits, so a fixed block on low-acceptance text measured *below* serial (11.7 tok/s
+  against 15.2 at the thinking preset; 17.5 against a 21.4 schedule on a real session
+  context), where the schedule never went under serial. `CHAD_DFLASH_ADAPTIVE=0` verifies
+  the full block every round (~12% faster at the greedy median, a tie at the thinking
+  preset); `CHAD_DFLASH_DRAFT=N` caps the width. `CHAD_NO_DFLASH=1` now decodes serially
+  rather than falling back to a second drafter.
+- `benchmarks/spec_decode.py` measures serial, schedule and fixed-block arms in one load,
+  on windows of this repo's own docs and code and on real mid-session contexts replayed
+  out of `~/.chad/sessions` (12–19k tokens, tool results and schemas in place), and reports
+  median and floor per arm plus acceptance by what the model was writing. On real contexts:
+  greedy serial 14.8 → 31.7 tok/s (schedule) / 36.0 (fixed block); thinking preset 13.9 →
+  27.6 / 27.1. The drafter accepts 35–55% of drafted positions inside `<think>` and
+  70–90% on tool calls; the 60 / 49–51 figures above are memorized-prose seeds at ~95%.
+- Memory: +1.1 GB resident for the drafter (its context cache is a 2048-row ring, ~40 MB);
+  on a 24 GB box that is ~30k tokens of context ceiling.
+- **Removed:** `CHAD_NO_MTP`, `CHAD_MTP_ADAPTIVE`, `CHAD_MTP_DRAFT`, `CHAD_MTP_MAX_DRAFT`,
+  `CHAD_MTP_H`, `CHAD_MTP_PATH`, `CHAD_NO_DRAFT_SHORTLIST`, `CHAD_DFLASH_REPO`, and
+  `python -m chad.mlx_mtp`.
+
+### Small-M matmul kernel for speculative verify
+
+Verifying a draft of k tokens is a k+1-row forward, and stock `quantized_matmul` priced
+every extra row at ~33 ms on the shipped model — the ladder that pinned the block drafter's
+width at 4. `mlx_qmm_mma.py` is a small-M MMA kernel in the lineage of avlp12's `qmm_mma4`
+(via mlx-dspark, MIT): one 8×8 `simdgroup_matrix` tile covers every verify width, so each
+weight group is read once for all rows. Its loop is rebuilt around the fragment registers —
+both operands are written straight into the MMA fragments (no threadgroup staging, no
+barriers in the K loop), the product runs transposed so each lane's weights are sixteen
+contiguous values of one row, weights enter the MMA as the exact bf16 of `2^bits + v` built
+by a bit-insert with the affine scale and bias folded in once per group, and rows past M are
+zero-filled in-kernel (no padded copy of the activations). It serves 3/4/5/6/8-bit g64
+weights, so the 3-bit body and the 5-bit `lm_head` qualify. A load-time probe races it
+against the stock kernel per weight shape and per width on the running machine, keeps only
+the winners (cached), and everything else stays stock. On the shipped model every eligible
+shape wins from five rows up (3-bit MLP 1.3× at five rows, 2.1× at eight; the 5-bit
+`lm_head` 1.4× / 2.3×; the kernel is flat in M), which makes a full-block verify round cost
+2.2 serial steps instead of 3.2 — greedy 47.7 → 60.1 tok/s, thinking preset 41.4 → 49–51.
+The chip's MMA issue rate (~5.4 TFLOPS, measured) is now the wall: at eight rows the
+MMA alone costs what the weight stream costs. `CHAD_NO_QMM_MMA=1` is the A/B arm;
+`CHAD_QMM_MMA_RECAL=1` re-probes after an mlx upgrade.
+
+### A clip is a loan, not a deletion
+
+chad truncates tool output in three places — bash's own head/tail budget, the per-result
+backstop cap, and compaction's aging passes. Only the first one used to keep the bytes it
+dropped. Measured over the banked session archive: of the results compaction trimmed,
+**7.6% were later re-fetched with a byte-identical call** (17 of 225, across 7 sessions) —
+a dead turn plus a full re-prefill each, on a box where a turn is 30–60 s. The clips that
+already carried a pointer were re-run **0** times.
+
+- **Compaction's trims now carry an executable pointer** (`trim_spill`). Before a tool
+  result is head/tail-trimmed, the full original goes to a spill file and the trimmed
+  message names it, so the omitted middle costs a `grep` instead of a repeat of the call.
+- **The per-result backstop cap joins the same contract** (`result_spill`), and now keeps
+  a **tail** as well as a head — a head-only clip of a long error kept the preamble and
+  dropped the sentence that said what went wrong.
+- **One spill store, one budget.** `spill.py` holds the file/permission/retention
+  discipline all three call sites share: per-process session dirs, per-kind file counts, a
+  dir-wide byte cap, 0600, and a 7-day sweep of dirs orphaned by dead processes. A body
+  that is already spilled re-points at its file rather than being written twice.
+
+### Fixed
+
+- **`/compact` raised `AttributeError`** the moment a session had an untrimmed tool
+  result: the manual reclaim path filtered on a module constant that no module defines.
+  It had no test, which is how it shipped; it has one now.
+
+### Added
+
+- **`/ctx`** — where the context window actually went, in tokens of the model's own
+  tokenizer: system prompt, tool schemas, history, and inside history the think residue,
+  the tool results, and the last step's results. `context N` says how full the window is
+  and nothing about why; a 40k skill body, an eager MCP server's schemas and a transcript
+  of think blocks all read identically on the bare gauge. Read-only and model-free, so it
+  works mid-turn — which is when the question gets asked.
+
+### Skills are slash commands now
+
+- **The skill catalog is out of the system prompt.** Agent Skills used to ride in every
+  prompt as an `<available_skills>` catalog so the model could select one, and be loaded
+  through an `activate_skill` tool. Both are gone. Every installed skill is now a slash
+  command: type `/` to see them all in the completion menu, `/ship` to run one,
+  `/investigate the flaky test` to run one against a specific ask.
+- **The measurement:** against 62 installed skills the catalog cost **4,751 tokens** and
+  the tool's enum another 294 — together 65% of the entire system prompt, on every turn of
+  every session. The system prompt went **7,975 → 2,824 tokens**. On a 24 GB Mac, where
+  the usable window is ~50k, that is 10% of the window handed back, and it no longer grows
+  with the number of skills you have installed.
+- **A loaded skill is a user turn**, not a tool result and not a prompt block — scoped to
+  the task, reclaimable by compaction once it is done (though still protected while the
+  task is live: you asked for that guidance by name).
+- **The load prints its price.** `loaded skill ship (41,238 tokens)` — big skills are big,
+  and on this hardware you should see that when you spend it, not infer it later from a
+  surprise compaction.
+- This is a deliberate divergence from the Agent Skills spec's tier-1 disclosure. chad
+  reads the same `SKILL.md` format from the same directories; it just declines to spend
+  60% of a small model's prompt letting it guess at a choice you can make from a menu.
+
+### The purge
+
+- **One tool surface.** The model sees exactly `bash`, `edit`, `write`,
+  `write_todos`, and `done` (plus MCP tools where configured).
+  Removed wholesale: the dedicated `read`/`grep`/`glob` tools, the line-addressed
+  edit family (`replace_lines`/`insert_lines`), the tree-sitter symbolic tools
+  (`repo_map`/`overview`/`view_symbol`/`find_symbol`/`definition`/`find_refs`/
+  `hover`/`replace_symbol`/`insert_symbol`/`rename_symbol`), the LSP client, and the
+  `task` sub-agent system. The former `CHAD_LEAN` arm is simply what chad is now.
+- **Eight levers, all ON.** `env_manifest`, `bash_read_skeleton`,
+  `bash_empty_diagnose`, `bash_trim_keep_failures`, `verify_baseline`,
+  `bash_line_clip`, `edit_miss_diagnose`, `rg_replace_flag_note`. `CHAD_DISABLE=a,b`
+  (or `all`) switches them off for leave-one-out ablation; `CHAD_ENABLE` is gone.
+  The other ~48 registered levers of 1.x — none of which earned a positive
+  pre-registered contrast — were removed along with their machinery.
+- **Safety is no longer optional.** The macOS Seatbelt sandbox for yolo-mode bash,
+  shadow-git edit checkpoints (`/undo`, `/restore`), the scoped destructive-command
+  guard, and credential-shaped env filtering for bash children are all unconditional
+  now (escape hatches: `CHAD_NO_SEATBELT`, `CHAD_NO_ENV_GUARD`,
+  `CHAD_NO_DESTRUCTIVE_GUARD`; opt-in tier: `CHAD_PROTECT_GIT`).
+- **Syntax gate is warn-only.** A mutation that introduces a parse error lands and
+  carries the warning in the same tool result; the lever-gated reject/revert tiers
+  are gone.
+- **Removed A/B knobs**: `CHAD_ENABLE`, `CHAD_LEAN`, `CHAD_NO_SYMBOLS`,
+  `CHAD_NO_TASK`, `CHAD_HIDE_TOOLS`, `CHAD_PROFILE` (model profiles are gone; the
+  prompt is model-agnostic), `CHAD_OFFLOAD_DIR`, `CHAD_LSP_TIMEOUT`,
+  `CHAD_LSP_INIT_TIMEOUT`, `CHAD_LSP_DIAG_TIMEOUT`, `CHAD_LSP_MAX_RSS_MB`.
+  `CHAD_THINK_CEILING` now defaults to 0 (off).
+- **Dependency drop**: `rustworkx` (the repo-map PageRank is gone; tree-sitter tags
+  stay, powering the ambient skeleton/definition-pointer lever).
+
+### Breaking: one model, and it is a different one
+
+- **The default model is now [`Qwen3.8-27B UD-Q3_K_XL-DFlash2`][model]**, a dense `qwen3_5`
+  hybrid (64 layers: 48 GatedDeltaNet + 16 full attention) quantized to 3-bit group-64
+  with `lm_head` held at 5-bit, plus the bundled DFlash2 drafter. ~13 GB resident, 262k native context. **This is a fresh
+  download on first run after upgrading**, and the Ornith weights in your Hugging Face
+  cache can be deleted once you are happy (`hf cache` will find them).
+- **The Ornith 35B/9B pair is retired**, and with it the RAM-aware pick that chose between
+  them and the `--model 35b` / `--model 9b` / `--model 27b` shorthands. `--model` now takes
+  `auto` or a repo id / local dir, nothing else — a stale `--model 9b` in a script is now a
+  literal (nonexistent) repo id rather than a silent alias, which is deliberate: a
+  half-removed alias table would quietly load the default and never tell you.
+- **Breaking: 24 GB is the floor.** There is no smaller model to fall back to, so a Mac
+  below the target gets a one-line warning at startup and runs anyway — chad advises, it
+  does not gate — but ~12 GB of weights plus the ~4.3 GB prefill transient leave too little
+  for a usable KV cache. Even at 24 GB the honest window is ~56k of the model's 262k; the
+  banner has always stated what you actually got.
+- **Why these bits.** On a dense model every parameter is on the critical path for every
+  token: no expert redundancy to absorb quantization error, and shrinking the weights is
+  the only decode lever there is. The recipe follows what the calibrated GGUF builds of
+  this checkpoint agree on — `lm_head` is a second full 1.27B-param tensor (vocab 248,320,
+  untied) and is where protection pays, while `embed_tokens` is a lookup table whose
+  per-row error never compounds through a matmul and is the cheapest tier to cut. Holding
+  both high, as a uniform "sensitive tier" would, spends ~0.78 GB on the tier that needs it
+  least — and on a 24 GB box 1 GB of weights is ~16k tokens of context.
+- **It ships its trained MTP head** as `mtp.safetensors` alongside the weights, which is
+  what the new self-speculative decoder drafts with (below). The conversion is ours rather
+  than mlx-community's: identical language weights, minus the 0.86 GB BF16 vision tower
+  that mlx-lm's loader discards at load anyway, plus that head.
+- **`chad prove` now runs the shipped model** instead of pinning a smaller stand-in. It
+  answers "does what I am about to run work on this machine", which a stand-in cannot, and
+  it costs no extra download since these are the weights chad was going to fetch anyway.
+[model]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX
+
+### Decode speed
+
+- **MTP self-speculative decoding** (`mlx_mtp.py`, default ON where a head exists).
+  Drafts with the checkpoint's own trained multi-token-prediction head loaded as a
+  sidecar, verifies in one batched forward, and applies exact rejection sampling — so
+  greedy output stays token-identical to the non-speculative path and sampled output
+  keeps the model's true distribution at any temperature. The shipped model bundles a
+  head, so this is on by default; a checkpoint without one is unaffected.
+  Measured on an M4 Pro at temp 1.0: 1.38× on quote-heavy spans, 1.11× on novel code,
+  1.0× on free prose. `CHAD_NO_MTP=1` disables it.
+- **Adaptive draft depth.** Rather than a fixed draft width, a per-round cost model
+  picks the depth from recent acceptance, and a full-accept streak qualifies a jump
+  onto the measured flat verify-cost plateau (S≥10 verifies cost about the same
+  through S=32). Low-acceptance regimes — temp-1 thinking, cold content — collapse to
+  depth 1–2 or a free skip, so the schedule degrades to fixed-k behavior rather than
+  below it. `CHAD_MTP_ADAPTIVE=0` restores fixed width; `CHAD_MTP_DRAFT` forces one
+  (and implies adaptive off); `CHAD_MTP_MAX_DRAFT` lowers the depth cap from its
+  default of 31 and `CHAD_MTP_H` seeds the cost model.
+- **An S>1 tier for the fused quantized-KV attention kernel** (`mlx_qsdpa.py`).
+  Speculative verification dispatches multi-token attention steps, which otherwise
+  fall back to dequantizing the whole cache once per attention layer. The fused
+  wide path now serves every verify width the draft schedule can pick, up to 24;
+  above that the fallback keeps them, because its cost is flat in width while the
+  fused kernel's partials slab is not, so the two cross over just under 32.
+  Measured on the shipped model as verify-round time (one load, interleaved arms,
+  real forwards): **+8.6% at 8k, +19.8% at 20k, +36.4% at 40k** for a width-10
+  round — the first rung of the plateau, and the one the schedule reaches most —
+  tapering to +2.2/+6.8/+12.3% at width 24. The gain grows with context because
+  the fallback re-reads the whole cache and this kernel reads it packed. Widths
+  the fused path never serves are unchanged within ±0.5%. Numerics stay at
+  output-dtype rounding level against an fp32 reference, the same acceptance class
+  as the fallback — though, like any two kernels for the same math, not bit-identical
+  to it, so flipping the knob can move a greedy near-tie.
+  `CHAD_NO_QSDPA_WIDE` / `CHAD_NO_QSDPA_WIDE_SGM` disable the tiers,
+  `CHAD_QSDPA_WIDE_KERNEL` forces the single-kernel variant.
+- **Verify-width kernel warming.** The attention kernel is templated on the verify
+  width, so a width that has never run is a Metal compile on the critical path of a
+  real step. Load now warms exactly the widths *this* configuration can dispatch —
+  the ones the draft schedule can pick, intersected with the ones the fused kernel
+  serves rather than the dequantize fallback — not the union of everything.
+  `CHAD_NO_KERNEL_WARM=1` opts out.
+- **Wide prompt-lookup decoding is now opt-in** (`CHAD_USE_PLD=1`), not default.
+  PLD drafts from context recurrence, so it can only accelerate text that already
+  appeared — and on real agentic traces that is a minority of what this agent
+  generates (~62–66% of generated tokens are `<think>`, and reasoning prose replays
+  at ~2.3%). Whole-session contribution measured at +2.2% of generated tokens. It
+  does not compose with MTP (one generate loop each), so on a checkpoint that
+  self-speculates, MTP is the better of the two.
+- **CATS sparse decode removed.** It never beat the alternatives on the hybrid and
+  could not run alongside speculation.
+- **`CHAD_NO_DRAFT_SHORTLIST=1`** disables the 2-bit shortlist readout used by the
+  greedy draft chain (draft-side only, never load-bearing — the chained drafts'
+  full-vocab `lm_head` read was ~70% of the head-step cost).
+- **Dead kernels removed.** Three custom decode paths earned their keep on a model or an
+  mlx version chad no longer ships against. Rather than linger as knobs that do nothing,
+  they are gone:
+  - `mlx_moe_fused.py` (the fused sparse-MoE decode kernels) and the MoE branch of
+    `mlx_fastpath.py`. The shipped model is dense; `install()` now declines a MoE
+    checkpoint outright instead of half-applying the dense transforms to it. **Removed
+    knob: `CHAD_NO_MOE_FUSED`.**
+  - The S=1 `simdgroup_matrix` attention tier in `mlx_qsdpa.py`, which needed exactly 8
+    query heads per KV head to fill its fixed 8×8 score tile. The shipped model is GQA-6
+    and could never dispatch it. **Removed knob: `CHAD_NO_QSDPA_SGM`.** Its *wide* (S>1)
+    sibling carries the retile idea forward on virtual rows and has no such constraint —
+    that one is live and is what speculative verification runs on.
+  - `mlx_qmm_s.py`, the fused small-batch quantized matmul, and the `QMM` indirection
+    in `mlx_fastpath.py` that existed only to host it. Re-measured against the stock op
+    at bf16 — the dtype the model actually runs, and the one an earlier fp16-only
+    measurement got wrong — on real verify shapes with cold weights, it is 1.01× at
+    S=3 (the shipped speculation width) and 0.71× at S=6: par at best, slower where it
+    matters. A kernel that ships OFF because it loses to the op it replaces is dead
+    code, not scaffolding. **Removed knobs: `CHAD_QMMS`, `CHAD_NO_QMMS`.**
+
+### Context, sampling, and other changes
+
+- **Breaking: `CHAD_CTX_RESERVE_GB` is replaced by `CHAD_CTX_SAFETY`.** The headroom
+  lever is now a *fraction* of the live Metal budget the auto-sizing may spend
+  (default 0.975) rather than an absolute gigabyte reserve, which is what lets the
+  same setting mean the same thing on a 16 GB and a 64 GB machine. The compaction
+  threshold now also subtracts the **prefill transient** — the attention scratch live
+  at the same moment as the cache — which is fixed rather than per-token (measured on
+  the 27B: 1.8 GB at 8k, 4.15 GB at 49k, flat thereafter). `CHAD_CTX_LIMIT` still
+  forces an exact threshold.
+- **New sampler knobs**: `CHAD_TOP_K` (quant-tail trim, off by default) and
+  `CHAD_PRESENCE_PENALTY` (0.0 by default and worth leaving there — code is
+  inherently repetitive, and measured at 1.5 the model produced 45 steps of pure
+  exploration, zero edits, and visibly corrupted tool arguments). All five sampler
+  settings now travel as one call, so `chad serve` honors them too — previously a
+  server started with `CHAD_MIN_P` ran without it and said nothing.
+- **New: `CHAD_REASONING_EFFORT`** (`xhigh` | `medium` | `low`) sets the
+  template-level reasoning budget on checkpoints whose chat template accepts one.
+  Unset, the argument is not passed at all, so templates without the knob are
+  unaffected.
+- **Tab-indented files edit correctly.** The `edit` tool's indentation-drift recovery
+  mis-indented a majority of edits in tab-indented sources; over the dogfood corpus
+  that path went from 33% to 100% correct.
+- **The cross-session warm start is now documented, with numbers.** Nothing changed in
+  the feature — chad has always checkpointed the stable system+tools KV prefix to disk
+  and reloaded it on the next session in the same project — but it was described only in
+  passing, as a `chad serve` footnote, and never measured. On the shipped model it is
+  worth 75.6 s → 5.5 s to the first tool call and ~103 s → 31.4 s on the whole turn.
+  See [Throughput & performance](docs/benchmarks.md).
+- **The demo GIF records the warm path.** `docs/demo.tape` built its fixture in a fresh
+  `mktemp` directory, which can only ever miss the warm-prefix checkpoint, so the demo
+  was recording chad's worst case and then hiding the resulting minute-long prefill
+  behind a timed cut. The tape now primes the checkpoint off camera and records the
+  session every user gets after their first — short enough to show unbroken, with no
+  hidden cut inside the turn.
+
 ## [1.13.0] — 2026-08-10
 
 - **Per-step generation cap raised 8192 → 32768** (`CHAD_MAX_GEN_TOKENS`

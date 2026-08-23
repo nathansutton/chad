@@ -4,8 +4,8 @@
 # import name, and command name are independent. `uvx chad-code` runs the alias
 # script added under [project.scripts].
 name = "chad-code"
-version = "1.13.0"
-description = "Local MLX-backed, Claude-Code-style coding agent (Apple Silicon, Ornith 35B/9B)"
+version = "2.0.0"
+description = "Claude-Code-style coding agent that runs entirely on a 24 GB Apple Silicon Mac (MLX, Qwen3.8-27B)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -35,8 +35,8 @@ dependencies = [
     # path, which loads no MLX. On macOS the default in-process engine installs it as before.
     # mlx 0.32.0: Metal command-buffer failures (incl. OOM) become catchable Python
     # exceptions instead of a SIGABRT (ml-explore/mlx#3523) — engine._prefill/generate
-    # lean on that for the 35B-on-24GB recovery path. Perf re-gated
-    # on the bump: prefill/decode within noise of 0.31.2 on both shipped models.
+    # lean on that for the on-24GB recovery path. Perf re-gated
+    # on the bump: prefill/decode within noise of 0.31.2 on the shipped model.
     "mlx>=0.32.0,<0.33; sys_platform == 'darwin'",
     "mlx-lm>=0.31.3,<0.32; sys_platform == 'darwin'",
     # mlx-lm requires transformers>=5.0, but 5.13.0 regressed AutoTokenizer.register:
@@ -57,11 +57,6 @@ dependencies = [
     "prompt_toolkit>=3.0.43",
     "tree-sitter>=0.26.0",
     "tree-sitter-language-pack>=1.12.2",
-    # repomap's personalized PageRank. Native and battle-tested where the previous
-    # hand-rolled power iteration was ours to maintain; single self-contained Rust
-    # wheel, zero transitive deps. Benchmarked vs scipy/networkx/igraph on a real
-    # 421k-edge graph: identical top-50 ranking, 0.79s -> 0.04s.
-    "rustworkx>=0.15",
     # Single 2.x code path (the 1.x cap left with serena-agent, which hard-pinned mcp
     # and was the only thing keeping chad below 2). The 1->2 port was done deliberately,
     # not by a resolver: two of the renames (isError->is_error, readOnlyHint->
@@ -110,7 +105,11 @@ Issues = "https://github.com/nathansutton/chad/issues"
 # types-pyyaml: skills.py imports yaml directly; mypy 1.x refuses to honor
 # ignore_missing_imports for packages with known typeshed stubs, so the gate
 # needs the stubs installed to pass on a plain (no-extra) sync.
-dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "types-pyyaml>=6"]
+# uvicorn: tests/test_mcp.py runs a real Streamable-HTTP MCP server on a loopback
+# port to exercise that transport end to end. It arrives transitively through `mcp`
+# today, but a transitive import in a test is a collection error waiting to happen —
+# `mcp` bounds it (>=0.31.1) and could make it optional. Declare what the tests import.
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "types-pyyaml>=6", "uvicorn>=0.31.1"]
 
 [build-system]
 requires = ["setuptools>=83.0.0"]
@@ -151,6 +150,10 @@ ignore = ["E741"]  # ambiguous var names (l/I) appear in existing math code
 # future re-syncs — not held to chad's own lint standard. (F401: imports left
 # in place for upstream fidelity after the transcribe(path) cut.)
 "src/chad/parakeet/*" = ["F401", "F821", "F841", "E741"]
+# Importing a pytest fixture by name and then taking it as a test parameter is the
+# standard cross-module fixture idiom, but it reads to pyflakes as the parameter
+# shadowing the import (F811). The import itself already carries a `# noqa: F401`.
+"tests/test_engine_pld_wide.py" = ["F811"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -174,10 +177,13 @@ module = "chad.parakeet.*"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-# These modules patch mlx_lm classes that only exist on macOS: with mlx installed
-# (dev Macs, the macos CI jobs) their `type: ignore[method-assign]` comments are load-
+# This module patches mlx_lm classes that only exist on macOS: with mlx installed
+# (dev Macs, the macos CI jobs) its `type: ignore[method-assign]` comments are load-
 # bearing; on the Linux lint runner mlx_lm is absent, the patched classes type as Any,
 # and warn_unused_ignores flags those same comments — unfixable in the code for both
-# platforms at once, so the unused-ignore warning alone is relaxed for them.
-module = ["chad.mlx_fastpath", "chad.mlx_moe_fused"]
+# platforms at once, so the unused-ignore warning alone is relaxed for it. (mlx_qsdpa
+# patches a module-level function, not a class method, so it needs no relaxation.)
+# mlx_qmm_mma patches the same way; engine's ignore sits on an mlx tree_flatten call
+# that is likewise Any on Linux.
+module = ["chad.mlx_fastpath", "chad.mlx_qmm_mma", "chad.engine"]
 warn_unused_ignores = false

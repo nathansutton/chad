@@ -13,6 +13,7 @@ per-call path unless the caller chooses to; these are thin wrappers, not a live 
 
 import logging
 import os
+import shutil
 
 log = logging.getLogger("chad")  # same named logger as diag.log; no chad-module imports
 
@@ -23,6 +24,26 @@ def flag(name: str) -> bool:
     NOTE: any non-empty value is true, including "0" — use `eq(name, "1")` when a var
     demands a strict `== "1"` opt-in rather than mere presence."""
     return bool(os.environ.get(name))
+
+
+# The shell that runs `bash` tool commands. The tool is named `bash` and the system
+# prompt tells the model it is bash, but both spawn paths ran /bin/sh — `shell=True`
+# (which is /bin/sh by definition) and the Seatbelt argv, which hardcoded it. On macOS
+# that is the same binary in POSIX mode, and the difference is not cosmetic: process
+# substitution, `diff <(a) <(b)` and `while read … done < <(…)`, is a hard syntax error
+# under /bin/sh and works under /bin/bash. A shell-level parse error reads to the model
+# as "my command was wrong" rather than "this shell is older than I assumed", so it
+# rewrites the command instead of the dialect and can burn several turns doing it.
+# PATH first (a host with a modern bash installed should get it), then /bin/bash, and a
+# host with no bash at all keeps the previous /bin/sh behavior rather than failing to
+# spawn. Resolved once at import — it cannot change mid-process.
+_SHELL = (shutil.which("bash")
+          or ("/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"))
+
+
+def shell_path() -> str:
+    """Absolute path to the shell used for `bash` tool commands (see `_SHELL`)."""
+    return _SHELL
 
 
 def eq(name: str, expected: str) -> bool:
