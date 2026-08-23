@@ -183,5 +183,7 @@ ignore_errors = true
 # and warn_unused_ignores flags those same comments — unfixable in the code for both
 # platforms at once, so the unused-ignore warning alone is relaxed for it. (mlx_qsdpa
 # patches a module-level function, not a class method, so it needs no relaxation.)
-module = ["chad.mlx_fastpath"]
+# mlx_qmm_mma patches the same way; engine's ignore sits on an mlx tree_flatten call
+# that is likewise Any on Linux.
+module = ["chad.mlx_fastpath", "chad.mlx_qmm_mma", "chad.engine"]
 warn_unused_ignores = false
