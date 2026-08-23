@@ -1,4 +1,4 @@
-# chad: a Claude-Code-style coding agent that fits on a 24 GB MacBook
+# chad: a Claude-Code-style coding agent on your lap
 
 [![tests](https://github.com/nathansutton/chad/actions/workflows/tests.yml/badge.svg)](https://github.com/nathansutton/chad/actions/workflows/tests.yml)
 
