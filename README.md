@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/nathansutton/chad/actions/workflows/tests.yml/badge.svg)](https://github.com/nathansutton/chad/actions/workflows/tests.yml)
 
-<img src="docs/claude-vs-chad.jpg" width="33%" alt="Two staircase newel posts side by side: Claude is a hand-carved wooden horse head, chad is a scuffed plastic toy horse tied on with twine">
+<img src="docs/claude-vs-chad.jpg" width="66%" alt="Two staircase newel posts side by side: Claude is a hand-carved wooden horse head, chad is a scuffed plastic toy horse tied on with twine">
 
 > Claude can do anything, for anyone, anywhere. chad does one thing. 🗿
 > *Coding under supervision.*
