@@ -172,6 +172,9 @@ already carried a pointer were re-run **0** times.
 
 ### Fixed
 
+- **An MLX deprecation warning printed into the TUI during model load** (`mx.metal.device_info`
+  → `mx.device_info`), garbling whatever was being typed ahead. The kernel-probe cache key it
+  fed is unchanged.
 - **`/compact` raised `AttributeError`** the moment a session had an untrimmed tool
   result: the manual reclaim path filtered on a module constant that no module defines.
   It had no test, which is how it shipped; it has one now.

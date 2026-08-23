@@ -340,7 +340,7 @@ def _eligible_groups(*models) -> dict:
 def _cache_key() -> str:
     import mlx.core as mx
     try:
-        chip = mx.metal.device_info().get("device_name", "metal")
+        chip = mx.device_info().get("device_name", "metal")
     except Exception:  # noqa: BLE001
         chip = platform.machine()
     return f"{chip}-mlx{mx.__version__}-k{_KERNEL_VERSION}".replace(" ", "_").replace("/", "_")
