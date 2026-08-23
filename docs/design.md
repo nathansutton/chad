@@ -83,19 +83,18 @@ Every other local-agent harness leads with a model menu — 75-provider matrices
 Ollama pulls, quant pickers. chad ships exactly one model and no flag to change it.
 That's not a missing feature; it's the design's load-bearing wall, for three reasons:
 
-1. **The harness is tuned to the model, and that tuning is the product.** chad's
-   tool-call parsing (four dialects + repair), edit forgiveness cascade, think-budget
-   defaults, loop/thrash guards, and the prefix-stable transcript engineering are all
-   fitted to how the shipped model actually misbehaves. Point the same harness at an arbitrary
-   model and every one of those calibrations is wrong in a different direction. A
-   picker doesn't add choice; it silently swaps a tested system for an untested one.
-2. **The engine co-design doesn't survive substitution.** The persistent prefix KV
+1. **The engine is fitted to the model, and that fit is the product.** The DFlash2
+   drafter reads this checkpoint's residual stream at five specific layers; the fused
+   quantized-KV attention kernel covers this attention shape; the small-M verify matmul
+   is probed per weight shape at load; the context governor knows this model's bytes per
+   token. Point the same engine at arbitrary weights and every one of those is either
+   absent or wrong — which is why `--model` is slower, not broken.
+2. **The engine co-design doesn't survive a server boundary.** The persistent prefix KV
    cache diffs *token ids* against a live cache object — it owns the tokenizer, the
    cache layout, and the model's hybrid SSM/attention non-trimmability trade
    ([above](#why-prefill-is-hard-not-just-expensive)). "Just let me pick a GGUF"
-   means "run through a stateless server boundary instead," and the measured cost of
-   that boundary is the whole moat (see
-   [The bet: the harness beats the model](../README.md#the-bet-at-this-end-of-the-report-card-the-harness-beats-the-model)).
+   means "run through a stateless server instead," and what that costs on the same
+   weights is measured in [the stock-engine comparison](benchmarks.md#same-model-same-mac-stock-engine).
 3. **Zero decisions is the UX, not a compromise.** The target user comes from Claude
    Code, which also has no model picker. One command, no decision, it works — that's
    the experience being copied, and every menu before the first task is a place to

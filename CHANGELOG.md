@@ -2,7 +2,40 @@
 
 Notable, user-visible changes.
 
-## [Unreleased]
+## [2.0.0] — 2026-08-23
+
+**The lean release, a new brain, and a faster one.** chad 2.0.0 is the drastic
+simplification the 1.x measurement program earned: every lever pack, alternate tool
+dialect, and scaffolding layer was measured against the bare model + tool loop with
+pre-registered paired contrasts, and nothing beat it. What survives is the bare loop plus
+the result-channel levers that make the bash route honest — now the default, all ON. Around
+that smaller harness the release changes the model chad runs (Qwen3.8-27B, dense, 3-bit)
+and lands a block-speculative decoder that roughly triples single-stream decode.
+
+**Two breaking changes to read before upgrading**: the default model is different (a fresh
+~13 GB download; the old weights can be deleted), and chad no longer supports Macs below
+24 GB.
+
+### The docs say what chad is, and quote nothing it can't reproduce on a Mac
+
+- **No benchmark scores, no comparisons to other agents or hosted models.** 1.x quoted a
+  Terminal-Bench 2.1 pass-rate and charted it against the paid leaderboard. Both are gone
+  from every page, and the release checklist now forbids them: the number was measured
+  with the weights served from another machine into Linux containers, which is not the
+  system chad is — a 24 GB laptop with the model in-process. The containerised harness
+  stays in `benchmarks/tb2/` as maintainer tooling for *paired* A/B runs, with no
+  published number.
+- **What replaces it is a stock-engine comparison on the same weights and the same Mac**
+  (`benchmarks/stock/`): llama.cpp and Ollama on Unsloth's `UD-Q3_K_XL` GGUF against chad
+  serial and chad default, each measured with its own benchmark. Serial decode lands in
+  the same place on every engine — the bandwidth wall — and the DFlash2 drafter is the
+  gap. The README leads with that table.
+- **The README is rewritten around the two things chad is for**: a Claude-Code-shaped
+  developer experience for one scoped task at a time, and a 24 GB MacBook Pro as the whole
+  machine. The engineering budget went to tokens per second and to context frugality;
+  everything else is deliberately plain. The "harness beats the model" framing of 1.x is
+  retired — the model got good, and the harness's job is to make it accessible.
+
 
 ### `write_todos` takes a checklist
 
@@ -42,6 +75,8 @@ rejected and the turn continues, the model now sees its own plan instead of a ho
 
 
 ### DFlash2 block speculation replaces the MTP head
+
+*(The MTP self-speculative decoder described under [Decode speed](#decode-speed) below was built and measured inside this same release cycle and never shipped; DFlash2 superseded it before the tag.)*
 
 Decoding on the shipped model speculates with a **DFlash2 block drafter**, and the
 checkpoint's multi-token-prediction head is **gone** — head, sidecar loader, draft-schedule
@@ -150,20 +185,6 @@ already carried a pointer were re-run **0** times.
   of think blocks all read identically on the bare gauge. Read-only and model-free, so it
   works mid-turn — which is when the question gets asked.
 
-## [2.0.0] — 2026-08-19
-
-**The lean release, and a new brain.** chad 2.0.0 is the drastic simplification the 1.x
-measurement program earned: every lever pack, alternate tool dialect, and scaffolding layer
-was measured against the bare model + tool loop with pre-registered paired contrasts, and
-nothing beat it. What survives is the bare loop plus the eight bash-route levers that make
-the result channel honest — and those are now the default, all ON. Around that smaller
-harness the release changes the model chad runs and lands a substantially faster
-decoder.
-
-**Two breaking changes to read before upgrading**: the default model is different (a fresh
-~12 GB download; the old weights can be deleted), and chad no longer supports Macs below
-24 GB.
-
 ### Skills are slash commands now
 
 - **The skill catalog is out of the system prompt.** Agent Skills used to ride in every
@@ -219,9 +240,9 @@ decoder.
 
 ### Breaking: one model, and it is a different one
 
-- **The default model is now [`Qwen3.8-27B UD-Q3_K_XL-MTP`][model]**, a dense `qwen3_5`
+- **The default model is now [`Qwen3.8-27B UD-Q3_K_XL-DFlash2`][model]**, a dense `qwen3_5`
   hybrid (64 layers: 48 GatedDeltaNet + 16 full attention) quantized to 3-bit group-64
-  with `lm_head` held at 5-bit. ~12 GB resident, 262k native context. **This is a fresh
+  with `lm_head` held at 5-bit, plus the bundled DFlash2 drafter. ~13 GB resident, 262k native context. **This is a fresh
   download on first run after upgrading**, and the Ornith weights in your Hugging Face
   cache can be deleted once you are happy (`hf cache` will find them).
 - **The Ornith 35B/9B pair is retired**, and with it the RAM-aware pick that chose between
@@ -249,13 +270,7 @@ decoder.
 - **`chad prove` now runs the shipped model** instead of pinning a smaller stand-in. It
   answers "does what I am about to run work on this machine", which a stand-in cannot, and
   it costs no extra download since these are the weights chad was going to fetch anyway.
-- **No benchmark claim ships with this release.** The 57% Terminal-Bench 2.1 result quoted
-  by 1.x was measured on Ornith 35B and says nothing about the new default, so it has moved
-  out of the README into [`docs/benchmarks.md`](docs/benchmarks.md), dated and labelled
-  historical. The new default has not been scored yet; per the standing rule, that number
-  will flip in its own dedicated commit when the run lands.
-
-[model]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-MTP-MLX
+[model]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX
 
 ### Decode speed
 

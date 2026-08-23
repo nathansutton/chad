@@ -5,7 +5,7 @@
 # script added under [project.scripts].
 name = "chad-code"
 version = "2.0.0"
-description = "Local MLX-backed, Claude-Code-style coding agent (Apple Silicon, Qwen3.8-27B)"
+description = "Claude-Code-style coding agent that runs entirely on a 24 GB Apple Silicon Mac (MLX, Qwen3.8-27B)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

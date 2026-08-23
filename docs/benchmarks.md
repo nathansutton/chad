@@ -1,10 +1,12 @@
 # Throughput & performance
 
 *The numbers that decide whether a local agent feels responsive — prefill speed, decode
-speed, and the per-step cost once the cache is warm. All of them are reproducible on your
-own Mac with `chad-bench`. Task pass-rates (Terminal-Bench 2.1) are reproducible too —
-they have their own kit in [`benchmarks/tb2/`](../benchmarks/tb2/README.md). For the
-engineering behind them, see [Design & internals](design.md).*
+speed, and the per-step cost once the cache is warm — plus what chad's engine buys over a
+stock engine on the same weights. Every number here is a hardware measurement you can
+reproduce on your own Mac: `chad-bench` for chad, `benchmarks/stock/` for the comparison.
+Nothing on this page is a score against anyone else; chad's premise is a 24 GB laptop, and
+the only comparisons that honour it are between engines on that laptop. For the engineering
+behind the numbers, see [Design & internals](design.md).*
 
 ## Reproduce it yourself
 
@@ -31,12 +33,11 @@ that appends ~16 tokens):
 
 | Model | Prefill (cold) | Decode | Warm-step prefill |
 |---|---|---|---|
-| **Qwen3.8-27B** `UD-Q3_K_XL-DFlash2` (shipped) | ~99 tok/s | ~20.3 tok/s | ~0.75 s (16 tok) |
+| **Qwen3.8-27B** `UD-Q3_K_XL-DFlash2` (shipped, default) | ~101 tok/s | ~58 tok/s | ~0.6 s (16 tok) |
+| same, serial (`CHAD_NO_DFLASH=1`) | ~99 tok/s | ~18 tok/s | ~0.6 s (16 tok) |
 
 > Measured on this machine with the command above; run it on yours — these are hardware
-> numbers, not scores. Figures for the models 1.x shipped are archived under
-> [Before 2.0.0](#before-200-the-ornith-tier), and are not comparable: a sparse MoE
-> activating ~3B params/token and a dense 27B are different animals.
+> numbers, not scores.
 
 Prefill is the honest cost of a dense checkpoint: every one of the 27B parameters is read
 for every token of the prompt, so ~99 tok/s is close to this chip's compute roofline rather
@@ -44,11 +45,12 @@ than a tuning failure. It is also why the [warm prefix
 cache](#the-second-session-in-a-project-starts-warm) matters more than any decode work — the
 third column, not the first, is what a session actually pays after its first turn.
 
-The decode figure is steady-state single-token decode. It does not capture the speculative
-plateau: `chad-bench` writes 128 tokens from a cold 5,000-token prompt, and the adaptive
-draft schedule only opens its deep widths behind a full-accept streak, so a short run
-mostly measures the shallow regime. Long generations at long context — the ones that
-dominate an agent session — do reach it.
+The default-row decode figure flatters the drafter: `chad-bench` tiles a block of code, the
+drafter accepts nearly all of it, and a 128-token run is short. On real mid-session agent
+contexts the same engine measures ~2× serial, not ~3× — the
+[speculative-decoding tables](#two-throughput-levers) are the numbers a session lives at.
+The warm step varies 0.5–0.75 s run to run; it is 16 tokens of prefill plus the fixed cost
+of one forward.
 
 `--agentic` measures a different thing and is worth knowing about: it seeds a large context
 (`--context-tokens`, default 24,000) and reproduces the **truncated-turn cache miss** — the
@@ -67,6 +69,54 @@ Qwen3.8-27B is **dense**: every parameter is read on every token, with no sparse
 hide behind. That is why the quant is aggressive — on a dense model, shrinking the weights is
 the only decode lever there is, which is also [why decode sits where it
 does](#why-decode-sits-where-it-does).
+
+## Same model, same Mac, stock engine
+
+The question chad has to answer is not how it compares to a hosted agent — it doesn't — but
+what its engine buys over a generic local-model tool pointed at the **same weights on the
+same laptop**. So: Qwen3.8-27B at the `UD-Q3_K_XL` recipe — Unsloth's GGUF for llama.cpp,
+chad's MLX conversion of the same per-tensor bit map — on the same M4 Pro (24 GB), one
+engine resident at a time, each measured with its own native benchmark on a 512-token
+prompt and a 128-token generation. Ollama is not a separate arm: it runs llama.cpp's
+engine underneath and exposes no speculative decoding for this model. It was measured once
+on the same GGUF (0.32.15, a `FROM`-only Modelfile, `num_ctx` 2048, temperature 0, timed
+from `/api/generate`'s own counters): 96 tok/s prefill, 10.9 tok/s decode — the llama.cpp
+number, as expected. The row is kept under `_runs/ollama.json`; there is no script arm
+because importing a GGUF into Ollama needs ~45 GB of scratch disk for nothing new.
+
+| Engine | Prefill (512-tok prompt) | Decode (128 tok) | Speculative decoding |
+|---|---|---|---|
+| llama.cpp `llama-bench` (stock, build 10470) | 102 tok/s | 10.9 tok/s | none for this model |
+| **chad**, serial (`CHAD_NO_DFLASH=1`) | 99 tok/s | 18.1 tok/s | off |
+| **chad**, default | 98 tok/s | **62 tok/s** | DFlash2 block drafter |
+
+Reproduce it with `uv run python benchmarks/stock/stock.py llama` and `… chad` — one arm
+at a time, since each loads ~13 GB — and `… table` to render the rows; the measured rows
+are committed under `benchmarks/stock/_runs/`. How to read it:
+
+- **Prefill is a wash.** Both engines read a 512-token prompt at ~100 tok/s: a dense 27B
+  reads every parameter for every prompt token, and that is the chip's compute roofline,
+  not anyone's tuning.
+- **Serial decode is the bandwidth wall, and the two rows sit on it differently.** The
+  MLX quant is ~12 GB resident against the GGUF's 13.1, and chad's serial step runs the
+  fused single-token kernels described [below](#why-decode-sits-where-it-does) —
+  concatenated `gate|up` and `in_proj` matmuls, a compiled layer step. llama.cpp's Metal
+  path for this hybrid GatedDeltaNet/attention architecture was not profiled; the row says
+  what a fitted engine buys on this checkpoint, not what llama.cpp can do in general.
+- **The drafter is the gap that matters.** DFlash2 block speculation is what chad's
+  default row shows, and on this model it exists only as an MLX drafter fitted to this
+  checkpoint. llama.cpp can draft with a separate small model (`--model-draft`), but
+  there is no DFlash2 head in GGUF form.
+- **62 is a ceiling, not a session number.** `chad-bench` tiles a block of code, the
+  drafter accepts nearly all of it, and a 128-token run mostly measures the width
+  schedule's opening regime. On real mid-session contexts the same engine measures 31.7
+  tok/s median / 21.4 floor greedy and 27.6 / 17.7 at the thinking preset — the
+  [speculative-decoding tables](#two-throughput-levers) below — which is ~2× serial and
+  the number a session actually lives at.
+- **The per-step cost in an agent loop is what no single-shot benchmark shows.** Both
+  engines can reuse a prompt prefix; the difference is that chad keeps the transcript a
+  strict token-prefix of the live cache *by construction*, across compaction and across
+  sessions — the [next section](#the-agentic-loop-win-075-s-per-step-not-50-s).
 
 ## The agentic-loop win: ~0.75 s per step, not ~50 s
 
@@ -235,66 +285,6 @@ where the drafter is available it is strictly the better of the two.
 
 ---
 
-## Task pass-rates: Terminal-Bench 2.1 (reproducible)
-
-Capability is measured on [Terminal-Bench 2.1](https://www.tbench.ai/leaderboard), and the
-whole run is reproducible **from a Mac**: the exact Harbor agent adapter, the runner script,
-and the serving recipe live in [`benchmarks/tb2/`](../benchmarks/tb2/README.md). chad is
-installed *into* each task container — TB2 verifies a task by the container's end state — so
-generation has to be remote: the in-container chad runs `--backend llama` against a server
-you provide. Serve this Mac's own weights with
-[`chad serve`](configuration.md#serving-the-local-model-to-a-container-chad-serve), or a GGUF
-with `llama-server` from a box that can hold them. Not `mlx_lm.server`: it strips the
-`<think>` block, which makes it unusable for a reasoning model.
-
-**The 2.0.0 default has not been scored yet, and this page will not guess.** Changing the
-default model invalidates the score measured on the old one, and chad's release rule is that
-a benchmark claim flips in its own dedicated commit once the run lands — never bundled into
-the release that changed the thing being measured. So 2.0.0 ships with no pass-rate claim,
-and the only scored number on this page is [archived under the model that earned
-it](#before-200-the-ornith-tier).
-
-Mind the kit's standing caveat when you run it: TB2 pass-rate is **throughput-sensitive**.
-Tasks carry wall-clock budgets, so your serving speed is part of the score, and a slow host
-can fail a task on time rather than on capability.
-
-### Before 2.0.0: the Ornith tier
-
-Archived, not claimed. Through 1.x chad shipped **two** models and picked between them by
-RAM — Ornith-1.0-35B on a 24 GB box, Ornith-1.0-9B on 16/18 GB. 2.0.0 retired both for a
-single dense 27B and made 24 GB the floor. **Nothing in this section describes what you get
-from chad today**; it is kept because the 57% below is a published number and a published
-number should stay checkable.
-
-<img src="tbench-size-vs-score.png" width="840" alt="Terminal-Bench 2.1: accuracy vs. cost per run. Every verified entry is a proprietary frontier model in a datacenter, costing $130–$2,000 per run. chad + Ornith (a 35B MoE) clears 57% on an Apple Silicon laptop for the electricity — the only no-API-cost point on the board.">
-
-| Measured | Model | Score | Conditions |
-|---|---|---|---|
-| chad 1.x, 2026 | Ornith-1.0-35B `UD-Q2_K_XL` | **57%** (51/89) | k=1, self-run, **not leaderboard-verified** |
-
-The comparison the chart makes is the durable part, and it is why chad exists: every
-*verified* entry on the TB 2.1 board is a proprietary frontier model in a datacenter, scoring
-59–84% and spending $130–$2,000 in API fees per run. That result sat at 57% for the
-electricity. The axis is capability per dollar. The *point* survives the model change; the
-number does not travel with it, which is why it lives here instead of on the front page.
-
-Throughput for the retired pair, measured with `chad-bench` on an M4 Pro (5,000-token cold
-prompt, 128-token decode, a follow-up turn appending ~16 tokens):
-
-| Model | Macs | Prefill (cold) | Decode | Warm-step prefill |
-|---|---|---|---|---|
-| Ornith-1.0-35B (2-bit MoE) | ≥ 24 GB | ~730 tok/s | ~74 tok/s | ~0.2 s (16 tok) |
-| Ornith-1.0-9B (4-bit dense) | 16 / 18 GB | ~360 tok/s | ~46 tok/s | ~0.25 s (16 tok) |
-
-Read those columns against the 27B's with care rather than as a regression. The 35B MoE
-activated only ~3B params per token — which is why it both prefilled ~7× faster and decoded
-~1.6× faster than the 9B dense model despite four times the parameters — and sparsity is
-exactly what 2.0.0 gave up. What it bought is on the [capability](#task-pass-rates-terminal-bench-21-reproducible)
-side of the ledger, and the warm-step column, the one a session actually pays, barely moved.
-
-
----
-
-*Day-to-day correctness is additionally tracked in a private eval suite (it seeds repos,
-runs the agent, and verifies the actual edit). This page stays focused on the numbers you
-can reproduce yourself: throughput via `chad-bench`, pass-rates via `benchmarks/tb2/`.*
+*Day-to-day correctness is tracked in a private eval suite (it seeds repos, runs the agent,
+and verifies the actual edit) and is not quoted here. This page stays focused on the numbers
+you can reproduce yourself: `chad-bench` and `benchmarks/stock/`.*

@@ -263,11 +263,11 @@ def _walk(value: Any, schema: dict, path: str) -> Tuple[Any, List[Err]]:
     if alts:
         best_v, best_e = value, None
         for alt in alts:
-            cv, errs = _walk(value, alt, path)
-            if not errs:
+            cv, alt_errs = _walk(value, alt, path)
+            if not alt_errs:
                 return cv, []
-            if best_e is None or len(errs) < len(best_e):
-                best_v, best_e = cv, errs
+            if best_e is None or len(alt_errs) < len(best_e):
+                best_v, best_e = cv, alt_errs
         return best_v, best_e or [Err(path, _expected(schema), _tname(value))]
 
     typ = schema.get("type")

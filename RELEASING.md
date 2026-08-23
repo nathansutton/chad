@@ -58,7 +58,11 @@ environment approval — publishes `chad-code` to PyPI.
    uvx --refresh chad-code -- --version
    ```
    `uvx` caches resolves — `--refresh` is what a real upgrade looks like.
-8. **Benchmark claims stay honest.** If the verified Terminal-Bench number
-   landed since the last release, the provisional labels flip in their own
-   dedicated commit per the pre-committed landing rules — never mixed into a
-   release commit.
+8. **No scores, no comparisons.** chad's docs carry hardware measurements a reader can
+   reproduce on their own Mac (`chad-bench`, `benchmarks/stock/`) and nothing else: no
+   task pass-rates, no leaderboard placings, no numbers against other agents or hosted
+   models. The premise is a 24 GB laptop with the model in-process, and anything measured
+   elsewhere — including `benchmarks/tb2/`, which serves the weights from another machine
+   into a container — describes a different system. If a release changes the model or
+   the engine, re-run the two kits on the release build and refresh the tables in the
+   same commit as the version bump.

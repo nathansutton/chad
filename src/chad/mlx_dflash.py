@@ -93,7 +93,8 @@ class DFlashConfig:
     def from_dict(cls, cfg: dict) -> "DFlashConfig":
         rope = cfg.get("rope_parameters") or {}
         dfc = cfg.get("dflash_config") or {}
-        get = lambda k, d=None: dfc.get(k, cfg.get(k, d))  # noqa: E731
+        def get(k: str, d: Any = None) -> Any:
+            return dfc.get(k, cfg.get(k, d))
         n_layers = int(cfg["num_hidden_layers"])
         lt = cfg.get("layer_types")
         if not lt:
@@ -307,6 +308,8 @@ def build(config: DFlashConfig):
             self.input_layernorm = nn.RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
             self.post_attention_layernorm = nn.RMSNorm(cfg.hidden_size,
                                                        eps=cfg.rms_norm_eps)
+            self.attention_conv: Optional[DFlashGroupedConv]
+            self.mlp_conv: Optional[DFlashGroupedConv]
             if cfg.conv_kernel_size:
                 self.attention_conv = DFlashGroupedConv(
                     cfg.hidden_size, cfg.conv_kernel_size, cfg.conv_group_size)
@@ -352,8 +355,8 @@ def build(config: DFlashConfig):
                 if cfg.selector_rank else None)
             # Bound by the engine: the target's embedding module and a logits
             # function over post-norm hidden (handles tied embeddings).
-            self._embed = None
-            self._logits = None
+            self._embed: Any = None
+            self._logits: Any = None
 
         def bind(self, embed, logits_fn):
             self._embed = embed

@@ -1,15 +1,15 @@
-# chad — a local, MLX-backed coding agent
+# chad — a Claude-Code-style coding agent that fits on a 24 GB MacBook
 
 [![tests](https://github.com/nathansutton/chad/actions/workflows/tests.yml/badge.svg)](https://github.com/nathansutton/chad/actions/workflows/tests.yml)
 
 > Claude can do anything, for anyone, anywhere. chad does one thing. 🗿
 > *Coding under supervision.*
 
-A single-user coding agent that runs **entirely locally on Apple Silicon** via
-[MLX](https://github.com/ml-explore/mlx). A deliberately lean, shell-first tool surface
-(bash, edit, write, a todo list, done), plan mode, and a full-screen
-TUI — driven by a local model on your laptop instead of a frontier model in a datacenter.
-No Docker, no API key, no model picker.
+A single-user coding agent that runs **entirely on a 24 GB Apple Silicon laptop** via
+[MLX](https://github.com/ml-explore/mlx). Plan mode, permission modes, a full-screen TUI,
+`@file` mentions, skills, MCP — the Claude Code workflow — driven by one good open model on
+your SSD. No Docker, no API key, no model picker, nothing leaves the machine. (Not
+affiliated with Anthropic; the shape is borrowed, the code is not.)
 
 ## Quickstart
 
@@ -20,17 +20,71 @@ uvx chad-code          # runs chad anywhere — the command is still `chad`
 uvx chad-code prove    # offline smoke test: 4 tiny fix-it tasks, verified, timed 🗿
 ```
 
-First run asks, then downloads the model once (~12 GB, resumable) into the shared Hugging
+First run asks, then downloads the model once (~13 GB, resumable) into the shared Hugging
 Face cache. While it downloads, `cd` into a project and think of a scoped first ask —
 *"fix the failing test in `tests/test_x.py`"* lands; *"improve my codebase"* flails.
 
 > **chad targets 24 GB Apple Silicon and nothing smaller.** It runs below that and will
-> tell you it is doing so, but the model needs ~12 GB resident before a single token of
+> tell you it is doing so, but the model needs ~13 GB resident before a single token of
 > context, so a 16 GB Mac gets a window too small to work in.
 
 > The PyPI package is **`chad-code`**; bare `chad` is an unrelated squatted package. Other
 > ways in (PATH install, bleeding-edge `main`, dev clone) are in
 > [Installing & upgrading](#installing--upgrading).
+
+## What chad is
+
+The open models got good. [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) writes
+correct code, uses a shell properly, and fits — quantized — on a laptop. Nobody needs
+convincing of that anymore. What a laptop still lacks is a harness that makes that model
+**feel** like the tool you already use. chad is that harness, and it is built around two
+commitments:
+
+1. **A Claude-Code-shaped developer experience for one scoped task at a time.** The same
+   TUI moves — shift-tab through `normal` / `auto-accept` / `yolo` / `plan`, an approval
+   prompt that shows the whole command, `@file`, `!cmd`, `/undo`, Agent Skills, MCP — so
+   nothing has to be relearned. One model, one command, zero decisions before the first ask.
+2. **A 24 GB MacBook Pro is the whole machine.** ~13 GB of weights plus a ~4 GB prefill
+   transient leaves no slack, so the context window is sized from *live* memory, and every
+   token of it is spent on purpose: a ~2.8k-token system prompt, tool output clipped with a path back to
+   the full body, a todo list that is a markdown checklist, no skill catalog in the prompt.
+
+Everything that serves those two commitments got the engineering budget; everything else is
+deliberately plain.
+
+**Where the budget went — tokens per second.** A dense 27B at 3-bit streams ~12 GB of
+weights per token, which on an M4 Pro is ~18 tok/s serially, and an agent that decodes at
+18 tok/s while re-reading its transcript every step is a batch job, not a pair programmer.
+chad owns its inference loop instead of talking to a server, and the speed comes from three
+things fitted to the shipped checkpoint:
+
+- **DFlash2 block speculation** — a bundled 1.9B drafter ([z-lab's DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2),
+  ported to MLX and quantized) proposes a whole block of tokens from the main model's own
+  hidden states; the main model verifies the block in one batched forward; exact rejection
+  sampling keeps every emitted token the model's own. Decode goes ~3× on prose and code,
+  ~2× on real mid-session agent contexts.
+- **A persistent prefix KV cache** — the transcript is kept a strict token-prefix of the
+  live cache, so a follow-up step prefills the ~16 tokens it appended, not the 5,000 it
+  already read: **~0.75 s per step instead of ~50 s**. Any server with prompt caching gets
+  the easy case; the work is keeping it true across compaction, truncated turns and
+  restarts — the stable system prefix is checkpointed to disk, so the second session in a
+  project starts warm (75.6 s → 5.5 s to the first tool call).
+- **Fused Metal kernels** — quantized-KV attention, a small-M matmul for speculative
+  verify, a compiled single-token layer step — chosen per machine at load time, no knobs.
+
+**Where it didn't — everything else is KISS.** Five tools: `bash`, `edit`, `write`,
+`write_todos`, `done`. `bash` is the primary tool because the model already knows `rg`,
+`sed -n`, and your test runner from pretraining, and a dedicated `read`/`grep`/`glob` family
+measured no better than the shell it replaced. The todo list is a checklist the model
+copies forward and ticks. There are no behavioral levers to tune. The whole harness is
+readable in an afternoon.
+
+**What it isn't.** A 3-bit 27B is not a frontier model: it lands a scoped ask and flails on
+a vague one. The usable window on 24 GB is tens of thousands of tokens, not the 262k on the
+label. The first turn in a *new* project spends over a minute prefilling before the warm
+start exists. Thinking is on by default and is most of what it generates. It needs a 24 GB
+Apple Silicon Mac, full stop. The docs quote no benchmark scores — only throughput you can
+reproduce on that Mac — because that is the only machine the claim is about.
 
 ## chad is not a baby Claude
 
@@ -53,41 +107,37 @@ instrument:
 > own shell. Recorded with `--yolo` so nothing pauses for a keypress; the default mode
 > stops and asks before every edit and every command.
 
-## Frontier capability, laptop cost
+## Same model, same Mac, stock engine
 
-The exam is [Terminal-Bench](https://www.tbench.ai/leaderboard), the standard benchmark for
-CLI coding agents, and chad won't top it — every verified entry on Terminal-Bench 2.1 is a
-frontier model in a datacenter, scoring 59–84%. The number worth looking at is what that
-capability **costs**: the paid field spends **$130–$2,000 in API fees per run**. chad spends
-electricity. On a laptop, *capability per dollar* is the axis you actually compete on.
+The fair question is not "how does chad compare to Claude" — it doesn't — but "what do I
+gain over pointing a generic local-model tool at the same weights?" So: Qwen3.8-27B at the
+same `UD-Q3_K_XL` recipe (Unsloth's GGUF for llama.cpp, chad's MLX conversion of the same
+bit map), the same M4 Pro (24 GB), one engine resident at a time, each measured with its own
+benchmark on a 512-token prompt and a 128-token generation. Ollama is not a separate row:
+it is llama.cpp underneath, with no speculative decoding for this model — measured once on
+the same GGUF (0.32.15, Modelfile `FROM` only): 96 tok/s prefill, **10.9** decode, the
+same number.
 
-> **No scored claim ships with 2.0.0.** The 57% (51/89, k=1, self-run) that earlier releases
-> quoted was measured on **Ornith 35B**, which 2.0.0 retired as the default — so it is not a
-> number about what you get when you install chad today. It is kept, dated and labelled, in
-> [Throughput & performance](docs/benchmarks.md#before-200-the-ornith-tier).
-> The 2.0.0 default has not been scored on Terminal-Bench 2.1 yet, and this section will
-> stay claim-free until it has been. The whole benchmark is **publicly reproducible from a
-> Mac** — adapter, runner and recipe live in [`benchmarks/tb2/`](benchmarks/tb2/README.md).
-> Check it, don't trust it.
+| Engine | Prefill (512-tok prompt) | Decode (128 tok) | Speculative decoding |
+|---|---|---|---|
+| llama.cpp `llama-bench` (stock, build 10470) | 102 tok/s | 10.9 tok/s | none for this model |
+| **chad**, serial (`CHAD_NO_DFLASH=1`) | 99 tok/s | 18.1 tok/s | off |
+| **chad**, default | 98 tok/s | **62 tok/s**¹ | DFlash2 block drafter |
 
-## The bet: at this end of the report card, the harness beats the model
+¹ `chad-bench`'s prompt is tiled code the drafter reads easily, so 62 is a ceiling. On ten
+real mid-session contexts replayed from `~/.chad/sessions` (12–19k tokens, tool results and
+schemas in place, 384-token decodes) the same engine measures **31.7 tok/s median / 21.4
+floor** greedy against 14.8 serial, and **27.6 / 17.7** at the default thinking preset
+against 13.9 — much of a real turn is `<think>`, where the drafter lands 35–55% of its
+proposals. That ~2× is the number a session lives at. The serial gap to llama.cpp is
+partly bytes (the MLX quant is ~12 GB against the GGUF's 13.1) and partly chad's fused
+single-token kernels; llama.cpp's Metal path for this hybrid architecture was not profiled,
+so read that row as what the fitted engine buys, not as a verdict on llama.cpp.
 
-Every serious coding harness was built for a frontier model behind a datacenter API — which
-bakes in two assumptions that are both false on a laptop: the model is an A student, and
-prefill is somebody else's electricity. A C+ student emits tool calls with typos, quotes
-edits it never applies, and rambles — and every token of transcript it drags around must be
-re-read by *your* GPU at a few hundred tokens a second.
-
-So chad's thesis isn't "run a model locally" — plenty of tools do that. It's that **for a
-small model, harness quality is worth more than a model upgrade**, and the harness and
-inference engine have to be designed *together*. The failure modes are all nameable: the
-model pours its edit into the reasoning channel and the harness drops it; asks for a tool
-the harness doesn't ship; balloons the context until cache reuse hits 0% and decode falls to
-2 tok/s. chad handles each *inside* the harness — tool calls parsed in four dialects and
-repaired, arguments schema-coerced with a self-repair loop, edits run through a forgiveness
-cascade, and above all the transcript kept a **strict token-prefix of the live KV cache** so
-prefill never re-reads what it already read. That co-design is the whole moat. The full
-story is in [Design & internals](docs/design.md).
+Method, the longer runs and the caveats are in
+[Throughput & performance](docs/benchmarks.md#same-model-same-mac-stock-engine); the rows
+are committed under [`benchmarks/stock/_runs/`](benchmarks/stock/); reproduce them with
+`uv run python benchmarks/stock/stock.py {llama,chad}`.
 
 ## Installing & upgrading
 
@@ -127,28 +177,22 @@ to work it out from here.
 
 | Model | Quant | Footprint |
 |---|---|---|
-| [Qwen3.8-27B `UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX) | 3-bit group-64 body, 5-bit `lm_head`, bundled 4-bit DFlash2 drafter | ~12 GB resident, 262k native context |
+| [Qwen3.8-27B `UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX) | 3-bit group-64 body, 5-bit `lm_head`, bundled 4-bit DFlash2 drafter | ~13 GB resident, 262k native context |
 
 Qwen3.8-27B is **dense** (64 layers: 48 GatedDeltaNet + 16 full attention), so every
-parameter is on the critical path for every token and shrinking the model is the only
-decode lever there is. The bits go where measurement says they pay: `lm_head` is a second
-full 1.27B-param tensor (vocab 248,320, untied), and the calibrated builds of this
-checkpoint agree it is the tier worth protecting — while `embed_tokens`, a lookup table
-whose per-row error never compounds through a matmul, is the cheapest. Quant names follow
-[Unsloth's dynamic-quant convention](https://docs.unsloth.ai/) (`UD-…`); the quant itself
-is MLX group-64 affine, not a llama.cpp k-quant.
-
-It decodes speculatively: a small **DFlash2 block drafter** (bundled with the weights,
-~1.1 GB resident) proposes a whole block of tokens in one forward from the main model's own
-hidden states, the main model verifies the block in one batched forward, and exact rejection
-sampling keeps greedy output token-identical to the unspeculated path. Measured on an M4
-Pro, that is 17.7 → 47.7 tok/s greedy and 22.4 → 41.4 at the default sampling preset.
+parameter is on the critical path for every token and the quant is where decode speed comes
+from. The bits go where measurement says they pay: `lm_head` is a second full 1.27B-param
+tensor and is held at 5-bit; `embed_tokens`, a lookup table whose error never compounds
+through a matmul, is cheapest. The name follows
+[Unsloth's dynamic-quant convention](https://docs.unsloth.ai/) (`UD-…`); the quant itself is
+MLX group-64 affine, not a llama.cpp k-quant. The DFlash2 drafter ships inside the same repo,
+pre-quantized — one download, and speculative decoding is simply there.
 
 **24 GB is the floor.** The context window is sized from the live Metal budget, not a
-constant, so a tighter box narrows its window rather than dying — but ~12 GB of weights
+constant, so a tighter box narrows its window rather than dying — but ~13 GB of weights
 plus a ~4.3 GB prefill transient spend most of a 24 GB budget before the first cached
-token, which is why a 24 GB Mac lands near ~56k of the model's 262k window rather than the
-whole thing. The banner states what you actually got. Below 24 GB chad warns and proceeds;
+token, which is why a 24 GB Mac lands in the tens of thousands of tokens rather than the
+model's 262k. The banner states what you actually got. Below 24 GB chad warns and proceeds;
 it does not gate you, but it cannot give you a usable window either.
 
 `--model <repo or local dir>` runs different weights through the same engine, and stays a
@@ -217,7 +261,7 @@ Plus three subcommands, each with its own `--help`:
 |---|---|
 | `chad serve` | serve this Mac's model to a container or the LAN ([Configuration](docs/configuration.md#serving-the-local-model-to-a-container-chad-serve)) |
 | `chad prove` | offline smoke test: 4 tiny fix-it tasks, verified, timed |
-| `chad levers` | print the harness lever registry as JSON (ablation driver) |
+| `chad levers` | print the result-channel lever registry as JSON (for A/B ablation) |
 
 A headless task (positional, or piped with no TTY) auto-approves mutating tools; the model
 runs greedy (temp 0). Every conversation is persisted under `~/.chad/sessions/`, and every
@@ -242,12 +286,11 @@ Both are covered in full in the [Configuration reference](docs/configuration.md)
 ## Documentation
 
 - **[Design & internals](docs/design.md)** — why prefill is the bill, the persistent prefix
-  cache, the trimmable/append-only trade, and the ideas borrowed from other agents.
+  cache, the trimmable/append-only trade, why the tool surface is five tools, and the ideas
+  borrowed from other agents.
 - **[Throughput & performance](docs/benchmarks.md)** — prefill / decode / warm-step
-  numbers you can reproduce with `chad-bench`, and what the cross-session warm start is
-  worth (75.6 s → 5.5 s to the first tool call).
-- **[Terminal-Bench 2.1 reproduction](benchmarks/tb2/README.md)** — the exact Harbor adapter
-  and runner; serve a model yourself and check the number.
+  numbers you can reproduce with `chad-bench`, the stock-engine comparison, and what the
+  cross-session warm start is worth.
 - **[Configuration reference](docs/configuration.md)** — Agent Skills, MCP servers, the
   context window, every environment variable, and the safety opt-outs.
 - **[Troubleshooting](docs/troubleshooting.md)** — when a session rambles, loops, or slows:

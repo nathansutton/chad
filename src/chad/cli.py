@@ -11,7 +11,7 @@ One model (Qwen3.8-27B, 3-bit, with its DFlash2 drafter), one entrypoint, run wi
 Plus three subcommands, each with its own `--help`: `chad serve`, `chad prove`,
 `chad levers`.
 
-Rare long-session knobs live in env vars — see README "Advanced".
+Rare long-session knobs live in env vars — see docs/configuration.md.
 """
 import argparse
 import json
@@ -614,10 +614,10 @@ def _add_model_arg(ap):
 def _agent_parser():
     ap = argparse.ArgumentParser(
         prog="chad",
-        description="Local MLX-backed coding agent. Run with `uv run chad`.",
+        description="Local coding agent for a 24 GB Apple Silicon Mac (MLX, one model, no API key).",
         epilog="subcommands (each takes --help): chad serve · chad prove · chad levers. "
                "Long-session and unattended-run knobs live in CHAD_* env vars — "
-               "see README \"Advanced\".",
+               "see docs/configuration.md.",
     )
     ap.add_argument("--version", action="version", version=_version_string())
     ap.add_argument("task", nargs="?",
