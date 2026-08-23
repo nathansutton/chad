@@ -10,23 +10,23 @@ Docs fixes, tests, bug fixes that come with a failing-test repro, portability an
 tooling improvements. The gate is fast and needs **no model weights**:
 
 ```bash
-uv run pytest -q            # unit gate — loads no model, runs in seconds
+uv run pytest -q            # unit gate: loads no model, runs in seconds
 uv run ruff check src tests # lint
 uv run mypy src/chad        # type check
 ```
 
-All three run in CI (`.github/workflows/tests.yml`) — a green `pytest` alone still fails
-the build if `ruff` or `mypy` is unhappy, so run all three before opening a PR.
+All three run in CI (`.github/workflows/tests.yml`). A green `pytest` alone still fails the
+build if `ruff` or `mypy` is unhappy, so run all three before opening a PR.
 
 ## What needs a conversation first
 
-Anything that changes **model-visible behavior** — prompts, tool schemas, guardrails,
-the engine, compaction. Be warned up front: these are validated on the maintainer's
-**private eval rig** (the core/hard/realworld/brutal tiers that self-skip here for lack
-of weights), which a PR can't run. That means I can't merge a behavior change on the
-unit tests alone — I have to take it to the rig myself. So please **open an issue and
-describe the change before building it**, or your PR may stall waiting on an eval pass
-you can't see. Not a brush-off — just how a RAM-bound local model gets kept honest.
+Anything that changes **model-visible behavior**: prompts, tool schemas, guardrails, the
+engine, compaction. These are validated on the maintainer's **private eval rig** (the
+core/hard/realworld/brutal tiers that self-skip here for lack of weights), which a PR can't
+run. I can't merge a behavior change on the unit tests alone; I have to take it to the rig
+myself. So please **open an issue and describe the change before building it**, or your PR
+may stall waiting on an eval pass you can't see. That is how a RAM-bound local model gets
+kept honest.
 
 ## Dev setup
 
@@ -44,13 +44,13 @@ Python is 3.11+; dependency and venv management is [uv](https://docs.astral.sh/u
 
 Two areas corrupt more than the line you touched, so lean on the existing tests:
 
-- **`engine.py` and `compaction.py`** — the shipped model's hybrid SSM/attention cache is
+- **`engine.py` and `compaction.py`.** The shipped model's hybrid SSM/attention cache is
   **non-trimmable**: any change to the prefix forces a full re-prefill, and a bug here
   corrupts every later turn. Run `test_engine.py` / `test_compaction.py`.
-- **the `run_turn` loop in `agent.py`** — the heart of the agent; guarded by
+- **The `run_turn` loop in `agent.py`.** The heart of the agent, guarded by
   `test_agent_guards.py`, with tool/edit behavior in `test_tools.py` / `test_edit.py`.
 
 ## Style
 
-ruff and mypy are the law. Match the surrounding comment density and naming — write code
+ruff and mypy are the law. Match the surrounding comment density and naming, and write code
 that reads like the code already there.
