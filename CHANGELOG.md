@@ -2,6 +2,18 @@
 
 Notable, user-visible changes.
 
+## [2.0.1] — 2026-08-23
+
+**Hotfix: pin mlx to 0.32.0.** mlx 0.32.1 (released after 2.0.0) produces degenerate
+generations with chad's kernel stack — garbage reasoning blocks, repetition loops, and
+hallucinated tasks from the first token. A fresh `uvx chad-code` resolved 0.32.1 and got
+the broken behavior; the same wheel forced to `mlx==0.32.0` behaves normally (A/B on the
+same prompt and repo). Until the point release is re-gated against chad's QSDPA/DFlash2
+kernels, the dependency is an exact `mlx==0.32.0` pin. No harness or model changes.
+
+If you installed while 2.0.0 was current and saw garbled output, upgrade
+(`uvx chad-code@latest` or `pip install -U chad-code`) — nothing else is needed.
+
 ## [2.0.0] — 2026-08-23
 
 **The lean release, a new brain, and a faster one.** chad 2.0.0 is the drastic
