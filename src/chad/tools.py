@@ -17,6 +17,7 @@ gates them behind a confirmation unless --yolo is set.
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import threading
@@ -667,61 +668,59 @@ def _indent_unit(data: str) -> str:
 # Planning tool (deepagents' write_todos): a scaffold that keeps the model on track
 # across multi-step tasks. Stateless-ish — the model re-sends the whole list each call.
 #
-# The wire format is a markdown checklist, one item per line — the SAME text this tool
-# prints back, so updating the plan is copying your own last output forward and flipping
-# a box. Models write checklists natively; a list of {content, status} objects they do
-# not, and asking for one bought a nested shape they mis-typed far more often than not.
-# The structured form is still accepted (see `parse_todos`) — nothing that already sends
-# it has to change.
+# Two wire formats are accepted (see `parse_todos`): a markdown checklist, one item per
+# line — the SAME text this tool prints back — and the structured {content, status} list.
+#
+# Measured on a full TB2.1 run: this model sends the structured list, as JSON text, on
+# 279 of 279 calls and never once mirrors the checklist it just read back. The XML
+# tool-call transport makes every parameter a string, so that JSON arrives double-
+# encoded and is recovered by validate._walk's un-double-stringify rule. Both paths are
+# load-bearing: keep the checklist parse for models that write one, and keep the
+# structured parse because this one does.
 _TODOS = []
 
-_MARK_TO_STATUS = {
-    "x": "completed", "✓": "completed", "✔": "completed", "done": "completed",
-    "completed": "completed", "complete": "completed",
-    "~": "in_progress", ">": "in_progress", "-": "in_progress", "*": "in_progress",
-    "wip": "in_progress", "doing": "in_progress", "active": "in_progress",
+# One accepted wire format: a list of {content, status} objects, which is what this model
+# sends on every call — as JSON text, because the XML tool-call transport makes every
+# parameter a string. validate._walk's un-double-stringify rule turns that back into a
+# list before it gets here.
+#
+# A markdown-checklist parse used to live alongside this one, on the theory that models
+# write checklists more naturally than nested objects. A full TB2.1 run settled it: 279
+# of 279 calls were the structured list, and not one was a checklist — even though the
+# tool prints the plan back AS a checklist on every call, so the model had the format in
+# front of it the whole time. Parsing a shape nothing sends is a second path to keep
+# correct for no traffic.
+_STATUS_WORDS = {
+    "completed": "completed", "complete": "completed", "done": "completed",
+    "finished": "completed",
     "in_progress": "in_progress", "in progress": "in_progress",
+    "inprogress": "in_progress", "doing": "in_progress", "active": "in_progress",
+    "wip": "in_progress", "started": "in_progress",
 }
 
-# `[ ] content`, tolerating a markdown bullet or "1." numbering in front and any short
-# word in the box ("[wip]", "[done]") as well as the single-character marks.
-_TODO_LINE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?\[(?P<mark>[^\]]{0,12})\]\s*(?P<content>.*)$")
 
-
-def _status_for(mark) -> str:
-    """Map a checkbox mark (or a status word from the structured form) to a status.
-    Anything unrecognized — including the empty box — is pending."""
-    return _MARK_TO_STATUS.get(str(mark).strip().lower(), "pending")
-
-
-def _todo_from_line(line: str):
-    """One checklist line -> {content, status}, or None if the line carries no item."""
-    line = line.strip()
-    if not line:
-        return None
-    m = _TODO_LINE.match(line)
-    if m is None:  # a bare line with no checkbox is still an item, not yet started
-        return {"content": line, "status": "pending"}
-    content = m.group("content").strip()
-    return {"content": content, "status": _status_for(m.group("mark"))} if content else None
+def _status_for(status) -> str:
+    """A status word -> one of the three statuses. Anything unrecognized is pending,
+    which is the safe direction: an unreadable status must never read as finished."""
+    return _STATUS_WORDS.get(str(status).strip().lower(), "pending")
 
 
 def parse_todos(value) -> list:
-    """Normalize whatever the model sent into `[{content, status}, ...]`.
+    """Normalize what the model sent into `[{content, status}, ...]`.
 
-    Accepts, in the order they are tried: JSON (the structured list, or either form
-    double-encoded as a string — Qwen3 stringifies nested fields), then a markdown
-    checklist. Unparseable input yields an empty list, which the tool turns into a
-    repair message rather than a silent no-op plan.
+    Accepts the structured list, or that list double-encoded as a JSON string (Qwen3
+    stringifies nested fields), or a bare list of strings — which becomes an all-pending
+    plan. Anything else yields an empty list, which the tool turns into a repair message
+    rather than a silent no-op plan.
     """
     if isinstance(value, str):
         try:
             loaded = json.loads(value)
         except (ValueError, TypeError):
-            loaded = None
-        if isinstance(loaded, (list, dict)):
-            return parse_todos(loaded)
-        return [t for t in (_todo_from_line(ln) for ln in value.splitlines()) if t]
+            return []
+        if not isinstance(loaded, (list, dict)):
+            return []
+        return parse_todos(loaded)
     if isinstance(value, dict):
         value = [value]
     if not isinstance(value, list):
@@ -732,10 +731,8 @@ def parse_todos(value) -> list:
             content = str(item.get("content", "")).strip()
             if content:
                 out.append({"content": content, "status": _status_for(item.get("status"))})
-        elif isinstance(item, str):
-            parsed = _todo_from_line(item)
-            if parsed is not None:
-                out.append(parsed)
+        elif isinstance(item, str) and item.strip():
+            out.append({"content": item.strip(), "status": "pending"})
     return out
 
 
@@ -746,11 +743,94 @@ def tool_write_todos(todos) -> str:
     global _TODOS
     items = parse_todos(todos)
     if not items:
-        return ("[no todos found. Send `todos` as a checklist, one item per line: "
-                "`[x] a finished step` / `[~] the step you are on` / `[ ] a step to do`.]")
+        return ("[no todos found. Send `todos` as a list of objects: "
+                '[{"content": "a step", "status": "in_progress"}, '
+                '{"content": "the next step", "status": "pending"}] — status is one of '
+                "pending / in_progress / completed.]")
     _TODOS = items
     lines = [f"  {_STATUS_MARKS[t['status']]} {t['content']}" for t in items]
     return "Plan updated:\n" + "\n".join(lines)
+
+
+def unfinished_todos() -> list:
+    """Contents of the current plan's items that are not `completed`, in order.
+
+    Empty when there is no plan, or when every box is ticked. Read by the `done`
+    guardrail so the model is asked about its own leftovers once before the turn ends.
+    """
+    return [t["content"] for t in _TODOS if t["status"] != "completed"]
+
+
+def clear_todos() -> None:
+    """Drop the plan. The list is module state that outlives a turn, which is what makes
+    a plan span turns; a new session must not inherit the previous one's leftovers."""
+    global _TODOS
+    _TODOS = []
+
+
+
+# Names a model reaches for that this surface does not expose. Reading is `bash`
+# (cat/sed/grep) — there is no read tool, and measured over 113 TB2.1 trials that costs
+# almost nothing: 4 trials opened with a `read_file` call, ate one unknown-tool
+# rejection, and recovered with bash on the next step. These aliases buy that step back
+# by rewriting the call into the `bash` it meant.
+#
+# They are deliberately NOT in SCHEMAS. Advertising them would spend prompt tokens on
+# every request of every turn to fix a first-step stumble in 4% of runs, and would grow
+# the surface the lean harness exists to shrink. Accepting a name is free; naming it is
+# not.
+READ_ALIASES = frozenset({
+    "read", "read_file", "readfile", "read_lines", "view", "view_file",
+    "open", "open_file", "cat_file", "get_file", "show_file",
+})
+
+_PATH_KEYS = ("path", "file_path", "file", "filename", "filepath", "target",
+              "abs_path", "absolute_path", "name")
+
+
+def alias_to_bash(name: str, args):
+    """Rewrite an unexposed read-ish call into the equivalent `bash` call.
+
+    Returns `(name, args)` unchanged when `name` is not an alias, or when no path
+    argument can be found — an alias with nothing to read is left alone so it takes the
+    normal unknown-tool repair path instead of running a nonsense command.
+    """
+    if name not in READ_ALIASES or not isinstance(args, dict):
+        return name, args
+    # Fall back ONLY when nothing actually answers to the name. An MCP server is free to
+    # expose a tool called `read`, and that server's tool must win over this shim —
+    # a convenience alias may never shadow a real dispatch.
+    if dispatch_for(name) is not None:
+        return name, args
+    path = next((str(args[k]).strip() for k in _PATH_KEYS
+                 if isinstance(args.get(k), (str, int, float)) and str(args[k]).strip()),
+                None)
+    if not path:
+        return name, args
+    q = shlex.quote(path)
+    # offset/limit under any of the names models use for them; both optional, and a
+    # non-integer is ignored rather than fatal (the whole file is a safe fallback).
+    def _int(*keys):
+        for k in keys:
+            try:
+                return int(args[k])
+            except (KeyError, TypeError, ValueError):
+                continue
+        return None
+
+    start = _int("offset", "start", "start_line", "from_line", "line")
+    limit = _int("limit", "count", "num_lines", "n")
+    end = _int("end", "end_line", "to_line")
+    if start is not None:
+        start = max(1, start)
+        if end is None:
+            end = start + limit - 1 if limit else start + 199
+        cmd = f"sed -n '{start},{end}p' {q} | cat -n"
+    elif limit:
+        cmd = f"head -n {limit} {q} | cat -n"
+    else:
+        cmd = f"cat -n {q}"
+    return "bash", {"command": cmd}
 
 
 # Each entry takes (args, should_stop); long-running tools honor should_stop so a
@@ -776,45 +856,37 @@ SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_todos",
-            "description": "Record or update your step-by-step plan for a multi-step task. "
-                           "Call this first for any task with 2+ steps, and again to update "
-                           "statuses as you progress.\n"
-                           "`todos` is a checklist, one item per line, written exactly the "
-                           "way this tool prints it back to you:\n"
-                           "  [x] a step that is finished\n"
-                           "  [~] the step you are working on now\n"
-                           "  [ ] a step still to do\n"
-                           "Send the whole list every time — it replaces the previous one.",
+            "description": "Record or update your step-by-step plan for a multi-step "
+                           "task. Call this first for any task with 2+ steps, and again "
+                           "to update statuses as you progress. Send the whole list every "
+                           "time — it replaces the previous one.\n"
+                           "Set a step to `completed` ONLY after you have run something "
+                           "that shows it works — a test, the program itself, a command "
+                           "whose output you read. Writing the code for a step is not "
+                           "finishing it. If you have not verified it, leave it "
+                           "`in_progress`; `done` will ask you about anything still open.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "todos": {
-                        "description": "The full checklist, one `[x]` / `[~]` / `[ ]` item "
-                                       "per line.",
-                        # Three accepted shapes, in match order. The structured list is
-                        # tried first so a caller that sends it keeps precise per-field
-                        # validation (a bad status -> a named enum error, not "expected
-                        # string"). The checklist string — what the description asks for
-                        # and what models actually write — must come before the list of
-                        # bare lines, or a multi-line checklist would match that branch
-                        # as ONE item and collapse the whole plan into a single row.
-                        "anyOf": [
-                            {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "content": {"type": "string"},
-                                        "status": {"type": "string",
-                                                   "enum": ["pending", "in_progress",
-                                                            "completed"]},
-                                    },
-                                    "required": ["content", "status"],
-                                },
+                        "description": "The full plan: a list of {content, status} "
+                                       "objects, status one of pending / in_progress / "
+                                       "completed.",
+                        # One shape. It arrives as JSON text over the XML tool-call
+                        # transport; _walk's un-double-stringify turns that back into a
+                        # list before this schema sees it, so no string branch is needed
+                        # here to accept what the model actually sends.
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {"type": "string",
+                                           "enum": ["pending", "in_progress",
+                                                    "completed"]},
                             },
-                            {"type": "string"},
-                            {"type": "array", "items": {"type": "string"}},
-                        ],
+                            "required": ["content", "status"],
+                        },
                     },
                 },
                 "required": ["todos"],

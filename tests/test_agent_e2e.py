@@ -21,6 +21,7 @@ import json
 import shlex
 import sys
 
+from chad import tools
 from chad.agent import Agent
 from chad.base_engine import BaseEngine, GenStats
 
@@ -180,7 +181,10 @@ def test_agent_loop_terminates_on_a_plain_final_answer(tmp_path):
     result = agent.run_turn("what's in data.txt?")
 
     assert result == "The file contains the number 42."
-    assert [m["name"] for m in agent.messages if m.get("role") == "tool"] == ["read"]
+    # `read` is not an exposed tool; tools.alias_to_bash rewrites it to the `bash` that
+    # reads the file, so the recorded tool message is the bash it became.
+    assert [m["name"] for m in agent.messages if m.get("role") == "tool"] == ["bash"]
+    assert "42" in agent.messages[-2]["content"]
 
 
 def test_agent_loop_surfaces_a_real_dispatch_failure(tmp_path, monkeypatch):
@@ -653,11 +657,13 @@ def test_final_plan_update_paired_with_done_is_not_dropped(tmp_path, monkeypatch
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "note.txt"
     script = [
-        _tool_call("write_todos", todos="[~] Write the note\n[ ] Read it back"),
+        _tool_call("write_todos", todos=[{"content": "Write the note", "status": "in_progress"},
+                                     {"content": "Read it back", "status": "pending"}]),
         _tool_call("write", path=str(target), content="hi\n"),
         _tool_call("bash", command="cat " + str(target)),
         # The closing step: plan update and done together.
-        _tool_call("write_todos", todos="[x] Write the note\n[x] Read it back")
+        _tool_call("write_todos", todos=[{"content": "Write the note", "status": "completed"},
+                                     {"content": "Read it back", "status": "completed"}])
         + "\n" + _tool_call("done", summary="wrote and read back the note"),
     ]
     agent = _agent(script)
@@ -670,3 +676,71 @@ def test_final_plan_update_paired_with_done_is_not_dropped(tmp_path, monkeypatch
                     if m.get("role") == "tool" and m.get("name") == "write_todos"]
     assert len(plan_results) == 2, [m.get("content") for m in plan_results]
     assert "[x] Read it back" in plan_results[-1]["content"]
+
+
+def test_done_with_an_open_todo_is_questioned_once_then_accepted(tmp_path, monkeypatch):
+    """The plan the model wrote this turn holds up `done` for exactly one question.
+
+    Measured on a full TB2.1 run, this is a nudge and not a gate on purpose: of the 75
+    turns that reached `done`, only 6 still had an open item and those 6 scored as well
+    as the rest, while 10 of the 12 turns that called `done` and scored zero had every
+    box ticked. One question is affordable; refusing a healthy run is not.
+    """
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "data.txt"
+    target.write_text("42\n")
+    tools.clear_todos()
+    script = [
+        _tool_call("write_todos", todos=[{"content": "look at the file", "status": "in_progress"},
+                                     {"content": "report the number", "status": "pending"}]),
+        _tool_call("bash", command=f"cat {target}"),
+        _tool_call("done", summary="read it"),                       # -> questioned
+        _tool_call("write_todos", todos=[{"content": "look at the file", "status": "completed"},
+                                     {"content": "report the number", "status": "completed"}]),
+        _tool_call("done", summary="read it, the number is 42"),     # -> accepted
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn("what does data.txt contain?")
+
+    assert result == "read it, the number is 42"
+    nudges = [m["content"] for m in agent.messages
+              if m.get("role") == "tool" and m.get("name") == "done"]
+    assert len(nudges) == 1, "the open-todo question must fire exactly once"
+    assert "report the number" in nudges[0]     # names the item that is still open
+    assert agent.engine._i == len(script)
+    tools.clear_todos()
+
+
+def test_done_is_not_questioned_when_every_todo_is_ticked(tmp_path, monkeypatch):
+    """Negative control: a finished plan must not cost a step."""
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "data.txt"
+    target.write_text("42\n")
+    tools.clear_todos()
+    script = [
+        _tool_call("write_todos", todos=[{"content": "look at the file", "status": "completed"}]),
+        _tool_call("bash", command=f"cat {target}"),
+        _tool_call("done", summary="read it"),
+    ]
+    agent = _agent(script, max_steps=10)
+
+    assert agent.run_turn("what does data.txt contain?") == "read it"
+    assert not [m for m in agent.messages
+                if m.get("role") == "tool" and m.get("name") == "done"]
+    tools.clear_todos()
+
+
+def test_a_stale_plan_from_an_earlier_turn_does_not_ambush_done(tmp_path, monkeypatch):
+    """A plan spans turns by design; only the plan written THIS turn gates this turn."""
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "data.txt"
+    target.write_text("42\n")
+    tools.tool_write_todos("[ ] something left over from a previous request")
+    agent = _agent([_tool_call("bash", command=f"cat {target}"),
+                    _tool_call("done", summary="unrelated task finished")], max_steps=10)
+
+    assert agent.run_turn("what does data.txt contain?") == "unrelated task finished"
+    assert not [m for m in agent.messages
+                if m.get("role") == "tool" and m.get("name") == "done"]
+    tools.clear_todos()

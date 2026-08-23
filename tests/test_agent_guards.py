@@ -106,6 +106,25 @@ def test_done_rejection():
     check("accept when work done and verified",
           done_rejection(did_work=True, unverified_edit=False,
                          empty_done_nudges=0, verify_nudges=0) is None)
+    # Open todos -> ask ONCE, then accept. Deliberately weaker than the other two:
+    # measured on 113 TB2.1 trials, only 6 of the 75 turns reaching `done` had an open
+    # item and those 6 averaged reward 0.833, while 10 of the 12 done-and-scored-zero
+    # turns had every box ticked. Worth one question, not a refusal.
+    check("open todos ask once",
+          done_rejection(did_work=True, unverified_edit=False, empty_done_nudges=0,
+                         verify_nudges=0, open_todos=2, todo_nudges=0) == "todos")
+    check("open todos never asked twice",
+          done_rejection(did_work=True, unverified_edit=False, empty_done_nudges=0,
+                         verify_nudges=0, open_todos=2, todo_nudges=1) is None)
+    check("no open todos accepts",
+          done_rejection(did_work=True, unverified_edit=False, empty_done_nudges=0,
+                         verify_nudges=0, open_todos=0, todo_nudges=0) is None)
+    check("verify takes priority over todos",
+          done_rejection(did_work=True, unverified_edit=True, empty_done_nudges=0,
+                         verify_nudges=0, open_todos=2, todo_nudges=0) == "verify")
+    check("todos default off for callers that do not pass a plan",
+          done_rejection(did_work=True, unverified_edit=False,
+                         empty_done_nudges=0, verify_nudges=0) is None)
 
 
 def test_update_work_flags():

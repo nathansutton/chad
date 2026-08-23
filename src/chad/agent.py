@@ -49,9 +49,11 @@ from .tools import (
     TERMINAL,
     _under_plans,
     active_schemas,
+    alias_to_bash,
     dispatch_for,
     is_mutating,
     tool_write_todos,
+    unfinished_todos,
 )
 from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_repair
 
@@ -899,6 +901,8 @@ class Agent:
         landing_nudges = 0  # one-shot "you're out of steps, land the edit" near the cap
         consecutive_failed_bash = 0  # back-to-back errored bash with no edit (thrash)
         thrash_nudges = 0
+        todo_nudges = 0
+        planned_this_turn = False  # write_todos ran this turn
         # Files edited this turn -> mtime at last syntax check. Bash can mutate files
         # too (sed -i, python rewrites) but bypasses the write/edit syntax gate; watch
         # edited files and re-check them after any bash that touched them (a measured
@@ -1290,7 +1294,7 @@ class Agent:
                          think_cap, think_cap_hits)
                 continue
 
-            calls = parse_tool_calls(text)
+            calls = [alias_to_bash(n, a) for n, a in parse_tool_calls(text)]
             if not calls:
                 # No tool call this step. Decide whether this is a genuine final answer
                 # or a stall to push past. Three stalls telemetry caught, in priority
@@ -1378,6 +1382,7 @@ class Agent:
                 for _n, _a in calls:
                     if _n == "write_todos" and isinstance(_a, dict) and "todos" in _a:
                         render_tool_start(self._emit, _n, _a)
+                        planned_this_turn = True
                         _res = tool_write_todos(_a["todos"])
                         render_tool_result(self._emit, _n, _a, _res)
                         self.messages.append({"role": "tool", "name": _n, "content": _res})
@@ -1386,8 +1391,14 @@ class Agent:
                 log.info("step %d: model says DONE (summary=%r) | did_work=%s "
                          "unverified_edit=%s", step, terminal.get("summary"),
                          did_work, unverified_edit)
+                # Only the plan the model wrote THIS turn can hold up this turn's
+                # `done`. A plan is module state that spans turns on purpose; without
+                # this guard a leftover item from an earlier request would ambush an
+                # unrelated one.
+                open_todos = unfinished_todos() if planned_this_turn else []
                 rejection = guardrails.done_rejection(
-                    did_work, unverified_edit, empty_done_nudges, verify_nudges)
+                    did_work, unverified_edit, empty_done_nudges, verify_nudges,
+                    open_todos=len(open_todos), todo_nudges=todo_nudges)
                 if self.mode == "plan" and rejection == "verify":
                     # Writing the plan file marks unverified_edit, but in plan mode the
                     # plan IS the deliverable — there is nothing to run/verify. Accept.
@@ -1412,6 +1423,21 @@ class Agent:
                                    "to verify them. Run the project's tests (or the code) with "
                                    "bash, check the output is correct, then call done. If a test "
                                    "fails, fix the code first.]",
+                    })
+                    continue
+                if rejection == "todos":
+                    todo_nudges += 1
+                    log.info("DONE questioned: %d open todo(s) -> nudge #%d (%s)",
+                             len(open_todos), todo_nudges, open_todos[:3])
+                    left = "\n".join(f"  - {c}" for c in open_todos[:8])
+                    self.messages.append({
+                        "role": "tool", "name": "done",
+                        "content": ("[your plan still has unfinished items:\n" + left +
+                                    "\nIf you have actually run something that shows each "
+                                    "of these works, set it to `completed` with "
+                                    "write_todos and call done again. If you have not, "
+                                    "verify it first — writing the code for a step is not "
+                                    "finishing it.]"),
                     })
                     continue
                 if action_task and not read_only_intent and self.mode != "plan" \
@@ -1507,6 +1533,11 @@ class Agent:
                     log.info("VALIDATE %s coerced: %s -> %s", name,
                              args_preview(args), args_preview(coerced))
                 args = coerced
+                if name == "write_todos":
+                    # Arms the open-todo question on this turn's `done`. Set here rather
+                    # than at the `done` branch's own write_todos call because the plan
+                    # is usually written in an ordinary earlier step, not alongside it.
+                    planned_this_turn = True
                 # Plan mode is read-only EXCEPT for writing the plan file itself:
                 # write/edit are allowed only under ./plans/. Every other mutating
                 # tool (bash) and any write outside ./plans/ is blocked.

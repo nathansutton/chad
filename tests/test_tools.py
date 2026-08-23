@@ -305,64 +305,138 @@ def test_write():
 # emit still has to land, since a mis-shaped plan used to cost a repair round-trip.
 
 def test_write_todos_formats():
-    checklist = "[x] Read the spec\n[~] Implement the parser\n[ ] Run the tests"
     expected = [("Read the spec", "completed"),
                 ("Implement the parser", "in_progress"),
                 ("Run the tests", "pending")]
+    structured = [{"content": c, "status": s} for c, s in expected]
 
     def statuses(v):
         return [(t["content"], t["status"]) for t in tools.parse_todos(v)]
 
-    check("todos: checklist string", statuses(checklist) == expected, statuses(checklist))
-    # Markdown bullets, numbering, capital/alternate marks, and word-marks are all in
-    # the wild; none of them should change the parse.
-    check("todos: bulleted + alternate marks",
-          statuses("- [X] Read the spec\n- [-] Implement the parser\n- [ ] Run the tests")
-          == expected)
-    check("todos: numbered + word marks",
-          statuses("1. [done] Read the spec\n2. [wip] Implement the parser\n3. [] Run the tests")
-          == expected)
-    # The structured form still works unchanged, and so does either form arriving
-    # double-encoded as a JSON string (the shape the served model actually emits).
-    structured = [{"content": c, "status": s} for c, s in expected]
-    check("todos: structured list", statuses(structured) == expected)
+    check("todos: structured list", statuses(structured) == expected, statuses(structured))
+    # The shape the served model actually emits: the same list as JSON text, because the
+    # XML tool-call transport makes every parameter a string.
     check("todos: JSON-string of objects", statuses(json.dumps(structured)) == expected)
-    # A bare line with no checkbox is an item that has not been started.
-    check("todos: bare lines are pending",
-          statuses("Read the spec\nImplement the parser")
-          == [("Read the spec", "pending"), ("Implement the parser", "pending")])
-    check("todos: list of bare strings", statuses(["[x] a", "b"])
-          == [("a", "completed"), ("b", "pending")])
-    # Blank lines and empty boxes carry no item.
-    check("todos: blanks dropped", statuses("[x] a\n\n   \n[ ] b")
-          == [("a", "completed"), ("b", "pending")])
-    check("todos: unparseable -> nothing", statuses("") == [] and statuses(7) == [])
-
-    # Round trip: what the tool prints must parse back to what it was given, so
-    # "copy your last plan forward and flip a box" is a closed loop.
-    printed = tools.tool_write_todos(checklist)
-    check("todos: render is the input format",
-          statuses(printed.split("\n", 1)[1]) == expected, printed)
+    check("todos: single object is a one-item plan",
+          statuses({"content": "a", "status": "completed"}) == [("a", "completed")])
+    # Status words vary in the wild; none of these should read as anything else.
+    check("todos: status synonyms",
+          statuses([{"content": "a", "status": "DONE"},
+                    {"content": "b", "status": "wip"}])
+          == [("a", "completed"), ("b", "in_progress")])
+    # An unreadable status must fall to pending — never to finished.
+    check("todos: unknown status is pending",
+          statuses([{"content": "a", "status": "?"}]) == [("a", "pending")])
+    check("todos: missing status is pending",
+          statuses([{"content": "a"}]) == [("a", "pending")])
+    # Bare strings stay tolerated by the parser (the schema is stricter — see
+    # test_write_todos_validation); they are a plan nothing has started.
+    check("todos: list of bare strings", statuses(["a", "b"])
+          == [("a", "pending"), ("b", "pending")])
+    check("todos: empty content dropped",
+          statuses([{"content": "  ", "status": "completed"},
+                    {"content": "b", "status": "pending"}]) == [("b", "pending")])
+    check("todos: unparseable -> nothing",
+          statuses("") == [] and statuses(7) == [] and statuses("[x] a checklist") == [])
     # Nothing parseable is a repair message, never a silent empty plan.
+    msg = tools.tool_write_todos("")
     check("todos: empty input explains the format",
-          tools.tool_write_todos("").startswith("[no todos found"))
+          msg.startswith("[no todos found") and '"status"' in msg, msg)
 
 
 def test_write_todos_validation():
-    """The schema advertises the checklist but keeps the structured form's precise
-    per-field errors — an `anyOf` is only worth having if it doesn't blur diagnostics."""
+    """One shape, so a wrong field is named precisely instead of blurring into
+    'some alternative did not match'."""
     from chad.validate import coerce_and_validate
 
-    for label, value in [("checklist", "[x] a\n[ ] b"),
-                         ("structured", [{"content": "a", "status": "pending"}]),
-                         ("JSON-string", '[{"content": "a", "status": "pending"}]'),
-                         ("bare strings", ["a", "b"])]:
+    for label, value in [("structured", [{"content": "a", "status": "pending"}]),
+                         ("JSON-string", '[{"content": "a", "status": "pending"}]')]:
         _, errs = coerce_and_validate("write_todos", {"todos": value})
         check(f"todos validate: {label} accepted", not errs, [str(e) for e in errs])
 
     _, errs = coerce_and_validate("write_todos", {"todos": [{"content": "x", "status": "doing"}]})
-    check("todos validate: bad status still named precisely",
+    check("todos validate: bad status named precisely",
           any("status" in e.path and "doing" in e.got for e in errs), [str(e) for e in errs])
+    _, errs = coerce_and_validate("write_todos", {"todos": ["a", "b"]})
+    check("todos validate: bare strings rejected with a field-level error",
+          errs and all("content" in e.path or "status" in e.path or "object" in e.expected
+                       for e in errs), [str(e) for e in errs])
     _, errs = coerce_and_validate("write_todos", {})
     check("todos validate: missing required reported",
           any(e.got == "missing" for e in errs), [str(e) for e in errs])
+
+
+# ---------------------------------------------------------------------------
+# Read-ish aliases: names the model reaches for that the lean surface does not
+# expose. Measured on TB2.1, 4 of 113 trials opened with `read_file` and burned a
+# step on the unknown-tool rejection before recovering with bash.
+# ---------------------------------------------------------------------------
+
+
+def test_alias_rewrites_a_read_call_into_the_bash_it_meant():
+    assert tools.alias_to_bash("read_file", {"path": "/app/x.py"}) == (
+        "bash", {"command": "cat -n /app/x.py"})
+
+
+def test_alias_quotes_paths_with_spaces():
+    name, args = tools.alias_to_bash("view_file", {"filename": "my notes.txt"})
+    assert name == "bash" and args["command"] == "cat -n 'my notes.txt'"
+
+
+def test_alias_honors_offset_and_limit():
+    assert tools.alias_to_bash("read", {"file": "a.py", "offset": 10, "limit": 5})[1] == {
+        "command": "sed -n '10,14p' a.py | cat -n"}
+    assert tools.alias_to_bash("read", {"file": "a.py", "start_line": 3, "end_line": 9})[1] == {
+        "command": "sed -n '3,9p' a.py | cat -n"}
+    assert tools.alias_to_bash("read", {"file": "a.py", "limit": 20})[1] == {
+        "command": "head -n 20 a.py | cat -n"}
+
+
+def test_alias_leaves_a_pathless_call_alone_for_the_normal_repair_path():
+    # Nothing to read -> don't invent a command; let the unknown-tool repair run.
+    assert tools.alias_to_bash("read_file", {}) == ("read_file", {})
+    assert tools.alias_to_bash("read_file", {"path": "  "}) == ("read_file", {"path": "  "})
+
+
+def test_alias_never_shadows_a_real_dispatch():
+    """An MCP server may legitimately expose `read`; that tool must win over the shim."""
+    tools.DISPATCH["read"] = lambda a, ss=None: "from the real tool"
+    try:
+        assert tools.alias_to_bash("read", {"path": "/a.py"}) == ("read", {"path": "/a.py"})
+    finally:
+        del tools.DISPATCH["read"]
+
+
+def test_alias_passes_exposed_tools_through_untouched():
+    assert tools.alias_to_bash("bash", {"command": "ls"}) == ("bash", {"command": "ls"})
+
+
+def test_aliases_are_not_advertised_to_the_model():
+    """Accepting a name is free; naming it costs prompt tokens on every request."""
+    exposed = {s["function"]["name"] for s in tools.SCHEMAS}
+    assert not (exposed & tools.READ_ALIASES)
+
+
+# ---------------------------------------------------------------------------
+# Plan state read by the `done` guardrail.
+# ---------------------------------------------------------------------------
+
+
+def test_unfinished_todos_lists_only_open_items():
+    tools.tool_write_todos([{"content": "done one", "status": "completed"},
+                            {"content": "doing this", "status": "in_progress"},
+                            {"content": "later", "status": "pending"}])
+    assert tools.unfinished_todos() == ["doing this", "later"]
+    tools.tool_write_todos([{"content": c, "status": "completed"}
+                            for c in ("done one", "doing this", "later")])
+    assert tools.unfinished_todos() == []
+    tools.clear_todos()
+    assert tools.unfinished_todos() == []
+
+
+def test_unfinished_todos_reads_json_text_from_the_xml_transport():
+    """The shape this model actually sends, arriving as JSON text over the XML transport."""
+    tools.tool_write_todos('[{"content": "a", "status": "completed"}, '
+                           '{"content": "b", "status": "pending"}]')
+    assert tools.unfinished_todos() == ["b"]
+    tools.clear_todos()

@@ -254,15 +254,28 @@ def update_work_flags(name, args, result, did_work, made_edit, unverified_edit):
     return did_work, made_edit, unverified_edit
 
 
-def done_rejection(did_work, unverified_edit, empty_done_nudges, verify_nudges):
+def done_rejection(did_work, unverified_edit, empty_done_nudges, verify_nudges,
+                   open_todos=0, todo_nudges=0):
     """Whether a `done` should be rejected, in run_turn's order. Returns 'empty'
     (no real work yet — the markdown-code-fence failure mode), 'verify' (files
-    changed but nothing run to verify them), or None (accept). The caller bumps the
-    matching counter and appends the corresponding nudge."""
+    changed but nothing run to verify them), 'todos' (the plan written this turn still
+    has open items), or None (accept). The caller bumps the matching counter and
+    appends the corresponding nudge.
+
+    'todos' is ONE nudge, not two, and it is a nudge rather than a hard gate on
+    purpose. Measured over 113 TB2.1 trials: of the 75 turns that reached `done`, only
+    6 still had an open item, and those 6 averaged reward 0.833 — as good as the rest.
+    Of the 12 turns that called `done` and scored zero, 10 had every box ticked. So the
+    open-todo signal catches almost none of the real early-`done` failures and, blocked
+    hard, would have interfered with six healthy runs. Asking once is affordable;
+    refusing is not.
+    """
     if not did_work and empty_done_nudges < 2:
         return "empty"
     if unverified_edit and verify_nudges < 2:
         return "verify"
+    if open_todos and todo_nudges < 1:
+        return "todos"
     return None
 
 
