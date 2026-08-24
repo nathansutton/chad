@@ -1,4 +1,4 @@
-# chad: a Claude-Code-style coding agent on your lap
+# chad: a local Claude-Code-style coding agent for your laptop
 
 [![tests](https://github.com/nathansutton/chad/actions/workflows/tests.yml/badge.svg)](https://github.com/nathansutton/chad/actions/workflows/tests.yml)
 
