@@ -42,7 +42,7 @@ dependencies = [
     # A/B-confirmed 2026-08-23: same wheel, same prompt, sane on ==0.32.0, garbled on
     # ==0.32.1). Point releases must be re-gated against the custom QSDPA/DFlash2/MMA
     # kernels before widening this pin.
-    "mlx==0.32.0; sys_platform == 'darwin'",
+    "mlx==0.32.1; sys_platform == 'darwin'",
     "mlx-lm>=0.31.3,<0.32; sys_platform == 'darwin'",
     # mlx-lm requires transformers>=5.0, but 5.13.0 regressed AutoTokenizer.register:
     # it now does `key.__module__.startswith("transformers.")` with no hasattr guard, and
