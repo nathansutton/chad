@@ -2,6 +2,21 @@
 
 Notable, user-visible changes.
 
+## [2.0.2] — 2026-08-27
+
+**Fix: a stray `<think>` no longer discards the turn it appears in.** A thinking turn is
+stored so that re-rendering it extends the live KV cache instead of re-prefilling the
+transcript. Two helpers held that invariant, and both assumed at most one, well-formed
+think block — so a model that wrote `<think>` *inside* its own reasoning defeated both at
+once: the block was never closed, the turn was stored raw and re-rendered with an
+injected empty block (diverging from the cache at the turn's first token), and the
+reasoning before the stray tag was dropped from the transcript entirely.
+
+Now only the closing tag decides whether a block is open, and only a *leading* `<think>`
+is treated as a delimiter — any later tag is reasoning the model wrote, not structure.
+Measured on the Qwen3.8 template, a stray-tag turn re-prefilled 1146 tokens before the
+fix and 22 after, with the dropped reasoning restored.
+
 ## [2.0.1] — 2026-08-23
 
 **Hotfix: pin mlx to 0.32.0.** mlx 0.32.1 (released after 2.0.0) produces degenerate
