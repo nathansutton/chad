@@ -4,7 +4,7 @@
 # import name, and command name are independent. `uvx chad-code` runs the alias
 # script added under [project.scripts].
 name = "chad-code"
-version = "2.0.1"
+version = "2.0.2"
 description = "Claude-Code-style coding agent that runs entirely on a 24 GB Apple Silicon Mac (MLX, Qwen3.8-27B)"
 readme = "README.md"
 license = "MIT"

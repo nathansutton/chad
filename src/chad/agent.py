@@ -206,8 +206,15 @@ def close_unclosed_think(text: str, thinking: bool) -> str:
     re-prefill of the whole transcript next step (measured: tens of thousands of tokens
     at large context). Appending the missing `</think>` keeps the cached tokens a strict
     prefix of the re-render, so only a couple of tokens prefill instead. No-op when
-    thinking is off or the block is already closed."""
-    if thinking and "<think>" not in text and "</think>" not in text and text:
+    thinking is off or the block is already closed.
+
+    Only the CLOSE decides this. An earlier guard also required no `<think>` in the
+    text, which read a stray opening tag — one the model wrote inside its own reasoning,
+    not the template's — as "already a block" and skipped the append. That turn then
+    reached `split_inline_reasoning` with no `</think>` to split on, so it was stored raw
+    and re-rendered with an injected empty think block: the exact full re-prefill this
+    function exists to prevent, on the longest turns, where it costs the most."""
+    if thinking and "</think>" not in text and text:
         return text + "\n</think>"
     return text
 
@@ -237,8 +244,17 @@ def split_inline_reasoning(m: dict) -> dict:
     if m.get("role") != "assistant" or "</think>" not in content:
         return m
     head, _, tail = content.partition("</think>")
+    head = head.rstrip("\n")
+    # Strip a LEADING `<think>` only. The generation prompt already opened the block, so
+    # any later tag is reasoning the model wrote, not a delimiter. Taking the LAST one
+    # (`split("<think>")[-1]`) silently dropped every reasoning token before a stray tag:
+    # transcript content lost, and the shortened re-render diverges from the cache right
+    # where the turn began.
+    unwrapped = head.lstrip()
+    if unwrapped.startswith("<think>"):
+        head = unwrapped[len("<think>"):]
     return {**m,
-            "reasoning_content": head.rstrip("\n").split("<think>")[-1].lstrip("\n"),
+            "reasoning_content": head.lstrip("\n"),
             "content": tail.lstrip("\n")}
 
 
