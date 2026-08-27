@@ -99,9 +99,15 @@ def test_close_unclosed_think():
     check("closed think untouched", close_unclosed_think(closed, True) == closed)
     # Thinking disabled (--no-think) -> never inject a tag.
     check("no-think untouched", close_unclosed_think("plain answer", False) == "plain answer")
-    # An explicit opening <think> in the text -> leave it (conservative; don't double-handle).
-    check("explicit <think> untouched",
-          close_unclosed_think("<think>partial", True) == "<think>partial")
+    # A stray opening <think> the model wrote INSIDE its own reasoning does not close
+    # anything. Only `</think>` decides. Reading the stray tag as "already handled" left
+    # the turn unclosed, which is the full re-prefill this helper exists to avoid.
+    check("stray <think>, no close -> closed",
+          close_unclosed_think("thinking <think> wait", True) == "thinking <think> wait\n</think>")
+    # ...and one that IS closed stays untouched, stray tag or not.
+    stray_closed = "thinking <think> wait</think>answer"
+    check("stray <think>, already closed -> untouched",
+          close_unclosed_think(stray_closed, True) == stray_closed)
     # Empty text -> no spurious tag.
     check("empty untouched", close_unclosed_think("", True) == "")
 
@@ -128,6 +134,14 @@ def test_split_inline_reasoning():
     check("tool turn untouched", split_inline_reasoning(tool) is tool)
     check("user turn untouched",
           split_inline_reasoning({"role": "user", "content": "a</think>b"})["content"] == "a</think>b")
+    # A stray <think> mid-reasoning is reasoning text, not a delimiter. Splitting on the
+    # LAST tag discarded everything before it — reasoning the model really emitted, gone
+    # from the transcript, and the shortened re-render no longer extends the KV cache.
+    out = split_inline_reasoning(
+        {"role": "assistant", "content": "first half <think> second half\n</think>\n\nans"})
+    check("stray tag keeps whole reasoning",
+          out["reasoning_content"] == "first half <think> second half", out)
+    check("stray tag keeps action", out["content"] == "ans", out)
 
 
 def test_reasoning_split_probe_classifies_templates():
@@ -181,6 +195,55 @@ def test_reasoning_split_probe_classifies_templates():
     check("unprobeable template -> off", a._reasoning_split_supported() is False)
 
 
+def test_stored_turn_extends_the_kv_cache():
+    """The invariant the two helpers exist to hold: whatever the model generated, the
+    NEXT render must begin with the bytes already in the KV cache.
+
+    Break it and the server re-evaluates the whole turn it just produced — the longer
+    the reasoning, the more it costs. Testing the property rather than each helper is
+    what catches a turn shape neither of them was written for; the shapes below are all
+    ones a real 27B emits. Model-free: `render` is a stand-in for Qwen3.8's template,
+    which reads `reasoning_content` and does NOT recover inline `</think>` itself.
+    """
+    def render(msgs):
+        out = []
+        for m in msgs:
+            role = m["role"]
+            if role == "assistant":
+                out.append("<|im_start|>assistant\n<think>\n"
+                           + (m.get("reasoning_content") or "")
+                           + "\n</think>\n\n" + (m.get("content") or "") + "<|im_end|>\n")
+            else:
+                out.append(f"<|im_start|>{role}\n{m.get('content') or ''}<|im_end|>\n")
+        # The generation prompt auto-opens the think block, so the turn continues inside it.
+        return "".join(out) + "<|im_start|>assistant\n<think>\n"
+
+    prefix = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "task"}]
+    reasoning = "weighing the ragged-row rule " * 8
+    call = "<tool_call>\n<function=bash>\n</function>\n</tool_call>"
+
+    shapes = {
+        "normal turn": reasoning + "\n</think>\n\nrunning it." + call,
+        "cut off mid-think": reasoning,
+        "stray <think>, never closed": reasoning + "<think> wait " + reasoning,
+        "stray <think>, then closed": (reasoning + "<think> wait " + reasoning
+                                       + "\n</think>\n\nrunning it." + call),
+    }
+    for name, generated in shapes.items():
+        # What the server holds after decoding this turn: the prompt it was given, then
+        # the raw bytes it emitted.
+        cached = render(prefix) + generated
+        # What chad sends next, once the turn is stored and a tool result appended.
+        stored = {"role": "assistant", "content": close_unclosed_think(generated, True)}
+        nxt = render([split_inline_reasoning(m) for m in
+                      prefix + [stored, {"role": "tool", "name": "bash", "content": "ok"}]])
+        keep = len(os.path.commonprefix([cached, nxt]))
+        check(f"{name}: render extends the cache",
+              keep >= len(cached) - len("\n"), f"diverged after {keep} of {len(cached)} chars")
+        # Reasoning the model emitted must survive into the transcript, all of it.
+        check(f"{name}: reasoning kept",
+              reasoning.strip() in split_inline_reasoning(stored).get("reasoning_content", ""))
+
 if __name__ == "__main__":
     with pytest.MonkeyPatch.context() as mp:
         with tempfile.TemporaryDirectory() as d:
@@ -198,6 +261,7 @@ if __name__ == "__main__":
     test_close_unclosed_think()
     test_split_inline_reasoning()
     test_reasoning_split_probe_classifies_templates()
+    test_stored_turn_extends_the_kv_cache()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
 
