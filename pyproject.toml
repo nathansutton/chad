@@ -138,6 +138,8 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+# Vendored Exercism exercises (benchmarks/matrix/tasks/) are upstream files, kept byte-identical.
+extend-exclude = ["benchmarks/matrix/tasks"]
 src = ["src", "tests"]
 
 [tool.ruff.lint]

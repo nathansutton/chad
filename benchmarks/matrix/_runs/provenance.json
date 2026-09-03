@@ -1,0 +1,49 @@
+{
+  "chad_version": "2.0.2",
+  "chad_file": "src/chad/__init__.py",
+  "mlx_version": "0.32.0",
+  "commit": "39c07d1",
+  "branch": "main",
+  "dirty": true,
+  "python": ".venv/bin/python3",
+  "canon_sampler": {
+    "CHAD_TEMP": "1.0",
+    "CHAD_TOP_K": "20",
+    "CHAD_TOP_P": "0.95",
+    "CHAD_MIN_P": "0.05",
+    "CHAD_PRESENCE_PENALTY": "0.0"
+  },
+  "harness": {
+    "run.py": "a3685f689915",
+    "sampler_proxy.py": "582a5cbc5c22",
+    "scorecard.py": "60b6929f0379",
+    "overnight.sh": "bc5777ff0459"
+  },
+  "chad_cli": "chad 2.0.2",
+  "skipped": {},
+  "harness_versions": {
+    "pi+llama": "0.80.3",
+    "opencode+llama": "1.17.12",
+    "chad+llama": "chad 2.0.2",
+    "dsh+llama": "0.1.1-rc.2",
+    "deepagents+llama": "deepagents-code 0.1.65",
+    "goose+llama": "1.39.0",
+    "mini+llama": "This is mini-swe-agent version 2.4.6.",
+    "crush+llama": "crush version v0.92.0",
+    "qwen+llama": "0.22.3",
+    "aider+llama": "aider 0.86.2",
+    "cline+llama": "3.0.60",
+    "codex+llama": "codex-cli 0.151.0",
+    "chad+mlx": "chad 2.0.2",
+    "chad+mlx-nodflash": "chad 2.0.2"
+  },
+  "python_version": "3.11.12",
+  "machine": {
+    "chip": "Apple M4 Pro",
+    "macos": "26.6.2",
+    "llama_cpp": "version: 0.1.1-dev (build 10470, commit 34af94cd9)",
+    "memory_gb": 24,
+    "note": "recorded after the run from the same machine; run.py now writes this block itself"
+  },
+  "harness_note": "sha256[:12] of the measurement scripts AS THEY RAN. The committed files differ: run.py (task corpus vendored, paths relativised, output redacted, --capture-bodies), sampler_proxy.py (--bodies capture, off by default), scorecard.py (rewritten derivation). No change touches what the proxy forces or records for a request."
+}

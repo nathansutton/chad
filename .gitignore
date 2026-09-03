@@ -27,5 +27,18 @@ benchmarks/tb2/harbor_logs_*/
 # Search-tool selection measurement harness — stays local
 benchmarks/search/
 
+# Harness x engine grid (benchmarks/matrix/README.md): the measured run's rows and turn
+# records are committed; logs, superseded runs, kept workdirs, captured request bodies
+# and the generated provider configs stay local. The traces dir is re-included below
+# the global `traces/` rule, minus the trajectories (full model output).
+benchmarks/matrix/_runs/*/
+!benchmarks/matrix/_runs/traces/
+benchmarks/matrix/_runs/traces/*/trajectory.json
+benchmarks/matrix/_runs/bodies/
+benchmarks/matrix/_cfg/
+# Working notes for the write-up, not part of the kit
+benchmarks/matrix/SPARKNOTES.md
+benchmarks/matrix/POST-DRAFT.md
+
 # `chad prove` scorecard rows — written to the invoking directory, per run
 /results.json
