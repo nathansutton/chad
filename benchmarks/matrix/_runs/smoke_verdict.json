@@ -1,0 +1,110 @@
+{
+  "pi+llama": {
+    "ok": true,
+    "why": "",
+    "passed": true,
+    "wall_s": 118.6,
+    "turns": 4,
+    "timed": 4,
+    "tail": "\u2192 grade` and records `True`.\n- **`roster()`** \u2014 returns all student names sorted by grade, then alphabetically.\n- **`grade(grade_number)`** \u2014 returns the students in that grade, sorted by name (empty list if none).\n- **`added()`** \u2014 returns the per-call success history (`[True, True, False, ...]`).\n"
+  },
+  "opencode+llama": {
+    "ok": true,
+    "why": "",
+    "passed": true,
+    "wall_s": 383.2,
+    "turns": 6,
+    "timed": 6,
+    "tail": "uctions.md\n\u001b[0m\u2192 \u001b[0mRead grade_school_test.py\n\u001b[0m\u2192 \u001b[0mRead grade_school.py\n\u001b[0m\n\u001b[0m\u2190 \u001b[0mWrite grade_school.py\nWrote file successfully.\n\u001b[0m\n\u001b[0m$ \u001b[0mpython -m pytest -q grade_school_test.py\n....................                                                     [100%]\n20 passed in 0.01s\n\u001b[0m\n"
+  },
+  "chad+llama": {
+    "ok": true,
+    "why": "",
+    "passed": true,
+    "wall_s": 115.0,
+    "turns": 4,
+    "timed": 4,
+    "tail": "m\u001b[2m \u2014\u001b[0m\u001b[2m no\u001b[0m\u001b[2m problem\u001b[0m\u001b[2m.\u001b[0m\u001b[2m Done\u001b[0m\u001b[2m.\u001b[0m\u001b[2m\n\u001b[0m\u001b[32m\n\n\u001b[0m\u001b[32m\n\u001b[0mbackend=llama \u00b7 base_url=http://127.0.0.1:8080 \u00b7 model=nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX (tokenizer local, generation proxied) ...\nready in 1.4s | context 32768 tokens (compact at 30720)\n"
+  },
+  "dsh+llama": {
+    "ok": true,
+    "why": "",
+    "passed": true,
+    "wall_s": 275.6,
+    "turns": 6,
+    "timed": 5,
+    "tail": "rted numerically, students sorted alphabetically within each grade.\n- **`grade(n)`** \u2014 alphabetically sorted students in that grade, `[]` if none.\n- **`added()`** \u2014 returns the True/False log of each `add_student` call in order.\n\n```\npython -m pytest -q grade_school_test.py\n\u2192 20 passed in 0.01s\n```\n"
+  },
+  "deepagents+llama": {
+    "ok": false,
+    "why": "never edited the stub",
+    "passed": false,
+    "wall_s": 340.7,
+    "turns": 4,
+    "timed": 1,
+    "tail": "KEY is not set.\nGet a key at https://tavily.com\n\nTo suppress, edit ~/.deepagents/config.toml:\n[warnings]\nsuppress = [\"tavily\"]\n\nRetrying model request 1/5\nRetrying model request 2/5\n\nUnexpected error (RemoteException): {'error': 'OpenAIInvalidRequestError', \n'message': 'An internal error occurred'}\n"
+  },
+  "goose+llama": {
+    "ok": true,
+    "why": "",
+    "passed": true,
+    "wall_s": 397.7,
+    "turns": 7,
+    "timed": 7,
+    "tail": "e (used by the \"cannot add twice\" tests).\n- **`roster()`** \u2014 returns all student names sorted by grade, then alphabetically by name.\n- **`grade(grade_number)`** \u2014 returns the alphabetically sorted names of students in that grade, or `[]` if no students are in that grade.\n\n```\n20 passed in 0.01s\n```\n"
+  },
+  "mini+llama": {
+    "ok": true,
+    "why": "",
+    "passed": true,
+    "wall_s": 294.8,
+    "turns": 6,
+    "timed": 6,
+    "tail": "2m08:31:15 - LiteLLM:WARNING\u001b[0m: utils.py:2907 - register_model: model=openai/qwen3.8-27b-local not in built-in cost map and no prefix/region variant matched; cache cost fields will default to 0. To track cache cost, add cache_creation_input_token_cost and cache_read_input_token_cost to model_info\n"
+  },
+  "crush+llama": {
+    "ok": true,
+    "why": "",
+    "passed": true,
+    "wall_s": 355.7,
+    "turns": 6,
+    "timed": 6,
+    "tail": "Done. Implemented `School` in grade_school.py with a per-grade student dict, a name set for duplicate rejection (logged in `_added_log`), and sorted `roster()`/`grade()` output. All 20 tests pass.\n"
+  },
+  "qwen+llama": {
+    "ok": false,
+    "why": "every request failed (status [400])",
+    "passed": false,
+    "wall_s": 1.2,
+    "turns": 1,
+    "timed": 0,
+    "tail": "roval-mode=yolo and no sandbox. All tool calls (shell, write, edit) auto-execute at this process's privilege level. Enable a sandbox via --sandbox / QWEN_SANDBOX, or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice.\n[API Error: 400 Failed to initialize samplers: failed to parse grammar]\n"
+  },
+  "aider+llama": {
+    "ok": false,
+    "why": "server timings missing from responses",
+    "passed": false,
+    "wall_s": 600.0,
+    "turns": 1,
+    "timed": 0,
+    "tail": "s ==. We can   \nimplement custom Roster class that is a list of (grade, names) but also compares\nequal to flat list of names? Need be careful. If test expects flat list, our    \nobject should equal flat list. If test expects tuple list, equal to tuple list. \nWarning: Input is not a terminal (fd=0).\n"
+  },
+  "cline+llama": {
+    "ok": true,
+    "why": "",
+    "passed": true,
+    "wall_s": 302.9,
+    "turns": 6,
+    "timed": 6,
+    "tail": " `[]` if the grade doesn't exist or has no students.\n\n- **`added()`**: Returns the full history of add outcomes in call order (e.g., `[True, True, False, True]` when a duplicate is attempted).\n\nVerification: `python -m pytest -q grade_school_test.py` \u2192 **20 passed**. The test file was not modified.\n"
+  },
+  "codex+llama": {
+    "ok": true,
+    "why": "",
+    "passed": true,
+    "wall_s": 155.2,
+    "turns": 3,
+    "timed": 3,
+    "tail": "sorted names for one grade, `[]` if none.\\n- `added` \u2014 returns the per-attempt success history.\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":28186,\"cached_input_tokens\":18128,\"cache_write_input_tokens\":0,\"output_tokens\":403,\"reasoning_output_tokens\":0}}\nReading additional input from stdin...\n"
+  }
+}

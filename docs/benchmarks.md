@@ -283,6 +283,23 @@ minority of what this agent writes: whole-session contribution measured at **+2.
 generated tokens. It also doesn't compose with block speculation (one generate loop each), so
 where the drafter is available it is strictly the better of the two.
 
+## Nine harnesses, one laptop: what the agent loop costs
+
+The rows above are engine numbers: how fast one process reads and writes tokens. They say
+nothing about what a person feels once an agent loop sits on top, and that turned out to
+be decided by the harness, not the engine. `benchmarks/matrix/` runs nine coding agents
+(pi, opencode, chad, deepseek-harness, goose, mini-swe-agent, crush, cline, codex) against
+**one** `llama-server` on the same GGUF, same eight Exercism tasks, same sampler forced on
+every request by a proxy, and records from the server's side what each harness made it
+read: the first-turn prompt, the uncached tokens per later turn, the wait each of those
+cost, the cache-reuse rate, and the side requests fired beside the agent loop. Same
+harness on chad's MLX engine is the engine cell.
+
+The committed run (`benchmarks/matrix/_runs/`), its method, its versions and its caveats
+are in [`benchmarks/matrix/README.md`](../benchmarks/matrix/README.md). The short form:
+on this laptop the first token arrives 13 s or 238 s after you press enter depending on
+the harness, and a later turn waits 1 s or 39 s, on the same weights.
+
 ---
 
 *Day-to-day correctness is tracked in a private eval suite (it seeds repos, runs the agent,
