@@ -73,7 +73,15 @@ on the record:
    with it, and the window it leaves behind (exits at 22.5k of 32k). The same fix moves
    crush from "4.6 s · 208 s" to "1.9 s · 41 s". goose is the arm whose cache genuinely
    dies every turn: `cache_n` pins at the system prompt (~9.4k) while the uncached count
-   climbs 742 → 1,459 → 5,521 → 8,872 across one task.
+   climbs 742 → 1,459 → 5,521 → 8,872 across one task. **Why** was a guess ("history
+   re-serialised") until the request bodies were captured and diffed
+   (`--capture-bodies` + `body_diff.py`, one goose task after the grid): the system
+   message and tools are byte-identical turn to turn, and the first differing message
+   is the *first user message*, into which goose injects a `<turn-context>` block with
+   `<current-time>` at minute resolution. Every turn that crosses a minute boundary
+   rewrites message 1, so the server's prefix match ends at the system prompt; the one
+   consecutive pair that stayed inside a minute appended cleanly and `cache_n` grew.
+   It is a timestamp in the prompt after all — just not in the part the hashes watch.
 3. An earlier note claimed a side request makes the *next* agent turn re-prefill
    thousands of tokens (dsh 2,443 vs 89). Every side request in this run sits beside
    turn 1, and turn 2 is every harness's read of the test file, so that comparison was
@@ -187,7 +195,8 @@ uv run python benchmarks/matrix/body_diff.py --all $MATRIX_RUNS/bodies/goose+lla
 
 `body_diff.py` reports, per consecutive pair, whether the system message and tools are
 byte-identical, the first message index at which the two requests differ, and how many
-characters of the rendered conversation they share.
+characters of the rendered conversation they share. That is how goose's per-turn cache
+miss was pinned to a minute-resolution timestamp in its first user message (above).
 
 ## Caveats, all of them
 
