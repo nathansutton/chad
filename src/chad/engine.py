@@ -544,6 +544,8 @@ class Engine:
     # dense — the MoE arm is here for `--model`.
     _is_moe: bool = field(init=False, default=False)
     _dflash: Any = field(init=False, default=None)
+    fastpath: bool = field(init=False, default=False)   # mlx_fastpath installed
+    _dflash_ladder: Any = field(init=False, default=None)   # learned round-cost seed
     _n_attn_heads: int = field(init=False, default=16)
     _n_kv_heads: int = field(init=False, default=0)
     _head_dim: int = field(init=False, default=0)
@@ -627,7 +629,11 @@ class Engine:
         # dense qwen3_5 hybrid; silent no-op on any other model or on failure.
         from . import mlx_fastpath
         _log_mlx_provenance()
-        mlx_fastpath.install(self.model, model_path=path)
+        self.fastpath = mlx_fastpath.install(self.model, model_path=path)
+        if not self.fastpath and not config.flag("CHAD_NO_FASTPATH"):
+            # install() says why when it declines a Prism pack or fails outright;
+            # this is the line that makes a stock-graph run visible at all.
+            log.info("FASTPATH not installed: decoding on the stock op graph")
         # Fused quantized-KV decode attention: makes kv_bits=8 a speed win
         # instead of a loss. Patches mlx_lm's quantized SDPA branch
         # only; inert unless a QuantizedKVCache is actually in play.
@@ -681,6 +687,9 @@ class Engine:
                 cfg = {**cfg, "text_config": {**cfg["text_config"], **override}}
             self.model, _ = prism_pack.load(str(model_path), cfg)
             self.reasoning_effort_default = prism_pack.REASONING_EFFORT_DEFAULT
+            # The speculative schedule's round-cost seed is per weight width.
+            from . import mlx_dflash
+            self._dflash_ladder = list(mlx_dflash.round_costs(prism_pack.BITS))
             return
         self.model, _ = load_model(model_path, model_config=override)
 
@@ -2569,6 +2578,8 @@ class Engine:
             stats.generated_tokens = len(out_ids)
             stats.gen_ids = list(out_ids)
             self._cached_ids = fed_ids
+            if policy is not None:
+                self._dflash_ladder = policy.learned_seed()
             mx.clear_cache()
             return detok.text, stats
         except BaseException:
@@ -2614,7 +2625,9 @@ class _DFlashDrafter:
                               cfg.block_size - 1))
         # Fresh per-turn schedule state: acceptance statistics are a property
         # of the current prompt/content, not of the session.
-        self.policy = (mlx_dflash.block_policy(self.cap)
+        # The round-cost ladder is the exception: it belongs to the machine and the
+        # checkpoint, so each turn starts from what the last one measured.
+        self.policy = (mlx_dflash.block_policy(self.cap, eng._dflash_ladder)
                        if eng.dflash_adaptive else None)
         self._ids = list(cfg.target_layer_ids)
         self._mask = int(cfg.mask_token_id)

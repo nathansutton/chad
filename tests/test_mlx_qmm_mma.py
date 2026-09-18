@@ -98,6 +98,45 @@ def test_qmm_dispatch_gate():
         q.disable()
 
 
+@pytest.mark.parametrize("bits,gs", [(2, 128), (4, 64)])
+def test_tiled_matches_stock_past_one_tile(bits, gs):
+    """Widths past M_MAX run as 8-row kernel calls plus a remainder; whatever the
+    remainder is (a full tile, a kernel-width one, a stock-width one, a single row)
+    every row has to land in its own place."""
+    mx.random.seed(2)
+    w = (mx.random.normal((N, K)) * 0.02).astype(mx.bfloat16)
+    wq, sc, bi = mx.quantize(w, group_size=gs, bits=bits)
+    for M in (9, 12, 16, 21):
+        x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
+        ref = mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
+                                  group_size=gs, bits=bits).astype(mx.float32)
+        got = q.tiled(x, wq, sc, bi, M, N, K, bits, gs, 5).astype(mx.float32)
+        assert got.shape == (M, N)
+        rows = mx.max(mx.abs(ref - got), axis=1) / mx.max(mx.abs(ref))
+        assert float(mx.max(rows)) < 0.02, (M, rows.tolist())
+
+
+def test_qmm_tiles_only_through_the_probed_width():
+    wq, sc, bi = _weights(4)
+    q.set_wins({(K, N, 4, 64): 3}, tile_max={(K, N, 4, 64): 16})
+    try:
+        for M, expect_tiled in ((9, True), (16, True), (17, False)):
+            x = (mx.random.normal((1, M, K)) * 0.1).astype(mx.bfloat16)
+            y = q.qmm(x, wq, sc, bi, 64, 4).astype(mx.float32)
+            ref = mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
+                                      group_size=64, bits=4).astype(mx.float32)
+            assert y.shape == (1, M, N)
+            # the stock path is bit-identical to itself; the kernel is only ulp-close
+            assert (float(mx.max(mx.abs(y - ref))) > 0.0) == expect_tiled, M
+            assert float(mx.max(mx.abs(y - ref))) < 0.02 * float(mx.max(mx.abs(ref)))
+        saved, tiles = q.wins(), q.tile_max()
+        q.disable()
+        q.set_wins(saved)                      # the A/B round trip keeps the tiling
+        assert q.tile_max() == tiles
+    finally:
+        q.set_wins(None, tile_max={})
+
+
 def test_quantized_linear_patch_routes_only_verified_shapes():
     lin = nn.QuantizedLinear(K, N, bias=False, group_size=64, bits=4)
     lin2 = nn.QuantizedLinear(K, N // 2, bias=False, group_size=64, bits=4)

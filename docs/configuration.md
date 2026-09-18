@@ -446,14 +446,32 @@ install or falls back to a stock path. The harness itself does not change.
 #### What the engine does with the ternary weights
 
 - the decode fast-path fuses `gate|up`, `qkv|z` and `q|k|v` behind **one** rotation each,
-  and folds the sign vectors into the RMSNorm weights and the elementwise gates inside its
-  compiled S=1 bodies, so a rotation costs one kernel; the uncompiled prefill path keeps the
-  pack's fp32 rotation. `CHAD_PRISM_ROT_FP32=1` runs the compiled bodies' rotation in fp32
-  too (an A/B arm; measured inside the noise);
+  and folds the sign vectors into the weights once, at install: the residual-width vectors
+  into the two layernorms, `down_proj`'s into the rows of `up_proj` (a sign flip of those
+  rows' scales and biases). All exact, since the vectors are ±1. A rotation is then one
+  kernel, the transform itself in the activation dtype, on **every** path: the serial
+  step, the width-2..8 verify forward a drafted round actually spends its time in, and
+  prefill. The pack's own rotation is four (two fp32 casts, the sign multiply, the
+  transform). Serial and verify forwards also rotate identically now, so they write the
+  cache at the same precision. `CHAD_PRISM_ROT_FP32=1` restores the fp32 transform
+  everywhere (an A/B arm: teacher-forced code NLL moves by ≤0.002 in no consistent
+  direction, and the native rotation prefills 1-3% faster);
 - the small-M verify kernel (`mlx_qmm_mma.py`) covers 2-bit g128, which is what makes an
   8-wide DFlash2 verify cost ~2.2 serial steps here as on the 3-bit. mlx's stock 2-bit
   matmul re-pays the weight read per row, made that verify 9× a decode step, and turned
-  drafting into a net loss (12 tok/s against 18 serial) until the kernel covered it;
+  drafting into a net loss (12 tok/s against 18 serial) until the kernel covered it. Past
+  one 8-row tile the same cliff came back (a 9-token forward cost 5.4 steps against 2.2
+  at 8), so widths 9-24 now run as several 8-row kernel calls: 1.2-1.8× faster on exactly
+  the forwards an agent step is made of (a warm tail, a short tool-result suffix);
+- the speculative schedule is seeded with a round-cost ladder measured on *this* weight
+  width, and each turn starts from the ladder the last one measured. The 3-bit ladder
+  prices every width past one 9-18% too cheap here. On low-acceptance prose (20-30% of
+  drafted positions accepted) the schedule sits at break-even with serial decoding on
+  either seed, within run-to-run noise, so this is a correctness-of-the-model fix, not
+  a measured tok/s one;
+- when the fast-path declines a Prism pack it says so, and why, as a warning. An unfused
+  pack decodes correctly and several times slower, which is not a thing to learn from a
+  stopwatch;
 - the residual stream runs in bf16. As the upstream pack ships, its fp32 norms and fp16
   scales promote every activation to fp32 from the first RMSNorm on; the loader casts the
   side tensors once, as mlx-lm's own loader does, at no cost in NLL (1.502 vs 1.500);
@@ -848,8 +866,14 @@ CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on t
   shipped model's shapes (dependent chains, M4 Pro): the 3-bit MLP matmuls 1.31× at six rows
   and 1.64× at eight, the 5-bit `lm_head` 1.55× / 1.87×, and below five rows the stock
   kernel wins, so verify widths 6-8 now cost about what width 5 does, which is what lets
-  the block drafter verify its full block (see `CHAD_DFLASH_DRAFT`). `CHAD_NO_QMM_MMA=1` is the A/B arm; `CHAD_QMM_MMA_RECAL=1` re-probes
-  (after an mlx upgrade, say).
+  the block drafter verify its full block (see `CHAD_DFLASH_DRAFT`). Past one tile the
+  kernel is **tiled**: a 9-24 row forward runs as 8-row kernel calls plus a remainder
+  (through the kernel when it is wide enough to win, stock otherwise). The same probe
+  races the tiled path against stock at 12, 16, 24, 32 and 48 rows per shape and keeps
+  the widest that won (24 on every shipped shape, M4 Pro: 1.5-1.8× at 12-16 rows, 1.2× at
+  24, a loss at 32, where mlx's own tiling takes over). `CHAD_NO_QMM_MMA=1` is the A/B
+  arm; `CHAD_QMM_MMA_RECAL=1` re-probes (after an mlx upgrade, say).
+  `benchmarks/verify_ladder.py` prints what a forward of each width costs on your machine.
 - `CHAD_NO_KERNEL_WARM`: the attention kernel is templated on its verify width, so a
   width that has never run means a Metal compile lands on the critical path of a real
   step. Load warms exactly the widths *this* configuration can dispatch (the ones the

@@ -287,7 +287,11 @@ runs out first.
 in, against 8.25 GB at a clean load); the 32k prefill ran at 90 tok/s and decode at 32k
 drafted 62 tok/s, no depth falloff. Running the compiled bodies' rotation in fp32
 (`CHAD_PRISM_ROT_FP32=1`) measured 63.6 drafted / 21.0 serial against 63.7 / 21.3: inside
-the noise, so the one-kernel native-dtype rotation stays the default.
+the noise, so the one-kernel native-dtype rotation stays the default. That
+rotation is what every path runs, prefill included (the sign vectors fold into the weights
+at install rather than inside the compiled bodies); teacher-forced code NLL over 7k tokens
+of three files reads 1.3830 / 1.6812 / 1.3576 native against 1.3847 / 1.6827 / 1.3573 with
+the fp32 transform, and prefill is 1-3% faster.
 
 The "as loaded" drafted number is the S=2..8 wall: the stock 2-bit matmul re-pays the
 weight read per verify row, so an 8-wide verify cost 9× a decode step and never amortized.
@@ -296,6 +300,41 @@ projection against 0.71 ms stock), which puts the block on the right side of the
 The serial step is bounded by mlx's 2-bit GEMV rate, not by dispatch, so the fast-path's
 kernel-count win is smaller here than on the 3-bit; the weights, the verify and the
 context are where the pack pays.
+
+The same cliff sat one row past the tile. What one main-model forward of width M costs
+(`benchmarks/verify_ladder.py`: one load, 8-bit KV, 2k tokens in front, median of 8):
+
+| width M | 1 | 2 | 4 | 8 | 9 | 12 | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|---|---|---|
+| one tile only, ms | 49.3 | 68.3 | 109.1 | 108.2 | 266.3 | 317.1 | 342.9 | 354.7 | 357.3 |
+| tiled (shipped), ms | 49.2 | 67.2 | 107.7 | 106.8 | **147.2** | **203.6** | **203.4** | **297.2** | 353.1 |
+| shipped, serial steps | 1.00 | 1.37 | 2.19 | 2.17 | 2.99 | 4.14 | 4.14 | 6.04 | 7.18 |
+
+Widths 9-24 are several 8-row kernel calls now (1.2-1.8×), which is where an agent step's
+warm tail and a short tool-result suffix land; past 24 mlx's own tiling wins and keeps the
+forward. Widths 1-8 moved ~1%: folding the sign vectors took ~500 kernel launches out of a
+verify forward and it barely shows, because a verify forward is matmul-bound, not
+dispatch-bound — the same thing a compiled verify step measured on the 3-bit.
+
+A drafted **round** costs more than its verify forward: the drafter's own forward, the
+rollback of rejected positions and the host sync ride on top, and on a 46-51 ms serial
+step they are a larger share than on the 3-bit's 57. Round wall over the serial step, a
+fixed width per arm (`benchmarks/spec_decode.py`, six prompt × preset cells agreeing to
+±0.05 within a run; the ratio moves with the machine's serial step, so two runs):
+
+| drafts verified | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| the 3-bit's ladder | 1.0 | 1.76 | 1.93 | 2.30 | 2.18 | 2.20 | 2.19 | 2.20 |
+| ternary, cool (21.5 tok/s serial) | 1.0 | 1.68 | 2.21 | 2.60 | 2.56 | 2.57 | 2.57 | 2.60 |
+| ternary, warm (19.7 tok/s serial) | 1.0 | 1.58 | 2.09 | 2.44 | 2.39 | 2.44 | 2.44 | 2.46 |
+
+The schedule picks its width from this ladder, and the 3-bit one prices every width past
+one 9-18% too cheap here, so the shipped schedule is seeded with the midpoint of the two
+measured rows and carries what each turn measures into the next. What that is worth in
+tok/s is not resolved: on the low-acceptance prose these rows come from (20-30% of drafted
+positions accepted) the schedule sits at break-even with serial on either seed (19.1-20.9
+tok/s against 19.0-19.9 serial, both trees, back to back on an idle machine), inside the
+±1 tok/s run-to-run noise of three prompts.
 
 ## Two throughput levers
 

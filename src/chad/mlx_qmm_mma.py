@@ -55,6 +55,15 @@ stock M=1 / stock at M / this kernel; the staged kernel in brackets):
   M=5 already wins 1.2-1.4x on every shape (the staged kernel tied stock there);
   the kernel is flat in M, so widths 4..8 cost the same.
 
+Past one tile: M = 9..~24 is its own cliff on the 2-bit packs. Stock 2-bit
+``quantized_matmul`` there is still paying per row (a width-9 forward of the ternary
+27B measured 5.4 serial steps against 2.2 at width 8), and it is where an agent step's
+warm tail, a short tool-result suffix and a wide lookup verify all land. :func:`qmm`
+tiles those widths: 8-row MMA calls over row slices of x plus a remainder (through the
+kernel when it is wide enough to win, stock otherwise), concatenated. The probe races
+the tiled path against stock at a few widths per shape and records where it stops
+winning (``tile_max``); mlx's own tiling takes over from there.
+
 Numerics: fp32 accumulation in a different order than qmm — 1-2 bf16 ulps apart,
 the same acceptance class as every other kernel swap here (fused attention,
 fastpath compile): per-token greedy-correct under the verify loop, NOT bit-identical
@@ -83,6 +92,7 @@ if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module l
     import mlx.core as mx
 
 M_MAX = 8            # one MMA tile
+TILE_PROBES = (12, 16, 24, 32, 48)   # widths the tiled path is raced against stock at
 N_MIN = 4096         # fewer output columns = too few threadgroups to fill the GPU
 _CACHE_DIR = os.path.expanduser("~/.cache/chad/qmm_mma")
 _SUPPORTED_BITS = (2, 3, 4, 5, 6, 8)
@@ -217,7 +227,7 @@ _SRC = r"""
 _SG = 8                  # simdgroups per threadgroup (split-K factor)
 _TILES = 4               # 8-column tiles per simdgroup
 _TG = 32 * _SG
-_KERNEL_VERSION = 5      # bump when the kernel changes: the probe cache is keyed on it
+_KERNEL_VERSION = 6      # bump when the kernel changes: the probe cache is keyed on it
 _kernels: dict = {}
 
 
@@ -253,9 +263,29 @@ def shape_ok(K: int, N: int, bits: int, group_size: int) -> bool:
             and K % 512 == 0)
 
 
-# Verified dispatch table: (K, N, bits, group_size) -> smallest M the kernel wins at
-# (M_MAX bounds the top). Empty until calibrate() runs; a missing shape runs stock.
+# Verified dispatch table: (K, N, bits, group_size) -> smallest M the kernel wins at.
+# Empty until calibrate() runs; a missing shape runs stock. _TILE_MAX holds, per
+# shape, the widest M the TILED path (several 8-row calls) still beats stock at;
+# a shape absent from it stops at one tile.
 _WINS: dict = {}
+_TILE_MAX: dict = {}
+
+
+def tiled(x, wq, sc, bi, M: int, N: int, K: int, bits: int, gs: int, m_min: int):
+    """x (M, K) with M > M_MAX, as 8-row kernel calls plus the remainder — through
+    the kernel when it is at least `m_min` rows (the kernel is flat in M, so a short
+    remainder is cheaper on the stock GEMV ladder), concatenated to (M, N)."""
+    import mlx.core as mx
+    parts = []
+    for r0 in range(0, M, M_MAX):
+        rows = min(M_MAX, M - r0)
+        xs = x[r0:r0 + rows]
+        if rows >= m_min:
+            parts.append(mma(xs, wq, sc, bi, rows, N, K, bits, gs))
+        else:
+            parts.append(mx.quantized_matmul(xs, wq, scales=sc, biases=bi,
+                                             transpose=True, group_size=gs, bits=bits))
+    return mx.concatenate(parts, axis=0)
 
 
 def qmm(x, wq, sc, bi, group_size: int, bits: int):
@@ -274,6 +304,9 @@ def qmm(x, wq, sc, bi, group_size: int, bits: int):
             if m_min <= M <= M_MAX:
                 return mma(x.reshape(M, K), wq, sc, bi, M, N, K, bits, group_size
                            ).reshape(*x.shape[:-1], N)
+            if M_MAX < M <= _TILE_MAX.get((K, N, bits, group_size), 0):
+                return tiled(x.reshape(M, K), wq, sc, bi, M, N, K, bits, group_size,
+                             m_min).reshape(*x.shape[:-1], N)
     return mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
                                group_size=group_size, bits=bits)
 
@@ -384,10 +417,12 @@ def _cache_key() -> str:
 
 def measure(groups: dict, verbose: bool = False) -> dict:
     """For every shape: numerics at each width, then a dependent-chain race at each
-    width M=2..8 (rotating across the shape's own weights). Returns
-    {(K, N, bits, gs): m_min} for shapes where the kernel wins from m_min up through
-    M_MAX (a shape that wins only in the middle is kept from its first win; a
-    shape that never wins is absent)."""
+    width M=2..8 (rotating across the shape's own weights), then the tiled path
+    against stock at TILE_PROBES. Returns {(K, N, bits, gs): (m_min, tile_max)} for
+    shapes where the kernel wins from m_min up through M_MAX (a shape that wins only
+    in the middle is kept from its first win; a shape that never wins is absent).
+    tile_max is the widest probed M the tiled path won at with every narrower probe
+    also winning, M_MAX when it never did."""
     import mlx.core as mx
     wins: dict = {}
     for (K, N, bits, gs), ws in groups.items():
@@ -409,15 +444,16 @@ def measure(groups: dict, verbose: bool = False) -> dict:
         if not ok:
             log.warning("qmm_mma: %dx%d b%dg%d rejected (numerics)", K, N, bits, gs)
             continue
+
+        def q_step(xx, t, _ws=ws, _b=bits, _g=gs):
+            w = _ws[t % len(_ws)]
+            return mx.quantized_matmul(xx, w[0], scales=w[1], biases=w[2],
+                                       transpose=True, group_size=_g, bits=_b)
+
         ratios = {}
         for M in range(2, M_MAX + 1):
             x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
             mx.eval(x)
-
-            def q_step(xx, t, _ws=ws, _b=bits, _g=gs):
-                w = _ws[t % len(_ws)]
-                return mx.quantized_matmul(xx, w[0], scales=w[1], biases=w[2],
-                                           transpose=True, group_size=_g, bits=_b)
 
             def k_step(xx, t, _ws=ws, _M=M, _N=N, _K=K, _b=bits, _g=gs):
                 w = _ws[t % len(_ws)]
@@ -429,20 +465,44 @@ def measure(groups: dict, verbose: bool = False) -> dict:
         first = next((M for M in range(2, M_MAX + 1)
                       if all(ratios[m] >= _MIN_GAIN for m in range(M, M_MAX + 1))),
                      None)
-        msg = " ".join(f"M{M}={r:.2f}x" for M, r in ratios.items())
+        tile_max = M_MAX
         if first is not None:
-            wins[(K, N, bits, gs)] = first
-        log.info("qmm_mma: %dx%d b%dg%d %s -> %s", K, N, bits, gs, msg,
-                 f"on from M={first}" if first else "off")
+            for M in TILE_PROBES:
+                x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
+                mx.eval(x)
+
+                def t_step(xx, t, _ws=ws, _M=M, _N=N, _K=K, _b=bits, _g=gs, _f=first):
+                    w = _ws[t % len(_ws)]
+                    return tiled(xx, w[0], w[1], w[2], _M, _N, _K, _b, _g, _f)
+
+                tq = min(_time_chain(q_step, x), _time_chain(q_step, x))
+                tt = min(_time_chain(t_step, x), _time_chain(t_step, x))
+                ratios[M] = tq / tt
+                if tq / tt < _MIN_GAIN:
+                    break
+                tile_max = M
+            wins[(K, N, bits, gs)] = (first, tile_max)
+        msg = " ".join(f"M{M}={r:.2f}x" for M, r in ratios.items())
+        verdict = (f"on from M={first}, tiled through M={tile_max}" if first else "off")
+        log.info("qmm_mma: %dx%d b%dg%d %s -> %s", K, N, bits, gs, msg, verdict)
         if verbose:
-            print(f"  qmm_mma {K}x{N} b{bits}g{gs}: {msg} -> "
-                  f"{'on from M=%d' % first if first else 'off'}", flush=True)
+            print(f"  qmm_mma {K}x{N} b{bits}g{gs}: {msg} -> {verdict}", flush=True)
     return wins
 
 
 def _shape_key(k) -> str:
     K, N, bits, gs = k
     return f"{K}x{N}b{bits}g{gs}"
+
+
+def _cache_entry(value) -> tuple[int, int]:
+    """One probe-cache value as (m_min, tile_max); (0, 0) — the kernel is off for the
+    shape — for anything that is not that pair."""
+    try:
+        m_min, tile_max = value
+        return int(m_min), int(tile_max)
+    except (TypeError, ValueError):
+        return 0, 0
 
 
 def calibrate(*models, verbose: bool = False) -> dict:
@@ -467,22 +527,25 @@ def calibrate(*models, verbose: bool = False) -> dict:
         t0 = time.time()
         fresh = measure(missing, verbose=verbose)
         for k in missing:
-            cached[_shape_key(k)] = fresh.get(k, 0)
+            cached[_shape_key(k)] = list(fresh.get(k, (0, 0)))
         try:
             with open(path, "w") as f:
                 json.dump(cached, f, indent=1, sort_keys=True)
         except Exception:  # noqa: BLE001
             pass
         log.info("qmm_mma: probed %d shape(s) in %.1fs", len(missing), time.time() - t0)
-    wins = {k: int(cached[_shape_key(k)]) for k in groups
-            if int(cached.get(_shape_key(k), 0) or 0) > 0}
+    entries = {k: _cache_entry(cached.get(_shape_key(k))) for k in groups}
+    wins = {k: m_min for k, (m_min, _) in entries.items() if m_min > 0}
     _WINS.clear()
     _WINS.update(wins)
+    _TILE_MAX.clear()
+    _TILE_MAX.update({k: entries[k][1] for k in wins})
     if wins:
         _install_patch()
         log.info("qmm_mma: small-M MMA verify kernel on for %d/%d shapes (%s)",
                  len(wins), len(keys),
-                 ", ".join(f"{_shape_key(k)}@M>={m}" for k, m in sorted(wins.items())))
+                 ", ".join(f"{_shape_key(k)}@M{m}..{_TILE_MAX[k]}"
+                           for k, m in sorted(wins.items())))
     return wins
 
 
@@ -514,12 +577,22 @@ def wins() -> dict:
     return dict(_WINS)
 
 
-def set_wins(wins: Optional[dict]) -> None:
-    """Force a win table (tests / A/B arms): {(K, N, bits, gs): m_min}."""
+def set_wins(wins: Optional[dict], tile_max: Optional[dict] = None) -> None:
+    """Force a win table (tests / A/B arms): {(K, N, bits, gs): m_min}. `tile_max`
+    replaces the tiled-path table when given and leaves it alone otherwise, so a
+    wins() -> disable() -> set_wins() round trip restores the probed state."""
     _WINS.clear()
+    if tile_max is not None:
+        _TILE_MAX.clear()
+        _TILE_MAX.update(tile_max)
     if wins:
         _WINS.update(wins)
         _install_patch()
+
+
+def tile_max() -> dict:
+    """A copy of the tiled-path table, {(K, N, bits, gs): widest tiled M}."""
+    return dict(_TILE_MAX)
 
 
 def stock(x, wq, sc, bi, group_size: int, bits: int) -> "mx.array":

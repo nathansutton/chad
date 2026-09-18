@@ -843,7 +843,8 @@ class Agent:
         def render1(m):
             return self._template_ids(self.engine.tok.apply_chat_template(
                 [m, {"role": "user", "content": "a"}], tools=schemas,
-                add_generation_prompt=True, enable_thinking=self.thinking))
+                add_generation_prompt=True, enable_thinking=self.thinking,
+                **self._template_extra()))
         a, b = render1({"role": "system", "content": static}), render1(sysm)
         n = 0
         for x, y in zip(a, b):

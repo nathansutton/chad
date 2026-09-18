@@ -46,6 +46,7 @@ import os
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 from . import mlx_qmm_mma
+from .config import flag as _flag
 from .diag import log
 
 if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module loads on Linux
@@ -90,24 +91,38 @@ def quiet_tokenizer_load():
         logger.removeFilter(flt)
 
 
-def rotate(x, block: int, signs, inverse: bool = False):
-    """Apply the pack's blockwise Hadamard rotation to activations.
+def rotate(x, block: int, signs=None, inverse: bool = False):
+    """Apply the pack's blockwise Hadamard rotation to activations, in x's dtype.
 
-    fp32 throughout: the transform sums `block` terms, and at bf16 the accumulation
-    loses the low bits the ternary levels are meant to resolve. Returns x's dtype."""
+    `signs` is the module's ±1 vector, multiplied in before the transform (after it
+    when `inverse`); None means the caller already folded it into whatever produced
+    x (an RMSNorm weight, a projection's rows), and the rotation is the transform
+    alone: ONE kernel. With the vector it is two.
+
+    The transform runs in the activation dtype. The pack's reference runtime casts to
+    fp32 around it (four kernels, fp32-width temporaries), which guards nothing
+    measurable on this model: the ±1 multiply is exact at any width, and teacher-forced
+    code NLL over 7k tokens of three files moved by at most 0.002, in no consistent
+    direction (1.3830 / 1.6812 / 1.3576 native against 1.3847 / 1.6827 / 1.3573), with
+    prefill 1-3% faster. CHAD_PRISM_ROT_FP32 restores the fp32 transform everywhere,
+    as the A/B arm."""
     import mlx.core as mx
 
     shape, dtype = x.shape, x.dtype
     if shape[-1] % block:
         raise ValueError(f"Hadamard block {block} does not divide width {shape[-1]}")
-    x = x.astype(mx.float32)
-    if not inverse:
-        x = x * signs
+    fp32 = _flag("CHAD_PRISM_ROT_FP32")
+    if fp32:
+        x = x.astype(mx.float32)
+    if signs is not None:
+        signs = signs.astype(x.dtype)       # a no-op for a pack loaded by load()
+        if not inverse:
+            x = x * signs
     x = mx.hadamard_transform(x.reshape(-1, block),
                               scale=1 / math.sqrt(block)).reshape(shape)
-    if inverse:
+    if signs is not None and inverse:
         x = x * signs
-    return x.astype(dtype)
+    return x.astype(dtype) if fp32 else x
 
 
 _PACKED: Optional[type] = None
@@ -136,6 +151,9 @@ def _packed_class():
             if signs is not None:
                 self.signs = signs
             self.block, self.embedding, self.dtype = block, embedding, dtype
+            # Set by the fast-path once it has folded this module's sign vector into
+            # whatever feeds it; the rotation is then the transform alone.
+            self.signs_folded = False
 
         def __call__(self, x):
             if self.embedding:
@@ -146,7 +164,7 @@ def _packed_class():
                 ).reshape(*shape, -1).astype(self.dtype)
                 return rotate(out, self.block, self.signs, True) if self.block else out
             if self.block:
-                x = rotate(x, self.block, self.signs)
+                x = rotate(x, self.block, None if self.signs_folded else self.signs)
             return mlx_qmm_mma.qmm(x, self.weight, self.scales, self.biases,
                                    GROUP_SIZE, BITS)
 
@@ -187,12 +205,24 @@ def load(model_path: str, config: Optional[dict] = None) -> tuple[Any, dict]:
     weights = {k: v for k, v in loaded.items() if k.startswith("language_model.")}
     del loaded
     dtype = mx.bfloat16
+    # Sign vectors too: they are ±1, exact at any width, and a wider one would promote
+    # the activation it multiplies.
     for k, v in weights.items():
-        if v.dtype != mx.uint32 and not k.endswith(".signs"):
+        if v.dtype != mx.uint32:
             weights[k] = v.astype(dtype)
     Packed = _packed_class()
     seen: set[str] = set()
-    shared: dict[int, "mx.array"] = {}   # input width -> the one sign vector of that width
+    # One array per DISTINCT sign vector, keyed on content. Identity is what the
+    # fast-path's fusion check reads, so it must not depend on the order the pack lists
+    # its modules in: keyed on width alone, a first-seen vector that differs from the
+    # projections' (the embedding's, say) would leave every later module of that width
+    # unshared and the whole fast-path declined.
+    sign_keys = [k for k in weights if k.endswith(".signs")]
+    mx.eval([weights[k] for k in sign_keys])          # one sync, not one per module
+    shared: dict[bytes, "mx.array"] = {}
+    for k in sign_keys:
+        v = weights[k]
+        weights[k] = shared.setdefault(bytes(memoryview(v.view(mx.uint16))), v)
     for record in config["modules"]:
         path = record["path"]
         if path in seen:
@@ -205,14 +235,6 @@ def load(model_path: str, config: Optional[dict] = None) -> tuple[Any, dict]:
         signs = weights.get(key + ".signs")
         if block and signs is None:
             raise ValueError(f"{path}: rotated module with no sign vector")
-        if signs is not None:
-            width = int(signs.shape[0])
-            first = shared.get(width)
-            if first is None:
-                shared[width] = signs
-            elif mx.array_equal(first, signs).item():
-                signs = first
-                weights[key + ".signs"] = first
         # mlx Modules are dicts, so the pack's dotted paths walk by subscript; a
         # numeric segment indexes the plain list `model.layers` is.
         parts = key.split(".")

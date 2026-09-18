@@ -21,13 +21,27 @@ away: `--model nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX`.
 What made it run at that speed rather than as a port: the rotated weights need their
 transform applied to the activations at runtime, and mlx-lm's plain loader would decode
 plausible garbage without raising, so chad routes the pack to its own loader. The decode
-fast-path fuses `gate|up`, `qkv|z` and `q|k|v` behind one rotation each; the small-M verify
-kernel now covers 2-bit g128 (mlx's stock 2-bit matmul made an 8-wide verify cost 9× a
-step and drafting a net loss); a checkpoint of the shipped shape with no bundled drafter
-borrows the shipped one, so pointing `--model` at the upstream `prism-ml` pack works too.
-The pack's chat template defaults `reasoning_effort` to xhigh; chad passes medium unless
-`CHAD_REASONING_EFFORT` is set. `CHAD_PRISM_ROT_FP32` is the A/B arm for the compiled
-bodies' rotation precision.
+fast-path fuses `gate|up`, `qkv|z` and `q|k|v` behind one rotation each and folds the
+pack's sign vectors into the weights at install, so a rotation is one kernel in the
+activation dtype on every path (serial step, verify forward, prefill) where the pack's own
+is four; the small-M verify kernel now covers 2-bit g128 (mlx's stock 2-bit matmul made
+an 8-wide verify cost 9× a step and drafting a net loss) and tiles widths 9-24 into 8-row
+calls, because the same cliff sat one row past the tile (a 9-token forward: 266 ms → 147;
+16 tokens: 343 → 203); the speculative schedule is seeded with the round-cost ladder
+measured on these weights instead of the 3-bit's, which prices every width past one 9-18%
+too cheap here, and each turn now starts from the ladder the last one measured (not a
+measured tok/s change: on low-acceptance text the schedule sits at break-even with
+serial on either seed); a checkpoint of the shipped shape with
+no bundled drafter borrows the shipped one, so pointing `--model` at the upstream
+`prism-ml` pack works too. The pack's chat template defaults `reasoning_effort` to xhigh;
+chad passes medium unless `CHAD_REASONING_EFFORT` is set, on every render including the
+cross-project warm-prefix head (rendered without it, the head was not a prefix of the
+real prompt under the upstream template and every fresh directory paid the cold prefill).
+`CHAD_PRISM_ROT_FP32` is the A/B arm for the rotation's precision. A Prism pack the
+fast-path cannot fuse now says so, with the reason, instead of decoding several times
+slower in silence; sign vectors are shared by content rather than by first-seen-per-width,
+which could trigger exactly that; and a donor drafter whose config and weights resolve to
+different hub snapshots is healed or refused rather than handed to the loader half-empty.
 
 ## [2.1.0] — 2026-09-14
 
