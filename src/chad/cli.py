@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """chad — a local, MLX-backed, Claude-Code-style coding agent.
 
-One model (Qwen3.8-27B, 3-bit, with its DFlash2 drafter), one entrypoint, run with uv:
+One model (Qwen3.8-27B, ternary, with its DFlash2 drafter), one entrypoint, run with uv:
 
     uv run chad                                # interactive full-screen TUI
     uv run chad "fix the bug in greet.py"      # one-shot, headless
@@ -38,31 +38,27 @@ if TYPE_CHECKING:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
-# The shipped model, on Hugging Face. Naming follows Unsloth's dynamic-quant
-# convention so the quant scheme is recognizable (UD = Unsloth Dynamic; Q3_K_XL =
-# a 3-bit body with extra bits where they pay), plus an -MLX suffix for format
-# discoverability. The quant itself is MLX group-64 affine, not llama.cpp Q3_K
-# k-quants — the model card says so; the tag is for recognition, not bit-for-bit
-# equivalence. The repo also carries the DFlash2 block drafter, pre-quantized, in
-# `dflash/` (~1.1 GB): one download gets the model and its speculative decoder,
-# with nothing built on first run (mlx_dflash.py).
+# The shipped model, on Hugging Face. The repo carries the weights AND the DFlash2
+# block drafter, pre-quantized, in `dflash/` (~1.1 GB): one download gets the model
+# and its speculative decoder, with nothing built on first run (mlx_dflash.py).
 #
 # Qwen3.8-27B is `qwen3_5` — DENSE (64 layers: 48 GatedDeltaNet + 16 full attention),
 # so every parameter is on the critical path for every token and shrinking the model
-# is the only decode lever there is. The recipe (`q3_e3h5`) is 3-bit group-64
-# throughout, except lm_head at 5-bit: with vocab_size 248,320 and tie_word_embeddings
-# false, the head is a second full 1.27B-param tensor, and the calibrated GGUF builds
-# of this same checkpoint are unanimous that it is the tier worth protecting while
-# embed_tokens — a lookup table, whose per-row error never compounds through a matmul
-# — is the cheapest. ~12.1 GB resident.
-_HF_MODEL = "nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX"
+# is the only decode lever there is. The shipped weights are Prism ML's ternary build:
+# every projection Hadamard-rotated offline and stored as 2-bit affine group-128 whose
+# three levels are {-s, 0, +s}, ~7.2 GB resident against the 3-bit recipe's 12.1 — and
+# on a dense model those 5 GB are context, at the governor's measured 34,816 B/token.
+# The rotation has to be undone on the activations at runtime (prism_pack.py); the
+# repo is our repack of the pack with the base tokenizer and the drafter bundled.
+_HF_MODEL = "nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX"
 # A dev clone that already built the weights locally should use them rather than
 # re-download — prefer this dir when present.
-_LOCAL_MODEL = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-q3_e3h5")
+_LOCAL_MODEL = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-Ternary-Bonsai-2")
 # chad targets 24 GB Apple Silicon and nothing smaller. Below this the model still
-# loads, but the context governor has almost nothing left to spend after ~12.1 GB of
-# weights and the ~4.3 GB prefill transient, so the window collapses toward its floor.
-# We warn and proceed rather than refuse: the harness advises, the caller decides.
+# loads, but the context governor has little left to spend after ~7.2 GB of weights,
+# the ~1.1 GB drafter and the ~4.3 GB prefill transient, so the window shrinks toward
+# its floor. We warn and proceed rather than refuse: the harness advises, the caller
+# decides.
 _MIN_RAM_GB = 23.5
 
 
@@ -487,10 +483,10 @@ def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL
 
 def _model_download_gb(model_id):
     """Approximate download size in GiB for the shipped model (for the disk preflight
-    and the confirm prompt — display honesty, not accounting): ~12.1 GB of weights
+    and the confirm prompt — display honesty, not accounting): ~7.2 GB of weights
     plus the ~1.1 GB bundled DFlash2 drafter. An arbitrary `--model` is unknowable
     ahead of the resolve, so it gets the same figure."""
-    return 13.2
+    return 8.3
 
 
 def _cached_weights_complete(

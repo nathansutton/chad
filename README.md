@@ -23,13 +23,13 @@ uvx chad-code          # runs anywhere; the command is still `chad`
 uvx chad-code prove    # offline smoke test: 4 tiny fix-it tasks, verified, timed 🗿
 ```
 
-The first run asks, then downloads the model once (~13 GB) into the shared Hugging
+The first run asks, then downloads the model once (~8 GB) into the shared Hugging
 Face cache. While it downloads, `cd` into a project and think of a scoped first ask:
 *"fix the failing test in `tests/test_x.py`"* lands, *"improve my codebase"* flails.
 
 chad targets 24 GB and nothing smaller. It runs below that and tells you it is doing so,
-but 13 GB of weights sit resident before a single token of context, so a 16 GB Mac gets a
-window too small to work in.
+but 8 GB of weights and drafter plus a ~4 GB prefill transient sit resident before a single
+token of context, so a 16 GB Mac gets a window too small to work in.
 
 The PyPI package is `chad-code`. Bare `chad` is an unrelated squatted package.
 
@@ -43,9 +43,9 @@ The PyPI package is `chad-code`. Bare `chad` is an unrelated squatted package.
 ## Same model, same Mac, stock engine
 
 What do you gain over pointing a generic local-model tool at the same weights?
-Qwen3.8-27B at the same `UD-Q3_K_XL` recipe (Unsloth's GGUF for
-llama.cpp, chad's MLX conversion of the same bit map), the same M4 Pro (24 GB), one engine
-resident at a time, each measured with its own benchmark on a 512-token prompt and a
+Qwen3.8-27B at the `UD-Q3_K_XL` recipe (Unsloth's GGUF for llama.cpp, chad's MLX
+conversion of the same bit map; chad runs it with `--model`), the same M4 Pro (24 GB), one
+engine resident at a time, each measured with its own benchmark on a 512-token prompt and a
 128-token generation.
 
 | Engine | Prefill (512-tok prompt) | Decode (128 tok) | Speculative decoding |
@@ -54,10 +54,16 @@ resident at a time, each measured with its own benchmark on a 512-token prompt a
 | llama.cpp `llama-server` (build 10917), serial | 97 tok/s | 11.3 tok/s | off |
 | llama.cpp `llama-server` (build 10917) | 95 tok/s | 11.1 tok/s² | DFlash2 drafter (Q4_K_M GGUF) |
 | **chad**, serial (`CHAD_NO_DFLASH=1`) | 100 tok/s | 17.9 tok/s | off |
-| **chad**, default | 101 tok/s | **62.9 tok/s**¹ | DFlash2 block drafter |
+| **chad** | 101 tok/s | **62.9 tok/s**¹ | DFlash2 block drafter |
 
 A 200-token function body takes roughly 18 seconds at 10.9 tok/s and 3 at 63. You wait for
 the first one and you talk to the second.
+
+The weights chad ships by default are the same model in Prism ML's **ternary** build
+(every projection Hadamard-rotated and stored at 2 bits): 7.2 GB resident instead of 12.3,
+the same 64 tok/s drafted and 21 serial on this Mac, and the 5 GB it gives back is
+context, roughly a **150k-token window** where the 3-bit landed near 56k. The like-for-like
+table above stays on the 3-bit recipe because that is the quant llama.cpp has a GGUF of.
 
 Ollama does not get its own row: it is llama.cpp underneath, measured without speculative
 decoding, and on the same GGUF (0.32.15, Modelfile `FROM` only) it measures 96 tok/s
@@ -166,20 +172,24 @@ chad ships exactly one, downloaded once into the shared Hugging Face cache
 
 | Model | Quant | Footprint |
 |---|---|---|
-| [Qwen3.8-27B `UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX) | 3-bit group-64 body, 5-bit `lm_head`, bundled 4-bit DFlash2 drafter | ~13 GB resident, 262k native context |
+| [Qwen3.8-27B `Ternary-Bonsai-2-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX) (default) | Prism ML's ternary build: Hadamard-rotated, 2-bit group-128, levels {−s, 0, +s}; bundled 4-bit DFlash2 drafter | ~8 GB resident, 262k native context, ~150k usable on 24 GB |
+| [Qwen3.8-27B `UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX) via `--model` | 3-bit group-64 body, 5-bit `lm_head`, the same bundled drafter | ~13 GB resident, ~56k usable on 24 GB |
 
 Qwen3.8-27B is **dense** (64 layers: 48 GatedDeltaNet + 16 full attention), so every
-parameter is on the critical path for every token and the quant is where decode speed comes
-from. The bits go where held-out perplexity says they pay: `lm_head` is a second full
-1.27B-param tensor and is held at 5-bit, while `embed_tokens` is a lookup table whose error
-never compounds through a matmul, so it is cheapest. The name follows
-[Unsloth's convention](https://docs.unsloth.ai/) (`UD-…`), though the quant is MLX group-64
-affine, not a llama.cpp k-quant. The drafter ships in the same repo, pre-quantized.
+parameter is on the critical path for every token and the quant is where both decode speed
+and context come from: the governor prices a gigabyte of weights at about 29k tokens of
+window. The ternary build is Prism ML's [Bonsai](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit)
+pack of this checkpoint, repacked text-only with the base tokenizer and the drafter
+bundled (Apache-2.0; created using Bonsai by Prism ML). Its projections are stored in a
+rotated basis that an ordinary MLX loader would silently get wrong, so chad carries its own
+loader for it and fits the decode fast-path, the verify kernel and the drafter to it. What it
+costs: on code, teacher-forced perplexity is 4.49 against the 3-bit's 3.99 (+12%), while
+the private eval tiers tie at 56/56. The 3-bit stays one flag away.
 
 `--model <repo or local dir>` runs different weights through the same engine and stays a
 first-class escape hatch. The drafter, the fused-attention coverage, the decode fastpath and
-the context governor are all fitted to the shipped checkpoint, so other weights run slower;
-they do not break.
+the context governor are all fitted to the two checkpoints above, so other weights run
+slower; they do not break.
 
 ## Installing & upgrading
 

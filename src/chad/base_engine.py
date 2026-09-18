@@ -168,6 +168,9 @@ class BaseEngine(Protocol):
     effective_ctx: int           # usable context window (tokens)
     cache_dir: Optional[str]     # on-disk KV checkpoint dir; None disables warm-start
     _cached_ids: list            # tokens currently resident in the prefix cache
+    # A chat-template `reasoning_effort` the loaded weights want passed when the user
+    # set none (a loader that disagrees with its template's default); None = template's.
+    reasoning_effort_default: Optional[str]
 
     # --- generation ------------------------------------------------------
     def generate(

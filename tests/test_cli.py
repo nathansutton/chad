@@ -144,7 +144,7 @@ def test_pick_model_small_box_warns(monkeypatch, capsys, tmp_path):
 
 
 def test_model_download_gb():
-    check("shipped repo -> ~13 GB", cli._model_download_gb(cli._HF_MODEL) == 13.2)
+    check("shipped repo -> ~8 GB", cli._model_download_gb(cli._HF_MODEL) == 8.3)
 
 
 def test_free_disk_gb():
@@ -182,7 +182,7 @@ def test_ensure_model_disk_preflight(monkeypatch, capsys, tmp_path):
     check("refused before the consent prompt", terminal.asked == [], terminal.asked)
     err = capsys.readouterr().err
     check("names the shortfall", "not enough free disk" in err, err)
-    check("names required space", "~13 GB" in err, err)
+    check("names required space", "~8 GB" in err, err)
     check("points at cache GC", "hf cache" in err, err)
 
 

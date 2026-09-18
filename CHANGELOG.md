@@ -4,6 +4,45 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-09-17
+
+**Model bump: the shipped weights are now Prism ML's ternary build of Qwen3.8-27B.** A
+re-download is coming (~8 GB, against ~13); the old snapshot can be freed with `hf cache rm`.
+The new default is [`nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX`](https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX):
+the same model with every projection Hadamard-rotated and stored at 2 bits (levels
+{−s, 0, +s}), repacked text-only with the base tokenizer and the DFlash2 drafter bundled.
+7.2 GB resident instead of 12.3, and on a dense model those 5 GB are context: the
+governor's window on a 24 GB Mac goes from ~56k tokens to ~150k. Decode holds: 64 tok/s
+drafted and 21 serial on the M4 Pro (the 3-bit: ~60 / 18). The cost is quality at the
+margin: teacher-forced perplexity on code is 4.49 against the 3-bit's 3.99 (+12%), while all six
+private eval tiers tie (56/56, no task flipped either way). The 3-bit quant stays one flag
+away: `--model nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX`.
+
+What made it run at that speed rather than as a port: the rotated weights need their
+transform applied to the activations at runtime, and mlx-lm's plain loader would decode
+plausible garbage without raising, so chad routes the pack to its own loader. The decode
+fast-path fuses `gate|up`, `qkv|z` and `q|k|v` behind one rotation each and folds the
+pack's sign vectors into the weights at install, so a rotation is one kernel in the
+activation dtype on every path (serial step, verify forward, prefill) where the pack's own
+is four; the small-M verify kernel now covers 2-bit g128 (mlx's stock 2-bit matmul made
+an 8-wide verify cost 9× a step and drafting a net loss) and tiles widths 9-24 into 8-row
+calls, because the same cliff sat one row past the tile (a 9-token forward: 266 ms → 147;
+16 tokens: 343 → 203); the speculative schedule is seeded with the round-cost ladder
+measured on these weights instead of the 3-bit's, which prices every width past one 9-18%
+too cheap here, and each turn now starts from the ladder the last one measured (not a
+measured tok/s change: on low-acceptance text the schedule sits at break-even with
+serial on either seed); a checkpoint of the shipped shape with
+no bundled drafter borrows the shipped one, so pointing `--model` at the upstream
+`prism-ml` pack works too. The pack's chat template defaults `reasoning_effort` to xhigh;
+chad passes medium unless `CHAD_REASONING_EFFORT` is set, on every render including the
+cross-project warm-prefix head (rendered without it, the head was not a prefix of the
+real prompt under the upstream template and every fresh directory paid the cold prefill).
+`CHAD_PRISM_ROT_FP32` is the A/B arm for the rotation's precision. A Prism pack the
+fast-path cannot fuse now says so, with the reason, instead of decoding several times
+slower in silence; sign vectors are shared by content rather than by first-seen-per-width,
+which could trigger exactly that; and a donor drafter whose config and weights resolve to
+different hub snapshots is healed or refused rather than handed to the loader half-empty.
+
 ## [2.1.0] — 2026-09-14
 
 **A write outside your workspace always asks — auto and yolo included.** `write` and

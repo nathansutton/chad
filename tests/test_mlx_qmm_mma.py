@@ -17,24 +17,45 @@ from chad import mlx_qmm_mma as q  # noqa: E402
 K, N = 512, 4096
 
 
-def _weights(bits, seed=0):
+def _weights(bits, seed=0, gs=64):
     mx.random.seed(seed)
     w = (mx.random.normal((N, K)) * 0.02).astype(mx.bfloat16)
-    wq, sc, bi = mx.quantize(w, group_size=64, bits=bits)
+    wq, sc, bi = mx.quantize(w, group_size=gs, bits=bits)
     mx.eval(wq, sc, bi)
     return wq, sc, bi
 
 
-@pytest.mark.parametrize("bits", [3, 4, 5, 6, 8])
-def test_matches_stock_kernel_at_every_width(bits):
-    wq, sc, bi = _weights(bits)
+@pytest.mark.parametrize("bits,gs", [(3, 64), (4, 64), (5, 64), (6, 64), (8, 64),
+                                     (2, 64), (2, 128), (4, 128)])
+def test_matches_stock_kernel_at_every_width(bits, gs):
+    wq, sc, bi = _weights(bits, gs=gs)
     for M in range(1, q.M_MAX + 1):
         x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
         ref = mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
-                                  group_size=64, bits=bits).astype(mx.float32)
-        got = q.mma(x, wq, sc, bi, M, N, K, bits).astype(mx.float32)
+                                  group_size=gs, bits=bits).astype(mx.float32)
+        got = q.mma(x, wq, sc, bi, M, N, K, bits, gs).astype(mx.float32)
         rel = float(mx.max(mx.abs(ref - got))) / max(float(mx.max(mx.abs(ref))), 1e-6)
-        assert rel < 0.02, (bits, M, rel)
+        assert rel < 0.02, (bits, gs, M, rel)
+
+
+def test_ternary_pack_levels_match_stock():
+    """The Prism packs: 2-bit g128 whose codes {0,1,2} decode to {-s, 0, +s} (biases
+    == -scales, code 3 unused). The lane's one-word window must cover every code."""
+    mx.random.seed(5)
+    codes = mx.random.randint(0, 3, (N, K)).astype(mx.uint32)
+    wq = mx.zeros((N, K // 16), dtype=mx.uint32)
+    for i in range(16):
+        wq = wq | (codes[:, i::16] << (2 * i))
+    sc = (mx.random.uniform(shape=(N, K // 128)) * 0.02 + 0.005).astype(mx.bfloat16)
+    bi = -sc
+    mx.eval(wq, sc, bi)
+    for M in (1, 4, 8):
+        x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
+        ref = mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
+                                  group_size=128, bits=2).astype(mx.float32)
+        got = q.mma(x, wq, sc, bi, M, N, K, 2, 128).astype(mx.float32)
+        rel = float(mx.max(mx.abs(ref - got))) / max(float(mx.max(mx.abs(ref))), 1e-6)
+        assert rel < 0.02, (M, rel)
 
 
 def test_partial_last_tile_is_guarded():
@@ -56,7 +77,7 @@ def test_partial_last_tile_is_guarded():
 
 def test_qmm_dispatch_gate():
     wq, sc, bi = _weights(4)
-    q.set_wins({(K, N, 4): 3})
+    q.set_wins({(K, N, 4, 64): 3})
     try:
         for M, expect_kernel in ((1, False), (2, False), (3, True), (8, True), (9, False)):
             x = (mx.random.normal((1, M, K)) * 0.1).astype(mx.bfloat16)
@@ -77,6 +98,45 @@ def test_qmm_dispatch_gate():
         q.disable()
 
 
+@pytest.mark.parametrize("bits,gs", [(2, 128), (4, 64)])
+def test_tiled_matches_stock_past_one_tile(bits, gs):
+    """Widths past M_MAX run as 8-row kernel calls plus a remainder; whatever the
+    remainder is (a full tile, a kernel-width one, a stock-width one, a single row)
+    every row has to land in its own place."""
+    mx.random.seed(2)
+    w = (mx.random.normal((N, K)) * 0.02).astype(mx.bfloat16)
+    wq, sc, bi = mx.quantize(w, group_size=gs, bits=bits)
+    for M in (9, 12, 16, 21):
+        x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
+        ref = mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
+                                  group_size=gs, bits=bits).astype(mx.float32)
+        got = q.tiled(x, wq, sc, bi, M, N, K, bits, gs, 5).astype(mx.float32)
+        assert got.shape == (M, N)
+        rows = mx.max(mx.abs(ref - got), axis=1) / mx.max(mx.abs(ref))
+        assert float(mx.max(rows)) < 0.02, (M, rows.tolist())
+
+
+def test_qmm_tiles_only_through_the_probed_width():
+    wq, sc, bi = _weights(4)
+    q.set_wins({(K, N, 4, 64): 3}, tile_max={(K, N, 4, 64): 16})
+    try:
+        for M, expect_tiled in ((9, True), (16, True), (17, False)):
+            x = (mx.random.normal((1, M, K)) * 0.1).astype(mx.bfloat16)
+            y = q.qmm(x, wq, sc, bi, 64, 4).astype(mx.float32)
+            ref = mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
+                                      group_size=64, bits=4).astype(mx.float32)
+            assert y.shape == (1, M, N)
+            # the stock path is bit-identical to itself; the kernel is only ulp-close
+            assert (float(mx.max(mx.abs(y - ref))) > 0.0) == expect_tiled, M
+            assert float(mx.max(mx.abs(y - ref))) < 0.02 * float(mx.max(mx.abs(ref)))
+        saved, tiles = q.wins(), q.tile_max()
+        q.disable()
+        q.set_wins(saved)                      # the A/B round trip keeps the tiling
+        assert q.tile_max() == tiles
+    finally:
+        q.set_wins(None, tile_max={})
+
+
 def test_quantized_linear_patch_routes_only_verified_shapes():
     lin = nn.QuantizedLinear(K, N, bias=False, group_size=64, bits=4)
     lin2 = nn.QuantizedLinear(K, N // 2, bias=False, group_size=64, bits=4)
@@ -85,7 +145,7 @@ def test_quantized_linear_patch_routes_only_verified_shapes():
                                 biases=lin["biases"], transpose=True,
                                 group_size=64, bits=4)
     stock2 = lin2(x)
-    q.set_wins({(K, N, 4): 2})
+    q.set_wins({(K, N, 4, 64): 2})
     try:
         y = lin(x)
         assert y.shape == stock.shape
@@ -103,8 +163,9 @@ def test_shape_gate():
     assert q.shape_ok(5120, 248320, 5, 64)
     assert not q.shape_ok(5120, 1024, 4, 64)      # too few columns
     assert not q.shape_ok(5000, 17408, 4, 64)     # K not a multiple of 512
-    assert not q.shape_ok(5120, 17408, 4, 128)    # group size
-    assert not q.shape_ok(5120, 17408, 2, 64)     # unsupported width
+    assert q.shape_ok(5120, 17408, 2, 128)        # the Prism ternary container
+    assert not q.shape_ok(5120, 17408, 4, 32)     # group size
+    assert not q.shape_ok(5120, 17408, 1, 64)     # unsupported width
 
 
 def test_eligible_groups_skips_fastpath_placeholders():
@@ -124,9 +185,9 @@ def test_eligible_groups_skips_fastpath_placeholders():
             self._fused_gs, self._fused_bits = 64, 4
 
     groups = q._eligible_groups(_Fused())
-    assert list(groups) == [(K, N, 4)] and len(groups[(K, N, 4)]) == 1
+    assert list(groups) == [(K, N, 4, 64)] and len(groups[(K, N, 4, 64)]) == 1
     # a placeholder module must also never be routed by the class patch
-    q.set_wins({(K, N, 4): 2})
+    q.set_wins({(K, N, 4, 64): 2})
     try:
         m = _Fused()
         x = (mx.random.normal((1, 8, K)) * 0.1).astype(mx.bfloat16)

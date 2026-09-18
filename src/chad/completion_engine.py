@@ -142,6 +142,7 @@ class CompletionEngine:
         self.timeout = timeout
         # 0 = auto: load() asks the server (/props n_ctx) so chad's window matches
         # the wall the server actually enforces; falls back to 32768 offline.
+        self.reasoning_effort_default = None
         self.effective_ctx = effective_ctx
         # tokenizer_id points at the HF repo whose tokenizer matches the served GGUF's
         # vocab (the served model_id is usually a GGUF repo with no tokenizer files).

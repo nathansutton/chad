@@ -450,6 +450,24 @@ def build(config: DFlashConfig):
 # first extra row too cheaply and collapsed the schedule on medium acceptance).
 BLOCK_ROUND_COSTS = (1.0, 1.76, 1.93, 2.30, 2.18, 2.20, 2.19, 2.20)
 
+# The same ladder on the 2-bit ternary pack (benchmarks/spec_decode.py, a fixed-width
+# arm per depth, round wall over the serial step of the same prompt). It is NOT the
+# 3-bit ladder rescaled: the serial step is shorter (46-51 ms against 57), so the
+# drafter forward, the rollback and the host sync are a larger share of every round,
+# and rows 2..4 ride mlx's 2-bit matmul, which pays more per row than its 3-bit one.
+# Measured twice, six prompt x preset cells each agreeing to +-0.05: on a cool machine
+# (21.5 tok/s serial) 1.68 / 2.21 / 2.60 / 2.56 / 2.57 / 2.57 / 2.60, on a warm one
+# (19.7) 1.58 / 2.09 / 2.44 / 2.39 / 2.44 / 2.44 / 2.46 — the ratio moves with the
+# serial step, which is the dispatch-bound half. The seed is the midpoint; either way
+# the 3-bit seed priced every width past 1 some 9-18% too cheap here, and
+# WidthPolicy.learned_seed carries what a turn measures into the next.
+BLOCK_ROUND_COSTS_2BIT = (1.0, 1.63, 2.15, 2.52, 2.48, 2.50, 2.50, 2.53)
+
+
+def round_costs(weight_bits: Optional[int]) -> tuple:
+    """The measured seed ladder for a target quantized at `weight_bits`."""
+    return BLOCK_ROUND_COSTS_2BIT if weight_bits == 2 else BLOCK_ROUND_COSTS
+
 
 class WidthPolicy:
     """Cost-model width schedule: choose the verified width that maximizes
@@ -536,6 +554,29 @@ class WidthPolicy:
         if ob is not None and ob[1] >= 2:
             return ob[0]
         return self._seed[depth] * self._unit()
+
+    LEARN_MIN = 4        # rounds at a depth before its wall may re-shape the seed
+
+    def learned_seed(self) -> list:
+        """The seed ladder for the NEXT turn: this one's, with every depth the turn
+        measured enough moved halfway to what it measured, in seed units (so the
+        result is scale-free like the seed itself — the next turn's context is a
+        different length and its walls a different scale).
+
+        The policy is rebuilt per turn because acceptance is a property of the
+        content, but the cost ladder is a property of the machine and the
+        checkpoint, and a turn that re-learns it from a wrong seed spends its first
+        rounds at the wrong width. Halfway, and only past LEARN_MIN rounds: a depth
+        priced out by one inflated sample (a kernel build, a rollback) is never
+        visited again to correct it."""
+        if not self._obs:
+            return list(self._seed)
+        unit = self._unit()
+        out = list(self._seed)
+        for d, (wall, n) in self._obs.items():
+            if n >= self.LEARN_MIN and unit > 0:
+                out[d] = 0.5 * out[d] + 0.5 * wall / unit
+        return out
 
     def _tail_p(self) -> float:
         """Acceptance estimate for positions >= TAIL_SPLIT. Real pooled
@@ -806,6 +847,57 @@ def bundle_dir(model_dir: str) -> Optional[str]:
     return d if os.path.isfile(os.path.join(d, "config.json")) else None
 
 
+# Drafters transfer across quantizations of one base model: a drafter reads the
+# target's residual stream at its tapped layers, which a different weight quantization
+# only perturbs (measured on the Prism ternary pack: 93% acceptance with the 3-bit
+# model's sidecar). A checkpoint that bundles no drafter borrows the one a sibling
+# repo bundles, keyed on the (hidden, layers, vocab) shape the tap needs anyway.
+DONORS: dict = {(5120, 64, 248320): "nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX"}
+
+
+def _donor_file(repo_id: str, filename: str, cached: bool = True) -> str:
+    """The local path of one file of a hub repo: the cache when it holds it (and
+    `cached`), a download — into the repo's CURRENT snapshot — otherwise."""
+    from huggingface_hub import hf_hub_download, try_to_load_from_cache
+    hit = try_to_load_from_cache(repo_id, filename) if cached else None
+    return hit if isinstance(hit, str) else hf_hub_download(repo_id, filename)
+
+
+def donor_bundle_dir(key, repo_id: Optional[str], donors: Optional[dict] = None,
+                     fetch: Optional[Callable[[str, str], str]] = None) -> Optional[str]:
+    """The sidecar dir a `donors` (default DONORS) sibling bundles for a target of
+    shape `key`, or None (no donor for the shape, the model IS the donor, or the
+    fetch failed). `fetch(repo_id, filename)` resolves one file; None = the hub."""
+    donor = (DONORS if donors is None else donors).get(key)
+    if not donor or donor == repo_id:
+        return None
+    resolve = fetch or _donor_file
+    try:
+        cfg = resolve(donor, f"{_BUNDLE}/config.json")
+        wts = resolve(donor, f"{_BUNDLE}/model.safetensors")
+        d = os.path.dirname(wts)
+        if os.path.dirname(cfg) != d and not _complete(d):
+            # The two files resolve independently, and a cache hit on the config
+            # from an older revision's snapshot next to weights downloaded into the
+            # current one is two directories, neither a bundle. The weights' snapshot
+            # is the live one: fetch the config into it.
+            if fetch is not None:
+                fetch(donor, f"{_BUNDLE}/config.json")
+            else:
+                _donor_file(donor, f"{_BUNDLE}/config.json", cached=False)
+    except Exception as e:  # noqa: BLE001 — offline/gated: decode without the drafter
+        log.warning("DFlash drafter: donor bundle %s unavailable (%s); decoding "
+                    "without it", donor, e)
+        return None
+    if not _complete(d):
+        log.warning("DFlash drafter: donor bundle %s resolved to a config and weights "
+                    "in different snapshots (%s, %s); decoding without it", donor,
+                    os.path.dirname(cfg), d)
+        return None
+    log.info("DFlash drafter: no bundle with these weights; borrowing %s's", donor)
+    return d
+
+
 def _complete(d: str) -> bool:
     return (os.path.isfile(os.path.join(d, "config.json"))
             and os.path.isfile(os.path.join(d, "model.safetensors")))
@@ -849,18 +941,22 @@ def ensure_bundle(model_dir: str, repo_id: Optional[str],
 
 
 def load_drafter(model: "nn.Module", model_dir: str, repo_id: Optional[str] = None,
-                 bits: int = 4, gs: int = 64) -> Optional["nn.Module"]:
+                 bits: int = 4, gs: int = 64, donors: Optional[dict] = None,
+                 fetch: Optional[Callable[[str, str], str]] = None) -> Optional["nn.Module"]:
     """Load the DFlash drafter bundled with the target's weights (or the dir
     CHAD_DFLASH_PATH names), bound to the target's embedding/lm_head, with the
     target tap installed. None when no drafter ships for this model or on any
     failure — DFlash is a pure speed feature, never load-bearing.
 
     `repo_id` is the model's HF repo when it came from the hub, so a bundle whose
-    weights the base download filtered out can be completed (see ensure_bundle)."""
+    weights the base download filtered out can be completed (see ensure_bundle).
+    `donors`/`fetch` are donor_bundle_dir's (tests inject them)."""
     try:
         key = _target_key(model)
         ensure_bundle(model_dir, repo_id)
         sdir = bundle_dir(model_dir)
+        if sdir is None and key is not None:
+            sdir = donor_bundle_dir(key, repo_id, donors, fetch)
         if key is None or sdir is None:
             return None
         if not _is_sidecar(sdir):

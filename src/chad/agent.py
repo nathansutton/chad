@@ -753,6 +753,12 @@ class Agent:
         self._split_ok = ok
         return ok
 
+    def _template_extra(self) -> dict:
+        """The template kwargs beyond messages/tools/thinking: the reasoning effort,
+        when one is set (the user's, else the engine's loader-carried default)."""
+        effort = self.reasoning_effort or self.engine.reasoning_effort_default
+        return {"reasoning_effort": effort} if effort else {}
+
     def _render(self, thinking: bool = None):
         # `thinking` overrides self.thinking for THIS render only (no-think
         # escalation renders one step with <think> off, then restores). None => self.thinking.
@@ -772,13 +778,14 @@ class Agent:
         # malformed TypeScript it cannot repair. `low` keeps the reasoning block and
         # shrinks it. Passed only when set, and via **kwargs, so templates that do not
         # accept the argument (q3_s6's, which has no reasoning_effort at all) render
-        # byte-identically to before.
-        extra = {}
-        if self.reasoning_effort:
-            extra["reasoning_effort"] = self.reasoning_effort
+        # byte-identically to before. A loader may carry a default of its own
+        # (engine.reasoning_effort_default) for a template whose default it disagrees
+        # with; the user's setting still wins. `_prefix_ids` renders with the same
+        # kwargs: the effort lands in the system block, so a prefix priced without
+        # it would not be a prefix of the prompt.
         ids = self._template_ids(self.engine.tok.apply_chat_template(
             messages, tools=self._active_schemas(), add_generation_prompt=True,
-            enable_thinking=thinking, **extra,
+            enable_thinking=thinking, **self._template_extra(),
         ))
         # Debug hook (env-gated, off by default): dump the first decoded render so a
         # rendered-prompt difference across environments can be diffed. Best-effort.
@@ -808,7 +815,8 @@ class Agent:
         def render1(u):
             return self._template_ids(self.engine.tok.apply_chat_template(
                 [sysm, {"role": "user", "content": u}], tools=schemas,
-                add_generation_prompt=True, enable_thinking=self.thinking))
+                add_generation_prompt=True, enable_thinking=self.thinking,
+                **self._template_extra()))
         a, b = render1("a"), render1("the quick brown fox jumps")
         n = 0
         for x, y in zip(a, b):
@@ -835,7 +843,8 @@ class Agent:
         def render1(m):
             return self._template_ids(self.engine.tok.apply_chat_template(
                 [m, {"role": "user", "content": "a"}], tools=schemas,
-                add_generation_prompt=True, enable_thinking=self.thinking))
+                add_generation_prompt=True, enable_thinking=self.thinking,
+                **self._template_extra()))
         a, b = render1({"role": "system", "content": static}), render1(sysm)
         n = 0
         for x, y in zip(a, b):

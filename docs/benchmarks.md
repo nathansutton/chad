@@ -33,7 +33,9 @@ that appends ~16 tokens):
 
 | Model | Prefill (cold) | Decode | Warm-step prefill |
 |---|---|---|---|
-| **Qwen3.8-27B** `UD-Q3_K_XL-DFlash2` (shipped, default) | ~104 tok/s | ~59 tok/s | ~0.55 s (16 tok) |
+| **Qwen3.8-27B** `Ternary-Bonsai-2-DFlash2` (shipped, default) | ~97 tok/s | ~60 tok/s | ~0.56 s (16 tok) |
+| same, serial (`CHAD_NO_DFLASH=1`) | ~99 tok/s | ~21 tok/s | ~0.56 s (16 tok) |
+| Qwen3.8-27B `UD-Q3_K_XL-DFlash2` (3-bit, `--model`) | ~104 tok/s | ~59 tok/s | ~0.55 s (16 tok) |
 | same, serial (`CHAD_NO_DFLASH=1`) | ~105 tok/s | ~18 tok/s | ~0.55 s (16 tok) |
 
 > Measured on this machine with the command above. Run it on yours; these are hardware
@@ -74,8 +76,9 @@ does](#why-decode-sits-where-it-does).
 
 The question chad has to answer is what its engine buys over a generic local-model tool
 pointed at the **same weights on the same laptop**. So: Qwen3.8-27B at the `UD-Q3_K_XL`
-recipe (Unsloth's GGUF for llama.cpp, chad's MLX conversion of the same per-tensor bit map)
-on the same M4 Pro (24 GB), one engine resident at a time, each measured with its own native
+recipe (Unsloth's GGUF for llama.cpp, chad's MLX conversion of the same per-tensor bit map,
+the 3-bit alternative chad runs with `--model`; the shipped ternary build has no GGUF to
+compare against) on the same M4 Pro (24 GB), one engine resident at a time, each measured with its own native
 benchmark on a 512-token prompt and a 128-token generation. It was measured once on the same 
 GGUF (0.32.15, a `FROM`-only Modelfile, `num_ctx` 2048, temperature 0, timed from 
 `/api/generate`'s own counters) at 96 tok/s prefill and 10.9 tok/s decode, the llama.cpp 
@@ -190,8 +193,11 @@ The first-order answer is memory bandwidth: each token streams the resident weig
 the chip once, so `tok/s ≈ bandwidth / resident-bytes-per-token`. On a **dense** model that
 story is largely right, and it is why the quant is as aggressive as it is: every parameter
 is read for every token, so shrinking the weights is the only decode lever there is. ~12 GB
-against this M4 Pro's ~273 GB/s is the envelope the engine works inside, and no amount of
-kernel work moves that wall.
+(the 3-bit) against this M4 Pro's ~273 GB/s is the envelope the engine works inside, and no
+amount of kernel work moves that wall. The ternary build's 7.2 GB should sit further inside
+it than it does: mlx's 2-bit GEMV streams at ~140 GB/s, about half the roofline, which is
+why its serial step (21 tok/s) is not the 30+ the byte count implies, and why the drafter
+carries the speed story there.
 
 Inside the envelope, two things decide how close you get. Both were first measured on the
 retired 35B, whose sparse MoE made them unmissable; the *lessons* are what carried into
@@ -237,18 +243,98 @@ you're getting.
 
 ## The model: Qwen3.8-27B
 
-chad runs **one** model, [`Qwen3.8-27B UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX):
-a dense `qwen3_5` hybrid (64 layers: 48 GatedDeltaNet + 16 full attention) quantized to
-3-bit group-64 with `lm_head` held at 5-bit, ~12 GB resident, 262k native context. One
-model, every machine, with no RAM-aware pick, no size tier and no flag. chad targets 24 GB Macs and
-nothing smaller. The vision tower is not present at all (it was dropped at conversion time;
-mlx-lm's `qwen3_5` loader would have discarded it at load anyway).
+chad runs **one** model, [`Qwen3.8-27B Ternary-Bonsai-2-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX):
+a dense `qwen3_5` hybrid (64 layers: 48 GatedDeltaNet + 16 full attention) in Prism ML's
+ternary build, every projection Hadamard-rotated and stored as 2-bit group-128 with levels
+{−s, 0, +s}, ~7.2 GB resident, 262k native context. One model, every machine, with no
+RAM-aware pick, no size tier and no flag. chad targets 24 GB Macs and nothing smaller. The
+vision tower is not present at all (dropped in the repack; the text-only loader would have
+skipped it anyway). The 3-bit
+[`UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX)
+quant of the same model is one `--model` away and is the quality reference below.
 
 It's a *thinking* model that emits tool calls in the XML `<function=…>` dialect; the harness
 parses both that and JSON, and strips `<think>` blocks. The repo also carries the
 **DFlash2 block drafter** it decodes with, pre-quantized in `dflash/`; see
 [speculative decoding](configuration.md#speculative-decoding--kernel-knobs). There are no
 model flags to pick from; you just run `chad`.
+
+### Ternary against the 3-bit
+
+What the ternary build costs and buys against the 3-bit quant of the same model. See
+[configuration](configuration.md#what-the-engine-does-with-the-ternary-weights) for what
+chad does to run it. Measured on the M4 Pro, one load per process, greedy, 512-token prompt,
+128-token decodes; "as loaded" is the upstream pack's own forward with nothing of chad's
+attached (fp32 activations, stock 2-bit matmul, no drafter):
+
+| | 3-bit (`--model`) | ternary, as loaded | ternary, shipped |
+|---|---|---|---|
+| weights resident | 12.33 GB | 7.15 GB | 7.15 GB |
+| serial decode | 17.9 tok/s | 17.8 | **21.3** |
+| drafted decode (DFlash2) | ~60 tok/s | 12.1 (net loss) | **63.7** (94% accepted) |
+| width-8 verify forward | 2.2 × a step | 9.2 × | **2.2 ×** |
+| prefill, 5k prompt | ~104 tok/s | 89 | 99 |
+| peak at 5k / 32k | — / 16.8 GB | — / 13.3 GB | 11.8 GB / 15.5 GB³ |
+| governor window (24 GB) | ~56k tokens | — | **~150k** (114k with the bench's residue resident) |
+| code NLL / ppl (1,535 tok, teacher-forced) | **1.383 / 3.99** | 1.500 / 4.48 | 1.502 / 4.49 |
+| private eval tiers (core, languages, hard, brutal, realworld, recovery) | 56/56 | — | 56/56 |
+
+The perplexity row is the honest cost: +12% on code against the 3-bit, which the task-level
+tiers do not resolve (56 tasks, no flip in either direction, at the shipped sampling preset). The window row is what it buys, and on this agent the window is what
+runs out first.
+
+³ With the drafter resident and after the bench's earlier sections (active 9.6 GB going
+in, against 8.25 GB at a clean load); the 32k prefill ran at 90 tok/s and decode at 32k
+drafted 62 tok/s, no depth falloff. Running the compiled bodies' rotation in fp32
+(`CHAD_PRISM_ROT_FP32=1`) measured 63.6 drafted / 21.0 serial against 63.7 / 21.3: inside
+the noise, so the one-kernel native-dtype rotation stays the default. That
+rotation is what every path runs, prefill included (the sign vectors fold into the weights
+at install rather than inside the compiled bodies); teacher-forced code NLL over 7k tokens
+of three files reads 1.3830 / 1.6812 / 1.3576 native against 1.3847 / 1.6827 / 1.3573 with
+the fp32 transform, and prefill is 1-3% faster.
+
+The "as loaded" drafted number is the S=2..8 wall: the stock 2-bit matmul re-pays the
+weight read per verify row, so an 8-wide verify cost 9× a decode step and never amortized.
+The small-M MMA kernel at 2-bit g128 is flat in width (0.35 ms at M=8 on the 5120→17408
+projection against 0.71 ms stock), which puts the block on the right side of the cliff.
+The serial step is bounded by mlx's 2-bit GEMV rate, not by dispatch, so the fast-path's
+kernel-count win is smaller here than on the 3-bit; the weights, the verify and the
+context are where the pack pays.
+
+The same cliff sat one row past the tile. What one main-model forward of width M costs
+(`benchmarks/verify_ladder.py`: one load, 8-bit KV, 2k tokens in front, median of 8):
+
+| width M | 1 | 2 | 4 | 8 | 9 | 12 | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|---|---|---|
+| one tile only, ms | 49.3 | 68.3 | 109.1 | 108.2 | 266.3 | 317.1 | 342.9 | 354.7 | 357.3 |
+| tiled (shipped), ms | 49.2 | 67.2 | 107.7 | 106.8 | **147.2** | **203.6** | **203.4** | **297.2** | 353.1 |
+| shipped, serial steps | 1.00 | 1.37 | 2.19 | 2.17 | 2.99 | 4.14 | 4.14 | 6.04 | 7.18 |
+
+Widths 9-24 are several 8-row kernel calls now (1.2-1.8×), which is where an agent step's
+warm tail and a short tool-result suffix land; past 24 mlx's own tiling wins and keeps the
+forward. Widths 1-8 moved ~1%: folding the sign vectors took ~500 kernel launches out of a
+verify forward and it barely shows, because a verify forward is matmul-bound, not
+dispatch-bound — the same thing a compiled verify step measured on the 3-bit.
+
+A drafted **round** costs more than its verify forward: the drafter's own forward, the
+rollback of rejected positions and the host sync ride on top, and on a 46-51 ms serial
+step they are a larger share than on the 3-bit's 57. Round wall over the serial step, a
+fixed width per arm (`benchmarks/spec_decode.py`, six prompt × preset cells agreeing to
+±0.05 within a run; the ratio moves with the machine's serial step, so two runs):
+
+| drafts verified | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| the 3-bit's ladder | 1.0 | 1.76 | 1.93 | 2.30 | 2.18 | 2.20 | 2.19 | 2.20 |
+| ternary, cool (21.5 tok/s serial) | 1.0 | 1.68 | 2.21 | 2.60 | 2.56 | 2.57 | 2.57 | 2.60 |
+| ternary, warm (19.7 tok/s serial) | 1.0 | 1.58 | 2.09 | 2.44 | 2.39 | 2.44 | 2.44 | 2.46 |
+
+The schedule picks its width from this ladder, and the 3-bit one prices every width past
+one 9-18% too cheap here, so the shipped schedule is seeded with the midpoint of the two
+measured rows and carries what each turn measures into the next. What that is worth in
+tok/s is not resolved: on the low-acceptance prose these rows come from (20-30% of drafted
+positions accepted) the schedule sits at break-even with serial on either seed (19.1-20.9
+tok/s against 19.0-19.9 serial, both trees, back to back on an idle machine), inside the
+±1 tok/s run-to-run noise of three prompts.
 
 ## Two throughput levers
 

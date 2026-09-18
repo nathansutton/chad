@@ -66,6 +66,7 @@ class ScriptedEngine:
         self.effective_ctx = effective_ctx
         self.cache_dir = None          # None disables the warm-start prefix path entirely
         self._cached_ids = []          # kept for seam compatibility; never populated
+        self.reasoning_effort_default = None
         self.tok = _FakeTok()
 
     def generate(self, prompt_ids, max_tokens=2048, on_token=None, stop_texts=None,
@@ -988,3 +989,35 @@ def test_a_symlink_out_of_the_workspace_is_caught(tmp_path, monkeypatch):
 
     assert seen == [("edit", "innocent.txt")]
     assert (tmp_path / "target.txt").read_text() == "new\n"
+
+
+def test_reasoning_effort_default_comes_from_the_engine(monkeypatch):
+    """A loader can carry a reasoning-effort default for a template whose own default
+    it disagrees with (the Prism pack's says xhigh; think-decode is two thirds of wall).
+    Without one the template's default stands (nothing is passed, so templates that do
+    not take the argument render as before); the user's CHAD_REASONING_EFFORT wins."""
+    seen = []
+
+    class _Tok(_FakeTok):
+        def apply_chat_template(self, messages, tools=None, add_generation_prompt=False,
+                                enable_thinking=False, **kw):
+            seen.append(dict(kw))
+            return super().apply_chat_template(messages, tools, add_generation_prompt,
+                                               enable_thinking)
+
+    def run(default=None):
+        eng = ScriptedEngine(["All done."])
+        eng.tok = _Tok()
+        if default:
+            eng.reasoning_effort_default = default
+        seen.clear()
+        Agent(eng, mode="yolo", thinking=False).run_turn("hi")
+        rendered = [kw for kw in seen if "tokenize" not in kw]   # not the split probe
+        assert rendered
+        return rendered
+
+    monkeypatch.delenv("CHAD_REASONING_EFFORT", raising=False)
+    assert all("reasoning_effort" not in kw for kw in run())
+    assert all(kw.get("reasoning_effort") == "medium" for kw in run("medium"))
+    monkeypatch.setenv("CHAD_REASONING_EFFORT", "low")
+    assert all(kw.get("reasoning_effort") == "low" for kw in run("medium"))

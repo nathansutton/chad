@@ -209,6 +209,7 @@ class _Engine:
     def __init__(self):
         self.model_id = "chartok-test"
         self.effective_ctx = 24000
+        self.reasoning_effort_default = None
         self.cache_dir = None
         self._cached_ids = []
         self.tok = _CharTok()
@@ -261,3 +262,25 @@ def test_static_prompt_split_and_custom_prompt(tmp_path, monkeypatch):
     agent2 = _agent_in(tmp_path / "q", monkeypatch, {})
     agent2.messages[0]["content"] = "You are a different assistant."
     assert agent2._static_head_ids() == []
+
+
+def test_static_head_renders_with_the_engine_effort_default(tmp_path, monkeypatch):
+    """A template that opens its system block with a reasoning-effort sentence (the
+    upstream Prism pack's, default xhigh) renders differently with the engine's carried
+    default than without it. The static head has to be rendered the way the full prefix
+    is, or it is not a prefix of it, the guard returns no head, and every fresh
+    directory pays the cold prefill the head checkpoint exists to skip."""
+    class _EffortTok(_CharTok):
+        def apply_chat_template(self, messages, tools=None, add_generation_prompt=False,
+                                enable_thinking=False, reasoning_effort="xhigh"):
+            body = super().apply_chat_template(messages, tools, add_generation_prompt,
+                                               enable_thinking)
+            return [ord(c) for c in f"<effort>{reasoning_effort}</effort>"] + body
+
+    monkeypatch.delenv("CHAD_REASONING_EFFORT", raising=False)
+    agent = _agent_in(tmp_path / "e", monkeypatch, {"main.py": "pass\n"})
+    agent.engine.tok = _EffortTok()
+    agent.engine.reasoning_effort_default = "medium"
+    head, full = agent._static_head_ids(), agent._stable_prefix_ids()
+    assert head and full[:len(head)] == head
+    assert agent.engine.tok.decode(head).startswith("<effort>medium</effort>")

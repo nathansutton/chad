@@ -521,3 +521,143 @@ def test_schedule_is_the_default_width_policy():
     select the fixed arm at load."""
     assert Engine.dflash_adaptive is True
     assert Engine.dflash_num_draft == 7
+
+
+def _tiny_sidecar(model, tmp_path, bits=4):
+    """A quantized DFlash sidecar for the tiny target, built the way the CLI builds one."""
+    import json
+
+    from mlx.utils import tree_flatten
+
+    args = model.language_model.args
+    n_layers = int(args.num_hidden_layers)
+    hf = {
+        "hidden_size": int(args.hidden_size), "num_hidden_layers": 2,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+        "intermediate_size": 128, "vocab_size": int(args.vocab_size),
+        "num_target_layers": n_layers, "max_position_embeddings": 512,
+        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        "dflash_config": {"block_size": 4, "target_layer_ids": [0, max(1, n_layers - 2)],
+                          "mask_token_id": int(args.vocab_size) - 1,
+                          "selector_rank": 64, "selector_top_k": 4,
+                          "conv_kernel_size": 2, "conv_group_size": 16},
+    }
+    src = tmp_path / "hf"
+    src.mkdir()
+    (src / "config.json").write_text(json.dumps(hf))
+    mx.random.seed(3)
+    bf = mlx_dflash.build(mlx_dflash.DFlashConfig.from_dict(hf))
+    mx.save_safetensors(str(src / "model.safetensors"), dict(tree_flatten(bf.parameters())))
+    return mlx_dflash.build_sidecar(str(src), str(tmp_path / "sidecar"), bits=bits, gs=64)
+
+
+def test_drafter_borrows_a_donor_bundle_for_a_shape_match(monkeypatch, tmp_path):
+    """A checkpoint with no bundled drafter (the Prism ternary pack) takes the sidecar a
+    DONORS sibling of the same (hidden, layers, vocab) bundles — resolved file by file
+    through the hub cache — and nothing else: a shape with no donor, or a model that
+    is itself the donor, decodes serially."""
+    monkeypatch.delenv("CHAD_DFLASH_PATH", raising=False)
+    model = _build_tiny()
+    out = _tiny_sidecar(model, tmp_path)
+    key = mlx_dflash._target_key(model)
+    asked = []
+
+    def donor_file(repo_id, filename):
+        asked.append((repo_id, filename))
+        return os.path.join(out, os.path.basename(filename))
+
+    weights = tmp_path / "weights"          # no dflash/ inside
+    weights.mkdir()
+
+    assert mlx_dflash.load_drafter(model, str(weights), donors={}, fetch=donor_file) is None
+    assert asked == []
+
+    donors = {key: "sibling/repo"}
+    assert mlx_dflash.load_drafter(model, str(weights), repo_id="sibling/repo",
+                                   donors=donors, fetch=donor_file) is None
+    assert asked == []                        # the donor itself: nothing to borrow
+
+    drafter = mlx_dflash.load_drafter(model, str(weights), repo_id="other/pack",
+                                      donors=donors, fetch=donor_file)
+    assert drafter is not None
+    assert asked == [("sibling/repo", "dflash/config.json"),
+                     ("sibling/repo", "dflash/model.safetensors")]
+
+
+def test_donor_bundle_split_across_snapshots_is_healed_or_refused(tmp_path):
+    """The donor's config and weights resolve one file at a time, so a stale cache hit
+    on the config beside weights downloaded into the current revision is two snapshot
+    dirs. Returning the config's dir handed the loader a bundle with no weights, and the
+    catch-all turned that into silent serial decoding. The weights' snapshot is the live
+    one: the config is re-fetched into it, and a split that cannot be healed is refused
+    rather than returned."""
+    import shutil
+
+    old, new = tmp_path / "snap-old" / "dflash", tmp_path / "snap-new" / "dflash"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    (old / "config.json").write_text("{}")
+    (new / "model.safetensors").write_bytes(b"")
+    calls = []
+
+    def healing(repo_id, filename):
+        calls.append(filename)
+        if filename.endswith("model.safetensors"):
+            return str(new / "model.safetensors")
+        if calls.count(filename) > 1:             # the forced re-fetch
+            shutil.copy(old / "config.json", new / "config.json")
+            return str(new / "config.json")
+        return str(old / "config.json")
+
+    donors = {"k": "sibling/repo"}
+    assert mlx_dflash.donor_bundle_dir("k", "other/pack", donors, healing) == str(new)
+    assert calls == ["dflash/config.json", "dflash/model.safetensors",
+                     "dflash/config.json"]
+
+    os.remove(new / "config.json")
+
+    def stuck(repo_id, filename):
+        name = os.path.basename(filename)
+        return str((new if name == "model.safetensors" else old) / name)
+
+    assert mlx_dflash.donor_bundle_dir("k", "other/pack", donors, stuck) is None
+
+
+def test_round_cost_seed_is_per_weight_width():
+    """The ladder's shape belongs to the checkpoint: the engine seeds the schedule with
+    the one measured at the target's weight width, and the schedule still spans skip to
+    full block on it."""
+    assert mlx_dflash.round_costs(2) == mlx_dflash.BLOCK_ROUND_COSTS_2BIT
+    assert mlx_dflash.round_costs(3) == mlx_dflash.round_costs(None) \
+        == mlx_dflash.BLOCK_ROUND_COSTS
+    cold = mlx_dflash.block_policy(7, mlx_dflash.round_costs(2))
+    for _ in range(12):
+        cold.record(7, 0, stopped_early=False)
+    assert cold.depth() == 0
+    hot = mlx_dflash.block_policy(7, mlx_dflash.round_costs(2))
+    for _ in range(12):
+        hot.record(7, 7, stopped_early=False)
+    assert hot.depth() == 7
+
+
+def test_learned_seed_carries_the_measured_ladder_in_seed_units():
+    """The next turn's seed is this turn's, moved halfway to what was measured at every
+    depth measured enough, in SEED units: a turn at twice the wall-clock scale (a longer
+    context) must learn the same ladder, and a depth seen once must not move at all."""
+    seed = list(mlx_dflash.BLOCK_ROUND_COSTS)
+    assert mlx_dflash.block_policy(7).learned_seed() == seed          # nothing observed
+
+    def learned(scale):
+        pol = mlx_dflash.block_policy(7)
+        for _ in range(8):
+            pol.observe_cost(0, 0.050 * scale)          # the anchor: most observed
+        for _ in range(4):
+            pol.observe_cost(3, 0.150 * scale)          # 3.0 steps, seed says 2.30
+        pol.observe_cost(5, 9.0 * scale)                # one inflated sample
+        return pol.learned_seed()
+
+    a, b = learned(1.0), learned(2.0)
+    assert a == pytest.approx(b)
+    assert a[3] == pytest.approx(0.5 * seed[3] + 0.5 * 3.0)
+    assert a[5] == seed[5] and a[0] == pytest.approx(seed[0])
+    assert mlx_dflash.block_policy(7, a).cost(3) == pytest.approx(a[3])

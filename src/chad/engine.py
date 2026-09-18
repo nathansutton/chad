@@ -518,6 +518,9 @@ class Engine:
     model: Any = field(init=False, default=None)
     tok: Any = field(init=False, default=None)
     effective_ctx: int = field(init=False, default=32768)
+    # A chat-template default the loaded weights need overridden (the Prism pack's
+    # template says xhigh where the shipped model's says medium); None = the template's.
+    reasoning_effort_default: Optional[str] = field(init=False, default=None)
     _cache: Any = field(init=False, default=None)
     _cached_ids: list = field(init=False, default_factory=list)
     # Token ids generated in the CURRENT turn, for the presence penalty. Reset at
@@ -541,6 +544,8 @@ class Engine:
     # dense — the MoE arm is here for `--model`.
     _is_moe: bool = field(init=False, default=False)
     _dflash: Any = field(init=False, default=None)
+    fastpath: bool = field(init=False, default=False)   # mlx_fastpath installed
+    _dflash_ladder: Any = field(init=False, default=None)   # learned round-cost seed
     _n_attn_heads: int = field(init=False, default=16)
     _n_kv_heads: int = field(init=False, default=0)
     _head_dim: int = field(init=False, default=0)
@@ -624,7 +629,11 @@ class Engine:
         # dense qwen3_5 hybrid; silent no-op on any other model or on failure.
         from . import mlx_fastpath
         _log_mlx_provenance()
-        mlx_fastpath.install(self.model, model_path=path)
+        self.fastpath = mlx_fastpath.install(self.model, model_path=path)
+        if not self.fastpath and not config.flag("CHAD_NO_FASTPATH"):
+            # install() says why when it declines a Prism pack or fails outright;
+            # this is the line that makes a stock-graph run visible at all.
+            log.info("FASTPATH not installed: decoding on the stock op graph")
         # Fused quantized-KV decode attention: makes kv_bits=8 a speed win
         # instead of a loss. Patches mlx_lm's quantized SDPA branch
         # only; inert unless a QuantizedKVCache is actually in play.
@@ -662,9 +671,26 @@ class Engine:
         does, including the tokenizer's stop ids from the model config (which folds in
         generation_config.json; the override never touches them)."""
         model_path = _download(path)
-        eos = load_config(model_path).get("eos_token_id")
-        self.tok = load_tokenizer(model_path, eos_token_ids=eos)
+        cfg = load_config(model_path)
+        eos = cfg.get("eos_token_id")
+        # Prism's Hadamard-folded ternary packs carry weights in a rotated basis and
+        # declare their own model_type. mlx-lm's affine loader would find the right
+        # shapes, skip the activation transform and return garbage without erroring,
+        # so they route to chad's own loader on the declared type.
+        from . import prism_pack
+        prism = prism_pack.is_prism_pack(cfg)
+        with prism_pack.quiet_tokenizer_load() if prism else contextlib.nullcontext():
+            self.tok = load_tokenizer(model_path, eos_token_ids=eos)
         override, self.effective_ctx = self._ctx_override(path)
+        if prism:
+            if override:
+                cfg = {**cfg, "text_config": {**cfg["text_config"], **override}}
+            self.model, _ = prism_pack.load(str(model_path), cfg)
+            self.reasoning_effort_default = prism_pack.REASONING_EFFORT_DEFAULT
+            # The speculative schedule's round-cost seed is per weight width.
+            from . import mlx_dflash
+            self._dflash_ladder = list(mlx_dflash.round_costs(prism_pack.BITS))
+            return
         self.model, _ = load_model(model_path, model_config=override)
 
     def _read_model_shape(self, path: str) -> None:
@@ -2552,6 +2578,8 @@ class Engine:
             stats.generated_tokens = len(out_ids)
             stats.gen_ids = list(out_ids)
             self._cached_ids = fed_ids
+            if policy is not None:
+                self._dflash_ladder = policy.learned_seed()
             mx.clear_cache()
             return detok.text, stats
         except BaseException:
@@ -2597,7 +2625,9 @@ class _DFlashDrafter:
                               cfg.block_size - 1))
         # Fresh per-turn schedule state: acceptance statistics are a property
         # of the current prompt/content, not of the session.
-        self.policy = (mlx_dflash.block_policy(self.cap)
+        # The round-cost ladder is the exception: it belongs to the machine and the
+        # checkpoint, so each turn starts from what the last one measured.
+        self.policy = (mlx_dflash.block_policy(self.cap, eng._dflash_ladder)
                        if eng.dflash_adaptive else None)
         self._ids = list(cfg.target_layer_ids)
         self._mask = int(cfg.mask_token_id)
