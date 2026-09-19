@@ -1,7 +1,7 @@
 # `benchmarks/stock/` — same model, same Mac, stock engine
 
-The rows behind the comparison table in the [README](../../README.md#same-model-same-mac-stock-engine)
-and [Throughput & performance](../../docs/benchmarks.md#same-model-same-mac-stock-engine):
+The rows behind the comparison table in
+[Throughput & performance](../../docs/benchmarks.md#same-model-same-mac-stock-engine):
 stock llama.cpp on Unsloth's `Qwen3.8-27B-UD-Q3_K_XL` GGUF, against chad
 serial and chad default on its MLX checkpoint of the same recipe — one laptop, one engine
 resident at a time, each measured with its own benchmark.
