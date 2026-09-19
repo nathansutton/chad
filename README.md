@@ -40,6 +40,14 @@ server it talks to. What that buys:
   turns, so each agent step prefills the ~16 tokens it appended instead of the 5,000 it
   already read: ~0.55 s instead of ~48 s. The system prefix is checkpointed to disk, so the
   next session starts warm too ([why prefill is the bill](docs/design.md#why-chad-exists)).
+- **It rewinds a cache that cannot be rewound.** This model is a hybrid: most of its layers
+  are recurrent, and their state has no per-token rows to drop, so its cache is not
+  trimmable. Stock engines treat that as append-only, where a rejected draft or a diverged
+  prompt means reading everything again. chad holds the model in one process, snapshots the
+  recurrent state, trims the attention layers natively, and rolls back exactly. That is
+  what lets speculative decoding pay off here, and why a truncated turn or a retry costs a
+  few tokens instead of the whole transcript
+  ([the cache trade](docs/design.md#trimmable-vs-append-only-the-cache-trade-chad-lives-with)).
 - **The window is big enough for real work.** The shipped ternary weights sit at about 8 GB
   resident, which leaves roughly 150k tokens of context on a 24 GB Mac
   ([the model](docs/benchmarks.md#the-model-qwen38-27b)).
