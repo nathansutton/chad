@@ -923,7 +923,7 @@ CHAD_REPOMAP_WORKERS=4   uv run chad  # subprocess workers for a cold repo scan 
 
 Voice mode is all on-device: [Parakeet-on-MLX](https://github.com/ml-explore/mlx) (vendored)
 transcribes your mic, macOS `say` speaks the replies. It needs the `speech` extra (see
-[Installing](../README.md#installing--upgrading)), and nothing leaves the machine.
+[Installing](usage.md#installing--upgrading)), and nothing leaves the machine.
 
 ```bash
 CHAD_VOICE="Daniel"        uv run chad  # macOS `say` voice (default: the system voice)
