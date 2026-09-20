@@ -29,7 +29,7 @@ for the same reason llama.cpp is: it works with everything. chad is moving the o
 
 **1 set of silicon**.  This project is focused on making the macbook pro you already have usable.  Not a $10K GPU.
 
-**1 capable model**. `Qwen 3.8 27B`.  This isn't the frontier, but you probably aren't solving frontier problems.  Focus on 1 model buys _speed_.  You'll experience ~ 30 tokens/second generation instead of ~ 10 tokens/second for stock llama.cpp implementations.  This speed comes from MLX, a couple of targeted custom kerns for this model, and a bundled dflash2 drafter.
+**1 capable model**. `Qwen 3.8 27B`.  This isn't the frontier, but you probably aren't solving frontier problems.  Focus on 1 model buys _speed_.  You'll experience ~ 30 tokens/second generation instead of ~ 10 tokens/second for stock llama.cpp implementations.  This speed comes from MLX, a couple of targeted custom kernels for this model, and a bundled dflash2 drafter.
 
 **1 tightly-coupled agent loop**.  Instead of a standard /completions endpoint, the agent loop in chad owns the backend process.  This comes with nice advantages that make the KV cache more stable and the coding experience measurably better (no long prefills!).  
 
