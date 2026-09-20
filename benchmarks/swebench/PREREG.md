@@ -21,17 +21,35 @@ into what the model already does. 1.x pushed against the model; 2.x stopped push
 | arm | tree | surface | levers |
 |---|---|---|---|
 | **LEAN** | release tag, frozen (sha `TBD`) | 5 tools | the 10 that are on by default |
-| **LEGACY-FULL** | `bench/legacy` (sha `TBD`) | 22 tools | `legacy-manifest.tsv`, frozen by sha |
-| LEGACY-TOOLS (follow-up) | `bench/legacy` | 22 tools | all off — the 1.x shipped default |
+| **LEGACY-FULL** | `bench/legacy` (sha `e2372a641f9a6f6478edd18be9f97c2f0c8757ae`, Phase 1; re-frozen when this file is committed) | 21 tools | `legacy-manifest.tsv`, frozen by sha |
+| LEGACY-TOOLS (follow-up) | `bench/legacy` | 21 tools | all off — the 1.x shipped default |
 
 Primary comparison is LEAN vs LEGACY-FULL at k=`TBD` (target 5). LEGACY-TOOLS runs
 afterwards and only on the instances where those two disagree or either is unstable: it
 explains a difference, it is not needed to find one.
 
+**21 tools, not 22.** The twenty-second is `activate_skill`, which chad offers only when
+a skills directory exists. Discovery walks `~/.claude/skills` as well as the workspace,
+so leaving it on would put the operator's own skills into every prompt — 70 of them on
+this machine, and the legacy arm's system prompt goes 7,655 → 33,450 characters. The
+runner sets `CHAD_NO_SKILLS=1` for both arms, and the surface is 21. This was measured
+in Phase 1, not assumed; see `PORTS.md`.
+
 **Steelman rule.** LEGACY-FULL gets its best honest configuration. `CHAD_ENABLE=all` is
 not a configuration; the manifest names every lever ON or OFF with a reason, and the
 runner refuses the arm without it. Any feature that cannot fire on a host checkout is
-listed as unreachable *before* scoring, never discovered afterwards.
+listed as unreachable *before* scoring, never discovered afterwards — the manifest
+carries that prediction per lever in a `fires_here` column, and `PORTS.md` carries it in
+prose.
+
+**The engine is identical by construction.** `bench/legacy` carries the 2.2.0 engine
+layer byte for byte; only the agent layer differs. The static bridge (`bridge.py`)
+checks this deterministically instead of spending a week on a statistical bridge arm:
+with the system prompt and tool schemas held equal, the two trees render the same first
+request — **2,442 token ids, identical** — so the template, the tokenizer, the id
+coercion and the sampler preset are shared code. As shipped the renders differ, and
+every difference is prompt or schema TEXT, enumerated in `PORTS.md`. That text is the
+design under test.
 
 ## Held fixed across arms
 
@@ -51,6 +69,14 @@ construction.
 (`run.py: PROMPT_SUFFIX`) that says what a solution is and that tests must not be edited.
 It names no file, no test command and no tool. `hints_text` is never shown — it is
 dropped at fetch time and never written to disk.
+
+**Environment set by the runner for both arms**, before chad is imported:
+`CHAD_NO_SEATBELT=1` (the runner owns confinement; Seatbelt does not nest),
+`CHAD_NO_SKILLS=1` (above), and `CHAD_TURN_BUDGET_S` = the trial wall cap. The last one
+is what the unattended-run governors take their deadline from; without it four levers
+the legacy manifest turns on were structurally unable to fire, and trials were cut off
+mid-generation by the runner's own stop callback instead. Both trees read it; only the
+legacy lever set acts on it.
 
 ## Hypotheses
 

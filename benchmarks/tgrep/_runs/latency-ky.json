@@ -1,0 +1,12 @@
+{
+  "corpus": "/Users/nate/repo/ky",
+  "files": 97,
+  "reps": 3,
+  "queries": 20,
+  "p50_ms": {
+    "rg": 7.86,
+    "noindex": 17.14,
+    "index": 4.17
+  },
+  "mismatches": 0
+}

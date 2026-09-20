@@ -25,3 +25,7 @@ _runs/*/
 _runs/*-rep[0-9]*/report/
 _runs/*-rep[0-9]*/workspaces/
 _runs/_gate/
+
+# The campaign's own KV checkpoint store (run.py: KV_CACHE_DIRNAME). Hundreds of MB per
+# checkpoint, rebuilt by the first block that needs one.
+_kv/

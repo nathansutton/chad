@@ -54,3 +54,7 @@ benchmarks/matrix/POST-DRAFT.md
 
 # `chad prove` scorecard rows — written to the invoking directory, per run
 /results.json
+.kata.local.toml
+plans/
+.agents
+.claude

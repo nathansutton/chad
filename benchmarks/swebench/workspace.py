@@ -31,6 +31,14 @@ CLONE_URLS = {
 
 _DIFF_HEADER = re.compile(r"^diff --git a/(?P<a>.+?) b/(?P<b>.+)$", re.M)
 
+# The trial's TMPDIR, inside the workspace because the sandbox profile makes the
+# workspace the one place a trial can certainly write. It is the RUNNER's scratch, not
+# the task's, and it must never reach a prediction: measured on the first live legacy
+# trial, node (spawned by the language server) left 81 compile-cache files here and
+# `diff()` handed the official grader a 207 KB patch of them with no source change in
+# it at all. The name lives here, next to the exclusion that keeps it out.
+SCRATCH = ".swb-tmp"
+
 
 def repos_dir(root: str) -> str:
     return os.path.join(root, "_repos")
@@ -93,6 +101,14 @@ def materialize(root: str, repo: str, sha: str, dest: str, label: str) -> str:
     _git(["config", "user.email", "workbench@localhost"], cwd=dest)
     _git(["config", "user.name", "workbench"], cwd=dest)
     _git(["config", "commit.gpgsign", "false"], cwd=dest)
+    # Before the seed commit, so the scratch dir is untracked-and-ignored for the whole
+    # life of the workspace: out of `diff()`, and out of the `git status` the model
+    # reads. `info/exclude` rather than a `.gitignore` file, which would itself be a
+    # change to the repository under test.
+    exclude = os.path.join(dest, ".git", "info", "exclude")
+    os.makedirs(os.path.dirname(exclude), exist_ok=True)
+    with open(exclude, "a", encoding="utf-8") as fh:
+        fh.write(f"\n# the runner's own scratch (workspace.SCRATCH)\n{SCRATCH}/\n")
     _git(["add", "-A"], cwd=dest)
     _git(["commit", "--quiet", "--no-verify", "-m", f"{label} @ {sha[:12]}"], cwd=dest)
     assert_history_free(dest)
@@ -119,9 +135,21 @@ def diff(dest: str) -> str:
     Staged first so that files the model created are included; `--binary` so that an
     accidental binary change produces an applicable patch rather than a `Binary files
     differ` line that fails silently at grading time.
+
+    `SCRATCH` is excluded by `materialize`, so the runner's own temp files cannot ride
+    into a prediction. That exclusion is asserted here rather than trusted: a patch is
+    the one artifact the grader sees, and a workspace built by some other path would
+    fail silently and expensively.
     """
     _git(["add", "-A"], cwd=dest)
-    return _git(["diff", "--cached", "--binary", "HEAD"], cwd=dest)
+    patch = _git(["diff", "--cached", "--binary", "HEAD"], cwd=dest)
+    leaked = [f for f in changed_files(patch) if f.split("/")[0] == SCRATCH]
+    if leaked:
+        raise RuntimeError(
+            f"{dest}: the runner's scratch reached the patch ({len(leaked)} files, "
+            f"e.g. {leaked[0]}). materialize() writes the exclusion; this workspace "
+            "was not built by it.")
+    return patch
 
 
 def reset(dest: str) -> None:

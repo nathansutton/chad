@@ -72,11 +72,41 @@ PROMPT_SUFFIX = (
 DEFAULT_WALL_CAP_S = 3600
 DEFAULT_MAX_STEPS = 60
 
+# The on-disk KV checkpoint store, the campaign's own rather than the operator's.
+#
+# It has to be ON: with `cache_dir=None` the engine does no warm start at all, and since
+# every trial stands in a directory that has never existed before, every trial pays the
+# full cold prefill of its system prompt. Measured on one legacy trial here: 194 s to
+# the first decoded token, nearly all of it prefill. The shipped CLI sets a cache dir,
+# so running without one measures a configuration nobody uses — and the campaign would
+# spend days of laptop re-prefilling the same static prompt head.
+#
+# It has to be the kit's own directory, not `~/.cache/chad/kv`: that one holds whatever
+# the machine happens to have accumulated (7.8 GB of it here, from unrelated work), and
+# a block should not start warm or cold depending on what the operator did last week.
+# The 8 GB cap is the CLI's own default, so eviction behaves as shipped.
+KV_CACHE_DIRNAME = "_kv"
+KV_CACHE_MAX_BYTES = 8 * 1024**3
+
 ARMS = ("lean", "legacy-full", "legacy-tools")
 
 
 def _now() -> str:
     return datetime.datetime.now().strftime("%Y%m%d")
+
+
+def _dir_bytes(path: str | None) -> int:
+    """Bytes in `path`, so a block records whether it started on a warm store. Block 1
+    of a campaign pays a cold head prefill that block 2 does not, and that shows up in
+    turn-1 numbers; recording it is what lets the analysis see it rather than average
+    over it."""
+    if not path or not os.path.isdir(path):
+        return 0
+    total = 0
+    for entry in os.scandir(path):
+        if entry.is_file(follow_symlinks=False):
+            total += entry.stat(follow_symlinks=False).st_size
+    return total
 
 
 def lever_env(arm: str, manifest: str) -> dict[str, str]:
@@ -111,9 +141,29 @@ def lever_env(arm: str, manifest: str) -> dict[str, str]:
     return {"CHAD_ENABLE": ",".join(sorted(on))}
 
 
-def preflight(allow_docker: bool = False) -> list[str]:
+def interpreter_matches(tree: str) -> bool:
+    """Is this process running under `tree`'s own environment?
+
+    The block imports chad from `<tree>/src`, but the dependencies come from whichever
+    interpreter is running — and the two trees do not have the same ones (the legacy
+    agent layer needs rustworkx for repomap's PageRank; the release tree dropped it with
+    `repo_map`). Run under the wrong one and the import fails deep in a traceback, or,
+    worse, succeeds because the sets happen to overlap and the block silently measures
+    one tree's code against the other tree's packages.
+    """
+    prefix = os.path.realpath(sys.prefix)
+    return prefix.startswith(os.path.realpath(tree) + os.sep)
+
+
+def preflight(allow_docker: bool = False, tree: str = "") -> list[str]:
     """Refuse to start a block on a machine that would make the numbers meaningless."""
     problems = []
+    if tree and not interpreter_matches(tree):
+        problems.append(
+            f"this python is {sys.prefix}, which is not {tree}'s. Run the block under "
+            f"the tree's own interpreter:\n"
+            f"           uv run --project {tree} python benchmarks/swebench/run.py "
+            f"--tree {tree} ...")
     if sys.platform != "darwin":
         problems.append("this benchmark is about an Apple Silicon laptop; "
                         f"this is {sys.platform}")
@@ -198,7 +248,8 @@ class Block:
     """One arm, one replicate: the model stays loaded across every trial in it."""
 
     def __init__(self, arm: str, rep: int, tree: str, model: str, out_dir: str,
-                 wall_cap: int, max_steps: int, manifest: str) -> None:
+                 wall_cap: int, max_steps: int, manifest: str,
+                 kv_cache_dir: str = "") -> None:
         self.arm = arm
         self.rep = rep
         self.tree = tree
@@ -209,6 +260,8 @@ class Block:
         self.lever_env = lever_env(arm, manifest)
         self.shim_dir = os.path.join(out_dir, "bin")
         self.base_path = os.environ.get("PATH", "")
+        # "" disables the warm start entirely — an A/B knob, not the campaign's setting.
+        self.kv_cache_dir = kv_cache_dir or None
 
     # -- environment ------------------------------------------------------
 
@@ -225,6 +278,21 @@ class Block:
             # Seatbelt profiles do not nest. chad's own confinement would fail to apply
             # inside the runner's and turn every command into an error.
             os.environ["CHAD_NO_SEATBELT"] = "1"
+        # Skill discovery walks `~/.claude/skills` as well as the workspace, so on a
+        # development machine the operator's personal skills ride into the system prompt
+        # of every trial. Measured on this one: 70 skills, and the legacy arm's system
+        # prompt goes 7,655 -> 33,450 chars — three quarters of it a catalog that exists
+        # nowhere else and has nothing to do with the harness under test. It also adds a
+        # tool (`activate_skill`), so the surface would differ per machine. Off for both
+        # arms: the kit has to mean the same thing on someone else's laptop.
+        os.environ["CHAD_NO_SKILLS"] = "1"
+        # The unattended-run governors take their deadline from here (both trees read
+        # it; only the legacy lever set acts on it). Set to the runner's own wall cap so
+        # the arm that has wrap-up behaviour gets to use it, rather than being cut off
+        # mid-generation by `should_stop` because nothing told it the budget.
+        os.environ["CHAD_TURN_BUDGET_S"] = str(self.wall_cap)
+        # Both are read at import and at prompt build, so they are set here — before
+        # `load_engine` imports chad — not per trial.
 
     def trial_env(self, task: dataset.Task, ws: str, profile: str) -> None:
         """Point the process environment at this trial: its sandbox profile, its
@@ -234,7 +302,7 @@ class Block:
         os.environ[sandbox.PROFILE_ENV] = profile
         os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
         os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TMPDIR"] = os.path.join(ws, ".swb-tmp")
+        os.environ["TMPDIR"] = os.path.join(ws, workspace.SCRATCH)
         os.makedirs(os.environ["TMPDIR"], exist_ok=True)
         # PYTHONPATH stands in for the container's editable install (envspec deviation 4):
         # without it `import django` fails from the test runner and the agent would be
@@ -251,12 +319,30 @@ class Block:
         sys.path.insert(0, os.path.join(self.tree, "src"))
         from chad.cli import _compute_ctx_limit, apply_sampler_env, apply_sampler_preset
         from chad.engine import Engine
-        eng = Engine(model_id=self.model)
+        eng = Engine(model_id=self.model, cache_dir=self.kv_cache_dir,
+                     kv_cache_max_bytes=KV_CACHE_MAX_BYTES)
         apply_sampler_preset(eng, thinking=thinking)
         apply_sampler_env(eng)
         load_s = eng.load()
         ctx_limit = _compute_ctx_limit(eng)
         return eng, ctx_limit, load_s
+
+    # -- what this arm is --------------------------------------------------
+
+    def surface(self) -> dict:
+        """The tool menu and prompt size this block actually rendered.
+
+        Recorded per block rather than asserted once, because both are derived at import
+        from the environment: the tool count moves with skill discovery, and the system
+        prompt moves with the levers. A number in `meta.json` is checkable against the
+        arm it claims to be; a number in a README is a claim about a past run.
+        """
+        from chad.prompt import build_system_prompt
+        from chad.tools import active_schemas
+        schemas = active_schemas()
+        return {"tools": sorted(s["function"]["name"] for s in schemas),
+                "n_tools": len(schemas),
+                "system_prompt_chars": len(build_system_prompt())}
 
     # -- one trial --------------------------------------------------------
 
@@ -279,7 +365,15 @@ class Block:
             return deadline[0] > 0 and time.time() > deadline[0]
 
         def emit(kind: str, text: str) -> None:
-            if not first_token[0] and kind == "stream" and text:
+            # The FIRST decode of the turn, which on a cold trial is almost entirely the
+            # prefill of the system prompt plus the task — the number H2 wants and the
+            # one a user feels. It keys off `gen`, not `stream`: a block runs headless,
+            # `run_turn(stream=False)` builds no stream view, and nothing of kind
+            # `stream` is ever emitted, so the first live trial recorded None. Both
+            # trees emit `gen` from the same throttled counter, every 16 decoded tokens,
+            # so the measurement is identical across arms; at this model's decode rate
+            # those 16 tokens are about a second against a prefill of tens.
+            if not first_token[0] and kind == "gen":
                 first_token[0] = time.time()
 
         start_dir = os.getcwd()
@@ -303,10 +397,19 @@ class Block:
             "instance_id": task.instance_id, "arm": self.arm, "rep": self.rep,
             "env": task.env_key, "wall_s": round(wall, 1),
             "capped": wall >= self.wall_cap,
-            "first_token_s": round(first_token[0] - t0, 2) if first_token[0] else None,
+            "first_gen_s": round(first_token[0] - t0, 2) if first_token[0] else None,
             "steps": sum(1 for m in agent.messages if m.get("role") == "assistant"),
             "tool_calls": _tool_calls(agent.messages),
             "tool_dispatches": agent.tool_dispatches,
+            # Calls the model batched with `done` that the turn loop never ran. A known
+            # difference between the trees, left unported and counted instead so the
+            # analysis can price it (PORTS.md); it can only ever cost the legacy arm.
+            # Zero on `lean` by construction rather than by fallback: that loop runs
+            # those calls through the ordinary path, so there are none to drop, and the
+            # tree carries no counter. A new arm on the lean tree should fail loudly
+            # here rather than silently report a 0 it never measured.
+            "dropped_sibling_calls": (0 if self.arm == "lean"
+                                      else agent.dropped_sibling_calls),
             "prefill_tokens": agent.prefill_tokens, "peak_ctx": agent.peak_ctx,
             "gen_tokens": agent.gen_tokens, "gen_time": round(agent.gen_time, 1),
             "think_tokens": agent.think_tokens, "forwards": agent.forwards,
@@ -341,6 +444,9 @@ class Block:
             "dataset": dataset.DATASET_ID, "dataset_revision": dataset.REVISION,
             "started": datetime.datetime.now().isoformat(timespec="seconds"),
             "n_tasks": len(tasks),
+            "surface": self.surface(),
+            "kv_cache_dir": self.kv_cache_dir,
+            "kv_cache_bytes_at_start": _dir_bytes(self.kv_cache_dir),
         }
         with open(os.path.join(self.out_dir, "meta.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh, indent=2, sort_keys=True)
@@ -396,9 +502,16 @@ def main() -> int:
                     help="keep each trial's checkout for a trajectory read")
     ap.add_argument("--allow-docker", action="store_true",
                     help="skip the Docker check (only for a dry run with no model)")
+    ap.add_argument("--kv-cache-dir", default=os.path.join(ROOT, KV_CACHE_DIRNAME),
+                    help="on-disk KV checkpoint store for the warm start "
+                         "(default: the kit's own)")
+    ap.add_argument("--no-kv-cache", action="store_true",
+                    help="run with no warm start at all — every trial cold-prefills its "
+                         "whole system prompt. An A/B arm, not the campaign's setting.")
     args = ap.parse_args()
 
-    problems = preflight(allow_docker=args.allow_docker)
+    problems = preflight(allow_docker=args.allow_docker,
+                         tree=os.path.abspath(args.tree))
     if problems:
         for p in problems:
             print(f"preflight: {p}", file=sys.stderr)
@@ -423,7 +536,8 @@ def main() -> int:
                                        f"{args.arm}-rep{args.rep}-{_now()}")
     block = Block(arm=args.arm, rep=args.rep, tree=os.path.abspath(args.tree),
                   model=model, out_dir=out_dir, wall_cap=args.wall_cap,
-                  max_steps=args.max_steps, manifest=args.manifest)
+                  max_steps=args.max_steps, manifest=args.manifest,
+                  kv_cache_dir="" if args.no_kv_cache else args.kv_cache_dir)
     block.install_shim()
 
     # Hold the machine awake for the block without touching the display setting; the

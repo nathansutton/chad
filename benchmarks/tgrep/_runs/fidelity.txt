@@ -1,0 +1,27 @@
+283 distinct rg commands replayed from recorded sessions
+
+byte-identical    :  147
+reordered         :   36
+match set differs :    2
+tgrep errored     :    0
+unparseable       :   98  (shell quoting shlex cannot split)
+
+same match set: 98.9%   byte-identical: 79.5%
+  DIFFERS  rg -n 'search' src/chad/tools.py                                             rg-only 1 / tgrep-only 4
+  DIFFERS  rg -n 'TimeoutError' source/ -g '!source/errors'                             rg-only 0 / tgrep-only 4
+
+64 MiB default cap
+  rg    found 2 file(s): ['./big.log', './small.txt']
+  tgrep found 1 file(s): ['./small.txt']
+
+grep immediately after an edit, on-disk index, no daemon
+  rg    -> ./mod.py:2:    return FRESHLY_WRITTEN
+  tgrep -> (no match)
+
+pattern colliding with a tgrep subcommand (one file, `-n <pattern>`)
+  'search'       rg=   1  tgrep=   4  tgrep --=   1  <- wrong
+  'index'        rg=   2  tgrep=   0  tgrep --=   2  <- wrong
+  'serve'        not run: `tgrep -n serve <file>` starts a server and never returns
+  'status'       rg=  18  tgrep=   6  tgrep --=  18  <- wrong
+  'count-files'  rg=   0  tgrep=   1  tgrep --=   0  <- wrong
+  'help'         rg=   1  tgrep=   0  tgrep --=   1  <- wrong

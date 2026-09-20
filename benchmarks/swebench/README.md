@@ -48,6 +48,27 @@ uv run python benchmarks/swebench/grade.py run benchmarks/swebench/_runs/lean-re
 `prepare.py` has six steps, each runnable alone and each safe to re-run: `dataset`,
 `specs`, `clone`, `envs`, `canary`, `validate`.
 
+A block runs under **its own tree's interpreter**, and `run.py` refuses to start
+otherwise. The two trees do not have the same dependencies — the legacy agent layer
+needs rustworkx for repomap's ranking, which the release tree dropped along with
+`repo_map` — so the wrong interpreter either fails deep in an import or, worse, succeeds
+and measures one tree's code against the other tree's packages.
+
+```sh
+# the legacy arm, its tree, its interpreter, its pre-registered lever manifest
+uv run --project ../chad-legacy python benchmarks/swebench/run.py \
+    --arm legacy-full --rep 1 --tree ../chad-legacy
+```
+
+Three checks belong to the legacy arm and are re-run after any port:
+
+```sh
+uv run python benchmarks/swebench/bridge.py --legacy ../chad-legacy      # the static bridge
+uv run python benchmarks/swebench/tool_probe.py --tree ../chad-legacy    # every tool, on django
+uv run --project ../chad-legacy python benchmarks/swebench/make_manifest.py \
+    --tree ../chad-legacy --out benchmarks/swebench/legacy-manifest.tsv
+```
+
 ## The five things that make the two arms comparable
 
 Each is owned by the runner, not by either harness tree, so neither tree needs to know
@@ -191,7 +212,48 @@ Docker Hub and pull natively — but neither swebench 4.x nor 5.x can address th
 both hardcode the image architecture and expose no flag for it. Renaming an arm64 image
 to the x86_64 name the harness expects would work; it is not done.
 
+## Phase 1 status: the legacy tree
+
+`bench/legacy` is the 2.2.0 release tree carrying the `c45c8dc` agent layer — 21 tools,
+65 levers, the LSP/symbol tier, `repo_map`, profiles and the sub-agent — on a **byte-
+identical engine layer**. `PORTS.md` is the ledger: what was ported and why, what was
+not, what cannot fire here, and the one known difference that is counted rather than
+fixed.
+
+| Phase 1 item | Result |
+|---|---|
+| `bench/legacy` builds and passes the release gate | ruff, mypy, anti-slop, 1282 tests |
+| `BaseEngine` seam | one call wide; the quarantine moved to the agent side, engine untouched |
+| `PORTS.md` | 24 agent-path commits classified; 11 ported, 10 design, 7 unreachable, 1 counted |
+| `legacy-manifest.tsv` | 65 levers: 63 ON, 2 OFF (both seatbelt conflicts), 7 predicted unable to fire |
+| static bridge | **clean on machinery** — 2,442 token ids identical under a controlled render |
+| every tool exercised on django | **19/19** dispatchable tools, under the trial sandbox |
+| `run.py` drives both trees | yes, and refuses the wrong interpreter |
+
+Five findings from Phase 1 changed the runner, and every one of them would have been
+invisible in the results:
+
+- **Skill discovery was importing the operator's own `~/.claude/skills`** into every
+  prompt — 70 of them on this machine, taking the legacy arm's system prompt from 7,655
+  to 33,450 characters and adding a tool. `CHAD_NO_SKILLS=1` for both arms now. The
+  legacy surface is therefore **21 tools**, not 22: `activate_skill` exists only when a
+  skills directory does.
+- **The unattended-run governors had no deadline.** Four levers the manifest turns on
+  read `CHAD_TURN_BUDGET_S`, which nothing set, so they were configured on and
+  structurally unable to fire. `run.py` sets it to the trial wall cap for both arms.
+- **The runner's own scratch was riding into the prediction.** The first live legacy
+  trial submitted a 207 KB patch of 81 node compile-cache files and no source change:
+  the trial `TMPDIR` lives inside the workspace, one `git add -A` from the diff. The
+  workspace now excludes it before the seed commit, and `diff()` asserts that it did.
+- **H2's first-token number was `None` on every trial.** It was recorded off a `stream`
+  emit, and a block runs `run_turn(stream=False)`, which emits none. It now keys off the
+  decode counter both trees emit identically, as `first_gen_s`.
+- **The on-disk warm start was off.** `Engine.cache_dir` defaults to `None`; the shipped
+  CLI sets it, the runner did not. A live legacy trial took **194 s to its first token**,
+  nearly all prefill of a static prompt head. The runner now uses a kit-owned KV store,
+  and records its size at block start.
+
 ## Still to come
 
-`run.py --arm legacy-full` needs the legacy tree and its lever manifest. `PREREG.md` is
-committed before the first legacy trial, with δ and k fixed by the pilot.
+Phase 2, the pilot: LEAN k=1 on all 50, which fixes the wall cap, δ and k, and commits
+`PREREG.md` before the first scored legacy trial.

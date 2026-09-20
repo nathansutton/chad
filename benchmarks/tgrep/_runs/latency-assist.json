@@ -1,0 +1,11 @@
+{
+  "corpus": "/Users/nate/assist",
+  "files": 17761,
+  "reps": 2,
+  "queries": 20,
+  "p50_ms": {
+    "rg": 372.82,
+    "index": 56.51
+  },
+  "mismatches": 0
+}

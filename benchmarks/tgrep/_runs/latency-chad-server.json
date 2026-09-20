@@ -1,0 +1,11 @@
+{
+  "corpus": "/Users/nate/repo/chad",
+  "files": 410,
+  "reps": 3,
+  "queries": 20,
+  "p50_ms": {
+    "rg": 16.67,
+    "server": 6.73
+  },
+  "mismatches": 0
+}

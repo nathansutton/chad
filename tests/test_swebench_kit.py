@@ -112,6 +112,42 @@ def _seed_repo(path: str) -> str:
     return base
 
 
+def test_runner_scratch_never_reaches_a_prediction(tmp_path):
+    """A prediction is the one artifact the grader sees, so it carries source changes
+    and nothing else.
+
+    The trial's TMPDIR sits inside the workspace — the one place the sandbox profile
+    certainly lets it write — which puts the runner's own scratch one `git add -A` away
+    from the patch. Measured on the first live legacy trial: node, spawned by the
+    language server, left 81 compile-cache files there and the prediction came out as
+    207 KB of them with no source change in it at all.
+    """
+    origin = str(tmp_path / "origin")
+    base = _seed_repo(origin)
+    root = str(tmp_path / "kit")
+    os.makedirs(os.path.join(root, "_repos"))
+    subprocess.run(["git", "clone", "--bare", "--quiet", origin,
+                    workspace.bare_path(root, "x/y")], check=True, capture_output=True)
+    ws = str(tmp_path / "ws")
+    workspace.materialize(root, "x/y", base, ws, "x__y-1")
+
+    junk = os.path.join(ws, workspace.SCRATCH, "node-compile-cache", "v1")
+    os.makedirs(junk)
+    for i in range(5):
+        with open(os.path.join(junk, f"c{i}"), "w", encoding="utf-8") as fh:
+            fh.write("cachejunk" * 200)
+    with open(os.path.join(ws, "mod.py"), "w", encoding="utf-8") as fh:
+        fh.write("def f():\n    return 3\n")
+
+    patch = workspace.diff(ws)
+    assert workspace.changed_files(patch) == ("mod.py",)
+    assert workspace.SCRATCH not in patch
+    # ...and the model does not see the runner's scratch in its own `git status`.
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=ws,
+                            capture_output=True, text=True, check=True).stdout
+    assert workspace.SCRATCH not in status
+
+
 def test_materialized_workspace_has_no_future(tmp_path):
     """The point of exporting instead of cloning: the fix is not in the object store."""
     origin = str(tmp_path / "origin")

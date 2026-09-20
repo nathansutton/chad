@@ -1,0 +1,21 @@
+model decode             48043.9 s   over 2594 steps
+all tool execution        6968.2 s
+  bash                   6965.5 s   941 calls
+  search-only bash          4.0 s   145 calls   mean 27.7 ms
+  grep in a compound     3244.1 s   218 calls   (a build or test run, not search)
+
+search latency        p50 20 ms   p90 40 ms   max 370 ms
+
+search share of chad's wall clock: 0.0073%
+  a  2.0x faster grep would return    2.0 s of 55012 s  (0.0036%)
+  a  3.0x faster grep would return    2.7 s of 55012 s  (0.0049%)
+  a 10.0x faster grep would return    3.6 s of 55012 s  (0.0066%)
+
+622 sessions across 570 distinct working directories (1.09 sessions per directory)
+sessions    files  cwd
+      20       97  /Users/nate/repo/ky
+      10      157  /Users/nate/assist/public
+       5      415  /Users/nate/repo/chad
+       5    17761  /Users/nate/assist
+       4     gone  /private/tmp/claude-501/-Users-nate-assist/b6661276-90ca-4b96-9745-57e590f2e741/scratchpad/dogfood
+       3     gone  /private/tmp/claude-501/-Users-nate-assist/974fa10e-ade7-4737-8c07-6768f42dfe0e/scratchpad/pytorch
