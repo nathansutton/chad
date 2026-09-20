@@ -183,6 +183,36 @@ refreshes the token as needed). Notes:
   an interactive login simply contributes no tools.
 - Token values are never logged. The token file is created `0600` from the first write.
 
+**Memcode long-term memory.** To make persistent personal memory available as an
+optional MCP server, add this entry to either MCP configuration file:
+
+```json
+{
+  "mcpServers": {
+    "memcode": {
+      "type": "http",
+      "url": "https://mcp.memcode.in/mcp",
+      "auth": "oauth"
+    }
+  }
+}
+```
+
+Start chad with `CHAD_MCP_OAUTH=1`, then authorize the server explicitly:
+
+```
+/mcp login memcode
+```
+
+The hosted endpoint discovers Memcode's OAuth server, opens its consent page, and
+stores only the resulting short-lived credentials in chad's protected token file.
+Do not add a Memcode API key or static `Authorization` header. The server exposes
+tools for saving, listing, searching, and retrieving memories, plus ingest status
+and memory-graph reads. Because the server currently does not advertise MCP
+read-only annotations, chad applies its safe default and asks for confirmation
+before every Memcode tool call. If login or the remote service is unavailable,
+the server contributes no tools and the rest of chad keeps working.
+
 **How they behave in the harness:**
 
 - Namespaced `mcp__<server>__<tool>`, so server tools can't collide with chad's
