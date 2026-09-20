@@ -88,12 +88,17 @@ beside every delta.
 
 Official `swebench.harness.run_evaluation` (pinned release in `grade.py: HARNESS`)
 against `princeton-nlp/SWE-bench_Verified`, restricted to the 50 mini instance ids.
-Images built locally for arm64; the published x86_64 images under emulation are the
-fallback, and the route used is recorded in every report. Empty or malformed patches
-score as unresolved. Nothing in this kit decides whether an instance is resolved.
+Empty or malformed patches score as unresolved. Nothing in this kit decides whether an
+instance is resolved.
 
-**Gold gate.** The 50 gold patches must resolve 50/50 on this machine before any agent
-trial is scored.
+**Route: the published x86_64 images under emulation**, recorded in every report.
+Building the images locally for arm64 was the plan's first choice and is measured not to
+work: an image built today installs the project with no date pin, so sphinx gets a 2026
+docutils and its suite dies during collection. See `grade.py`'s module docstring.
+
+**Gold gate: PASSED 50/50** on that route, 2026-09-19, before any agent trial
+(`_runs/_gate/gold.gold-x86_64-20260919.json`). Re-run it if the harness pin, the image
+route, or the machine changes.
 
 ## Disclosed departures from a server-scale run
 

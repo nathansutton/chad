@@ -39,8 +39,8 @@ about the harness, so the effective sample is smaller than 50.
 ## Running it
 
 ```sh
-uv run python benchmarks/swebench/prepare.py all     # no model, no Docker
-uv run python benchmarks/swebench/grade.py gate      # Docker; the 50/50 gold gate
+uv run python benchmarks/swebench/prepare.py all                   # no model, no Docker
+uv run python benchmarks/swebench/grade.py gate                    # Docker; the gold gate
 uv run --project . python benchmarks/swebench/run.py --arm lean --rep 1
 uv run python benchmarks/swebench/grade.py run benchmarks/swebench/_runs/lean-rep1-*
 ```
@@ -139,6 +139,15 @@ rows. `hints_text` is dropped at fetch time; the field never lands on this disk.
 - **Environments**: 13/13 build.
 - **Workbench validation**: **40/50** instances reproduce the benchmark's pass/fail
   structure natively. The rows are in `_data/workbench_validation.jsonl`.
+- **Gold gate: PASSED, 50/50** on the published x86_64 images under emulation
+  (`_runs/_gate/`). The official harness reproduces every gold patch here, which is what
+  licenses any later number. Nothing agentic is scored until this holds.
+
+What the gate cost, since the campaign shares a laptop disk with 12 GB of weights:
+**19.1 GB** of image store for all 50 instances — far less than 50 × 2.1 GB, because the
+per-repo base and environment layers are shared — and **5m15s** to evaluate all 50 at
+four workers. Emulation is much cheaper here than feared; pulling the images, not running
+them, is the slow part, and it happens once.
 
 The 10 that do not are concentrated in older sphinx (3.1–4.1) and one django instance:
 
@@ -155,10 +164,34 @@ The 10 that do not are concentrated in older sphinx (3.1–4.1) and one django i
 None of this changes the scored set, and none of it favours an arm: both arms get the
 same workbench, and the grade always comes from the container.
 
+## The grading route: the fallback turned out to be the only route
+
+The plan's first choice was to build the grading images here for arm64 and keep the
+published x86_64 images under emulation as a fallback. Measured, the first choice does
+not work, for the same reason the native workbench needed a date pin.
+
+A locally built image is built *today*, and SWE-bench's recipe installs the project with
+`pip install -e .[test]` and no date pin — so sphinx's unbounded `docutils>=0.12`
+resolves to a 2026 docutils and the suite dies on `No module named
+'docutils.utils.roman'`. `envspec.py` fixes that for the workbench with
+`--exclude-newer`; it cannot be fixed for the grader, because patching upstream's image
+build is how a grader stops being the public grader.
+
+Probed on two gold patches: **locally built arm64 1/2, published x86_64 2/2**, the
+failure being sphinx. The published route then passed the full gate 50/50. So the route
+is `--route x86_64` (the default) — images published back when those dependency graphs
+still resolved, run under emulation. `--route arm64` is kept so the finding can be
+reproduced rather than taken on trust.
+
+Two practical notes. The published images must be pulled with an explicit
+`--platform linux/amd64`; without it Docker reports "no matching manifest for
+linux/arm64/v8" and the harness then fails each instance with a 404 *during* the run, so
+`grade.py` pulls them up front instead. And published **arm64** images do exist on
+Docker Hub and pull natively — but neither swebench 4.x nor 5.x can address them, as
+both hardcode the image architecture and expose no flag for it. Renaming an arm64 image
+to the x86_64 name the harness expects would work; it is not done.
+
 ## Still to come
 
-`grade.py gate` has not been run — it needs Docker and an arm64 image build, and it is
-the first stop condition in the plan: the 50 gold patches must resolve 50/50 before any
-agent trial is scored. `run.py --arm legacy-full` needs the legacy tree and its lever
-manifest. `PREREG.md` is committed before the first legacy trial, with δ and k fixed by
-the pilot.
+`run.py --arm legacy-full` needs the legacy tree and its lever manifest. `PREREG.md` is
+committed before the first legacy trial, with δ and k fixed by the pilot.

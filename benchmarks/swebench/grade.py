@@ -23,13 +23,30 @@ built differently, a test that depends on the host, an architecture difference �
 number produced by it would not be comparable to anything. It is the first stop
 condition in the plan for a reason: it is cheap, and everything downstream assumes it.
 
-ARCHITECTURE
-------------
-Images are built locally for arm64 (`--namespace ''`), because the published images are
-x86_64 and emulating 500 test runs under Rosetta is slow enough to change what a timeout
-means. If the arm64 build cannot pass the gold gate, the fallback is the published
-x86_64 images under emulation — slower, but the same harness and the same tests, and the
-route actually used is recorded in the report.
+ARCHITECTURE: THE FALLBACK IS THE ROUTE
+---------------------------------------
+The plan's first choice was to build the images here for arm64 (`--namespace ''`) and
+keep the published x86_64 images under emulation as a fallback. Measured on this
+machine, the first choice does not work and the fallback is the only honest route.
+
+A locally built image is built *today*, and SWE-bench's image recipe installs the
+project with `pip install -e .[test]` and no date pin. For sphinx that resolves
+`docutils>=0.12` — unbounded in sphinx 3.x and 5.x — to a 2026 docutils, and the suite
+dies on `No module named 'docutils.utils.roman'`, which has not existed since docutils
+0.21. It is the same failure the native workbench hit, and `envspec.py` fixes it there
+with `--exclude-newer`; it cannot be fixed here, because patching upstream's image build
+is precisely how a grader stops being the public grader. Probed on two gold patches:
+arm64 local build 1/2, published x86_64 2/2, the failure being sphinx.
+
+So: `--route x86_64`, the images published when those dependency graphs still resolved,
+run under emulation. Slower, and the wall cap in `run.py` is ours anyway and disclosed.
+`--route arm64` is kept so the finding can be reproduced rather than taken on trust.
+
+Published arm64 images do exist on Docker Hub (`swebench/sweb.eval.arm64.…`, and they
+pull), but neither swebench 4.x nor 5.x can address them: both hardcode the image
+architecture and expose no flag for it. Renaming an arm64 image to the x86_64 name the
+harness expects would work and is not done — a grader that has been tricked about what
+it is running is not a grader.
 """
 from __future__ import annotations
 
@@ -53,11 +70,19 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 HARNESS = "swebench==4.0.5"
 
 ROUTES = {
-    # namespace None -> build images locally; the empty string is how the CLI spells it.
+    # Build the images here. MEASURED TO FAIL THE GOLD GATE — see the module docstring.
+    # Kept because the finding is worth being able to reproduce.
     "arm64": ["--namespace", ""],
-    # the published images, under emulation
+    # The published images. This is the route that works.
     "x86_64": ["--namespace", "swebench"],
 }
+
+# Published images have to be fetched by hand on Apple Silicon. `docker pull` without an
+# explicit platform resolves the manifest list for the host and reports "no matching
+# manifest for linux/arm64/v8"; the harness's own fetch then inspects an image that is
+# not there and fails the instance with a 404 rather than a diagnosis.
+PUBLISHED_NAMESPACE = "swebench"
+PUBLISHED_PLATFORM = {"x86_64": "linux/amd64"}
 
 
 def _model_is_resident() -> str:
@@ -97,8 +122,67 @@ def _instance_ids() -> list[str]:
     return [i.instance_id for i in dataset.load_instances(ROOT)]
 
 
+def published_image(instance_id: str, route: str) -> str:
+    """The published image for an instance, spelled the way the harness spells it —
+    Docker Hub forbids a double underscore in a repository name, so upstream substitutes
+    `_1776_`."""
+    key = f"sweb.eval.{route}.{instance_id}:latest".replace("__", "_1776_")
+    return f"{PUBLISHED_NAMESPACE}/{key}".lower()
+
+
+def prepull(instance_ids: list[str], route: str) -> list[str]:
+    """Fetch the published images this run needs; returns the ids that could not be got.
+
+    Done here rather than left to the harness because the harness cannot do it on this
+    machine: it asks Docker for an image whose manifest list has no arm64 entry, gets
+    nothing, and reports a 404 per instance at grading time — after the run has started.
+    Pulling first turns that into one clear failure before anything is scored.
+    """
+    platform = PUBLISHED_PLATFORM.get(route)
+    if not platform:
+        return []
+    missing = []
+    for n, iid in enumerate(instance_ids, 1):
+        image = published_image(iid, route)
+        have = subprocess.run(["docker", "image", "inspect", image],
+                              capture_output=True, check=False, timeout=120)
+        if have.returncode == 0:
+            continue
+        print(f"  pulling [{n}/{len(instance_ids)}] {iid} ...", flush=True)
+        out = subprocess.run(["docker", "pull", "-q", "--platform", platform, image],
+                             capture_output=True, text=True, check=False, timeout=3600)
+        if out.returncode != 0:
+            missing.append(iid)
+            print(f"    FAILED: {out.stderr.strip()[:160]}")
+    return missing
+
+
+def docker_image_bytes() -> int:
+    """Total size of the local image store, so a route's disk cost can be measured as a
+    delta rather than guessed. The campaign shares a laptop disk with the weights."""
+    out = subprocess.run(
+        ["docker", "system", "df", "--format", "{{.Type}}\t{{.Size}}"],
+        capture_output=True, text=True, check=False, timeout=120)
+    for line in out.stdout.splitlines():
+        kind, _, size = line.partition("\t")
+        if kind.strip() == "Images":
+            return _parse_size(size.strip())
+    return 0
+
+
+def _parse_size(text: str) -> int:
+    units = {"B": 1, "KB": 10 ** 3, "MB": 10 ** 6, "GB": 10 ** 9, "TB": 10 ** 12}
+    for suffix in sorted(units, key=len, reverse=True):
+        if text.upper().endswith(suffix):
+            try:
+                return int(float(text[:-len(suffix)].strip()) * units[suffix])
+            except ValueError:
+                return 0
+    return 0
+
+
 def evaluate(predictions: str, run_id: str, route: str, report_dir: str,
-             workers: int = 4, timeout: int = 1800) -> int:
+             instance_ids: list[str], workers: int = 4, timeout: int = 1800) -> int:
     """Drive the official harness. Its dependencies are rented for the call, so nothing
     the grader needs is ever installed beside the model."""
     os.makedirs(report_dir, exist_ok=True)
@@ -110,10 +194,15 @@ def evaluate(predictions: str, run_id: str, route: str, report_dir: str,
             "--max_workers", str(workers),
             "--timeout", str(timeout),
             "--report_dir", report_dir,
-            "--instance_ids", *_instance_ids(),
+            "--instance_ids", *instance_ids,
             *ROUTES[route]]
     print(" ".join(argv[:12]) + " ...", flush=True)
-    return subprocess.run(argv, check=False).returncode
+    # Run FROM the report directory. The harness honours `--report_dir` for the summary
+    # but writes its per-instance `logs/run_evaluation/...` tree relative to wherever it
+    # was invoked, and on some releases the summary lands there too. Pointing its working
+    # directory at the run's own folder keeps every artifact together and stops the
+    # repository root collecting `logs/` and stray `gold.*.json` after a grading pass.
+    return subprocess.run(argv, cwd=report_dir, check=False).returncode
 
 
 def read_report(report_dir: str, model_name: str, run_id: str) -> dict:
@@ -122,7 +211,9 @@ def read_report(report_dir: str, model_name: str, run_id: str) -> dict:
     safe = model_name.replace("/", "__")
     path = os.path.join(report_dir, f"{safe}.{run_id}.json")
     if not os.path.exists(path):
-        candidates = [f for f in os.listdir(report_dir) if f.endswith(f".{run_id}.json")]
+        # The naming has moved between releases; match on the run id, which is ours.
+        candidates = sorted(f for f in os.listdir(report_dir)
+                            if f.endswith(f".{run_id}.json"))
         if not candidates:
             raise FileNotFoundError(f"no report for run {run_id} in {report_dir}")
         path = os.path.join(report_dir, candidates[0])
@@ -141,18 +232,36 @@ def summarize(report: dict) -> str:
     return "\n".join(lines)
 
 
-def cmd_gate(route: str, workers: int) -> int:
-    """The 50 gold patches must resolve 50/50 before any agent trial is scored."""
+def cmd_gate(route: str, workers: int, only: str = "", label: str = "") -> int:
+    """The 50 gold patches must resolve 50/50 before any agent trial is scored.
+
+    `--only` grades a subset. It cannot pass the gate — the gate is the whole set — but
+    it is how the route gets tried before hours of image builds are spent on it, and how
+    the per-instance disk cost is measured on a laptop that has to hold the weights too.
+    """
+    ids = sorted(set(only.split(","))) if only else _instance_ids()
     report_dir = os.path.join(ROOT, "_runs", "_gate")
-    run_id = f"gold-{route}-{time.strftime('%Y%m%d')}"
-    rc = evaluate("gold", run_id, route, report_dir, workers=workers)
+    run_id = f"gold-{route}-{label or time.strftime('%Y%m%d')}"
+    before = docker_image_bytes()
+    missing = prepull(ids, route)
+    if missing:
+        print(f"could not fetch {len(missing)} published image(s): {missing[:5]}",
+              file=sys.stderr)
+        return 1
+    rc = evaluate("gold", run_id, route, report_dir, ids, workers=workers)
     if rc != 0:
         print(f"harness exited {rc}", file=sys.stderr)
+    grew = docker_image_bytes() - before
     report = read_report(report_dir, "gold", run_id)
     print(summarize(report))
+    print(f"  image store grew {grew / 1e9:.1f} GB over {len(ids)} instance(s)")
     resolved = report.get("resolved_instances", 0)
+    if only:
+        print(f"\nSUBSET only: {resolved}/{len(ids)} on the {route} route. The gate is "
+              f"all {dataset.N_INSTANCES}; run it without --only to pass it.")
+        return 0 if resolved == len(ids) else 1
     if resolved != dataset.N_INSTANCES:
-        missed = sorted(set(_instance_ids()) - set(report.get("resolved_ids", [])))
+        missed = sorted(set(ids) - set(report.get("resolved_ids", [])))
         print(f"\nGATE FAILED on the {route} route: {resolved}/{dataset.N_INSTANCES}.")
         print(f"  did not resolve: {missed}")
         print("  this grader is not the public grader; try the other image route "
@@ -173,7 +282,14 @@ def cmd_run(run_dir: str, route: str, workers: int) -> int:
     model_name = f"chad-{meta['arm']}"
     run_id = f"{meta['arm']}-rep{meta['rep']}-{route}"
     report_dir = os.path.join(run_dir, "report")
-    rc = evaluate(predictions, run_id, route, report_dir, workers=workers)
+    os.makedirs(report_dir, exist_ok=True)
+    missing = prepull(_instance_ids(), route)
+    if missing:
+        print(f"could not fetch {len(missing)} published image(s): {missing[:5]}",
+              file=sys.stderr)
+        return 1
+    rc = evaluate(predictions, run_id, route, report_dir, _instance_ids(),
+                  workers=workers)
     if rc != 0:
         print(f"harness exited {rc}", file=sys.stderr)
     report = read_report(report_dir, model_name, run_id)
@@ -196,10 +312,17 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("gate", help="grade the 50 gold patches")
+    g.add_argument("--only", default="",
+                   help="comma-separated instance ids — tries the route cheaply; "
+                        "cannot pass the gate")
+    g.add_argument("--label", default="", help="run id suffix (default: today)")
     r = sub.add_parser("run", help="grade one block's predictions")
     r.add_argument("run_dir")
     for p in (g, r):
-        p.add_argument("--route", default="arm64", choices=sorted(ROUTES))
+        # x86_64 by default: the locally built arm64 images are measured NOT to pass the
+        # gold gate (see the module docstring), so defaulting to them would hand a new
+        # reader the broken route first.
+        p.add_argument("--route", default="x86_64", choices=sorted(ROUTES))
         p.add_argument("--workers", type=int, default=4)
         p.add_argument("--force", action="store_true",
                        help="skip the preflight (it exists for a reason)")
@@ -212,7 +335,7 @@ def main() -> int:
                 print(f"preflight: {p}", file=sys.stderr)
             return 2
     if args.cmd == "gate":
-        return cmd_gate(args.route, args.workers)
+        return cmd_gate(args.route, args.workers, only=args.only, label=args.label)
     return cmd_run(args.run_dir, args.route, args.workers)
 
 
