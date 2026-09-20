@@ -217,6 +217,10 @@ exclude = [
     "src/chad/parakeet/**",          # vendored upstream, not held to chad's gate (see ruff/mypy)
     "benchmarks/matrix/tasks/**",    # vendored Exercism exercises, kept byte-identical
     "tools/anti_slop/**",
+    # SWE-bench kit artifacts: checkouts of django and sphinx plus their dependency
+    # trees, materialised by `prepare.py` and git-ignored. Third-party source, not
+    # chad's, and the sphinx test corpus includes files that are not even UTF-8.
+    "benchmarks/swebench/_*/**",
 ]
 # Pre-existing findings live in the baseline (regenerate: `make slop-baseline`). A run
 # fails only on what is NEW; edit a baselined line and its finding comes back, so the

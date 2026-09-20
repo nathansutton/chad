@@ -1,0 +1,23 @@
+# django__django-3.1: python 3.8 (upstream 3.6), swebench==4.0.5
+# dependencies resolved as of 2020-05-12, the date of environment setup commit 0668164b4ac9
+asgiref==3.2.7
+certifi==2020.4.5.1
+chardet==3.0.4
+docutils==0.16
+geoip2==3.0.0
+idna==2.9
+jinja2==2.11.2
+markupsafe==1.1.1
+maxminddb==1.5.4
+python-memcached==1.59
+pytz==2020.1
+pywatchman==1.4.1
+pyyaml==5.3.1
+requests==2.23.0
+selenium==3.141.0
+setuptools==75.3.4
+six==1.14.0
+sqlparse==0.3.1
+tblib==1.6.0
+urllib3==1.25.9
+wheel==0.45.1

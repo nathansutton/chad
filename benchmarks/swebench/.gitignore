@@ -1,0 +1,27 @@
+# The kit is committed; the things the kit builds are not. Everything ignored here is
+# reproducible from `prepare.py` — bare clones (~420 MB), the 13 workbench environments,
+# trial workspaces, and the fetched dataset, which is pinned by digest and re-downloaded
+# rather than vendored (redistributing a benchmark is how forks of it start).
+#
+# Scoped to this directory rather than added to the root ignore file, so the kit lands
+# as one self-contained change.
+_data/
+_repos/
+_envs/
+_work/
+_validate/
+_canary/
+
+# Phase 0's own result: which instances reproduce the benchmark's pass/fail structure on
+# this machine. Small, and the analysis cites it.
+!_data/
+_data/*
+!_data/workbench_validation.jsonl
+
+# Measured blocks are committed the way the matrix nights are: the rows, not the
+# container logs or the kept checkouts.
+_runs/*/
+!_runs/*-rep[0-9]*/
+_runs/*-rep[0-9]*/report/
+_runs/*-rep[0-9]*/workspaces/
+_runs/_gate/
