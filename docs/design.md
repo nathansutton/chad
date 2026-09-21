@@ -83,7 +83,8 @@ configuration differed from each other by about as much as our changes differed 
 baseline. We had been fitting noise, one plausible tool at a time.
 
 The trajectories said the same thing more plainly. These are the tool calls from 355
-tasks on 1.13.0 with all 21 tools offered:
+tasks on 1.13.0 with all 21 tools offered (per-trial counts:
+[`history/toolmix-1.13.0.jsonl`](https://huggingface.co/datasets/nathansutton/chad-polyglot-runs/blob/main/history/toolmix-1.13.0.jsonl)):
 
 ```
 18,431 tool calls
@@ -156,7 +157,8 @@ reading against 84 minutes of generating, and 82% of what it generated was insid
 in Go and in JavaScript, and neither was a wrong answer. The model stated the right
 algorithm in a few hundred tokens and then worked test cases by hand inside one `<think>`
 block, 21,000 tokens of it, until the clock ran out. The drafter helps least exactly there,
-because reasoning is the text it predicts worst.
+because reasoning is the text it predicts worst. The run, trajectories included, is
+`design-sample` in [`RUNS.md`](../benchmarks/polyglot/RUNS.md).
 
 The 1.x reflex would be a nudge, a budget and a switch. The 2.x rule is that a change
 ships when a paired run on the laptop says it helped, and the eval for that is

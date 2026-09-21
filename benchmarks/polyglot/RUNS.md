@@ -11,3 +11,4 @@ tidy; a rerun gets a new label.
 
 | label | date | chad | harness | model | tasks × reps | dataset path | trials.jsonl sha256 |
 |---|---|---|---|---|---|---|---|
+| design-sample | 2026-09-21 | 2.2.0 (374ec56+dirty) | chad | Qwen3.8-27B-Ternary-Bonsai-2 | 12 × 1 | hf://datasets/nathansutton/chad-polyglot-runs/polyglot/design-sample | 285ea7a3cb7dd9d68fa5557497ac1e9f62088ff4f8128902e6c67ebbf5065fa1 |
