@@ -1,2 +1,0 @@
-def transpose(text):
-    pass

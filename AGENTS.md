@@ -3,7 +3,7 @@
 chad is a local, single-user, Apple-Silicon coding agent: one MLX engine, one five-tool
 surface, one agent loop. Why it is built this way is in `docs/design.md`; what each module
 does, and which tests guard it, is the table in
-[`docs/design.md#architecture-map`](docs/design.md#architecture-map). Read those before
+[`docs/architecture.md#architecture-map`](docs/architecture.md#architecture-map). Read those before
 proposing a redesign — this file does not repeat them.
 
 ## Gate
@@ -12,7 +12,7 @@ Run `make gate` before you call anything done. It runs four targets in order, an
 the same four:
 
 - `make lint` — `uv run ruff check src tests benchmarks`
-- `make typecheck` — `uv run mypy src/chad`
+- `make typecheck` — `uv run mypy src/chad benchmarks/polyglot`
 - `make slop` — the vendored anti-slop linter (`tools/anti_slop`) over `src`, `tests`
   and `benchmarks`; stdlib-only, runs on its own 3.12 interpreter
 - `make test` — `uv run pytest -q`, which loads no model and finishes in seconds
@@ -41,10 +41,12 @@ Two areas corrupt more than the line you touched, so lean on the existing tests:
 ## Model-visible changes need a conversation
 
 Prompts, tool schemas, guardrails, the engine and compaction change **model-visible
-behavior**. Those are validated on the maintainer's private eval rig, which a PR cannot
-run and which self-skips here for lack of weights, so the unit tests alone cannot carry
-them. Open an issue describing the change before building it, or the work stalls waiting
-on an eval pass you cannot see.
+behavior**, which the unit tests cannot measure. `benchmarks/polyglot` can, on your own
+Mac: pin a pool of tasks a baseline passes only sometimes (`stats.py pool`, from a
+published baseline via `fetch.py` or your own run with `--reps 2` or more), run that pool
+on `main` and on your branch, and bring the `stats.py compare` output with the PR. Open an
+issue describing the change first: a paired run costs a night, so agree on what it should
+show before spending it.
 
 ## Dependency pins are load-bearing
 

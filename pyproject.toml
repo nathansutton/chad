@@ -143,8 +143,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-# Vendored Exercism exercises (benchmarks/matrix/tasks/) are upstream files, kept byte-identical.
-extend-exclude = ["benchmarks/matrix/tasks", "tools/anti_slop"]  # vendored linter: not chad's style
+extend-exclude = ["tools/anti_slop"]  # vendored linter: not chad's style
 src = ["src", "tests"]
 
 [tool.ruff.lint]
@@ -169,7 +168,9 @@ ignore = ["E741"]  # ambiguous var names (l/I) appear in existing math code
 
 [tool.mypy]
 python_version = "3.11"
-files = ["src/chad"]
+files = ["src/chad", "benchmarks/polyglot"]
+# The kit's underscore dirs hold fetched exercises, trial workspaces and model output.
+exclude = ['^benchmarks/polyglot/_']
 ignore_missing_imports = true   # mlx/tree_sitter/mcp ship partial or no stubs
 warn_unused_ignores = true
 implicit_optional = true        # `x: T = None` defaults are idiomatic throughout; this
@@ -215,7 +216,7 @@ exclude = [
     ".agents/**",
     ".claude/**",
     "src/chad/parakeet/**",          # vendored upstream, not held to chad's gate (see ruff/mypy)
-    "benchmarks/matrix/tasks/**",    # vendored Exercism exercises, kept byte-identical
+    "benchmarks/polyglot/_*/**",     # fetched exercises, trial workspaces, model output
     "tools/anti_slop/**",
 ]
 # Pre-existing findings live in the baseline (regenerate: `make slop-baseline`). A run

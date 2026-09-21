@@ -290,7 +290,7 @@ That is **34,816 bytes per token**. A pure-attention transformer of the same sha
 layers keeping per-token K/V rather than 16) would spend ~131,000 bytes per token at the
 same quantization, about **4×** as much, and its 128k row alone would exceed the whole
 machine. Trading trimmability for a flat memory profile is what buys the window
-([design](design.md#trimmable-vs-append-only-the-cache-trade-chad-lives-with)); `CHAD_KV_BITS=0`
+([design](design.md#the-cache-only-appends)); `CHAD_KV_BITS=0`
 roughly doubles the numbers above. When the prompt nears the window, old verbose tool outputs
 are compacted.
 

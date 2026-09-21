@@ -4,6 +4,20 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+### One benchmark, and no run output in the repository
+
+- **`benchmarks/polyglot` is the one agent eval.** Terminal-Bench (`benchmarks/tb2`), the
+  nine-harness grid (`benchmarks/matrix`), the `ctxengine` and search harnesses that no
+  longer ran, and two one-off scripts are gone. The grid, with every row it recorded, is
+  at the tag `archive/matrix-nine-harnesses` and `benchmarks/matrix/README.md` points
+  there; the unmerged SWE-bench kit is at `archive/149-swebench-kit`. The engine
+  instruments (`benchmarks/stock`, `spec_decode.py`, `verify_ladder.py`) stay.
+- **Run data is published, not committed.** `publish.py` bundles a run with its local
+  paths rewritten and uploads only when asked; `fetch.py` brings one back and checks it
+  against the sha256 in `benchmarks/polyglot/RUNS.md`. A test fails if run output is ever
+  tracked. A model-visible change now arrives with a paired `stats.py compare` a
+  contributor can run on their own Mac (CONTRIBUTING.md).
+
 ## [2.2.0] — 2026-09-17
 
 **Model bump: the shipped weights are now Prism ML's ternary build of Qwen3.8-27B.** A

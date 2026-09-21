@@ -6,7 +6,7 @@ lint:
 	uv run ruff check src tests benchmarks
 
 typecheck:
-	uv run mypy src/chad
+	uv run mypy src/chad benchmarks/polyglot
 
 # anti-slop is vendored and stdlib-only but needs Python 3.12+, so it runs on its own
 # interpreter, outside the 3.11 project env (config: [tool.anti-slop] in pyproject.toml).

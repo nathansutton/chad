@@ -27,7 +27,10 @@ from chad.tui import (  # noqa: E402
 
 # -- item 2: completion helpers ---------------------------------------------
 
-def test_slash_matches_prefix_and_multiword():
+def test_slash_matches_prefix_and_multiword(tmp_path, monkeypatch):
+    # Installed skills join this menu; with none in reach it is the builtins alone.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     assert [c for c, _ in slash_matches("/mo")] == ["/model", "/mode"]
     # a multi-word command completes from its shared prefix
     assert set(c for c, _ in slash_matches("/mcp")) >= {"/mcp", "/mcp trust", "/mcp login"}

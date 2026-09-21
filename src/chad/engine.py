@@ -68,7 +68,7 @@ except ImportError as _e:  # non-Apple host: remote backend only
 # importing mlx.core. Re-exported here so existing `from .engine import GenStats` keeps
 # working (bench.py, tests) — the class is unchanged.
 from . import config
-from .base_engine import THINK_CLOSE, GenStats, think_ceiling_hit
+from .base_engine import THINK_CLOSE, GenStats, TailWatch, think_ceiling_hit
 from .diag import log
 
 # checkpoint filename prefix (on the basename)
@@ -2303,6 +2303,8 @@ class Engine:
             fed_ids = list(prompt_ids[:-1])
             detok = self.tok.detokenizer
             detok.reset()
+            # Which phase a round was drafted in, for the acceptance histogram only.
+            think_closed = TailWatch(["</think>"])
 
             while len(out_ids) < max_tokens:
                 if should_stop and should_stop():
@@ -2435,6 +2437,8 @@ class Engine:
                 stats.forwards += 1
                 stats.draft_proposed += k
                 stats.draft_accepted += n_acc
+                if k:
+                    stats.note_round(k, n_acc, acting=think_closed.hit)
                 if policy is not None and k:
                     # An accepted draft that IS a stop token ends the walk without
                     # indicting the next position — the round ended because the
@@ -2511,9 +2515,10 @@ class Engine:
                     out_ids.append(tid)
                     self._seen.append(tid)
                     detok.add_token(tid)
-                    if on_token:
-                        seg = detok.last_segment
-                        if seg:
+                    seg = detok.last_segment
+                    if seg:
+                        think_closed.feed(seg)
+                        if on_token:
                             on_token(seg)
                 if not stop and stop_condition is not None \
                         and stop_condition(detok.text, len(out_ids)):
@@ -2556,6 +2561,7 @@ class Engine:
                             if seg:
                                 on_token(seg)
                     stats.salvaged = True
+                    think_closed.feed(THINK_CLOSE)
                     # The freshly sampled token must be EMITTED here as well as
                     # made pending: the loop invariant is that the pending token is
                     # already in out_ids (it always enters as a committed bonus
