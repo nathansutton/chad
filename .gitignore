@@ -22,3 +22,5 @@ traces/
 # trial workspaces, KV checkpoints, run output and publish bundles. Nothing a run produces
 # is committed; published runs are listed in benchmarks/polyglot/RUNS.md.
 benchmarks/polyglot/_*/
+plans/
+.agents
