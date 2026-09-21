@@ -43,8 +43,10 @@ You do not have an Apple Silicon with 24 GB RAM.  You want to pick your local mo
   terminal UI, and the command-line flags.
 - [Throughput & performance](docs/benchmarks.md) has every number above, the stock-engine
   comparison, the model, and how to reproduce them with `chad-bench`.
-- [Design & internals](docs/design.md) covers why prefill is the bill, the persistent
-  prefix cache, and why the tool surface is five tools.
+- [Design](docs/design.md) is the argument: why the agent owns the engine, why there are
+  five tools, and what 1.x got wrong.
+- [Architecture](docs/architecture.md) is the module map, the session file format and the
+  tool-call wire format.
 - [Configuration reference](docs/configuration.md) documents project instructions, Agent
   Skills, MCP servers, plan mode, the slash commands, the context window, every environment
   variable, and the safety opt-outs.

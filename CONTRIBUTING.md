@@ -5,7 +5,7 @@ sharp design constraint (prefill is the bill, the KV cache stays warm), so here'
 honest map of what lands easily and what needs a conversation first.
 
 Working here with an agent? Start at [`AGENTS.md`](AGENTS.md); the per-module map is in
-[`docs/design.md#architecture-map`](docs/design.md#architecture-map).
+[`docs/architecture.md#architecture-map`](docs/architecture.md#architecture-map).
 
 ## What lands easily
 

@@ -3,7 +3,7 @@
 chad is a local, single-user, Apple-Silicon coding agent: one MLX engine, one five-tool
 surface, one agent loop. Why it is built this way is in `docs/design.md`; what each module
 does, and which tests guard it, is the table in
-[`docs/design.md#architecture-map`](docs/design.md#architecture-map). Read those before
+[`docs/architecture.md#architecture-map`](docs/architecture.md#architecture-map). Read those before
 proposing a redesign — this file does not repeat them.
 
 ## Gate
