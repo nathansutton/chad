@@ -8,7 +8,13 @@ tests/test_openai_engine.py; the deltas ARE the point: token-id prompts go over 
 wire verbatim (no decode), and server timings produce exact (non-approximate) stats.
 """
 
-from chad.base_engine import THINK_CLOSE, BaseEngine, TailWatch, think_ceiling_hit
+from chad.base_engine import (
+    THINK_CLOSE,
+    BaseEngine,
+    GenStats,
+    TailWatch,
+    think_ceiling_hit,
+)
 from chad.completion_engine import (
     CompletionEngine,
     build_completion_body,
@@ -464,3 +470,15 @@ def test_generate_salvage_does_not_refire_on_the_injected_close():
     assert stats.salvaged is True
     assert len(bodies) == 2, "salvaged more than once — the injected close was missed"
     assert THINK_CLOSE in text
+
+
+def test_note_round_keeps_a_histogram_per_width_and_phase():
+    """Entry i of a width's row counts the rounds that accepted exactly i drafts; rounds
+    drafted after </think> closed are kept apart from the reasoning ones."""
+    stats = GenStats()
+    for k, n_acc, acting in [(4, 0, False), (4, 0, False), (4, 4, False), (2, 1, False),
+                             (4, 3, True)]:
+        stats.note_round(k, n_acc, acting)
+    assert stats.draft_hist == {4: [2, 0, 0, 0, 1], 2: [0, 1, 0]}
+    assert stats.draft_hist_acting == {4: [0, 0, 0, 1, 0]}
+    assert GenStats().draft_hist is not stats.draft_hist      # no shared default

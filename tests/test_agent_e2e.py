@@ -823,6 +823,56 @@ def test_interrupt_ends_turn_and_marks_agent():
     assert last["role"] == "assistant"
     assert last["content"].startswith("still reasoning")
     assert last["content"].endswith("</think>")
+    # The cut step never closed its think, so it is reasoning end to end — the step a
+    # wall clock interrupts is the runaway, and it must not read as zero thinking.
+    cut = max(1, len(script[1]) // 4)
+    assert agent.think_tokens > cut and agent.gen_tokens > agent.think_tokens
+
+
+class _StreamingEngine(ScriptedEngine):
+    """Streams each turn one character per token and, at `peek_at` tokens, reads the
+    trajectory file back — what a harness tailing a live trial would see."""
+
+    def __init__(self, script, path, peek_at):
+        super().__init__(script)
+        self.path, self.peek_at, self.seen = path, peek_at, None
+
+    def generate(self, prompt_ids, max_tokens=2048, on_token=None, **kw):
+        text = self.script[self._i]
+        self._i += 1
+        for n, ch in enumerate(text, 1):
+            on_token(ch)
+            if n == self.peek_at and self.seen is None:
+                with open(self.path, encoding="utf-8") as f:
+                    self.seen = json.load(f)
+        return text, GenStats(prompt_tokens=len(prompt_ids), generated_tokens=len(text))
+
+
+def test_trajectory_shows_the_step_in_flight_then_the_real_one(tmp_path):
+    """A think that never ends leaves no message, so the trajectory carries the partial
+    text while it is being generated, and swaps in the real step once it lands."""
+    from chad import atif
+    path = str(tmp_path / "trial.json")
+    atif.start(path)
+    try:
+        think = "trace it by hand " * 20                      # > PENDING_EVERY characters
+        eng = _StreamingEngine([think + "</think>\n\nall done"], path, atif.PENDING_EVERY)
+        Agent(eng, mode="yolo", thinking=True).run_turn("solve it", stream=False)
+    finally:
+        atif._reset_for_tests()
+
+    live = eng.seen["steps"][-1]
+    assert live["extra"] == {"in_flight": True, "generated_tokens": atif.PENDING_EVERY}
+    assert live["reasoning_content"] == think[:atif.PENDING_EVERY] and live["message"] == ""
+
+    with open(path, encoding="utf-8") as f:
+        final = json.load(f)
+    assert all(not (s.get("extra") or {}).get("in_flight") for s in final["steps"])
+    done = final["steps"][-1]
+    assert done["metrics"]["extra"]["finish"] == "eos"
+    assert done["metrics"]["extra"]["think_tokens"] > 0
+    assert final["final_metrics"]["extra"]["total_think_tokens"] == \
+        done["metrics"]["extra"]["think_tokens"]
 
 
 def test_interrupt_while_a_tool_call_is_generated_does_not_dispatch_it(tmp_path):
