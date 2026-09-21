@@ -41,10 +41,12 @@ Two areas corrupt more than the line you touched, so lean on the existing tests:
 ## Model-visible changes need a conversation
 
 Prompts, tool schemas, guardrails, the engine and compaction change **model-visible
-behavior**. Those are validated on the maintainer's private eval rig, which a PR cannot
-run and which self-skips here for lack of weights, so the unit tests alone cannot carry
-them. Open an issue describing the change before building it, or the work stalls waiting
-on an eval pass you cannot see.
+behavior**, which the unit tests cannot measure. `benchmarks/polyglot` can, on your own
+Mac: pin a pool of tasks a baseline passes only sometimes (`stats.py pool`, from a
+published baseline via `fetch.py` or your own run with `--reps 2` or more), run that pool
+on `main` and on your branch, and bring the `stats.py compare` output with the PR. Open an
+issue describing the change first: a paired run costs a night, so agree on what it should
+show before spending it.
 
 ## Dependency pins are load-bearing
 

@@ -50,12 +50,14 @@ weights.
 ## What needs a conversation first
 
 Anything that changes **model-visible behavior**: prompts, tool schemas, guardrails, the
-engine, compaction. These are validated on the maintainer's **private eval rig** (the
-core/hard/realworld/brutal tiers that self-skip here for lack of weights), which a PR can't
-run. I can't merge a behavior change on the unit tests alone; I have to take it to the rig
-myself. So please **open an issue and describe the change before building it**, or your PR
-may stall waiting on an eval pass you can't see. That is how a RAM-bound local model gets
-kept honest.
+engine, compaction. Unit tests can't say whether a change like that helps, so it should
+arrive with a measurement, and [`benchmarks/polyglot`](benchmarks/polyglot/README.md) is
+one you can run on your own Mac. Pin a pool of tasks a baseline passes only sometimes,
+run the pool on `main` and on your branch, and paste the `stats.py compare` output (an
+exact sign test, paired by task) into the PR; the kit's README has the commands. Please
+**open an issue and describe the change before building it**: a paired run costs a night,
+and it is worth agreeing on what it should show first. That is how a RAM-bound local
+model gets kept honest.
 
 ## Dev setup
 

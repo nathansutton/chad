@@ -12,8 +12,9 @@ environment approval — publishes `chad-code` to PyPI.
    make gate
    ```
 2. **Behavior changes eval'd.** Anything model-visible since the last release
-   (prompts, tool schemas, guardrails, engine, compaction) has been through the
-   private eval rig (see CONTRIBUTING.md — the unit gate alone is not enough).
+   (prompts, tool schemas, guardrails, engine, compaction) has a paired polyglot
+   comparison against the last release (`benchmarks/polyglot/stats.py compare`; see
+   CONTRIBUTING.md — the unit gate alone is not enough).
 3. **CHANGELOG.md**: move `[Unreleased]` under the new version heading with the
    date. If the model itself was bumped, say so explicitly — a *model* bump is
    what tells users a re-download is coming and old snapshots can be freed.

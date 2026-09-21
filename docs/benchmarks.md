@@ -411,6 +411,8 @@ the harness, and a later turn waits 1 s or 39 s, on the same weights.
 
 ---
 
-*Day-to-day correctness is tracked in a private eval suite (it seeds repos, runs the agent,
-and verifies the actual edit) and is not quoted here. This page stays focused on the numbers
-you can reproduce yourself: `chad-bench` and `benchmarks/stock/`.*
+*Correctness is measured by [`benchmarks/polyglot`](../benchmarks/polyglot/README.md): 215
+exercises in six languages, run by the shipped agent on the laptop. Its pass rates are not
+quoted here, because its job is telling two builds apart with a paired test, not ranking
+chad. This page stays focused on the numbers you can reproduce yourself: `chad-bench` and
+`benchmarks/stock/`.*
