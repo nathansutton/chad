@@ -191,7 +191,7 @@ optional MCP server, add this entry to either MCP configuration file:
   "mcpServers": {
     "memcode": {
       "type": "http",
-      "url": "https://mcp.memcode.in/mcp",
+      "url": "https://mcp.memcode.in/i/chad/mcp",
       "auth": "oauth"
     }
   }
