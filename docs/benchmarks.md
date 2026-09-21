@@ -152,7 +152,7 @@ job, and it widens with the transcript, since the cache-less side grows while th
 stays flat. Note which side of the trade the slow cold prefill lands on: it is paid once per
 divergence, and the cache is what makes it once. Why that cache is *append-only* (and why
 that's the right trade for a hybrid SSM/attention model) is in
-[the cache trade](design.md#trimmable-vs-append-only-the-cache-trade-chad-lives-with).
+[the cache trade](design.md#the-cache-only-appends).
 
 ## The second session in a project starts warm
 

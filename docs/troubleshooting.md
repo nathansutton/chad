@@ -19,7 +19,7 @@ machine is broken" from "the model struggled with my task" in about a minute.
 | A turn burns minutes without landing an edit | runaway turn | the [governor](configuration.md#turn-budgets--think-cap) already ends it for one-shot runs; interactively, ctrl-c and re-scope the ask smaller |
 | The same `sed -n` / `rg` run over and over | the loop guard counts identical calls across the whole turn and will abort it, so the ask is likely too vague | a smaller, concrete task; **name the file** you want changed |
 | First turn in a **new** project takes over a minute before anything happens | cold warm-prefix: the system+tools KV has to be built once per distinct system prompt | expected once, then it is ~5 s. The banner's `[warm start: N prefix tokens from disk cache]` tells you which turn you are having (see [benchmarks](benchmarks.md#the-second-session-in-a-project-starts-warm)) |
-| First token slow after `/compact` or a truncation | one-time full re-prefill (the cache is non-trimmable); the status line shows an advancing % | expected: this is the cache trade chad lives with; see [Design & internals](design.md#trimmable-vs-append-only-the-cache-trade-chad-lives-with) |
+| First token slow after `/compact` or a truncation | one-time full re-prefill (the cache is non-trimmable); the status line shows an advancing % | expected: this is the cache trade chad lives with; see [Design & internals](design.md#the-cache-only-appends) |
 
 ## Memory
 

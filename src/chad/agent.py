@@ -584,7 +584,7 @@ class Agent:
         # ATIF trajectory capture, off unless CHAD_TRAJECTORY_JSON is set.
         self._atif = atif.recorder()
         self._atif_seg = self._atif.new_segment() if self._atif else None
-        self._atif_stats: list = []   # one entry per successful generate, in step order
+        self._atif_stats: list[atif.StepStat] = []   # one per stored assistant turn, in order
         if self._atif and self._atif.model_name is None:
             self._atif.model_name = engine.model_id
         self.interrupted = False
@@ -914,6 +914,7 @@ class Agent:
         if self._atif is None or self._atif_seg is None:
             return
         try:
+            self._atif.set_pending(self._atif_seg, None)   # its message has landed by now
             self._atif.set_segment(
                 self._atif_seg,
                 atif.steps_from_messages(self.messages, self._atif.model_name,
@@ -921,6 +922,18 @@ class Agent:
             self._atif.dump()
         except Exception as e:      # never let telemetry break a turn
             log.warning("atif: sync failed: %s", e)
+
+    def _atif_pending(self, text: str, thinking: bool, generated: int, started: str) -> None:
+        """Show the step still being generated: the one a runaway `<think>` never finishes,
+        and so the one a rebuild from `messages` can never contain."""
+        if self._atif is None or self._atif_seg is None:
+            return
+        try:
+            self._atif.set_pending(self._atif_seg, atif.pending_step(
+                text, thinking, self._atif.model_name, generated, started))
+            self._atif.dump()
+        except Exception as e:      # never let telemetry break a turn
+            log.warning("atif: pending dump failed: %s", e)
 
     def run_turn(self, user_text: str, stream=True):
         """Thin wrapper so the trajectory is flushed on EVERY exit from the turn —
@@ -1185,11 +1198,18 @@ class Agent:
 
             view = _StreamView(self._emit, started_in_think=step_thinking) if stream else None
             gen_count = [0]  # decoded chunks this step (~tokens); fed to the live ↓ counter
+            atif_parts: list[str] = []      # this step's text so far, kept only when recording
+            atif_started = atif.now() if self._atif else ""
 
             def on_token(t):
                 if view:
                     view.feed(t)
                 gen_count[0] += 1
+                if self._atif:
+                    atif_parts.append(t)
+                    if gen_count[0] % atif.PENDING_EVERY == 0:
+                        self._atif_pending("".join(atif_parts), step_thinking,
+                                           gen_count[0], atif_started)
                 # Throttle: a status emit per ~16 tokens keeps the queue cheap while the
                 # bottom-line ↓ counter still climbs visibly (the refresher renders ~20 Hz).
                 if gen_count[0] % 16 == 0:
@@ -1233,12 +1253,6 @@ class Agent:
             # non-trimmable cache its decoded text won't re-tokenize identically, so it
             # also forces the next-step re-prefill). Tracked so the no-call branch can
             # tell "truncated mid-thought" apart from "deliberately answered."
-            if self._atif:   # one entry per SUCCESSFUL generate — a retried step appends
-                             # nothing, keeping this list aligned with assistant messages
-                self._atif_stats.append(
-                    {"prompt_tokens": stats.prompt_tokens,
-                     "cached_tokens": stats.cached_tokens,
-                     "generated_tokens": stats.generated_tokens})
             hit_cap = stats.generated_tokens >= self.max_gen_tokens
             # Close-and-continue fired: the engine force-closed a runaway <think>
             # and decoded the action in the same step. Counted for autopsy (a salvaged step
@@ -1268,6 +1282,40 @@ class Agent:
             # content.
             text = _SPECIAL_TOKEN_RE.sub("", text).rstrip()
 
+            # Estimate reasoning overhead: the generation opens inside <think> (the
+            # template emits the opening tag), so everything up to </think> is thinking,
+            # and a thinking step that never closed the block — cut by a soft cap, the
+            # token cap or an interrupt — is reasoning end to end. Counted before the
+            # interrupt return below: the step a wall clock cuts is the runaway think,
+            # and dropping it made the longest reasoning in a run read as none at all.
+            # (A repetition stop that fired after </think> takes the fraction path.)
+            if "</think>" in text:
+                frac = len(text.split("</think>", 1)[0]) / len(text)
+                _think_delta = int(stats.generated_tokens * frac)
+            elif step_thinking or stats.stop_condition_fired:
+                _think_delta = stats.generated_tokens
+            else:
+                _think_delta = 0
+            self.think_tokens += _think_delta
+            if self._atif and text:   # one entry per STORED assistant turn — an interrupt
+                                      # with no text stores none, and the list stays aligned
+                finish = ("interrupted" if self._should_stop() else
+                          "max_tokens" if hit_cap else
+                          "repeat_stop" if rep_fired[0] else
+                          "think_cap" if stats.stop_condition_fired else "eos")
+                self._atif_stats.append(atif.StepStat(
+                    prompt_tokens=stats.prompt_tokens, cached_tokens=stats.cached_tokens,
+                    generated_tokens=stats.generated_tokens, think_tokens=_think_delta,
+                    prefill_s=stats.prefill_s, gen_s=stats.gen_s, forwards=stats.forwards,
+                    draft_proposed=stats.draft_proposed,
+                    draft_accepted=stats.draft_accepted, finish=finish,
+                    salvaged=stats.salvaged, compacted=compacted,
+                    # "before </think>" is reasoning only when the step opened in a
+                    # think block; a no-think step drafted its whole turn as action.
+                    draft_hist_think=stats.draft_hist if step_thinking else {},
+                    draft_hist_act=stats.draft_hist_acting if step_thinking
+                    else stats.draft_hist))
+
             # Interrupted (often mid-prefill, so text is empty): stop cleanly without
             # appending an empty assistant turn.
             if self._should_stop():
@@ -1283,22 +1331,6 @@ class Agent:
             # step on the non-trimmable cache). See close_unclosed_think.
             self.messages.append({"role": "assistant",
                                   "content": close_unclosed_think(text, step_thinking)})
-
-            # Estimate reasoning overhead: the generation opens inside <think> (the
-            # template emits the opening tag), so everything up to </think> is thinking.
-            # A soft-cap stop fires only while still inside <think>, so ALL of
-            # this step's tokens are reasoning — count them so think-token telemetry (the
-            # metric the budget is measured against) doesn't under-report the capped runs.
-            # (A repetition stop can also land inside think — same accounting; one that
-            # fired after </think> falls to the fraction path below like any other turn.)
-            if stats.stop_condition_fired and "</think>" not in text:
-                _think_delta = stats.generated_tokens
-            elif "</think>" in text and len(text):
-                frac = len(text.split("</think>", 1)[0]) / len(text)
-                _think_delta = int(stats.generated_tokens * frac)
-            else:
-                _think_delta = 0
-            self.think_tokens += _think_delta
 
             # Per-step first, turn-cumulative second. The cumulative ratio alone can't
             # show a step where drafting actually paid: a run of span-heavy tool-call

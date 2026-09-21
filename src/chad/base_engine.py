@@ -129,6 +129,17 @@ class GenStats:
                                     # that can't report cached_tokens / per-forward
                                     # accounting sets this so callers know the
                                     # throughput/prefill numbers are estimates.
+    draft_hist: dict[int, list[int]] = field(default_factory=dict)
+    draft_hist_acting: dict[int, list[int]] = field(default_factory=dict)
+                                    # block-drafter rounds by proposed width k: entry i
+                                    # counts the rounds that accepted exactly i of the k.
+                                    # The two totals above say how much drafting paid;
+                                    # this says WHERE the walk stops — a wall at 0 is a
+                                    # head that misses the first token, a tail at k is a
+                                    # width too narrow for the text. `_acting` holds the
+                                    # rounds drafted after </think> closed, the rest are
+                                    # reasoning: the two phases accept very differently,
+                                    # and one blended ratio describes neither.
     gen_ids: list = field(default_factory=list)
                                     # the token ids generated this turn. The engine knows
                                     # them exactly; a caller must never re-derive them by
@@ -136,6 +147,12 @@ class GenStats:
                                     # path (the prompt-lookup path stores what it FED the
                                     # cache, which omits the final pending token, and an
                                     # OOM empties it).
+
+    def note_round(self, k: int, n_acc: int, acting: bool) -> None:
+        """Count one drafted round (k > 0) into its phase's histogram."""
+        row = (self.draft_hist_acting if acting else self.draft_hist).setdefault(
+            k, [0] * (k + 1))
+        row[n_acc] += 1
 
     @property
     def tok_per_s(self) -> float:

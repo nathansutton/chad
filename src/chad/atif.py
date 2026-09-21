@@ -26,6 +26,17 @@ reasoning_content, tool_calls[], observation, metrics, model_name}`. Every model
 `extra: "forbid"`, and a validator requires each `observation.results[].source_call_id`
 to name a `tool_call_id` **in the same step** — hence one step carries both a turn's tool
 calls and their results.
+
+**What a step cost.** The schema's three token counts cannot tell a step that reasoned for
+twenty minutes from one that decoded a long file, so each agent step's `metrics.extra`
+carries the rest of what the engine measured (`StepStat`): the reasoning slice, prefill and
+decode seconds, speculative yield, and why the generation ended.
+
+**The step in flight.** A rebuild from `messages` only ever shows finished steps, and the
+step worth seeing is the one that never finishes — a runaway `<think>` a harness kills at
+its timeout leaves no message behind. So the agent hands over the partial text every
+`PENDING_EVERY` tokens and the document ends in one step marked `extra.in_flight`, replaced
+by the real step once its message lands.
 """
 
 import json
@@ -35,6 +46,8 @@ import re
 import tempfile
 import threading
 import uuid
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -48,7 +61,7 @@ SCHEMA_VERSION = "ATIF-v1.7"
 _THINK_BLOCK = re.compile(r"<think>(.*?)</think>", re.S)
 
 
-def _now() -> str:
+def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -64,14 +77,66 @@ def split_think(text: str) -> tuple[str, str]:
     return reasoning, strip_think(text)
 
 
-def _metrics(stat: dict) -> dict:
+PENDING_EVERY = 256     # tokens between rewrites of the in-flight step (~10 s of decode)
+
+
+@dataclass(frozen=True)
+class StepStat:
+    """What one generation cost, as the engine measured it. `finish` names why it ended:
+    `eos`, `max_tokens`, `think_cap`, `repeat_stop` or `interrupted`."""
+    prompt_tokens: int = 0          # newly prefilled — excludes the cached prefix
+    cached_tokens: int = 0
+    generated_tokens: int = 0
+    think_tokens: int = 0
+    prefill_s: float = 0.0
+    gen_s: float = 0.0
+    forwards: int = 0
+    draft_proposed: int = 0
+    draft_accepted: int = 0
+    finish: str = "eos"
+    salvaged: bool = False
+    compacted: bool = False         # compaction shrank the render, so this step's prefill
+                                    # is a re-prefill of kept context, not new content
+    # Drafted rounds by proposed width k: entry i counts the rounds that accepted exactly
+    # i of the k. Split by phase, because reasoning and a tool call accept differently.
+    draft_hist_think: Mapping[int, Sequence[int]] = field(default_factory=dict)
+    draft_hist_act: Mapping[int, Sequence[int]] = field(default_factory=dict)
+
+
+def _draft_phase(hist: Mapping[int, Sequence[int]]) -> dict[str, JsonValue]:
+    """One phase's drafting: totals, the per-verify yield, and the histogram itself.
+    JSON keys are strings, so the width is spelled out."""
+    rounds = sum(sum(row) for row in hist.values())
+    proposed = sum(k * sum(row) for k, row in hist.items())
+    accepted = sum(i * n for row in hist.values() for i, n in enumerate(row))
+    return {"rounds": rounds, "proposed": proposed, "accepted": accepted,
+            "accepted_per_round": round(accepted / rounds, 2) if rounds else 0.0,
+            "first_token_miss": round(sum(row[0] for row in hist.values()) / rounds, 3)
+            if rounds else 0.0,
+            "by_width": {str(k): list(row) for k, row in sorted(hist.items())}}
+
+
+def _metrics(stat: StepStat) -> dict[str, JsonValue]:
     """chad's GenStats counts `prompt_tokens` as tokens *actually prefilled*, excluding the
     prefix served from cache. ATIF's `prompt_tokens` is documented as including cached
     tokens, so add them back — otherwise a warm KV cache reads as a shrinking prompt."""
-    prompt = stat.get("prompt_tokens", 0) + stat.get("cached_tokens", 0)
-    return {"prompt_tokens": prompt,
-            "completion_tokens": stat.get("generated_tokens", 0),
-            "cached_tokens": stat.get("cached_tokens", 0)}
+    extra: dict[str, JsonValue] = {
+        "think_tokens": stat.think_tokens, "prefill_s": round(stat.prefill_s, 2),
+        "gen_s": round(stat.gen_s, 2),
+        "tok_per_s": round(stat.generated_tokens / stat.gen_s, 1) if stat.gen_s > 0 else 0.0,
+        "forwards": stat.forwards,
+        "draft_proposed": stat.draft_proposed, "draft_accepted": stat.draft_accepted,
+        "finish": stat.finish}
+    if stat.salvaged:
+        extra["salvaged"] = True
+    if stat.compacted:
+        extra["compacted"] = True
+    if stat.draft_hist_think or stat.draft_hist_act:
+        extra["draft"] = {"think": _draft_phase(stat.draft_hist_think),
+                          "act": _draft_phase(stat.draft_hist_act)}
+    return {"prompt_tokens": stat.prompt_tokens + stat.cached_tokens,
+            "completion_tokens": stat.generated_tokens,
+            "cached_tokens": stat.cached_tokens, "extra": extra}
 
 
 # First-seen timestamps, keyed by the identity of the message each step describes.
@@ -90,7 +155,7 @@ def _metrics(stat: dict) -> dict:
 _STAMPS: dict[int, tuple[dict, str]] = {}
 
 
-def _stamp(m: dict, clock: Callable[[], str] = _now) -> str:
+def _stamp(m: dict, clock: Callable[[], str] = now) -> str:
     """The time `m` was first seen in a rebuild, minted on first sight."""
     hit = _STAMPS.get(id(m))
     if hit is not None and hit[0] is m:
@@ -100,8 +165,27 @@ def _stamp(m: dict, clock: Callable[[], str] = _now) -> str:
     return ts
 
 
+def pending_step(text: str, thinking: bool, model_name: Optional[str], generated: int,
+                 started: str) -> dict[str, JsonValue]:
+    """The step still being generated, from the text decoded so far.
+
+    On a thinking step the template opened `<think>`, so text with no close tag yet is all
+    reasoning — `split_think` alone would file it as the visible message."""
+    if thinking and "</think>" not in text:
+        reasoning, visible = text, ""
+    else:
+        reasoning, visible = split_think(text)
+    step: dict[str, JsonValue] = {"source": "agent", "message": visible, "timestamp": started,
+                                  "extra": {"in_flight": True, "generated_tokens": generated}}
+    if model_name:
+        step["model_name"] = model_name
+    if reasoning.strip():
+        step["reasoning_content"] = reasoning
+    return step
+
+
 def steps_from_messages(messages: list, model_name: Optional[str],
-                        stats: list, clock: Callable[[], str] = _now) -> list[dict]:
+                        stats: list[StepStat], clock: Callable[[], str] = now) -> list[dict]:
     """Convert one Agent's `messages` into ATIF steps (without global `step_id`s).
 
     A `role: "tool"` message is not a step — it is an *observation* attached to the
@@ -167,6 +251,33 @@ def steps_from_messages(messages: list, model_name: Optional[str],
     return steps
 
 
+def _totals(mets: list[dict]) -> dict[str, JsonValue]:
+    """The trial in one row: what a score table needs without re-reading every step."""
+    prompt = sum(m["prompt_tokens"] for m in mets)
+    gen_s = sum(m["extra"]["gen_s"] for m in mets)
+    out: dict[str, JsonValue] = {
+        "total_think_tokens": sum(m["extra"]["think_tokens"] for m in mets),
+        "total_gen_s": round(gen_s, 2),
+        "total_prefill_s": round(sum(m["extra"]["prefill_s"] for m in mets), 2),
+        "tok_per_s": round(sum(m["completion_tokens"] for m in mets) / gen_s, 1)
+        if gen_s > 0 else 0.0,
+        "cache_hit_rate": round(sum(m["cached_tokens"] for m in mets) / prompt, 3)
+        if prompt else 0.0,
+        "compactions": sum(1 for m in mets if m["extra"].get("compacted")),
+        "finishes": {f: sum(1 for m in mets if m["extra"]["finish"] == f)
+                     for f in sorted({m["extra"]["finish"] for m in mets})}}
+    for phase in ("think", "act"):
+        blocks = [m["extra"]["draft"][phase] for m in mets if "draft" in m["extra"]]
+        rounds = sum(b["rounds"] for b in blocks)
+        if rounds:
+            proposed = sum(b["proposed"] for b in blocks)
+            accepted = sum(b["accepted"] for b in blocks)
+            out[f"draft_{phase}"] = {
+                "rounds": rounds, "accept_rate": round(accepted / proposed, 3),
+                "accepted_per_round": round(accepted / rounds, 2)}
+    return out
+
+
 def _pkg_version() -> str:
     """The installed chad-code version, for the trajectory's agent.version field.
     Was a hardcoded literal, which silently rots on every release — a leaderboard
@@ -191,6 +302,7 @@ class TrajectoryRecorder:
         self.session_id = str(uuid.uuid4())
         self.model_name: Optional[str] = None
         self._segments: list[list[dict]] = []
+        self._pending: dict[int, dict[str, JsonValue]] = {}
         self._lock = threading.Lock()
 
     def new_segment(self) -> int:
@@ -208,9 +320,21 @@ class TrajectoryRecorder:
             if 0 <= idx < len(self._segments):
                 self._segments[idx] = steps
 
+    def set_pending(self, idx: int, step: Optional[dict[str, JsonValue]]) -> None:
+        """Set or clear (None) the in-flight step that trails segment `idx`."""
+        with self._lock:
+            if step is None:
+                self._pending.pop(idx, None)
+            else:
+                self._pending[idx] = step
+
     def to_dict(self) -> dict:
         with self._lock:
-            steps = [s for seg in self._segments for s in seg]
+            steps = []
+            for idx, seg in enumerate(self._segments):
+                steps.extend(seg)
+                if idx in self._pending:
+                    steps.append(dict(self._pending[idx]))
         for n, s in enumerate(steps, 1):     # ATIF: sequential from 1, document-wide
             s["step_id"] = n
         agent: dict[str, JsonValue] = {"name": self.agent_name, "version": self.agent_version}
@@ -227,7 +351,8 @@ class TrajectoryRecorder:
                 "total_prompt_tokens": sum(m["prompt_tokens"] for m in mets),
                 "total_completion_tokens": sum(m["completion_tokens"] for m in mets),
                 "total_cached_tokens": sum(m["cached_tokens"] for m in mets),
-                "total_steps": len(steps)}
+                "total_steps": len(steps),
+                "extra": _totals(mets)}
         return doc
 
     def dump(self) -> None:
@@ -261,6 +386,15 @@ def recorder() -> Optional[TrajectoryRecorder]:
         path = config.env_str("CHAD_TRAJECTORY_JSON")
         if path:
             _RECORDER = TrajectoryRecorder(path)
+    return _RECORDER
+
+
+def start(path: str) -> TrajectoryRecorder:
+    """Install a fresh process recorder writing to `path`, for a driver that runs many
+    trials in one process and wants a document per trial. Agents built afterwards record
+    into it; one built earlier keeps the recorder it was constructed with."""
+    global _RECORDER, _INIT
+    _RECORDER, _INIT = TrajectoryRecorder(path), True
     return _RECORDER
 
 
