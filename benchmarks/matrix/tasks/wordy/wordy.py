@@ -1,2 +1,0 @@
-def answer(question):
-    pass

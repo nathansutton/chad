@@ -1,13 +1,13 @@
 """ATIF (Agent Trajectory Interchange Format) v1.7 trajectory emitter.
 
-The Terminal-Bench leaderboard requires an ATIF trajectory for **every passing trial**
-(the Apr-2026 "Leaderboard Integrity Update"). Harbor's built-in agents get this for free
-by subclassing its agent base; chad is driven as a CLI, so it has to emit the document
-itself or a submission is rejected.
+A trial's row says whether it passed; its trajectory says where the tokens and the seconds
+went, step by step, and `benchmarks/polyglot/trace.py` reads one back as a table — even
+while the trial is still running. The document is ATIF, Harbor's published schema, rather
+than a private format, so a trajectory another harness wrote reads the same way.
 
-Set `CHAD_TRAJECTORY_JSON=/path/trajectory.json` to turn this on. It is a pure observer:
-nothing here changes agent behavior, and any failure is swallowed (a benchmark harness
-must never lose a trial because telemetry broke).
+Set `CHAD_TRAJECTORY_JSON=/path/trajectory.json`, or call `start()`, to turn this on. It
+is a pure observer: nothing here changes agent behavior, and any failure is swallowed (a
+benchmark harness must never lose a trial because telemetry broke).
 
 **Why derive from `agent.messages` rather than instrument the tool dispatch.**
 `run_turn` appends `{"role": "tool", ...}` from ~9 different sites (validation rejects,

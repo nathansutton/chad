@@ -143,8 +143,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-# Vendored Exercism exercises (benchmarks/matrix/tasks/) are upstream files, kept byte-identical.
-extend-exclude = ["benchmarks/matrix/tasks", "tools/anti_slop"]  # vendored linter: not chad's style
+extend-exclude = ["tools/anti_slop"]  # vendored linter: not chad's style
 src = ["src", "tests"]
 
 [tool.ruff.lint]
@@ -217,7 +216,6 @@ exclude = [
     ".agents/**",
     ".claude/**",
     "src/chad/parakeet/**",          # vendored upstream, not held to chad's gate (see ruff/mypy)
-    "benchmarks/matrix/tasks/**",    # vendored Exercism exercises, kept byte-identical
     "benchmarks/polyglot/_data/**",  # fetched upstream exercises and toolchain caches
     "benchmarks/polyglot/_work/**",  # trial workspaces: upstream tests plus model output
     "tools/anti_slop/**",

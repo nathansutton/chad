@@ -63,7 +63,7 @@ environment approval — publishes `chad-code` to PyPI.
    reproduce on their own Mac (`chad-bench`, `benchmarks/stock/`) and nothing else: no
    task pass-rates, no leaderboard placings, no numbers against other agents or hosted
    models. The premise is a 24 GB laptop with the model in-process, and anything measured
-   elsewhere — including `benchmarks/tb2/`, which serves the weights from another machine
-   into a container — describes a different system. If a release changes the model or
+   elsewhere — a server feeding the weights into a container, say — describes a different
+   system. If a release changes the model or
    the engine, re-run the two kits on the release build and refresh the tables in the
    same commit as the version bump.

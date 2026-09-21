@@ -176,7 +176,7 @@ The cold column is a real cost and worth stating plainly: the first turn in a *n
 spends over a minute reading a system prompt before it does anything you asked for. Until
 2.0.3 every new directory paid it, because the checkpoint was keyed on the whole system
 prompt, cwd and workspace listing included, and a fresh directory could never hit it
-(`benchmarks/matrix` measured 32 of 32 fresh-directory cells missing, 24 s each; on 2.0.3
+(the [nine-harness grid](#nine-harnesses-one-laptop-what-the-agent-loop-costs) measured 32 of 32 fresh-directory cells missing, 24 s each; on 2.0.3
 three nights of the same grid have 47 of 48 restoring the head and prefilling a
 ~320-token tail in 3.2-3.6 s). Now there are two checkpoints: the full prefix, which a restart in the same
 project restores outright, and its project-independent head (the tool schemas and
@@ -396,7 +396,7 @@ where the drafter is available it is strictly the better of the two.
 
 The rows above are engine numbers: how fast one process reads and writes tokens. They say
 nothing about what a person feels once an agent loop sits on top, and that turned out to
-be decided by the harness, not the engine. `benchmarks/matrix/` runs nine coding agents
+be decided by the harness, not the engine. A grid ran nine coding agents
 (pi, opencode, chad, deepseek-harness, goose, mini-swe-agent, crush, cline, codex) against
 **one** `llama-server` on the same GGUF, same eight Exercism tasks, same sampler forced on
 every request by a proxy, and records from the server's side what each harness made it
@@ -404,8 +404,8 @@ read: the first-turn prompt, the uncached tokens per later turn, the wait each o
 cost, the cache-reuse rate, and the side requests fired beside the agent loop. Same
 harness on chad's MLX engine is the engine cell.
 
-The committed run (`benchmarks/matrix/_runs/`), its method, its versions and its caveats
-are in [`benchmarks/matrix/README.md`](../benchmarks/matrix/README.md). The short form:
+The grid is archived: its runner, method, versions, caveats and every row it recorded are at
+the tag [`archive/matrix-nine-harnesses`](https://github.com/nathansutton/chad/tree/archive/matrix-nine-harnesses/benchmarks/matrix). The short form:
 on this laptop the first token arrives 13 s or 238 s after you press enter depending on
 the harness, and a later turn waits 1 s or 39 s, on the same weights.
 

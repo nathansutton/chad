@@ -15,43 +15,6 @@ dist/
 # Prefill-tax capture (raw session traces, may contain previews)
 traces/
 
-# TB2 reproduction kit — run artifacts stay local (benchmarks/tb2/README.md)
-benchmarks/tb2/dataset/
-benchmarks/tb2/jobs/
-benchmarks/tb2/*.tsv
-# Local model builds (quantize_q6.py default --out)
-benchmarks/tb2/models/
-# Harbor per-run log dirs (job configs + trial logs) — run artifacts, never published
-benchmarks/tb2/harbor_logs_*/
-
-# Search-tool selection measurement harness — stays local
-benchmarks/search/
-
-# Harness x engine grid (benchmarks/matrix/README.md): each measured night lives in its
-# own `_runs/repN-YYYYMMDD/` and its rows and turn records are committed; logs, kept
-# workdirs, captured request bodies and the generated provider configs stay local. The
-# per-night traces dir is re-included below the global `traces/` rule, minus the
-# trajectories (full model output). Anything else under `_runs/` is a scratch run.
-benchmarks/matrix/_runs/*/
-!benchmarks/matrix/_runs/rep[0-9]*/
-!benchmarks/matrix/_runs/rep[0-9]*/traces/
-benchmarks/matrix/_runs/rep[0-9]*/traces/*/trajectory.json
-benchmarks/matrix/_runs/rep[0-9]*/bodies/
-# Side runs are committed the same way, under a name that says what they measured, so the
-# scorecard never pools them with the nights: `goose-<version>-*` and `chad-<version>-*`.
-!benchmarks/matrix/_runs/goose-[0-9]*/
-!benchmarks/matrix/_runs/goose-[0-9]*/traces/
-benchmarks/matrix/_runs/goose-[0-9]*/traces/*/trajectory.json
-benchmarks/matrix/_runs/goose-[0-9]*/bodies/
-!benchmarks/matrix/_runs/chad-[0-9]*/
-!benchmarks/matrix/_runs/chad-[0-9]*/traces/
-benchmarks/matrix/_runs/chad-[0-9]*/traces/*/trajectory.json
-benchmarks/matrix/_runs/chad-[0-9]*/bodies/
-benchmarks/matrix/_cfg/
-# Working notes for the write-up, not part of the kit
-benchmarks/matrix/SPARKNOTES.md
-benchmarks/matrix/POST-DRAFT.md
-
 # `chad prove` scorecard rows — written to the invoking directory, per run
 /results.json
 

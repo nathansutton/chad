@@ -3,7 +3,7 @@
 Before 2.0.3 the warm-prefix checkpoint was keyed on the whole rendered system prompt —
 working directory, workspace listing and project docs included — so a session in a new
 directory could never hit it and paid the full ~2.5k-token cold prefill every time
-(measured: 32 of 32 fresh-directory cells in benchmarks/matrix missed, ~24 s each). Now
+(measured: 32 of 32 fresh-directory sessions missed, ~24 s each). Now
 the engine keeps two checkpoints: the FULL prefix (same project -> zero prefill) and its
 static HEAD, the tool schemas + behavioral prompt that are byte-identical in every
 project (any project -> restore the head, prefill only the per-project tail).
