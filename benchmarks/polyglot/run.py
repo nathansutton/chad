@@ -2,7 +2,8 @@
 
     uv run python benchmarks/polyglot/run.py --label baseline            # all valid tasks
     uv run python benchmarks/polyglot/run.py --label baseline --reps 3   # k=3, rep-major
-    uv run python benchmarks/polyglot/run.py --label arm-b --tasks-file results/pool.txt
+    uv run python benchmarks/polyglot/run.py --label arm-b \
+        --tasks-file benchmarks/polyglot/_runs/baseline/pool.txt
     CHAD_DISABLE=env_manifest uv run python benchmarks/polyglot/run.py --label no-manifest
 
 The agent under test is the one a user gets: the shipped model, the shipped sampler

@@ -1,8 +1,8 @@
 """Read trial rows: score a run, pin a discrimination pool, compare two arms by task.
 
-    python benchmarks/polyglot/stats.py score   results/baseline/trials.jsonl
-    python benchmarks/polyglot/stats.py pool    results/baseline/trials.jsonl > results/pool.txt
-    python benchmarks/polyglot/stats.py compare results/baseline/trials.jsonl results/arm-b/trials.jsonl
+    python benchmarks/polyglot/stats.py score   _runs/baseline/trials.jsonl
+    python benchmarks/polyglot/stats.py pool    _runs/baseline/trials.jsonl > _runs/baseline/pool.txt
+    python benchmarks/polyglot/stats.py compare _runs/baseline/trials.jsonl _runs/arm-b/trials.jsonl
 
 Stdlib only; nothing here loads a model.
 

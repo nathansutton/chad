@@ -1,18 +1,24 @@
-"""The polyglot eval kit's model-free parts: leak-proof workspaces, test restoration, and
-the paired statistics. Nothing here needs the upstream checkout, a toolchain or a model —
-exercises are built in tmp_path in upstream's layout."""
+"""The polyglot eval kit's model-free parts: leak-proof workspaces, test restoration, the
+paired statistics, and publishing a run without its local paths. Nothing here needs the
+upstream checkout, a toolchain, a model or the network — exercises and runs are built in
+tmp_path in the layouts upstream and `run.py` use."""
 import json
 import os
+import re
+import subprocess
 import sys
+import tarfile
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "benchmarks", "polyglot"))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO, "benchmarks", "polyglot"))
 
 import trace as kit_trace  # noqa: E402
 
 import catalog  # noqa: E402
+import fetch  # noqa: E402
+import publish  # noqa: E402
 import run  # noqa: E402
 import stats  # noqa: E402
 import workspace  # noqa: E402
@@ -183,3 +189,114 @@ def test_counts_rows_profile_without_their_trajectories(tmp_path):
     report = kit_trace.profile([], kit_trace.load_counts(str(rows)))
     assert report.splitlines()[0] == "2 trials, 3 tool calls"
     assert "prompt tokens" not in report
+
+
+def test_no_run_output_is_tracked():
+    out = subprocess.run(["git", "ls-files", "benchmarks"], cwd=REPO, capture_output=True,
+                         text=True, check=False)
+    if out.returncode != 0:
+        pytest.skip("not a git checkout")
+    run_output = re.compile(r"(^|/)(_runs|_work|_kv|_data|_publish|trajectories)/|trials\.jsonl$")
+    tracked = [p for p in out.stdout.splitlines()
+               if run_output.search(p) and not p.startswith("benchmarks/stock/_runs/")]
+    assert tracked == [], "run output belongs in a published bundle (publish.py), not in git"
+
+
+ROOTS = publish.Roots(home="/Users/tester", repo="/Users/tester/repo/chad",
+                      kit="/Users/tester/repo/chad/benchmarks/polyglot")
+WS = ROOTS.kit + "/_work/arm/rep1/go/bob"
+
+
+def _run_dir(root, message=f"cd {WS} && go test ./...", tail=""):
+    """A finished run in `run.py`'s layout, embedding the paths a real one does."""
+    run_dir = root / "arm"
+    (run_dir / "trajectories" / "go").mkdir(parents=True)
+    rows = [{"task": "go/bob", "language": "go", "rep": 1, "passed": True, "capped": False,
+             "wall_s": 12.0, "gen_tokens": 100, "test_tail": ""},
+            {"task": "go/two", "language": "go", "rep": 1, "passed": False, "capped": True,
+             "wall_s": 1199.8, "gen_tokens": 900,
+             "test_tail": tail or f"{WS}/bob_test.go:9: want 2 "
+                                  f"(full output: {ROOTS.home}/.cache/chad/spill/1/bash-1.log)"}]
+    (run_dir / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (run_dir / "meta.json").write_text(json.dumps({
+        "label": "arm", "started": "2026-09-21T17:26:45", "chad_version": "2.2.0",
+        "git_rev": "abc1234", "git_dirty": False, "model": ROOTS.repo + "/models/Qwen"}))
+    (run_dir / "trajectories" / "go" / "bob.rep1.json").write_text(
+        json.dumps({"steps": [{"source": "agent", "step_id": 1, "message": message}]}))
+    return run_dir
+
+
+def test_publish_rewrites_every_local_path(tmp_path):
+    out = tmp_path / "out"
+    b = publish.bundle(str(_run_dir(tmp_path)), str(out), ROOTS, with_trajectories=True)
+    rows = (out / "trials.jsonl").read_text()
+    assert "/Users/" not in rows
+    assert "./bob_test.go:9" in rows and "~/.cache/chad/spill/1/bash-1.log" in rows
+    assert json.loads((out / "meta.json").read_text())["model"] == "<repo>/models/Qwen"
+    with tarfile.open(out / publish.TRAJECTORIES) as tar:
+        assert tar.getnames() == ["trajectories/go/bob.rep1.json"]
+        member = tar.extractfile("trajectories/go/bob.rep1.json")
+        assert member is not None and b"cd . && go test" in member.read()
+    assert b.runs_row == ("| arm | 2026-09-21 | 2.2.0 (abc1234) | chad | Qwen | 2 × 1 | "
+                          "hf://datasets/nathansutton/chad-polyglot-runs/polyglot/arm | "
+                          f"{b.sha256} |")
+
+
+def test_rows_alone_unless_trajectories_are_asked_for(tmp_path):
+    publish.bundle(str(_run_dir(tmp_path)), str(tmp_path / "out"), ROOTS)
+    assert sorted(os.listdir(tmp_path / "out")) == ["meta.json", "trials.jsonl"]
+
+
+def test_a_prefix_is_only_rewritten_whole():
+    assert publish.redact("/Users/testerson/notes.txt", ROOTS) == "/Users/testerson/notes.txt"
+    assert publish.problems("/Users/testerson/notes.txt", ROOTS)
+    assert not publish.problems("the earlier `ls -la /Users/.../bob/` failed", ROOTS)
+
+
+@pytest.mark.parametrize("message, reason", [
+    (f"cat {ROOTS.home}/.ssh/config", "paths outside the workspace: ~/.ssh/config"),
+    ("ls /Users/someone-else/src", "an absolute home path survived"),
+    ("export HF_TOKEN=hf_" + "x1" * 17, "a credential-shaped string"),
+])
+def test_publish_refuses_what_must_not_leave_the_machine(tmp_path, message, reason):
+    with pytest.raises(publish.PublishError, match=re.escape(reason)) as refused:
+        publish.bundle(str(_run_dir(tmp_path, message)), str(tmp_path / "out"), ROOTS,
+                       with_trajectories=True)
+    assert "trajectories/go/bob.rep1.json" in str(refused.value)
+    assert not (tmp_path / "out").exists()
+
+
+def _ledger(tmp_path, b, sha256=None):
+    row = b.runs_row.replace("hf://datasets/nathansutton/chad-polyglot-runs/polyglot/arm",
+                             f"file://{b.path}")
+    if sha256:
+        row = row.replace(b.sha256, sha256)
+    path = tmp_path / "RUNS.md"
+    path.write_text(f"# Published runs\n\n{publish.RUNS_HEADER}\n|---|---|---|---|---|---|---|---|\n"
+                    f"{row}\n")
+    return fetch.read_ledger(str(path))
+
+
+def test_fetch_round_trips_a_bundle_to_the_same_score(tmp_path):
+    run_dir = _run_dir(tmp_path / "local")
+    b = publish.bundle(str(run_dir), str(tmp_path / "bundle"), ROOTS, with_trajectories=True)
+    dest = fetch.fetch(_ledger(tmp_path, b)["arm"], str(tmp_path / "runs"))
+    assert stats.score_report(stats.load_trials(os.path.join(dest, "trials.jsonl"))) == \
+        stats.score_report(stats.load_trials(str(run_dir / "trials.jsonl")))
+    assert os.path.exists(os.path.join(dest, "trajectories", "go", "bob.rep1.json"))
+    with pytest.raises(fetch.FetchError, match="already exists"):
+        fetch.fetch(_ledger(tmp_path, b)["arm"], str(tmp_path / "runs"))
+
+
+def test_fetch_refuses_rows_that_are_not_the_ones_recorded(tmp_path):
+    b = publish.bundle(str(_run_dir(tmp_path / "local")), str(tmp_path / "bundle"), ROOTS)
+    entry = _ledger(tmp_path, b, sha256="0" * 64)["arm"]
+    with pytest.raises(fetch.FetchError, match="sha256"):
+        fetch.fetch(entry, str(tmp_path / "runs"))
+    assert not (tmp_path / "runs" / "arm").exists()
+
+
+def test_the_committed_ledger_has_the_columns_fetch_reads():
+    with open(fetch.LEDGER, encoding="utf-8") as f:
+        assert publish.RUNS_HEADER in f.read()
+    assert isinstance(fetch.read_ledger(fetch.LEDGER), dict)

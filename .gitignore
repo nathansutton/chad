@@ -18,9 +18,7 @@ traces/
 # `chad prove` scorecard rows — written to the invoking directory, per run
 /results.json
 
-# Polyglot eval kit (benchmarks/polyglot/README.md): the upstream exercises, toolchain
-# caches and trial workspaces are fetched or built locally; results/ is what is committed.
-benchmarks/polyglot/_data/
-benchmarks/polyglot/_work/
-benchmarks/polyglot/_kv/
-benchmarks/polyglot/_runs/
+# Polyglot eval kit (benchmarks/polyglot/README.md): fetched exercises, toolchain caches,
+# trial workspaces, KV checkpoints, run output and publish bundles. Nothing a run produces
+# is committed; published runs are listed in benchmarks/polyglot/RUNS.md.
+benchmarks/polyglot/_*/

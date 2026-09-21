@@ -74,14 +74,34 @@ To make flips cheap, pin a **pool** from a baseline with two or more reps — th
 the baseline passes sometimes but not always — before looking at the arm under test:
 
 ```sh
-python benchmarks/polyglot/stats.py pool _runs/baseline/trials.jsonl > results/pool.txt
-CHAD_DISABLE=env_manifest uv run python benchmarks/polyglot/run.py \
-    --label no-manifest --tasks-file benchmarks/polyglot/results/pool.txt --reps 3
-python benchmarks/polyglot/stats.py compare _runs/baseline/trials.jsonl _runs/no-manifest/trials.jsonl
+cd benchmarks/polyglot
+python stats.py pool _runs/baseline/trials.jsonl > _runs/baseline/pool.txt
+CHAD_DISABLE=env_manifest uv run python run.py \
+    --label no-manifest --tasks-file _runs/baseline/pool.txt --reps 3
+python stats.py compare _runs/baseline/trials.jsonl _runs/no-manifest/trials.jsonl
 ```
 
 The pool authorizes a change; the full set only vetoes one, by showing it broke tasks
 that used to be safe.
+
+## Publishing a run
+
+Nothing a run produces is committed: `_runs/`, `_work/` and the rest of the underscore
+directories stay on the machine, and a test fails if any of it is ever tracked. A run
+that a write-up cites is published instead:
+
+```sh
+uv run python benchmarks/polyglot/publish.py --label baseline           # rows only
+uv run python benchmarks/polyglot/publish.py --label baseline --with-trajectories --upload
+```
+
+`publish.py` rewrites every local path (the workspace becomes `.`, the home directory
+`~`) and refuses the bundle if a home path, a path outside the workspace or a
+credential-shaped string survives. It prints the sha256 of the rows and a row to paste
+into [`RUNS.md`](RUNS.md). It uploads to the dataset repository only with `--upload`.
+`fetch.py --label <label>` downloads a published run into `_runs/<label>/` and refuses it
+unless its rows hash to what `RUNS.md` recorded, so someone else's baseline can be
+compared against a local arm.
 
 ## Files
 
@@ -94,7 +114,9 @@ that used to be safe.
 | `run.py` | a block of trials: one model load, one row per trial |
 | `stats.py` | score, pool, paired compare |
 | `trace.py` | one trial's ATIF trajectory as a step table: tokens, think, seconds, why each step ended — readable while the trial is still running |
-| `results/` | committed runs: `meta.json` + `trials.jsonl` per label |
+| `publish.py` | a finished run as a path-free bundle, uploaded only on request |
+| `fetch.py` | a published run back into `_runs/`, checked against its `RUNS.md` hash |
+| `RUNS.md` | the ledger of published runs: what ran, where it is, the sha256 of its rows |
 
 Each row records pass/fail, wall clock, steps, generated / thinking / prefilled tokens,
 peak context, which levers fired, and the machine's thermal state. `meta.json` records

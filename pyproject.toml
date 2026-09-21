@@ -216,8 +216,7 @@ exclude = [
     ".agents/**",
     ".claude/**",
     "src/chad/parakeet/**",          # vendored upstream, not held to chad's gate (see ruff/mypy)
-    "benchmarks/polyglot/_data/**",  # fetched upstream exercises and toolchain caches
-    "benchmarks/polyglot/_work/**",  # trial workspaces: upstream tests plus model output
+    "benchmarks/polyglot/_*/**",     # fetched exercises, trial workspaces, model output
     "tools/anti_slop/**",
 ]
 # Pre-existing findings live in the baseline (regenerate: `make slop-baseline`). A run
