@@ -140,20 +140,46 @@ def test_pool_is_the_frontier_and_needs_reps():
         stats.pool(_trials({"t": [True]}))
 
 
-def test_profile_pools_tool_mix_and_cache_share_across_a_run(tmp_path):
-    def step(name, prompt, cached):
-        return {"source": "agent", "step_id": 3,
-                "tool_calls": [{"function_name": name, "arguments": {}}],
-                "metrics": {"prompt_tokens": prompt, "cached_tokens": cached,
-                            "completion_tokens": 100,
-                            "extra": {"think_tokens": 40, "prefill_s": 1.0, "gen_s": 4.0}}}
-    for lang, steps in (("go", [step("bash", 1000, 900), step("bash", 2000, 1900)]),
-                        ("rust", [step("edit", 1000, 900)])):
-        path = tmp_path / "trajectories" / lang / "x.rep1.json"
+def _step(name, prompt, cached, command=""):
+    return {"source": "agent", "step_id": 3,
+            "tool_calls": [{"function_name": name,
+                            "arguments": {"command": command} if command else {}}],
+            "metrics": {"prompt_tokens": prompt, "cached_tokens": cached,
+                        "completion_tokens": 100,
+                        "extra": {"think_tokens": 40, "prefill_s": 1.0, "gen_s": 4.0}}}
+
+
+def _write_run(root):
+    for lang, steps in (("go", [_step("bash", 1000, 900, "grep -rn Score . | head"),
+                                _step("bash", 2000, 1900, "go test ./... | tail -5")]),
+                        ("rust", [_step("edit", 1000, 900)])):
+        path = root / "trajectories" / lang / "x.rep1.json"
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps({"steps": [{"source": "user"}, *steps]}))
-    report = kit_trace.profile(kit_trace.load_run(str(tmp_path)))
-    assert "2 trials, 3 model steps, 3 tool calls" in report
-    assert "bash             2   67%" in report
+
+
+def test_profile_pools_tool_mix_and_cache_share_across_a_run(tmp_path):
+    _write_run(tmp_path)
+    docs = [doc for _, doc in kit_trace.load_run(str(tmp_path))]
+    report = kit_trace.profile(docs, [kit_trace.tool_counts(doc) for doc in docs])
+    assert "2 trials, 3 tool calls, 3 model steps" in report
+    assert "  bash                2  66.7%" in report
     assert "from cache 3700 (92.5%), prefilled 300" in report
     assert "120 of them thinking (40%)" in report
+
+
+def test_tool_counts_attribute_a_pipeline_to_its_first_command():
+    doc = {"steps": [_step("bash", 1, 0, "grep -rn x . | head"),
+                     _step("bash", 1, 0, "pytest -q | tail -5"),
+                     _step("bash", 1, 0, "cd src && cat main.go")]}
+    assert kit_trace.tool_counts(doc) == {"bash": 3, "bash:search": 1, "bash:read": 1}
+
+
+def test_counts_rows_profile_without_their_trajectories(tmp_path):
+    _write_run(tmp_path)
+    rows = tmp_path / "counts.jsonl"
+    rows.write_text("".join(json.dumps({"trajectory": path, "calls": kit_trace.tool_counts(doc)}) + "\n"
+                            for path, doc in kit_trace.load_run(str(tmp_path))))
+    report = kit_trace.profile([], kit_trace.load_counts(str(rows)))
+    assert report.splitlines()[0] == "2 trials, 3 tool calls"
+    assert "prompt tokens" not in report

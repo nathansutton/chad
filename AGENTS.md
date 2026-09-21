@@ -12,7 +12,7 @@ Run `make gate` before you call anything done. It runs four targets in order, an
 the same four:
 
 - `make lint` — `uv run ruff check src tests benchmarks`
-- `make typecheck` — `uv run mypy src/chad`
+- `make typecheck` — `uv run mypy src/chad benchmarks/polyglot`
 - `make slop` — the vendored anti-slop linter (`tools/anti_slop`) over `src`, `tests`
   and `benchmarks`; stdlib-only, runs on its own 3.12 interpreter
 - `make test` — `uv run pytest -q`, which loads no model and finishes in seconds

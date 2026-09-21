@@ -54,3 +54,10 @@ benchmarks/matrix/POST-DRAFT.md
 
 # `chad prove` scorecard rows — written to the invoking directory, per run
 /results.json
+
+# Polyglot eval kit (benchmarks/polyglot/README.md): the upstream exercises, toolchain
+# caches and trial workspaces are fetched or built locally; results/ is what is committed.
+benchmarks/polyglot/_data/
+benchmarks/polyglot/_work/
+benchmarks/polyglot/_kv/
+benchmarks/polyglot/_runs/
