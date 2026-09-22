@@ -351,15 +351,17 @@ def audit(proxy: Proxy, model: str) -> dict[str, str]:
     the proxy, then the parameters of the slot that served it, from `/slots`. `ok` per
     family when every forced value is what the server applied; anything else is a
     reason the block's rows cannot claim a forced sampler for that family."""
-    probes: dict[str, tuple[str, dict[str, JsonValue]]] = {
-        "chat": ("/v1/chat/completions", {"model": model, "max_tokens": 1,
-                                          "messages": [{"role": "user", "content": "hi"}]}),
-        "responses": ("/v1/responses", {"model": model, "max_output_tokens": 1,
-                                        "input": [{"role": "user", "content": "hi"}]}),
-        "completion": ("/completion", {"prompt": "hi", "n_predict": 1}),
+    # Each probe's length limit is distinct, and `/slots` reports it back as `n_predict`:
+    # that, not the order of task ids, is what names the slot that served it.
+    probes: dict[str, tuple[str, int, dict[str, JsonValue]]] = {
+        "chat": ("/v1/chat/completions", 2, {"model": model, "max_tokens": 2,
+                                             "messages": [{"role": "user", "content": "hi"}]}),
+        "responses": ("/v1/responses", 3, {"model": model, "max_output_tokens": 3,
+                                           "input": [{"role": "user", "content": "hi"}]}),
+        "completion": ("/completion", 4, {"prompt": "hi", "n_predict": 4}),
     }
     verdicts = {}
-    for family, (path, body) in probes.items():
+    for family, (path, marker, body) in probes.items():
         req = urllib.request.Request(proxy.origin + path, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         try:
@@ -370,7 +372,7 @@ def audit(proxy: Proxy, model: str) -> dict[str, str]:
         except (OSError, ValueError) as e:
             verdicts[family] = f"unverified: {e}"
             continue
-        verdicts[family] = _slot_verdict(proxy.forced, slots)
+        verdicts[family] = _slot_verdict(proxy.forced, slots, marker)
     return verdicts
 
 
@@ -395,18 +397,23 @@ def erase_slots(upstream: str) -> int:
         return -1
 
 
-def _slot_verdict(forced: Mapping[str, JsonValue], slots: JsonValue) -> str:
-    """The slot with the newest task served the probe just sent: nothing else is in
-    flight before a block starts."""
-    newest: Mapping[str, JsonValue] = {}
-    best = -1.0
+def _slot_verdict(forced: Mapping[str, JsonValue], slots: JsonValue, marker: int = 0) -> str:
+    """The sampler of the slot that served a probe: the one reporting the probe's
+    `n_predict` marker, else the one with the newest task (nothing else is in flight
+    before a block starts)."""
+    served: Mapping[str, JsonValue] = {}
+    best = -2.0
     for slot in slots if is_array(slots) else ():
         if not is_object(slot):
             continue
+        params = slot.get("params")
         task = slot.get("id_task")
-        if is_number(task) and task > best:
-            best, newest = float(task), slot
-    params = newest.get("params")
+        rank = float(task) if is_number(task) else -1.0
+        if marker and is_object(params) and params.get("n_predict") == marker:
+            rank += 1e12               # the marker outranks any task id
+        if rank > best:
+            best, served = rank, slot
+    params = served.get("params")
     if not is_object(params):
         return "unverified: /slots names no parameters"
     return sampler_check(forced, params)

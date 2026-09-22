@@ -162,6 +162,11 @@ def test_the_audit_reads_the_slot_that_served_each_probe(relay):
     assert proxy._slot_verdict(FORCED, [{"id_task": 1, "params": {**FORCED, "top_k": 40}}]) \
         .startswith("mismatch: top_k")
     assert proxy._slot_verdict(FORCED, [{"id_task": 1}]).startswith("unverified")
+    # An idle slot may keep no task id: the probe's own n_predict still names it.
+    slots = [{"id_task": -1, "params": {**FORCED, "n_predict": 3}},
+             {"id_task": -1, "params": {**FORCED, "min_p": 0.05, "n_predict": 2}}]
+    assert proxy._slot_verdict(FORCED, slots, marker=3) == "ok"
+    assert proxy._slot_verdict(FORCED, slots, marker=2).startswith("mismatch: min_p")
 
 
 def _record(t, messages, reply, timings, tools=True):
