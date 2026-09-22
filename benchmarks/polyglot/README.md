@@ -84,6 +84,45 @@ python stats.py compare _runs/baseline/trials.jsonl _runs/no-manifest/trials.jso
 The pool authorizes a change; the full set only vetoes one, by showing it broke tasks
 that used to be safe.
 
+## Other harnesses
+
+`--harness` runs the same tasks, prompt, wall cap and verification under another coding
+agent's own command line: an entry of `harnesses.py` (pi, opencode, dsh, goose,
+mini-swe-agent, crush, cline, codex), or `chad-llama`, chad's own CLI on the same server
+as them, which is the arm every foreign one is paired against. They all talk to one
+llama-server that is already running:
+
+```sh
+llama-server -m <gguf> --port 8080 -c 32768 -ngl 999 --jinja --alias qwen3.8-27b-local
+uv run python benchmarks/polyglot/run.py --label pi-pool --harness pi \
+    --tasks-file benchmarks/polyglot/_runs/baseline/pool.txt --server http://127.0.0.1:8080
+```
+
+One engine at a time: stop the server before an in-process chad block, and never start
+one beside it.
+
+An entry is data: the harness's headless argv, the environment variables it reads, the
+config files its home should hold. Every trial runs it cut off from the machine it runs
+on:
+
+- the workspace is under the system temp directory, not this checkout, because most
+  harnesses read `AGENTS.md` from the directories above the one they start in;
+- `HOME` and the XDG directories are a throwaway home the entry's config is written
+  into, and the environment is rebuilt from an allowlist, so no key or token from your
+  shell reaches the agent;
+- the process runs under `sandbox-exec`, with file writes denied outside the workspace,
+  that home and the temp directories;
+- at the wall cap the harness's whole process group is killed.
+
+chad in process is the one arm not isolated this way: MLX needs Metal, so it keeps the
+real home, and chad sandboxes every bash command the model runs itself.
+
+`harnesses.lock` pins the version of each harness a result is measured with, and
+`run.py` refuses one that has drifted. `python benchmarks/polyglot/harnesses.py` lists
+installed against locked; `harnesses.py lock <name>` pins what is installed. A CLI arm's
+row has the same frame as chad's, with the harness's exit code where chad's own counters
+are; its output is kept in `_runs/<label>/output/`.
+
 ## Publishing a run
 
 Nothing a run produces is committed: `_runs/`, `_work/` and the rest of the underscore
@@ -95,8 +134,8 @@ uv run python benchmarks/polyglot/publish.py --label baseline           # rows o
 uv run python benchmarks/polyglot/publish.py --label baseline --with-trajectories --upload
 ```
 
-`publish.py` rewrites every local path (the workspace becomes `.`, the home directory
-`~`) and refuses the bundle if a home path, a path outside the workspace or a
+`publish.py` rewrites every local path (the workspace becomes `.`, a CLI arm's throwaway
+home `<home>`, the home directory `~`) and refuses the bundle if a home path, a path outside the workspace or a
 credential-shaped string survives. It prints the sha256 of the rows and a row to paste
 into [`RUNS.md`](RUNS.md). It uploads to the dataset repository only with `--upload`.
 `fetch.py --label <label>` downloads a published run into `_runs/<label>/` and refuses it
@@ -111,7 +150,10 @@ compared against a local arm.
 | `workspace.py` | leak-free trial directories, `run-tests.sh`, `verify()` |
 | `prepare.py` | one-time fetch of everything trials need from the network |
 | `gold.py` | the gold gate; writes `manifest.json` |
-| `run.py` | a block of trials: one model load, one row per trial |
+| `run.py` | a block of trials: one arm, one model load, one row per trial |
+| `harness/` | the contract every arm meets (`__init__.py`), chad in process (`chad_inprocess.py`), any CLI agent in isolation (`cli.py`) |
+| `harnesses.py` | every CLI arm as data; `lock` pins the installed versions |
+| `harnesses.lock` | the version, install command and entry-point sha256 each arm is measured with |
 | `stats.py` | score, pool, paired compare |
 | `trace.py` | one trial's ATIF trajectory as a step table: tokens, think, seconds, why each step ended — readable while the trial is still running |
 | `publish.py` | a finished run as a path-free bundle, uploaded only on request |

@@ -17,6 +17,12 @@ Notable, user-visible changes.
   against the sha256 in `benchmarks/polyglot/RUNS.md`. A test fails if run output is ever
   tracked. A model-visible change now arrives with a paired `stats.py compare` a
   contributor can run on their own Mac (CONTRIBUTING.md).
+- **Any coding agent can run the polyglot set.** `run.py --harness <name>` drives a CLI
+  agent from a data entry in `harnesses.py` — its argv, environment and config files —
+  in a throwaway home, with an allowlisted environment, under Seatbelt, outside this
+  checkout, at a version pinned in `harnesses.lock`. Nothing reads or overwrites your
+  dotfiles. chad in process is one implementation of the same contract, and its rows
+  are unchanged.
 
 ## [2.2.0] — 2026-09-17
 

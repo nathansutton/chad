@@ -242,6 +242,18 @@ def test_publish_rewrites_every_local_path(tmp_path):
                           f"{b.sha256} |")
 
 
+def test_a_cli_trial_is_rewritten_wherever_its_root_is():
+    """A CLI arm's trials live in the system temp directory, not under the kit."""
+    root = "/private/var/folders/ab/cd_ef/T/chad-polyglot"
+    text = (f"cmake {root}/_work/pi-pool/rep2/cpp/bank-account/build && "
+            f"cat {root}/_home/pi-pool/rep2/cpp/bank-account/.pi/agent/models.json; "
+            "grep -rn x benchmarks/polyglot/_work/arm/rep1/go/bob")
+    assert publish.redact(text, ROOTS) == (
+        "cmake ./build && cat <home>/.pi/agent/models.json; "
+        "grep -rn x benchmarks/polyglot/_work/arm/rep1/go/bob")
+    assert not publish.problems(publish.redact(text, ROOTS), ROOTS)
+
+
 def test_rows_alone_unless_trajectories_are_asked_for(tmp_path):
     publish.bundle(str(_run_dir(tmp_path)), str(tmp_path / "out"), ROOTS)
     assert sorted(os.listdir(tmp_path / "out")) == ["meta.json", "trials.jsonl"]
@@ -299,4 +311,4 @@ def test_fetch_refuses_rows_that_are_not_the_ones_recorded(tmp_path):
 def test_the_committed_ledger_has_the_columns_fetch_reads():
     with open(fetch.LEDGER, encoding="utf-8") as f:
         assert publish.RUNS_HEADER in f.read()
-    assert isinstance(fetch.read_ledger(fetch.LEDGER), dict)
+    assert "design-sample" in fetch.read_ledger(fetch.LEDGER)

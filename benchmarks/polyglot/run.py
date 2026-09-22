@@ -1,24 +1,32 @@
-"""Run a block of trials: one model load, many exercises, one row per trial.
+"""Run a block of trials: one arm, many exercises, one row per trial.
 
     uv run python benchmarks/polyglot/run.py --label baseline            # all valid tasks
     uv run python benchmarks/polyglot/run.py --label baseline --reps 3   # k=3, rep-major
     uv run python benchmarks/polyglot/run.py --label arm-b \
         --tasks-file benchmarks/polyglot/_runs/baseline/pool.txt
     CHAD_DISABLE=env_manifest uv run python benchmarks/polyglot/run.py --label no-manifest
+    uv run python benchmarks/polyglot/run.py --label pi-pool --harness pi \
+        --tasks-file benchmarks/polyglot/_runs/baseline/pool.txt --server http://127.0.0.1:8080
 
-The agent under test is the one a user gets: the shipped model, the shipped sampler
-preset, the RAM-aware context limit, yolo mode, the default step budget. An arm is
-whatever differs in the environment or the checkout when the block is launched; the label
-names it and `meta.json` records what it actually was.
+The default arm is the agent a user gets: chad in this process, with the shipped model,
+the shipped sampler preset, the RAM-aware context limit, yolo mode, the default step
+budget. An arm is whatever differs in the environment or the checkout when the block is
+launched; the label names it and `meta.json` records what it actually was.
+
+`--harness <name>` runs another entry of `harnesses.py` instead: a coding agent's own
+command line, in a throwaway home under Seatbelt (`harness/cli.py`), against the
+llama-server already listening at `--server`. The tasks, the prompt, the wall cap, the
+verification and the row are the same loop whoever is solving (`harness/__init__.py`).
 
 The weights load once per block. On a 24 GB laptop a load is minutes and load/teardown
 cycling is the one thing here with kernel panics on its record, so a block is resumable
 instead: rows already in `trials.jsonl` are skipped, and re-running the same command
 picks up where a crash, a lid close or a Ctrl-C left it.
 
-Every trial also leaves an ATIF trajectory under `_runs/<label>/trajectories/`, rewritten
-as the trial runs — including the step still being generated — so a trial stuck in a long
-think can be read while it is stuck: `python benchmarks/polyglot/trace.py <file>`.
+Every chad trial also leaves an ATIF trajectory under `_runs/<label>/trajectories/`,
+rewritten as the trial runs — including the step still being generated — so a trial
+stuck in a long think can be read while it is stuck: `python benchmarks/polyglot/trace.py
+<file>`. A CLI arm's own output goes to `_runs/<label>/output/`.
 
 With `--reps N` the order is rep-major — every task once, then every task again — so a
 block cut short still has balanced coverage instead of k=3 on the first third of the
@@ -27,30 +35,27 @@ alphabet.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import datetime
-import functools
-import io
 import json
 import os
+import shutil
 import subprocess
 import sys
-import time
-from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import catalog  # noqa: E402
+import harnesses  # noqa: E402
 import workspace  # noqa: E402
-from catalog import JsonValue, Task  # noqa: E402
-
-if TYPE_CHECKING:
-    from chad.engine import Engine
+from catalog import JsonValue, Task, is_object  # noqa: E402
+from harness import AtifDoc, Harness, Solved, Trial  # noqa: E402
+from harness.chad_inprocess import ChadInProcess  # noqa: E402
+from harness.cli import CliHarness, Endpoint, HarnessError, server_context  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(catalog.ROOT))
 DEFAULT_WALL_CAP_S = 1200
-KV_CACHE_MAX_BYTES = 4 * 1024**3
+DEFAULT_SERVER = "http://127.0.0.1:8080"
 
 _DOCS = ("introduction.md", "instructions.md", "instructions.append.md")
 
@@ -79,27 +84,11 @@ def _git(*args: str) -> str:
 
 def thermal() -> str:
     """macOS's CPU speed limit at the end of a trial: a throttled run should be visible
-    in its rows, not inferred afterwards from a suspicious wall time."""
+    in its rows, not inferred afterwards from a suspicious wall time. Empty off macOS."""
+    if not shutil.which("pmset"):
+        return ""
     out = subprocess.run(["pmset", "-g", "therm"], capture_output=True, text=True, check=False)
     return next((ln.strip() for ln in out.stdout.splitlines() if "CPU_Speed_Limit" in ln), "")
-
-
-@contextlib.contextmanager
-def _stdin_from_devnull() -> Iterator[None]:
-    """Launched from a terminal, a confirm prompt would go to `input()` behind the
-    redirected stdout — an invisible question no timeout interrupts. Closed at the file
-    descriptor as well as `sys.stdin`, because spawned shells inherit fd 0."""
-    saved_fd, saved_stdin = os.dup(0), sys.stdin
-    devnull = open(os.devnull, encoding="utf-8")
-    try:
-        os.dup2(devnull.fileno(), 0)
-        sys.stdin = devnull
-        yield
-    finally:
-        sys.stdin = saved_stdin
-        os.dup2(saved_fd, 0)
-        os.close(saved_fd)
-        devnull.close()
 
 
 def done_keys(trials_path: str) -> set[tuple[str, int]]:
@@ -130,100 +119,66 @@ def select_tasks(only: str, tasks_file: str, limit: int) -> list[Task]:
     return tasks[:limit] if limit else tasks
 
 
+def row(task: Task, label: str, rep: int, solved: Solved, verdict: workspace.Verdict,
+        doc: AtifDoc | None, trajectory: str, machine: str) -> dict[str, JsonValue]:
+    """One trial's record: the same frame for every arm, with the arm's own fields in the
+    middle. `trajectory` is the document's path relative to the run."""
+    final = doc.get("final_metrics") if doc is not None else None
+    return {
+        "task": task.name, "language": task.language, "label": label, "rep": rep,
+        "passed": verdict.passed, "capped": solved.capped,
+        "wall_s": round(solved.wall_s, 1), "verify_s": round(verdict.seconds, 1),
+        **solved.fields,
+        "thermal": machine,
+        # The trajectory's own trial totals — cache hit rate, tok/s, draft acceptance
+        # by phase, compactions — so a score table never has to open the documents.
+        "metrics": final if is_object(final) else {},
+        "trajectory": trajectory if doc is not None else None,
+        "test_tail": "" if verdict.passed else verdict.tail[-600:],
+    }
+
+
 class Block:
-    def __init__(self, label: str, model: str, thinking: bool, max_steps: int | None,
-                 wall_cap: int):
-        self.label, self.model, self.thinking = label, model, thinking
-        self.max_steps, self.wall_cap = max_steps, wall_cap
-        self.out_dir = os.path.join(catalog.ROOT, "_runs", label)
+    def __init__(self, label: str, harness: Harness, wall_cap: int,
+                 runs: str = os.path.join(catalog.ROOT, "_runs")):
+        self.label, self.harness, self.wall_cap = label, harness, wall_cap
+        self.out_dir = os.path.join(runs, label)
         self.trials_path = os.path.join(self.out_dir, "trials.jsonl")
         os.makedirs(self.out_dir, exist_ok=True)
 
-    def load_engine(self) -> tuple[Engine, int, float]:
-        """The engine as the shipped CLI builds it: preset first, CHAD_* env second."""
-        from chad.cli import _compute_ctx_limit, apply_sampler_env, apply_sampler_preset
-        from chad.engine import Engine
-        eng = Engine(model_id=self.model, cache_dir=os.path.join(catalog.ROOT, "_kv"),
-                     kv_cache_max_bytes=KV_CACHE_MAX_BYTES)
-        apply_sampler_preset(eng, thinking=self.thinking)
-        apply_sampler_env(eng)
-        load_s = eng.load()
-        return eng, _compute_ctx_limit(eng), load_s
-
-    def write_meta(self, ctx_limit: int, load_s: float, n_tasks: int, reps: int) -> None:
+    def write_meta(self, arm: Mapping[str, JsonValue], n_tasks: int, reps: int) -> None:
         import chad
-        from chad import levers
-        from chad.tools import active_schemas
         meta: dict[str, JsonValue] = {
             "label": self.label, "started": datetime.datetime.now().isoformat(timespec="seconds"),
+            "harness": self.harness.name, "harness_version": self.harness.version(),
             "chad_version": chad.__version__, "git_rev": _git("rev-parse", "--short", "HEAD"),
             "git_dirty": bool(_git("status", "--porcelain", "--", "src")),
-            "model": self.model, "thinking": self.thinking, "ctx_limit": ctx_limit,
-            "max_steps": self.max_steps, "wall_cap_s": self.wall_cap,
-            "load_s": round(load_s, 1), "tasks": n_tasks, "reps": reps,
+            "wall_cap_s": self.wall_cap, "tasks": n_tasks, "reps": reps,
             "upstream_commit": catalog.UPSTREAM_COMMIT,
-            "levers_active": levers.active(),
-            "chad_env": {k: v for k, v in sorted(os.environ.items()) if k.startswith("CHAD_")},
-            "tools": sorted(s["function"]["name"] for s in active_schemas()),
+            **arm,
         }
         with open(os.path.join(self.out_dir, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=1)
             f.write("\n")
 
-    def trajectory_path(self, task: Task, rep: int) -> str:
-        return os.path.join(self.out_dir, "trajectories", task.language,
-                            f"{task.slug}.rep{rep}.json")
+    def trial(self, task: Task, rep: int) -> Trial:
+        where = (self.label, f"rep{rep}", task.language, task.slug)
+        name = f"{task.slug}.rep{rep}"
+        return Trial(workspace=os.path.join(self.harness.root, "_work", *where),
+                     home=os.path.join(self.harness.root, "_home", *where),
+                     prompt=prompt_for(task), wall_cap_s=self.wall_cap,
+                     trajectory=os.path.join(self.out_dir, "trajectories", task.language,
+                                             f"{name}.json"),
+                     output=os.path.join(self.out_dir, "output", task.language, f"{name}.log"))
 
-    def solve(self, eng: Engine, ctx_limit: int, task: Task, rep: int) -> dict[str, JsonValue]:
-        from chad import atif, levers
-        from chad.agent import Agent
-
-        ws = os.path.join(catalog.ROOT, "_work", self.label, f"rep{rep}", task.language,
-                          task.slug)
-        workspace.materialize(task, ws)
-        deadline = time.time() + self.wall_cap
-        fires_before = levers.fire_counts()
-        start_dir, saved_path = os.getcwd(), os.environ.get("PATH", "")
-        try:
-            os.chdir(ws)
-            os.environ["PATH"] = workspace.trial_env()["PATH"]
-            traj = self.trajectory_path(task, rep)
-            # Before the Agent: it binds the recorder it is built with.
-            recorder = atif.start(traj)
-            build = functools.partial(Agent, eng, thinking=self.thinking, mode="yolo",
-                                      ctx_limit=ctx_limit,
-                                      should_stop=lambda: time.time() > deadline,
-                                      emit=lambda _kind, _text: None)
-            # No --max-steps keeps the agent's own default rather than restating it here.
-            agent = build() if self.max_steps is None else build(max_steps=self.max_steps)
-            t0 = time.time()
-            with contextlib.redirect_stdout(io.StringIO()), _stdin_from_devnull():
-                agent.run_turn(prompt_for(task), stream=False)
-            wall = time.time() - t0
-        finally:
-            os.chdir(start_dir)
-            os.environ["PATH"] = saved_path
-        verdict = workspace.verify(task, ws)
-        fired = {k: v - fires_before.get(k, 0) for k, v in levers.fire_counts().items()
-                 if v > fires_before.get(k, 0)}
-        return {
-            "task": task.name, "language": task.language, "label": self.label, "rep": rep,
-            # The deadline stops the agent a moment BEFORE the cap, so the wall time alone
-            # reads a capped trial as one that finished at 1199.8 s.
-            "passed": verdict.passed, "capped": agent.interrupted,
-            "wall_s": round(wall, 1), "verify_s": round(verdict.seconds, 1),
-            "steps": sum(1 for m in agent.messages if m.get("role") == "assistant"),
-            "tool_dispatches": agent.tool_dispatches,
-            "gen_tokens": agent.gen_tokens, "think_tokens": agent.think_tokens,
-            "prefill_tokens": agent.prefill_tokens, "peak_ctx": agent.peak_ctx,
-            "gen_time_s": round(agent.gen_time, 1),
-            "levers_fired": fired, "thermal": thermal(),
-            # The trajectory's own trial totals — cache hit rate, tok/s, draft acceptance
-            # by phase, compactions — so a score table never has to open the documents.
-            "metrics": recorder.to_dict().get("final_metrics", {}),
-            "trajectory": os.path.relpath(traj, self.out_dir),
-            "test_tail": "" if verdict.passed else verdict.tail[-600:],
-        }
+    def solve(self, task: Task, rep: int) -> dict[str, JsonValue]:
+        trial = self.trial(task, rep)
+        workspace.materialize(task, trial.workspace)
+        self.harness.prepare(trial.home)
+        solved = self.harness.solve(trial)
+        verdict = workspace.verify(task, trial.workspace)
+        return row(task, self.label, rep, solved, verdict, self.harness.trajectory(),
+                   os.path.relpath(trial.trajectory, self.out_dir), thermal())
 
     def run(self, tasks: list[Task], reps: int) -> int:
         todo = [(rep, t) for rep in range(1, reps + 1) for t in tasks]
@@ -232,42 +187,80 @@ class Block:
         print(f"[{self.label}] {len(todo)} trials to run, {len(done)} already recorded")
         if not todo:
             return 0
-        eng, ctx_limit, load_s = self.load_engine()
-        self.write_meta(ctx_limit, load_s, len(tasks), reps)
+        self.write_meta(self.harness.start(), len(tasks), reps)
         passed = 0
         for i, (rep, task) in enumerate(todo, 1):
-            row = self.solve(eng, ctx_limit, task, rep)
+            record = self.solve(task, rep)
             with open(self.trials_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row) + "\n")
-            passed += bool(row["passed"])
-            print(f"[{i}/{len(todo)}] {'PASS' if row['passed'] else 'fail'} {task.name} "
-                  f"rep{rep} {row['wall_s']}s {row['steps']} steps | running {passed}/{i}",
-                  flush=True)
+                f.write(json.dumps(record) + "\n")
+            passed += bool(record["passed"])
+            steps = f" {record['steps']} steps" if "steps" in record else ""
+            print(f"[{i}/{len(todo)}] {'PASS' if record['passed'] else 'fail'} {task.name} "
+                  f"rep{rep} {record['wall_s']}s{steps} | running {passed}/{i}", flush=True)
         return 0
+
+
+def tokenizer_dir() -> str:
+    """The shipped model's directory, for an arm that renders token ids itself (chad on
+    llama-server). Resolved here, where HOME is the real one: inside a trial a repo id
+    would resolve against the throwaway home's empty cache. Empty when it is nowhere
+    local, which only an arm that needs it refuses."""
+    from chad.cli import _pick_model
+    model = _pick_model()[0]
+    if os.path.isdir(model):
+        return model
+    from huggingface_hub import snapshot_download
+    try:
+        return snapshot_download(model, local_files_only=True)
+    except (OSError, ValueError):      # not in the cache, or not a repo id at all
+        return ""
+
+
+def build_harness(args: argparse.Namespace) -> Harness:
+    if args.harness == "chad":
+        model = args.model
+        if not model:
+            from chad.cli import _pick_model
+            model = _pick_model()[0]
+        return ChadInProcess(model, not args.no_think, args.max_steps)
+    spec = harnesses.SPECS[args.harness]
+    if spec.unsupported:               # before asking for a server it would never use
+        raise HarnessError(f"{spec.name} is marked unsupported: {spec.unsupported}")
+    server = args.server.rstrip("/")
+    endpoint = Endpoint(server, args.served_model, server_context(server), tokenizer_dir())
+    return CliHarness(spec, endpoint, harnesses.load_lock().get(spec.name))
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--label", required=True, help="names the arm; rows go to _runs/<label>/")
-    ap.add_argument("--model", default="", help="HF repo or local dir (default: the shipped model)")
+    ap.add_argument("--harness", default="chad", choices=["chad", *harnesses.SPECS],
+                    help="who solves: chad in this process (default), or an entry of harnesses.py")
     ap.add_argument("--reps", type=int, default=1)
     ap.add_argument("--only", default="", help="task-name prefix, e.g. `rust/`")
     ap.add_argument("--tasks-file", default="", help="one task name per line (a pinned pool)")
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--no-think", action="store_true")
-    ap.add_argument("--max-steps", type=int, default=None, help="default: the agent's own")
     ap.add_argument("--wall-cap", type=int, default=DEFAULT_WALL_CAP_S, help="seconds per trial")
+    chad = ap.add_argument_group("chad in process")
+    chad.add_argument("--model", default="", help="HF repo or local dir (default: the shipped model)")
+    chad.add_argument("--no-think", action="store_true")
+    chad.add_argument("--max-steps", type=int, default=None, help="default: the agent's own")
+    cli = ap.add_argument_group("any other harness")
+    cli.add_argument("--server", default=DEFAULT_SERVER,
+                     help="origin of the llama-server every trial of the block talks to")
+    cli.add_argument("--served-model", default=harnesses.SERVED_MODEL,
+                     help="the model id that server answers to (its --alias)")
     args = ap.parse_args()
+    if args.harness != "chad" and (args.model or args.no_think or args.max_steps is not None):
+        ap.error("--model, --no-think and --max-steps apply to --harness chad only")
 
     tasks = select_tasks(args.only, args.tasks_file, args.limit)
     if not tasks:
         raise SystemExit("no tasks selected")
-    model = args.model
-    if not model:
-        from chad.cli import _pick_model
-        model = _pick_model()[0]
-    block = Block(args.label, model, not args.no_think, args.max_steps, args.wall_cap)
-    return block.run(tasks, args.reps)
+    try:
+        return Block(args.label, build_harness(args), args.wall_cap).run(tasks, args.reps)
+    except HarnessError as e:
+        raise SystemExit(f"[{args.label}] {e}") from None
 
 
 if __name__ == "__main__":
