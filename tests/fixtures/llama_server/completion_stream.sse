@@ -1,0 +1,50 @@
+data: {"index": 0, "content": "<think>", "tokens": [248068], "stop": false, "id_slot": -1, "tokens_predicted": 1, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": "\n", "tokens": [198], "stop": false, "id_slot": -1, "tokens_predicted": 2, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": "The", "tokens": [760], "stop": false, "id_slot": -1, "tokens_predicted": 3, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " user", "tokens": [1156], "stop": false, "id_slot": -1, "tokens_predicted": 4, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " simply", "tokens": [4777], "stop": false, "id_slot": -1, "tokens_predicted": 5, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " wants", "tokens": [6587], "stop": false, "id_slot": -1, "tokens_predicted": 6, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " me", "tokens": [728], "stop": false, "id_slot": -1, "tokens_predicted": 7, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " to", "tokens": [310], "stop": false, "id_slot": -1, "tokens_predicted": 8, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " say", "tokens": [1910], "stop": false, "id_slot": -1, "tokens_predicted": 9, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " \"", "tokens": [328], "stop": false, "id_slot": -1, "tokens_predicted": 10, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": "hi", "tokens": [5834], "stop": false, "id_slot": -1, "tokens_predicted": 11, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": ".\"", "tokens": [1149], "stop": false, "id_slot": -1, "tokens_predicted": 12, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " This", "tokens": [1061], "stop": false, "id_slot": -1, "tokens_predicted": 13, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " is", "tokens": [369], "stop": false, "id_slot": -1, "tokens_predicted": 14, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " a", "tokens": [264], "stop": false, "id_slot": -1, "tokens_predicted": 15, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " very", "tokens": [1546], "stop": false, "id_slot": -1, "tokens_predicted": 16, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " straightforward", "tokens": [29350], "stop": false, "id_slot": -1, "tokens_predicted": 17, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " request", "tokens": [1622], "stop": false, "id_slot": -1, "tokens_predicted": 18, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": ".", "tokens": [13], "stop": false, "id_slot": -1, "tokens_predicted": 19, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " I", "tokens": [353], "stop": false, "id_slot": -1, "tokens_predicted": 20, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": "'ll", "tokens": [3172], "stop": false, "id_slot": -1, "tokens_predicted": 21, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " keep", "tokens": [2426], "stop": false, "id_slot": -1, "tokens_predicted": 22, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " it", "tokens": [424], "stop": false, "id_slot": -1, "tokens_predicted": 23, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": " simple", "tokens": [4145], "stop": false, "id_slot": -1, "tokens_predicted": 24, "tokens_evaluated": 11}
+
+data: {"index": 0, "content": "", "tokens": [], "id_slot": 0, "stop": true, "model": "qwen3.8-27b-local", "tokens_predicted": 24, "tokens_evaluated": 11, "generation_settings": {"seed": 4294967295, "temperature": 1.0, "dynatemp_range": 0.0, "dynatemp_exponent": 1.0, "top_k": 20, "top_p": 0.949999988079071, "min_p": 0.0, "top_n_sigma": -1.0, "xtc_probability": 0.0, "xtc_threshold": 0.10000000149011612, "typical_p": 1.0, "repeat_last_n": 64, "repeat_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "dry_multiplier": 0.0, "dry_base": 1.75, "dry_allowed_length": 2, "dry_penalty_last_n": 64, "dry_sequence_breakers": ["\n", ":", "\"", "*"], "mirostat": 0, "mirostat_tau": 5.0, "mirostat_eta": 0.10000000149011612, "adaptive_target": -1.0, "adaptive_decay": 0.8999999761581421, "stop": [], "max_tokens": 24, "n_predict": 24, "n_keep": 0, "n_discard": 0, "ignore_eos": false, "stream": true, "logit_bias": [], "n_probs": 0, "min_keep": 0, "grammar": "", "grammar_lazy": false, "grammar_triggers": [], "preserved_tokens": [], "chat_format": "Content-only", "reasoning_format": "deepseek", "reasoning_in_content": false, "generation_prompt": "", "samplers": ["penalties", "dry", "top_n_sigma", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"], "speculative.types": "none", "timings_per_token": false, "post_sampling_probs": false, "backend_sampling": false, "lora": []}, "has_new_line": true, "truncated": false, "stop_type": "limit", "stopping_word": "", "tokens_cached": 34, "timings": {"cache_n": 0, "prompt_n": 11, "prompt_ms": 826.076, "prompt_per_token_ms": 75.09781818181818, "prompt_per_second": 13.315966085444924, "predicted_n": 24, "predicted_ms": 2135.178, "predicted_per_token_ms": 92.83382608695652, "predicted_per_second": 10.771935641899645}}
+

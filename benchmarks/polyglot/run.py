@@ -5,8 +5,9 @@
     uv run python benchmarks/polyglot/run.py --label arm-b \
         --tasks-file benchmarks/polyglot/_runs/baseline/pool.txt
     CHAD_DISABLE=env_manifest uv run python benchmarks/polyglot/run.py --label no-manifest
-    uv run python benchmarks/polyglot/run.py --label pi-pool --harness pi \
-        --tasks-file benchmarks/polyglot/_runs/baseline/pool.txt --server http://127.0.0.1:8080
+    uv run python benchmarks/polyglot/server.py &                        # llama arms only
+    uv run python benchmarks/polyglot/run.py --label h3-pi --harness pi \
+        --tasks-file benchmarks/polyglot/subsets/harness-3.txt --reps 3
 
 The default arm is the agent a user gets: chad in this process, with the shipped model,
 the shipped sampler preset, the RAM-aware context limit, yolo mode, the default step
@@ -15,7 +16,9 @@ launched; the label names it and `meta.json` records what it actually was.
 
 `--harness <name>` runs another entry of `harnesses.py` instead: a coding agent's own
 command line, in a throwaway home under Seatbelt (`harness/cli.py`), against the
-llama-server already listening at `--server`. The tasks, the prompt, the wall cap, the
+llama-server `server.py` keeps running at `--server`, through a proxy the block starts
+in front of it (`proxy.py`: the sampler forced, every request recorded, each trial's
+log turned into its ATIF trajectory). The tasks, the prompt, the wall cap, the
 verification and the row are the same loop whoever is solving (`harness/__init__.py`).
 
 The weights load once per block. On a 24 GB laptop a load is minutes and load/teardown
@@ -35,6 +38,7 @@ alphabet.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
@@ -42,21 +46,24 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import catalog  # noqa: E402
 import harnesses  # noqa: E402
+import server  # noqa: E402
 import workspace  # noqa: E402
 from catalog import JsonValue, Task, is_object  # noqa: E402
 from harness import AtifDoc, Harness, Solved, Trial  # noqa: E402
 from harness.chad_inprocess import ChadInProcess  # noqa: E402
 from harness.cli import CliHarness, Endpoint, HarnessError, server_context  # noqa: E402
+from harness.proxied import Proxied  # noqa: E402
+from proxy import Proxy, shipped_sampler  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(catalog.ROOT))
 DEFAULT_WALL_CAP_S = 1200
-DEFAULT_SERVER = "http://127.0.0.1:8080"
+DEFAULT_SERVER = f"http://127.0.0.1:{server.DEFAULT_PORT}"
 
 _DOCS = ("introduction.md", "instructions.md", "instructions.append.md")
 
@@ -223,8 +230,19 @@ def tokenizer_dir() -> str:
         return ""
 
 
-def build_harness(args: argparse.Namespace) -> Harness:
+def token_counter(tokenizer: str) -> Callable[[str], int] | None:
+    """Think tokens for a proxy trajectory, counted with the served model's tokenizer:
+    the server counts what it generated, not which of it was reasoning."""
+    if not tokenizer:
+        return None
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(tokenizer)
+    return lambda text: len(tok.encode(text, add_special_tokens=False))
+
+
+def build_harness(args: argparse.Namespace, stack: contextlib.ExitStack) -> Harness:
     if args.harness == "chad":
+        server.refuse("in-process block")
         model = args.model
         if not model:
             from chad.cli import _pick_model
@@ -233,9 +251,16 @@ def build_harness(args: argparse.Namespace) -> Harness:
     spec = harnesses.SPECS[args.harness]
     if spec.unsupported:               # before asking for a server it would never use
         raise HarnessError(f"{spec.name} is marked unsupported: {spec.unsupported}")
-    server = args.server.rstrip("/")
-    endpoint = Endpoint(server, args.served_model, server_context(server), tokenizer_dir())
-    return CliHarness(spec, endpoint, harnesses.load_lock().get(spec.name))
+    server.refuse("cli block")
+    upstream = args.server.rstrip("/")
+    stray = os.path.join(catalog.ROOT, "_runs", args.label, "output", "stray.requests.jsonl")
+    relay = Proxy(upstream, shipped_sampler(), stray)
+    relay.start()
+    stack.callback(relay.stop)
+    tokenizer = tokenizer_dir()
+    endpoint = Endpoint(relay.origin, args.served_model, server_context(relay.origin), tokenizer)
+    return Proxied(CliHarness(spec, endpoint, harnesses.load_lock().get(spec.name)), relay,
+                   token_counter(tokenizer))
 
 
 def main() -> int:
@@ -254,7 +279,8 @@ def main() -> int:
     chad.add_argument("--max-steps", type=int, default=None, help="default: the agent's own")
     cli = ap.add_argument_group("any other harness")
     cli.add_argument("--server", default=DEFAULT_SERVER,
-                     help="origin of the llama-server every trial of the block talks to")
+                     help="origin of the running llama-server (`server.py`); every trial "
+                          "reaches it through the block's own proxy")
     cli.add_argument("--served-model", default=harnesses.SERVED_MODEL,
                      help="the model id that server answers to (its --alias)")
     args = ap.parse_args()
@@ -265,9 +291,11 @@ def main() -> int:
     if not tasks:
         raise SystemExit("no tasks selected")
     try:
-        block = Block(args.label, build_harness(args), args.wall_cap, tasks_file=args.tasks_file)
-        return block.run(tasks, args.reps)
-    except HarnessError as e:
+        with contextlib.ExitStack() as stack:
+            block = Block(args.label, build_harness(args, stack), args.wall_cap,
+                          tasks_file=args.tasks_file)
+            return block.run(tasks, args.reps)
+    except (HarnessError, server.EngineBusy) as e:
         raise SystemExit(f"[{args.label}] {e}") from None
 
 
