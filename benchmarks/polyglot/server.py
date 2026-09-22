@@ -76,15 +76,19 @@ class LlamaServer:
                  ctx: int = DEFAULT_CTX):
         self.gguf, self.log, self.alias, self.port, self.ctx = gguf, log, alias, port, ctx
         self.origin = f"http://127.0.0.1:{port}"
+        self.slots = os.path.join(os.path.dirname(os.path.abspath(log)), "llama-slots")
         self._proc: subprocess.Popen[bytes] | None = None
 
     def argv(self) -> list[str]:
+        # --slot-save-path: llama-server refuses every slot action without one, and a
+        # block's first act is erasing the slots so it starts on a cold prefix cache.
         return ["llama-server", "-m", self.gguf, "--host", "127.0.0.1", "--port", str(self.port),
-                "-c", str(self.ctx), "-ngl", "999", "--jinja", "--metrics", "--alias", self.alias]
+                "-c", str(self.ctx), "-ngl", "999", "--jinja", "--metrics", "--alias", self.alias,
+                "--slot-save-path", self.slots]
 
     def __enter__(self) -> str:
         refuse("server")
-        os.makedirs(os.path.dirname(os.path.abspath(self.log)), exist_ok=True)
+        os.makedirs(self.slots, exist_ok=True)
         with open(self.log, "ab") as log:
             self._proc = subprocess.Popen(self.argv(), stdout=log, stderr=subprocess.STDOUT)
         deadline = time.time() + HEALTH_TIMEOUT_S

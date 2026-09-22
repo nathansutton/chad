@@ -253,6 +253,12 @@ def test_two_engines_are_never_resident():
     server.refuse("in-process block", pgrep(blocks=[os.getpid()]))  # itself does not count
 
 
+def test_the_server_is_started_so_its_slots_can_be_erased(tmp_path):
+    argv = server.LlamaServer("m.gguf", str(tmp_path / "server.log")).argv()
+    assert argv[argv.index("--slot-save-path") + 1] == str(tmp_path / "llama-slots")
+    assert argv[argv.index("-c") + 1] == "32768" and "--jinja" in argv
+
+
 needs_sandbox = pytest.mark.skipif(not seatbelt.Seatbelt().probe(),
                                    reason="sandbox-exec cannot enforce from here")
 
