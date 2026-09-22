@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import threading
+import time
 import urllib.request
 
 import pytest
@@ -106,6 +107,8 @@ class _Upstream:
                 if "action=erase" in self.path:
                     return self._json({})
                 upstream.bodies.append(json.loads(body))
+                if json.loads(body).get("hold"):
+                    time.sleep(5)        # a non-streamed generation that outlives its trial
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
@@ -158,6 +161,34 @@ def test_the_proxy_forces_the_sampler_and_passes_the_reply_through(relay, tmp_pa
     p.route("")
     _post(p.origin, "/v1/chat/completions", body)
     assert len(proxy_atif.load(str(tmp_path / "stray.jsonl"))) == 1
+
+
+def test_a_request_belongs_to_the_trial_it_arrived_in_and_ends_with_it(relay, tmp_path):
+    p, _ = relay
+    p.route(str(tmp_path / "trial-a.jsonl"))
+    body = {"model": "m", "messages": [SYSTEM, USER], "hold": True}   # the agent's own thread
+    caller = threading.Thread(target=lambda: _post_quietly(p.origin, body))
+    caller.start()
+    time.sleep(0.5)
+    t0 = time.time()
+    p.route(str(tmp_path / "trial-b.jsonl"))              # trial A is over
+    caller.join(timeout=10)
+    deadline = time.time() + 5
+    while not (tmp_path / "trial-a.jsonl").exists() and time.time() < deadline:
+        time.sleep(0.05)
+    record = proxy_atif.load(str(tmp_path / "trial-a.jsonl"))[0]
+    assert record["aborted"] is True and time.time() - t0 < 4    # hung up, not waited out
+    assert not (tmp_path / "trial-b.jsonl").exists()
+    doc = proxy_atif.convert([*_chat_log()[:1], record], "x", "0", "m")
+    assert doc["steps"][-1]["extra"] == {"in_flight": True, "aborted": True}
+    assert doc["final_metrics"]["extra"]["aborted"] == 1
+
+
+def _post_quietly(origin, body):
+    try:
+        _post(origin, "/v1/chat/completions", body)
+    except OSError:
+        pass                           # the proxy hung up, as it should
 
 
 def test_the_audit_reads_the_slot_that_served_each_probe(relay):

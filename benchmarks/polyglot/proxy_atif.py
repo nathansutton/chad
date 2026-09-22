@@ -8,7 +8,9 @@ those are: the ones that open with the same first message — the system prompt,
 chad's raw `/completion`, the head of the token prompt — as the trial's most frequent
 one. The title, summary and compaction requests some harnesses fire beside the loop open
 with a different one; they are counted in `final_metrics.extra.side`, not made into
-steps. A step's tool calls are the reply's, its observation the tool results the next
+steps. A request its trial ended before it finished was hung up by the proxy; it
+becomes the in-flight step chad's own trajectories end with, counted in no totals. A
+step's tool calls are the reply's, its observation the tool results the next
 request of the conversation carries back, and its metrics are the server's own counts:
 `prompt_tokens` includes the cached ones, as chad's do, so the two sources add up the
 same way.
@@ -143,6 +145,13 @@ def convert(records: Sequence[Mapping[str, JsonValue]], agent: str, version: str
                               "timestamp": _stamp(_num(agent_records[0].get("t")))})
     for i, record in enumerate(agent_records):
         request, reply = _obj(record.get("request")), _obj(record.get("reply"))
+        if record.get("aborted") is True:
+            # Hung up when its trial ended: the step that was still being generated,
+            # marked the way chad marks its own, and counted in no totals.
+            steps.append({"source": "agent", "message": "", "model_name": model,
+                          "timestamp": _stamp(_num(record.get("t"))),
+                          "extra": {"in_flight": True, "aborted": True}})
+            continue
         if "prompt" in request:
             reasoning, visible, calls = _completion_step(reply)
         else:
@@ -212,6 +221,7 @@ def _final(steps: Sequence[Mapping[str, JsonValue]], side: Sequence[Mapping[str,
         "cache_hit_rate": round(cached / prompt, 3) if prompt else 0.0,
         "finishes": dict(Counter(_text(e.get("finish")) for e in extras)),
         "requests": len(records),
+        "aborted": sum(1 for r in records if r.get("aborted") is True),
         "sampler": dict(Counter(_text(r.get("sampler")) for r in records)),
         "side": {"requests": len(side),
                  "prompt_n": int(sum(_num(t.get("prompt_n")) for t in timings)),

@@ -34,6 +34,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import socket
 import threading
 import time
 import urllib.parse
@@ -236,6 +237,10 @@ class Proxy:
         self.stray = stray             # where a request outside any trial is logged
         self._log = ""
         self._lock = threading.Lock()
+        # Upstream connections still streaming, by id: the log their request arrived
+        # under, and the connection to hang up if that trial ends first.
+        self._inflight: dict[int, tuple[str, http.client.HTTPConnection]] = {}
+        self._aborted: set[int] = set()
         self._server = ThreadingHTTPServer(("127.0.0.1", port), _handler(self))
         self._server.daemon_threads = True
         self.origin = f"http://127.0.0.1:{self._server.server_address[1]}"
@@ -248,19 +253,53 @@ class Proxy:
         self._server.server_close()
 
     def route(self, log: str) -> None:
-        """Send later records to `log` (a trial's), or with "" to the stray log."""
+        """File requests that arrive from now on under `log` (a trial's), or with "" in the
+        stray log. A request still in flight under another log is hung up: its trial has
+        ended and its harness is gone, and a slot left generating for nobody would be
+        billed, in tokens and in wait, to whoever runs next."""
         with self._lock:
+            ending = [(key, conn) for key, (owner, conn) in self._inflight.items()
+                      if owner != log]
+            self._aborted.update(key for key, _ in ending)
             self._log = log
+        for _key, conn in ending:
+            _hang_up(conn)
 
-    def record(self, entry: Mapping[str, JsonValue]) -> None:
+    def admit(self, conn: http.client.HTTPConnection) -> tuple[int, str]:
+        """Register a request as it arrives: its key, and the log it belongs to — the
+        trial it arrived in, however long it runs."""
         with self._lock:
-            path = self._log or self.stray
+            self._inflight[id(conn)] = (self._log, conn)
+            return id(conn), self._log
+
+    def release(self, key: int) -> bool:
+        """Unregister a finished request; whether `route()` hung it up."""
+        with self._lock:
+            self._inflight.pop(key, None)
+            aborted = key in self._aborted
+            self._aborted.discard(key)
+            return aborted
+
+    def record(self, entry: Mapping[str, JsonValue], log: str) -> None:
+        with self._lock:
+            path = log or self.stray
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
 
     def force(self, body: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
         return {**body, **self.forced}
+
+
+def _hang_up(conn: http.client.HTTPConnection) -> None:
+    """Shut the socket down rather than close it: a thread blocked reading a socket is
+    woken by a shutdown, not reliably by a close of the descriptor under it."""
+    sock = conn.sock
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
 
 def _handler(proxy: Proxy) -> type[BaseHTTPRequestHandler]:
@@ -303,53 +342,62 @@ def _handler(proxy: Proxy) -> type[BaseHTTPRequestHandler]:
             if is_object(sent):
                 body = json.dumps(proxy.force(sent)).encode()
             conn = http.client.HTTPConnection(proxy.host, proxy.port, timeout=None)
+            key, log = proxy.admit(conn)
             headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP}
             headers["Content-Length"] = str(len(body))
+            status, kept, first, gone = 0, bytearray(), 0.0, False
             try:
                 conn.request(self.command, self.path, body=body, headers=headers)
                 upstream = conn.getresponse()
-            except OSError as e:
-                self.send_error(502, f"llama-server unreachable: {e}")
-                return
-            self.send_response_only(upstream.status, upstream.reason)
-            chunked = "chunked" in (upstream.getheader("Transfer-Encoding") or "").lower()
-            for key, value in upstream.getheaders():
-                if key.lower() not in _HOP or (key.lower() == "content-length" and not chunked):
-                    self.send_header(key, value)
-            self.send_header("Connection", "close")
-            self.end_headers()
-            kept, first, gone = bytearray(), 0.0, False
-            while True:
-                chunk = upstream.read1(65536)
-                if not chunk:
-                    break
-                if generating:
-                    kept += chunk
-                try:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    gone = True
-                    break
-                first = first or time.time()
-            conn.close()
-            self.close_connection = True
+                status = upstream.status
+                self.send_response_only(upstream.status, upstream.reason)
+                chunked = "chunked" in (upstream.getheader("Transfer-Encoding") or "").lower()
+                for name, value in upstream.getheaders():
+                    if name.lower() not in _HOP or (name.lower() == "content-length" and not chunked):
+                        self.send_header(name, value)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                while True:
+                    chunk = upstream.read1(65536)
+                    if not chunk:
+                        break
+                    if generating:
+                        kept += chunk
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        gone = True
+                        break
+                    first = first or time.time()
+            except (OSError, http.client.HTTPException) as e:
+                # The server failed, or `route()` hung up on a trial that ended.
+                if not status:
+                    try:
+                        self.send_error(502, f"llama-server: {e}")
+                    except OSError:
+                        gone = True
+            finally:
+                conn.close()
+                aborted = proxy.release(key)
+                self.close_connection = True
             if is_object(sent):
                 reply = parse_reply(bytes(kept))
                 entry: dict[str, JsonValue] = {
-                    "t": round(t0, 3), "path": path, "status": upstream.status,
+                    "t": round(t0, 3), "path": path, "status": status,
                     "ttfb_s": round(first - t0, 3) if first else None,
                     "total_s": round(time.time() - t0, 3), "client_gone": gone,
+                    "aborted": aborted,
                     "asked": {k: sent[k] for k in proxy.forced if k in sent},
                     "sampler": sampler_check(proxy.forced, reply.settings),
                     "request": sent, "reply": reply_record(reply)}
-                if not (reply.timings or reply.content or reply.tool_calls):
+                if not (aborted or reply.timings or reply.content or reply.tool_calls):
                     # A reply that parses to nothing is kept raw (its ends), so the next
                     # one can be read instead of guessed at.
                     entry.update({"raw_bytes": len(kept),
                                   "raw_head": bytes(kept[:2048]).decode("utf-8", "replace"),
                                   "raw_tail": bytes(kept[-2048:]).decode("utf-8", "replace")})
-                proxy.record(entry)
+                proxy.record(entry, log)
 
     return Relay
 
