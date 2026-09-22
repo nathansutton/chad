@@ -165,6 +165,22 @@ def test_the_committed_harness_subset_is_the_draw_it_says_it_is():
     assert lines[1:] == stats.subset(catalog.load_manifest(), 6, "harness-1")
 
 
+def test_spread_covers_as_many_languages_as_it_has_tasks():
+    names = [f"{lang}/t{i}" for lang in ("go", "rust", "cpp", "java") for i in range(5)]
+    picked = stats.spread(names, 3, "seed-a")
+    assert len({n.split("/")[0] for n in picked}) == 3 and picked == sorted(picked)
+    assert picked == stats.spread(list(reversed(names)), 3, "seed-a")
+    with pytest.raises(ValueError, match="cannot span 4 languages"):
+        stats.spread(names, 5, "seed-a")
+
+
+def test_the_committed_three_are_drawn_from_the_committed_thirty_six():
+    kit = os.path.join(REPO, "benchmarks", "polyglot", "subsets")
+    three = stats.read_task_list(os.path.join(kit, "harness-3.txt"))
+    assert three == stats.spread(stats.read_task_list(os.path.join(kit, "harness-36.txt")),
+                                 3, "harness-3")
+
+
 def _step(name, prompt, cached, command=""):
     return {"source": "agent", "step_id": 3,
             "tool_calls": [{"function_name": name,

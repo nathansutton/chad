@@ -4,6 +4,7 @@
     python benchmarks/polyglot/stats.py pool    _runs/baseline/trials.jsonl > _runs/baseline/pool.txt
     python benchmarks/polyglot/stats.py compare _runs/baseline/trials.jsonl _runs/arm-b/trials.jsonl
     python benchmarks/polyglot/stats.py subset --per-language 6 --seed harness-1
+    python benchmarks/polyglot/stats.py subset --spread 3 --seed harness-3 --from subsets/harness-36.txt
 
 Stdlib only; nothing here loads a model.
 
@@ -179,6 +180,24 @@ def subset(names: Sequence[str], per_language: int, seed: str) -> list[str]:
     return sorted(picked)
 
 
+def spread(names: Sequence[str], n: int, seed: str) -> list[str]:
+    """`n` tasks in `n` different languages: the languages drawn first, then one task in
+    each — the most languages a sample of `n` can cover."""
+    by_language: dict[str, list[str]] = defaultdict(list)
+    for name in sorted(names):
+        by_language[name.split("/")[0]].append(name)
+    if n > len(by_language):
+        raise ValueError(f"{n} tasks cannot span {len(by_language)} languages")
+    rng = random.Random(seed)
+    languages = sorted(rng.sample(sorted(by_language), n))
+    return sorted(rng.choice(by_language[language]) for language in languages)
+
+
+def read_task_list(path: str) -> list[str]:
+    with open(path, encoding="utf-8") as f:
+        return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+
+
 def score_report(trials: Sequence[Trial]) -> str:
     rates = pass_rates(trials)
     by_lang: dict[str, list[float]] = defaultdict(list)
@@ -228,8 +247,12 @@ def main() -> int:
     c.add_argument("a")
     c.add_argument("b")
     d = sub.add_parser("subset")
-    d.add_argument("--per-language", type=int, required=True)
+    how = d.add_mutually_exclusive_group(required=True)
+    how.add_argument("--per-language", type=int, help="this many tasks in every language")
+    how.add_argument("--spread", type=int, help="this many tasks, each in a different language")
     d.add_argument("--seed", required=True)
+    d.add_argument("--from", dest="source", default="",
+                   help="draw from this task list (default: manifest.json)")
     args = ap.parse_args()
     if args.command == "score":
         print(score_report(load_trials(args.trials)))
@@ -237,9 +260,17 @@ def main() -> int:
         print("\n".join(pool(load_trials(args.trials), args.include_never)))
     elif args.command == "subset":
         from catalog import load_manifest
-        print(f"# {args.per_language} per language, drawn from manifest.json by "
-              f"`stats.py subset --per-language {args.per_language} --seed {args.seed}`")
-        print("\n".join(subset(load_manifest(), args.per_language, args.seed)))
+        names = read_task_list(args.source) if args.source else load_manifest()
+        source = f" --from {args.source}" if args.source else ""
+        if args.spread:
+            picked = spread(names, args.spread, args.seed)
+            print(f"# {args.spread} tasks in {args.spread} languages, drawn by `stats.py subset "
+                  f"--spread {args.spread} --seed {args.seed}{source}`")
+        else:
+            picked = subset(names, args.per_language, args.seed)
+            print(f"# {args.per_language} per language, drawn from manifest.json by "
+                  f"`stats.py subset --per-language {args.per_language} --seed {args.seed}`")
+        print("\n".join(picked))
     else:
         print(compare_report(compare(load_trials(args.a), load_trials(args.b))))
     return 0

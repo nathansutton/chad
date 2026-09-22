@@ -1,0 +1,4 @@
+# 3 tasks in 3 languages, drawn by `stats.py subset --spread 3 --seed harness-3 --from subsets/harness-36.txt`
+cpp/grade-school
+go/scale-generator
+rust/alphametics
