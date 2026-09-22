@@ -11,8 +11,9 @@ without `--upload`.
 
 A run records where the agent stood: every workspace path, the model directory, the
 interpreter, chad's spill files. Before anything is written, each file is rewritten so the
-trial's workspace is `.`, a CLI arm's throwaway home is `<home>`, the kit is `<kit>`, the
-checkout is `<repo>` and the home directory is `~`, and then checked. The bundle is refused if a `/Users/<name>` path or the
+trial's workspace is `.`, a CLI arm's throwaway home is `<home>` (including the `~` such an
+arm writes, which is that home), the kit is `<kit>`, the checkout is `<repo>` and the home
+directory is `~`, and then checked. The bundle is refused if a `/Users/<name>` path or the
 home directory survives, if a path under `~` leads somewhere a trial has no business being, or if
 a string looks like a credential. A refusal names the file: the fix is a look at that trial,
 not a looser rule.
@@ -95,10 +96,17 @@ class Bundle:
     runs_row: str
 
 
-def redact(text: str, roots: Roots) -> str:
-    """Every local prefix rewritten, most specific first."""
+def redact(text: str, roots: Roots, isolated: bool = False) -> str:
+    """Every local prefix rewritten, most specific first. `isolated`: the arm ran in a
+    throwaway home (`harness/cli.py`), so a `~` in what it wrote — a harness describing
+    its own config directory, say — is that home, not the maintainer's, and is written
+    as such rather than left to look like a path into someone's account."""
     text = _WORKSPACE.sub(".", text)
     text = _TRIAL_HOME.sub("<home>", text)
+    if isolated:
+        # Before the home prefix is folded to `~`, or a real path into the maintainer's
+        # account would end up spelled as the throwaway home and stop being a refusal.
+        text = _HOME_PATH.sub(lambda m: "<home>" + m.group(0)[1:], text)
     for prefix, name in ((roots.kit, "<kit>"), (roots.repo, "<repo>"), (roots.home, "~")):
         text = re.sub(re.escape(prefix) + _WHOLE, name, text)
     return text
@@ -182,11 +190,14 @@ def bundle(run_dir: str, out_dir: str, roots: Roots, with_trajectories: bool = F
         for root, _dirs, files in sorted(os.walk(base)):
             sources += [(os.path.relpath(os.path.join(root, f), run_dir), os.path.join(root, f))
                         for f in sorted(files) if f.endswith(".json")]
+    with open(os.path.join(run_dir, "meta.json"), encoding="utf-8") as f:
+        # An arm with its own throwaway home says so; chad in process does not.
+        isolated = "isolation" in _read_meta(f.read())
     clean: dict[str, str] = {}
     refused = []
     for name, path in sources:
         with open(path, encoding="utf-8") as f:
-            text = redact(f.read(), roots)
+            text = redact(f.read(), roots, isolated)
         refused += [f"{name}: {why}" for why in problems(text, roots)]
         clean[name] = text
     if refused:

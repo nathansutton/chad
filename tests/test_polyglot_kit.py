@@ -323,6 +323,20 @@ def test_a_cli_trial_is_rewritten_wherever_its_root_is():
     assert not publish.problems(publish.redact(text, ROOTS), ROOTS)
 
 
+def test_an_isolated_arms_tilde_is_its_throwaway_home(tmp_path):
+    """A foreign harness describing its own config dir wrote `~/.config/...`; in an arm
+    with a throwaway home that is not the maintainer's account, and the bundle says so."""
+    text = "files under ~/.config/opencode/, and /Users/tester/.ssh/config"
+    assert publish.redact(text, ROOTS, isolated=True).startswith("files under <home>/.config")
+    assert publish.problems(publish.redact("under ~/.config/x", ROOTS, isolated=True), ROOTS) == []
+    # chad in process runs in the real home, so the same text is still refused there.
+    assert publish.problems(publish.redact("under ~/.config/x", ROOTS), ROOTS)
+    # A real path into the maintainer's account is still a refusal in an isolated arm.
+    assert publish.problems(publish.redact(text, ROOTS, isolated=True), ROOTS)
+    assert publish.redact(ROOTS.home + "/.cargo/registry", ROOTS, isolated=True) == \
+        "~/.cargo/registry"                       # the real cargo home a trial does use
+
+
 def test_rows_alone_unless_trajectories_are_asked_for(tmp_path):
     publish.bundle(str(_run_dir(tmp_path)), str(tmp_path / "out"), ROOTS)
     assert sorted(os.listdir(tmp_path / "out")) == ["meta.json", "trials.jsonl"]
