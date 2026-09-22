@@ -146,6 +146,25 @@ def test_pool_is_the_frontier_and_needs_reps():
         stats.pool(_trials({"t": [True]}))
 
 
+def test_subset_is_a_seeded_draw_per_language():
+    names = [f"{lang}/t{i}" for lang in ("go", "rust") for i in range(10)]
+    picked = stats.subset(names, 3, "seed-a")
+    assert picked == sorted(picked) and len(picked) == 6
+    assert sum(n.startswith("go/") for n in picked) == 3
+    assert picked == stats.subset(list(reversed(names)), 3, "seed-a")
+    assert picked != stats.subset(names, 3, "seed-b")
+    with pytest.raises(ValueError, match="only 10 tasks"):
+        stats.subset(names, 11, "seed-a")
+
+
+def test_the_committed_harness_subset_is_the_draw_it_says_it_is():
+    path = os.path.join(REPO, "benchmarks", "polyglot", "subsets", "harness-36.txt")
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    assert "--per-language 6 --seed harness-1" in lines[0]
+    assert lines[1:] == stats.subset(catalog.load_manifest(), 6, "harness-1")
+
+
 def _step(name, prompt, cached, command=""):
     return {"source": "agent", "step_id": 3,
             "tool_calls": [{"function_name": name,

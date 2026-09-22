@@ -3,6 +3,7 @@
     python benchmarks/polyglot/stats.py score   _runs/baseline/trials.jsonl
     python benchmarks/polyglot/stats.py pool    _runs/baseline/trials.jsonl > _runs/baseline/pool.txt
     python benchmarks/polyglot/stats.py compare _runs/baseline/trials.jsonl _runs/arm-b/trials.jsonl
+    python benchmarks/polyglot/stats.py subset --per-language 6 --seed harness-1
 
 Stdlib only; nothing here loads a model.
 
@@ -26,6 +27,15 @@ show). Pin the pool from a baseline run BEFORE looking at the arm you want to te
 both arms on it, and the same evidence costs a fraction of the trials. The full set
 still has a job the pool cannot do: checking that a change did not break the tasks that
 used to be safe.
+
+WHY THERE IS ALSO A SUBSET
+--------------------------
+A pool needs a baseline of the very arm being compared, at two reps or more. Comparing
+harnesses has no such arm to spare: they run on a GGUF the pool's baseline never saw,
+and a llama-server trial costs two or three of an in-process one. `subset` is the
+alternative that needs no run at all: a seeded draw of N tasks per language from the
+manifest, committed before any arm runs, so the sample cannot have been chosen by its
+results. It spends trials on tasks that never flip, which the paired test simply ties.
 """
 from __future__ import annotations
 
@@ -33,6 +43,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -153,6 +164,21 @@ def pool(trials: Sequence[Trial], include_never: bool = False) -> list[str]:
     return sorted(task for task, r in rates.items() if 0 < r < 1 or (include_never and r == 0))
 
 
+def subset(names: Sequence[str], per_language: int, seed: str) -> list[str]:
+    """`per_language` tasks from each language, by one seeded draw over the sorted names:
+    the same manifest and seed give the same list on any machine and any Python."""
+    by_language: dict[str, list[str]] = defaultdict(list)
+    for name in sorted(names):
+        by_language[name.split("/")[0]].append(name)
+    rng = random.Random(seed)
+    picked = []
+    for language in sorted(by_language):
+        if len(by_language[language]) < per_language:
+            raise ValueError(f"{language} has only {len(by_language[language])} tasks")
+        picked += rng.sample(by_language[language], per_language)
+    return sorted(picked)
+
+
 def score_report(trials: Sequence[Trial]) -> str:
     rates = pass_rates(trials)
     by_lang: dict[str, list[float]] = defaultdict(list)
@@ -201,11 +227,19 @@ def main() -> int:
     c = sub.add_parser("compare")
     c.add_argument("a")
     c.add_argument("b")
+    d = sub.add_parser("subset")
+    d.add_argument("--per-language", type=int, required=True)
+    d.add_argument("--seed", required=True)
     args = ap.parse_args()
     if args.command == "score":
         print(score_report(load_trials(args.trials)))
     elif args.command == "pool":
         print("\n".join(pool(load_trials(args.trials), args.include_never)))
+    elif args.command == "subset":
+        from catalog import load_manifest
+        print(f"# {args.per_language} per language, drawn from manifest.json by "
+              f"`stats.py subset --per-language {args.per_language} --seed {args.seed}`")
+        print("\n".join(subset(load_manifest(), args.per_language, args.seed)))
     else:
         print(compare_report(compare(load_trials(args.a), load_trials(args.b))))
     return 0

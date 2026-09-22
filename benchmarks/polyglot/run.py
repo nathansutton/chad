@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import shutil
@@ -140,8 +141,9 @@ def row(task: Task, label: str, rep: int, solved: Solved, verdict: workspace.Ver
 
 class Block:
     def __init__(self, label: str, harness: Harness, wall_cap: int,
-                 runs: str = os.path.join(catalog.ROOT, "_runs")):
+                 runs: str = os.path.join(catalog.ROOT, "_runs"), tasks_file: str = ""):
         self.label, self.harness, self.wall_cap = label, harness, wall_cap
+        self.tasks_file = tasks_file
         self.out_dir = os.path.join(runs, label)
         self.trials_path = os.path.join(self.out_dir, "trials.jsonl")
         os.makedirs(self.out_dir, exist_ok=True)
@@ -157,6 +159,11 @@ class Block:
             "upstream_commit": catalog.UPSTREAM_COMMIT,
             **arm,
         }
+        if self.tasks_file:
+            # A subset or pool is only pre-registered if the rows name exactly which one.
+            with open(self.tasks_file, "rb") as f:
+                meta["tasks_sha256"] = hashlib.sha256(f.read()).hexdigest()
+            meta["tasks_file"] = os.path.relpath(os.path.abspath(self.tasks_file), REPO_ROOT)
         with open(os.path.join(self.out_dir, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=1)
             f.write("\n")
@@ -258,7 +265,8 @@ def main() -> int:
     if not tasks:
         raise SystemExit("no tasks selected")
     try:
-        return Block(args.label, build_harness(args), args.wall_cap).run(tasks, args.reps)
+        block = Block(args.label, build_harness(args), args.wall_cap, tasks_file=args.tasks_file)
+        return block.run(tasks, args.reps)
     except HarnessError as e:
         raise SystemExit(f"[{args.label}] {e}") from None
 
