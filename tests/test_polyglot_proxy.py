@@ -184,6 +184,32 @@ def test_a_request_belongs_to_the_trial_it_arrived_in_and_ends_with_it(relay, tm
     assert doc["final_metrics"]["extra"]["aborted"] == 1
 
 
+def test_a_client_that_hangs_up_takes_its_generation_with_it(relay, tmp_path):
+    """A non-streaming client that times out and leaves: llama-server would cancel the
+    generation for a client it saw leave, so the proxy must not keep it alive."""
+    import socket as sock
+    p, _ = relay
+    p.route(str(tmp_path / "trial.jsonl"))
+    body = json.dumps({"model": "m", "messages": [SYSTEM, USER], "hold": True}).encode()
+    host, port = p.origin.removeprefix("http://").split(":")
+    client = sock.create_connection((host, int(port)))
+    client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                   b"application/json\r\nContent-Length: " + str(len(body)).encode() +
+                   b"\r\n\r\n" + body)
+    time.sleep(0.5)
+    t0 = time.time()
+    client.close()                                     # the client's own timeout
+    deadline = time.time() + 5
+    while not (tmp_path / "trial.jsonl").exists() and time.time() < deadline:
+        time.sleep(0.05)
+    record = proxy_atif.load(str(tmp_path / "trial.jsonl"))[0]
+    assert record["client_gone"] is True and record["aborted"] is False
+    assert time.time() - t0 < 3                        # hung up, not left to finish
+    doc = proxy_atif.convert([*_chat_log()[:1], record], "x", "0", "m")
+    assert doc["steps"][-1]["extra"] == {"in_flight": True, "aborted": False}
+    assert doc["final_metrics"]["extra"]["abandoned"] == 1
+
+
 def _post_quietly(origin, body):
     try:
         _post(origin, "/v1/chat/completions", body)

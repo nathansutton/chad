@@ -34,6 +34,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import select
 import socket
 import threading
 import time
@@ -302,6 +303,25 @@ def _hang_up(conn: http.client.HTTPConnection) -> None:
             pass
 
 
+def _watch(client: socket.socket, conn: http.client.HTTPConnection, done: threading.Event,
+           left: threading.Event) -> None:
+    """Hang up upstream as soon as the client hangs up. A streaming reply finds out at
+    its next write; a non-streaming one has nothing to write until the generation ends,
+    and llama-server, which would cancel it for a client that left, sees only the proxy
+    still connected — so it would finish a reply nobody is waiting for, beside the
+    client's own retry."""
+    while not done.wait(0.5):
+        try:
+            readable, _, _ = select.select([client], [], [], 0)
+            closed = bool(readable) and not client.recv(1, socket.MSG_PEEK)
+        except (OSError, ValueError):
+            closed = True
+        if closed and not done.is_set():
+            left.set()
+            _hang_up(conn)
+            return
+
+
 def _handler(proxy: Proxy) -> type[BaseHTTPRequestHandler]:
     class Relay(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -346,6 +366,10 @@ def _handler(proxy: Proxy) -> type[BaseHTTPRequestHandler]:
             headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP}
             headers["Content-Length"] = str(len(body))
             status, kept, first, gone = 0, bytearray(), 0.0, False
+            done, left = threading.Event(), threading.Event()
+            if generating:
+                threading.Thread(target=_watch, args=(self.connection, conn, done, left),
+                                 daemon=True).start()
             try:
                 conn.request(self.command, self.path, body=body, headers=headers)
                 upstream = conn.getresponse()
@@ -378,8 +402,10 @@ def _handler(proxy: Proxy) -> type[BaseHTTPRequestHandler]:
                     except OSError:
                         gone = True
             finally:
+                done.set()
                 conn.close()
                 aborted = proxy.release(key)
+                gone = gone or left.is_set()
                 self.close_connection = True
             if is_object(sent):
                 reply = parse_reply(bytes(kept))
