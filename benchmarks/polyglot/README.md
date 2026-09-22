@@ -93,7 +93,7 @@ as them, which is the arm every foreign one is paired against. They all talk to 
 llama-server, started once for the whole llama phase:
 
 ```sh
-uv run python benchmarks/polyglot/server.py        # the matrix's GGUF, -c 32768, --jinja; Ctrl-C stops it
+uv run python benchmarks/polyglot/server.py        # chad's own weights in llama.cpp; Ctrl-C stops it
 uv run python benchmarks/polyglot/run.py --label h3-pi --harness pi \
     --tasks-file benchmarks/polyglot/subsets/harness-3.txt --reps 3
 ```
@@ -102,6 +102,15 @@ uv run python benchmarks/polyglot/run.py --label h3-pi --harness pi \
 matrix article did — per arm, the prompt tax of turn 1 and its wait, the tokens the
 prefix cache could not serve on each later turn and their wait, cache reuse, side
 requests — and pairs each arm's pass rate with the reference arm by task.
+
+The llama arms run **the model chad ships**, not a conventional quant of it: Prism ML's
+Ternary Bonsai 2 of Qwen3.8-27B, as `Ternary-Bonsai-2-27B-PQ2_0.gguf` against chad's MLX
+2-bit pack of the same build. That keeps a harness comparison on the weights a chad user
+actually runs, and makes chad-in-process against chad-on-llama an engine comparison
+rather than a weights one. Those files need Prism ML's
+[llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) (stock llama.cpp rejects
+`PQ2_0`); `server.py` looks for it in `_data/llama-prism/`, or at
+`POLYGLOT_LLAMA_SERVER`, and refuses to start a stock binary on these weights.
 
 One engine at a time, enforced: an in-process block refuses while a llama-server is up,
 and a block refuses while another block runs.

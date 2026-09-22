@@ -315,6 +315,22 @@ def test_two_engines_are_never_resident():
     server.refuse("in-process block", pgrep(blocks=[os.getpid()]))  # itself does not count
 
 
+def test_the_server_binary_is_the_fork_these_weights_need(tmp_path):
+    fork = tmp_path / "fork" / "bin"
+    fork.mkdir(parents=True)
+    (fork / "llama-server").write_text("#!/bin/sh\n")
+    assert server.binary({}, str(fork.parent)) == (str(fork / "llama-server"), True)
+    assert server.binary({"POLYGLOT_LLAMA_SERVER": "/opt/x"}, "/nowhere") == ("/opt/x", True)
+    stock = tmp_path / "stock"
+    stock.mkdir()
+    (stock / "llama-server").write_text("#!/bin/sh\n")
+    (stock / "llama-server").chmod(0o755)
+    assert server.binary({"PATH": str(stock)}, "/nowhere") == \
+        (str(stock / "llama-server"), False)          # stock cannot read PQ2_0
+    with pytest.raises(server.EngineBusy, match="no llama-server at all"):
+        server.binary({"PATH": str(tmp_path / "empty")}, "/nowhere")
+
+
 def test_the_server_is_started_so_its_slots_can_be_erased(tmp_path):
     argv = server.LlamaServer("m.gguf", str(tmp_path / "server.log")).argv()
     assert argv[argv.index("--slot-save-path") + 1] == str(tmp_path / "llama-slots")

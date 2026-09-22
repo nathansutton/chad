@@ -32,11 +32,12 @@ from string import Template
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import catalog  # noqa: E402
+import server  # noqa: E402
 from catalog import JsonValue, is_object, is_text  # noqa: E402
 from harness.cli import CliHarness, CliSpec, Endpoint, HarnessError, Pin, entry_sha256  # noqa: E402
 
 LOCK = os.path.join(catalog.ROOT, "harnesses.lock")
-SERVED_MODEL = "qwen3.8-27b-local"     # the llama-server --alias every arm asks for
+SERVED_MODEL = server.ALIAS            # the llama-server --alias every arm asks for
 
 _OPENCODE = """{
   "provider": {
