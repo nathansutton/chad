@@ -181,6 +181,40 @@ def test_the_committed_three_are_drawn_from_the_committed_thirty_six():
                                  3, "harness-3")
 
 
+def _arm_run(root, label, outcomes, turns):
+    """A run in `run.py`'s layout: one row per (task, passed), each naming a trajectory
+    whose agent turns are `turns` = [(prompt_tokens, cached_tokens, prefill_s), ...]."""
+    run_dir = root / label
+    rows = []
+    for n, (task, passed) in enumerate(outcomes):
+        rel = f"trajectories/go/t{n}.rep1.json"
+        (run_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+        (run_dir / rel).write_text(json.dumps({"steps": [{"source": "user"}] + [
+            {"source": "agent", "metrics": {"prompt_tokens": p, "cached_tokens": c,
+                                            "completion_tokens": 10, "extra": {"prefill_s": s}}}
+            for p, c, s in turns]}))
+        rows.append({"task": task, "language": "go", "rep": 1, "passed": passed, "capped": not passed,
+                     "wall_s": 60.0, "gen_tokens": 100, "side_requests": 1, "trajectory": rel})
+    (run_dir / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return str(run_dir)
+
+
+def test_a_scorecard_line_separates_the_tax_from_later_turns(tmp_path):
+    ref = _arm_run(tmp_path, "ref", [("go/a", True), ("go/b", True)],
+                   [(2000, 0, 20.0), (2100, 2000, 1.0), (2300, 2100, 2.0)])
+    arm = _arm_run(tmp_path, "arm", [("go/a", True), ("go/b", False)],
+                   [(9000, 0, 90.0), (9500, 9000, 5.0)])
+    c = stats.card(arm)
+    assert (c.trials, c.passed, c.capped, c.tax, c.first_wait_s) == (2, 1, 1, 9000, 90.0)
+    assert (c.later_uncached, c.later_wait_s, c.steps, c.side) == (500, 5.0, 2, 1.0)
+    assert c.reuse == pytest.approx(9000 / 9500)
+    assert stats.card(ref).later_uncached == 150          # median of 100 and 200
+    table = stats.scorecard_report(ref, [ref, arm]).splitlines()
+    assert "| ref | 2/2 | 0 | 2,000 |" in table[2] and table[2].endswith("| reference |")
+    assert table[3].startswith("| arm | 1/2 | 1 | 9,000 | 90.0 s | 500 |")
+    assert table[3].endswith("| 0 / 1 (1.00) |")
+
+
 def _step(name, prompt, cached, command=""):
     return {"source": "agent", "step_id": 3,
             "tool_calls": [{"function_name": name,

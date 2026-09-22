@@ -98,6 +98,11 @@ uv run python benchmarks/polyglot/run.py --label h3-pi --harness pi \
     --tasks-file benchmarks/polyglot/subsets/harness-3.txt --reps 3
 ```
 
+`stats.py scorecard --ref _runs/h3-chad-llama _runs/h3-*` reads the result the way the
+matrix article did — per arm, the prompt tax of turn 1 and its wait, the tokens the
+prefix cache could not serve on each later turn and their wait, cache reuse, side
+requests — and pairs each arm's pass rate with the reference arm by task.
+
 One engine at a time, enforced: an in-process block refuses while a llama-server is up,
 and a block refuses while another block runs.
 
