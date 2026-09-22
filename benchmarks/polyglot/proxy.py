@@ -92,10 +92,11 @@ def _text(value: JsonValue) -> str:
 
 
 def _docs(raw: str) -> list[Mapping[str, JsonValue]]:
-    """The JSON objects of a reply: each `data:` line of a stream, or the one body."""
-    stripped = raw.lstrip()
-    lines = ([ln[5:].strip() for ln in raw.splitlines() if ln.startswith("data:")]
-             if stripped.startswith(("data:", "event:")) else [stripped])
+    """The JSON objects of a reply: each `data:` line of a stream, or the one body. A
+    stream is recognized by any `data:` line, not by its first bytes: a server may open
+    one with an SSE comment or a blank line, and chad's own client skips both."""
+    streamed = [ln[5:].strip() for ln in raw.splitlines() if ln.startswith("data:")]
+    lines = streamed or [raw.strip()]
     docs = []
     for line in lines:
         if not line or line == "[DONE]":
@@ -335,13 +336,20 @@ def _handler(proxy: Proxy) -> type[BaseHTTPRequestHandler]:
             self.close_connection = True
             if is_object(sent):
                 reply = parse_reply(bytes(kept))
-                proxy.record({
+                entry: dict[str, JsonValue] = {
                     "t": round(t0, 3), "path": path, "status": upstream.status,
                     "ttfb_s": round(first - t0, 3) if first else None,
                     "total_s": round(time.time() - t0, 3), "client_gone": gone,
                     "asked": {k: sent[k] for k in proxy.forced if k in sent},
                     "sampler": sampler_check(proxy.forced, reply.settings),
-                    "request": sent, "reply": reply_record(reply)})
+                    "request": sent, "reply": reply_record(reply)}
+                if not (reply.timings or reply.content or reply.tool_calls):
+                    # A reply that parses to nothing is kept raw (its ends), so the next
+                    # one can be read instead of guessed at.
+                    entry.update({"raw_bytes": len(kept),
+                                  "raw_head": bytes(kept[:2048]).decode("utf-8", "replace"),
+                                  "raw_tail": bytes(kept[-2048:]).decode("utf-8", "replace")})
+                proxy.record(entry)
 
     return Relay
 

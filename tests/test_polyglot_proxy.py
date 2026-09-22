@@ -58,6 +58,11 @@ def test_a_responses_stream_is_read_once():
     assert reply.finish == "completed" and reply.timings["prompt_n"] == 279
 
 
+def test_a_stream_that_opens_with_a_comment_is_still_a_stream():
+    reply = proxy.parse_reply(b": keep-alive\n\n" + _fixture("completion_stream.sse"))
+    assert reply.content.startswith("<think>") and reply.timings["predicted_n"] == 24
+
+
 def test_completion_echoes_the_sampler_it_applied():
     reply = proxy.parse_reply(_fixture("completion_stream.sse"))
     assert reply.content.startswith("<think>") and reply.timings["predicted_n"] == 24
