@@ -122,6 +122,13 @@ _SPECIAL_TOKEN_RE = re.compile(r"<\|[A-Za-z0-9_]+\|>")
 MENTION_MAX_LINES = 400
 MENTION_MAX_CHARS = 10000
 
+# A step's <think> is force-closed past this many tokens and the action decoded in the
+# same step. The shipped model can hand-trace a combinatorial task inside one think for
+# 20k+ tokens, coherent but never committing to code, until the turn's wall runs out;
+# a step that is actually reasoning toward an action finishes well inside this, so the
+# ceiling bites only that runaway, and the model then acts on what it has.
+THINK_CEILING_DEFAULT = 4096
+
 
 def _attach_snapshot(path: str) -> str:
     try:
@@ -521,12 +528,10 @@ class Agent:
         self.think_budget = think_budget
         # Close-and-continue think ceiling: force-closes a runaway <think> and
         # CONTINUES decoding the action in the same step, so the reasoning so far
-        # stays in context and nothing is re-derived. OFF by default: force-closing
-        # </think> mid-generation is the most invasive thing the harness can do to
-        # the token stream, and the measured record says the bare loop doesn't need
-        # it. CHAD_THINK_CEILING=N arms it.
+        # stays in context and nothing is re-derived. CHAD_THINK_CEILING=N moves it,
+        # 0 turns it off.
         if think_ceiling is None:
-            think_ceiling = config.env_int("CHAD_THINK_CEILING", 0)
+            think_ceiling = config.env_int("CHAD_THINK_CEILING", THINK_CEILING_DEFAULT)
         self.think_ceiling = think_ceiling
         # Template-level reasoning budget (Qwen3.8: xhigh | medium | low). Unset =>
         # the template's own default, and the argument is not passed at all, so
@@ -1237,8 +1242,8 @@ class Agent:
                     last_pct[0] = pct
                     self._emit("prefill", f"{done}/{total}")
 
-            # Close-and-continue ceiling: armed only when CHAD_THINK_CEILING is
-            # set AND this step is actually thinking (a no-think escalation step has no
+            # Close-and-continue ceiling: armed unless CHAD_THINK_CEILING=0, and only
+            # when this step is actually thinking (a --no-think step has no
             # <think> to salvage). None => the engine path is byte-identical to before.
             step_ceiling = self.think_ceiling if (self.think_ceiling and step_thinking) else None
             text, stats = self.engine.generate(

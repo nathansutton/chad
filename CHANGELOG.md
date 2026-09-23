@@ -4,6 +4,16 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+### The think ceiling is on by default
+
+- **`CHAD_THINK_CEILING` now defaults to 4096** (was 0, off). On hard tasks the shipped
+  ternary model can think inside one `<think>` for 20k+ tokens, hand-tracing the problem
+  without ever writing code, until the wall cap kills the turn. The ceiling force-closes
+  that block and decodes the action in the same step. On three pre-registered polyglot
+  tasks x 3 reps in process it took the shipped model from 3/9 to 6/9, with no step
+  thinking past 4,119 tokens (was 23,830). `CHAD_THINK_CEILING=0` restores the old
+  behavior.
+
 ### One benchmark, and no run output in the repository
 
 - **`benchmarks/polyglot` is the one agent eval.** Terminal-Bench (`benchmarks/tb2`), the

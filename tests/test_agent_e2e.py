@@ -22,8 +22,10 @@ import os
 import shlex
 import sys
 
+import pytest
+
 from chad import guardrails, tools
-from chad.agent import Agent, reject_escalation
+from chad.agent import THINK_CEILING_DEFAULT, Agent, reject_escalation
 from chad.base_engine import BaseEngine, GenStats
 
 # The interpreter running the tests, not whatever `python` PATH happens to hold.
@@ -590,6 +592,30 @@ def _run_escalation(monkeypatch, *, ablated: bool):
     agent = Agent(eng, mode="yolo", thinking=True, max_gen_tokens=64)
     agent.run_turn("change the config value")   # an action task, not read-only
     return tok.flags
+
+
+class _CeilingEngine(ScriptedEngine):
+    """Records the think ceiling each step's generate was handed."""
+
+    def __init__(self, script):
+        super().__init__(script)
+        self.ceilings = []
+
+    def generate(self, prompt_ids, max_tokens=2048, on_token=None, **kw):
+        self.ceilings.append(kw.get("think_ceiling"))
+        return super().generate(prompt_ids, max_tokens, on_token, **kw)
+
+
+@pytest.mark.parametrize("env, want", [(None, THINK_CEILING_DEFAULT), ("0", None), ("900", 900)])
+def test_the_think_ceiling_is_on_by_default_and_zero_turns_it_off(monkeypatch, env, want):
+    if env is None:
+        monkeypatch.delenv("CHAD_THINK_CEILING", raising=False)
+    else:
+        monkeypatch.setenv("CHAD_THINK_CEILING", env)
+    eng = _CeilingEngine(["<think>ok</think>done"])
+    eng.tok = _ThinkFlagTok()
+    Agent(eng, mode="yolo", thinking=True).run_turn("what is in this repo?")
+    assert eng.ceilings == [want]
 
 
 class _BigThinkEngine(ScriptedEngine):

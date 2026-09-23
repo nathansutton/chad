@@ -576,7 +576,7 @@ rather than a silent no-op.
 
 ```bash
 CHAD_THINK_BUDGET=1500        uv run chad  # soft-cap each step's <think> at N tokens, then force-close + continue
-CHAD_THINK_CEILING=384        uv run chad  # force-close a runaway <think> but keep decoding the action in the SAME step (off by default)
+CHAD_THINK_CEILING=4096       uv run chad  # force-close a runaway <think> but keep decoding the action in the SAME step (default 4096; 0 = off)
 CHAD_TURN_BUDGET_TOKENS=90000 uv run chad  # governor token budget (default 3× the context limit)
 CHAD_TURN_BUDGET_S=600        uv run chad  # wall-clock variant (seconds); off by default
 CHAD_AUTO_CONTINUE=2          uv run chad  # on a hard stop, relaunch a fresh turn seeded with the progress note, N times
@@ -607,10 +607,11 @@ CHAD_MAX_GEN_TOKENS=32768     uv run chad  # hard per-STEP generation cap (defau
   before `CHAD_THINK_BUDGET`. Where the think-cap force-closes `<think>` and *ends* the
   step (so the model re-derives its reasoning next step), this force-closes the runaway
   block and keeps decoding the action in the same step, the reasoning so far stays
-  in context and nothing is re-derived. **Off by default**: force-closing `</think>`
-  mid-generation is the most invasive thing the harness can do to the token stream, and
-  the measured record says the bare loop doesn't need it. Steps it fires on are counted
-  as *salvaged* in the session log.
+  in context and nothing is re-derived. **On by default at 4096 tokens**: the shipped
+  model can spend 20k+ tokens of one `<think>` hand-tracing a combinatorial task without
+  ever writing the code, until the turn's wall runs out, while a step that is reasoning
+  toward an action finishes well inside 4096. `CHAD_THINK_CEILING=0` turns it off. Steps
+  it fires on are counted as *salvaged* in the session log.
 - `CHAD_TURN_BUDGET_TOKENS`: the governor's cumulative-prefill budget per turn; defaults
   to 3× the context limit. Disable the governor entirely with `CHAD_NO_GOVERNOR=1` (below).
 - `CHAD_TURN_BUDGET_S`: a wall-clock (seconds) variant of the same governor; off by
