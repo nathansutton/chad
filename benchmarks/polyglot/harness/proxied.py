@@ -5,7 +5,8 @@ Nothing the harness sees changes — same argv, same home, same sandbox; the `En
 was built with already points at the proxy. What the wrapper adds is what only the proxy
 knows: the tokens the server generated, how many generation requests the trial made and
 how many of them were side requests beside the agent loop, and how the sampler check
-came out. `start()` also records the block's sampler audit, then empties every slot of
+came out. `start()` records the forced sampler and template kwargs in the block's meta,
+so a row can prove the thinking level it ran at. `start()` also records the block's sampler audit, then empties every slot of
 the server, so each arm's block starts on a cold prefix cache whatever ran before it.
 
 chad-llama writes a trajectory of its own; the proxy's reading of the same trial is kept
@@ -44,6 +45,7 @@ class Proxied:
     def start(self) -> Mapping[str, JsonValue]:
         meta = dict(self.inner.start())
         meta["sampler_forced"] = dict(self.proxy.forced)
+        meta["template_forced"] = dict(self.proxy.template)
         meta["sampler_audit"] = dict(audit(self.proxy, self.inner.endpoint.model))
         meta["slots_erased"] = erase_slots(self.proxy.upstream)
         meta["think_tokens"] = "counted with the served tokenizer" if self.count_tokens \

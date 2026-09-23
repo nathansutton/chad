@@ -59,7 +59,7 @@ from harness import AtifDoc, Harness, Solved, Trial  # noqa: E402
 from harness.chad_inprocess import ChadInProcess  # noqa: E402
 from harness.cli import CliHarness, Endpoint, HarnessError, server_context  # noqa: E402
 from harness.proxied import Proxied  # noqa: E402
-from proxy import Proxy, shipped_sampler  # noqa: E402
+from proxy import Proxy, shipped_sampler, shipped_template  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(catalog.ROOT))
 DEFAULT_WALL_CAP_S = 1200
@@ -254,7 +254,7 @@ def build_harness(args: argparse.Namespace, stack: contextlib.ExitStack) -> Harn
     server.refuse("cli block")
     upstream = args.server.rstrip("/")
     stray = os.path.join(catalog.ROOT, "_runs", args.label, "output", "stray.requests.jsonl")
-    relay = Proxy(upstream, shipped_sampler(), stray)
+    relay = Proxy(upstream, shipped_sampler(), shipped_template(), stray)
     relay.start()
     stack.callback(relay.stop)
     tokenizer = tokenizer_dir()

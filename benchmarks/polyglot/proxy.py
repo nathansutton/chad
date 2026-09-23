@@ -15,6 +15,13 @@ applied, so those requests are checked one by one; the chat and Responses endpoi
 nothing, so `audit()` checks them once per block, before the first trial, through
 `/slots`.
 
+The thinking level is forced the same way, on the endpoints where llama-server renders
+the harness's messages through the weights' chat template (chat, Responses): no harness
+sets `reasoning_effort`, so each would inherit whatever default the loaded GGUF's
+template carries — xhigh on the Prism packs — while chad renders its own prompt at
+medium. `/completion` and the other raw-prompt endpoints are left alone: their prompt
+arrives already rendered, and the field would change nothing.
+
 RECORDED
 --------
 One line per generation request into the log of the trial in flight (`route()`): when it
@@ -48,6 +55,9 @@ from catalog import JsonValue, is_array, is_number, is_object, is_text
 
 GEN_PATHS = frozenset({"/completion", "/completions", "/v1/completions", "/chat/completions",
                        "/v1/chat/completions", "/responses", "/v1/responses", "/infill"})
+# The subset of those whose prompt llama-server renders itself, from the request's messages.
+RENDERED_PATHS = frozenset({"/chat/completions", "/v1/chat/completions", "/responses",
+                            "/v1/responses"})
 # Request headers that describe one hop, not the request; Content-Length is recomputed
 # because a forced body is a different length.
 _HOP = frozenset({"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -68,6 +78,12 @@ def shipped_sampler() -> dict[str, JsonValue]:
     return {"temperature": preset["temp"], "top_k": int(preset["top_k"]),
             "top_p": preset["top_p"], "min_p": preset["min_p"],
             "presence_penalty": preset["presence_penalty"], **_IDENTITY}
+
+
+def shipped_template() -> dict[str, JsonValue]:
+    """The chat-template kwargs chad renders its own prompt with, read from chad itself."""
+    from chad.prism_pack import REASONING_EFFORT_DEFAULT
+    return {"reasoning_effort": REASONING_EFFORT_DEFAULT}
 
 
 @dataclass(frozen=True)
@@ -229,12 +245,13 @@ class Proxy:
     """One block's proxy: a thread serving 127.0.0.1:`port` (0 picks one), forwarding
     to the llama-server at `upstream`."""
 
-    def __init__(self, upstream: str, forced: Mapping[str, JsonValue], stray: str,
-                 port: int = 0):
+    def __init__(self, upstream: str, forced: Mapping[str, JsonValue],
+                 template: Mapping[str, JsonValue], stray: str, port: int = 0):
         split = urllib.parse.urlsplit(upstream)
         self.upstream = upstream.rstrip("/")
         self.host, self.port = split.hostname or "127.0.0.1", split.port or 80
         self.forced = dict(forced)
+        self.template = dict(template)
         self.stray = stray             # where a request outside any trial is logged
         self._log = ""
         self._lock = threading.Lock()
@@ -288,8 +305,22 @@ class Proxy:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
 
-    def force(self, body: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
-        return {**body, **self.forced}
+    def force(self, body: Mapping[str, JsonValue], path: str) -> dict[str, JsonValue]:
+        """The body as sent upstream: the sampler over the harness's, and on a rendered
+        endpoint the template kwargs over any it set itself, its other kwargs kept."""
+        forced = {**body, **self.forced}
+        if path in RENDERED_PATHS and self.template:
+            kwargs: dict[str, JsonValue] = {}
+            own = body.get("chat_template_kwargs")
+            if is_object(own):
+                kwargs.update(own)
+            kwargs.update(self.template)
+            forced["chat_template_kwargs"] = kwargs
+        return forced
+
+    def asked(self, body: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+        """What the harness set of what `force()` overrides, as it set it."""
+        return {k: body[k] for k in (*self.forced, "chat_template_kwargs") if k in body}
 
 
 def _hang_up(conn: http.client.HTTPConnection) -> None:
@@ -360,7 +391,7 @@ def _handler(proxy: Proxy) -> type[BaseHTTPRequestHandler]:
                     sent = None
             generating = is_object(sent)
             if is_object(sent):
-                body = json.dumps(proxy.force(sent)).encode()
+                body = json.dumps(proxy.force(sent, path)).encode()
             conn = http.client.HTTPConnection(proxy.host, proxy.port, timeout=None)
             key, log = proxy.admit(conn)
             headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP}
@@ -414,7 +445,7 @@ def _handler(proxy: Proxy) -> type[BaseHTTPRequestHandler]:
                     "ttfb_s": round(first - t0, 3) if first else None,
                     "total_s": round(time.time() - t0, 3), "client_gone": gone,
                     "aborted": aborted,
-                    "asked": {k: sent[k] for k in proxy.forced if k in sent},
+                    "asked": proxy.asked(sent),
                     "sampler": sampler_check(proxy.forced, reply.settings),
                     "request": sent, "reply": reply_record(reply)}
                 if not (aborted or reply.timings or reply.content or reply.tool_calls):

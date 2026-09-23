@@ -27,6 +27,7 @@ from test_polyglot_kit import _exercise  # noqa: E402
 
 FIXTURES = os.path.join(REPO, "tests", "fixtures", "llama_server")
 FORCED = proxy.shipped_sampler()
+TEMPLATE = proxy.shipped_template()
 
 
 def _fixture(name):
@@ -130,7 +131,7 @@ class _Upstream:
 @pytest.fixture
 def relay(tmp_path):
     upstream = _Upstream(_fixture("chat_tool_stream.sse"))
-    p = proxy.Proxy(upstream.origin, FORCED, str(tmp_path / "stray.jsonl"))
+    p = proxy.Proxy(upstream.origin, FORCED, TEMPLATE, str(tmp_path / "stray.jsonl"))
     p.start()
     yield p, upstream
     p.stop()
@@ -161,6 +162,25 @@ def test_the_proxy_forces_the_sampler_and_passes_the_reply_through(relay, tmp_pa
     p.route("")
     _post(p.origin, "/v1/chat/completions", body)
     assert len(proxy_atif.load(str(tmp_path / "stray.jsonl"))) == 1
+
+
+def test_the_thinking_level_is_forced_where_the_server_renders_the_prompt(relay, tmp_path):
+    p, upstream = relay
+    assert TEMPLATE == {"reasoning_effort": "medium"}
+    p.route(str(tmp_path / "trial.jsonl"))
+    chat = {"model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"reasoning_effort": "xhigh", "enable_thinking": True}}
+    _post(p.origin, "/v1/chat/completions", chat)
+    assert upstream.bodies[-1]["chat_template_kwargs"] == {"reasoning_effort": "medium",
+                                                           "enable_thinking": True}
+    _post(p.origin, "/v1/responses", {"model": "m", "input": "hi"})
+    assert upstream.bodies[-1]["chat_template_kwargs"] == TEMPLATE
+    _post(p.origin, "/completion", {"prompt": "<|im_start|>user\nhi", "n_predict": 4})
+    assert "chat_template_kwargs" not in upstream.bodies[-1]
+    records = proxy_atif.load(str(tmp_path / "trial.jsonl"))
+    assert records[0]["asked"] == {"chat_template_kwargs": chat["chat_template_kwargs"]}
+    assert records[0]["request"] == chat                      # as the harness sent it
+    assert [r["asked"] for r in records[1:]] == [{}, {}]
 
 
 def test_a_request_belongs_to_the_trial_it_arrived_in_and_ends_with_it(relay, tmp_path):
@@ -364,6 +384,7 @@ def test_a_proxied_cli_trial_gets_the_servers_counts_and_a_trajectory(tmp_path, 
     wrapped = Proxied(arm, p, count_tokens=lambda text: len(text.split()))
     block = run.Block("arm", wrapped, wall_cap=120, runs=str(tmp_path / "_runs"))
     meta = wrapped.start()
+    assert meta["template_forced"] == {"reasoning_effort": "medium"}
     assert meta["sampler_audit"] == {"chat": "ok", "responses": "ok", "completion": "ok"}
     record = block.solve(task, 1)
     assert record["passed"] is True and record["exit_code"] == 0
