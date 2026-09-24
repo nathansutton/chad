@@ -1,0 +1,36 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_2jyyxqKLbxE0PTxZG7FhnRUyOpbeZTyU","object":"response","status":"in_progress"}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_2jyyxqKLbxE0PTxZG7FhnRUyOpbeZTyU","object":"response","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"fc_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO","arguments":"","call_id":"call_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO","name":"bash","type":"function_call","status":"in_progress"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"{","item_id":"fc_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"\"command\":\"","item_id":"fc_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"ls","item_id":"fc_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":" -","item_id":"fc_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"la","item_id":"fc_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"\"","item_id":"fc_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"}","item_id":"fc_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"fc_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO","type":"function_call","status":"completed","arguments":"{\"command\":\"ls -la\"}","call_id":"call_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO","name":"bash"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_2jyyxqKLbxE0PTxZG7FhnRUyOpbeZTyU","object":"response","created_at":1790041267,"status":"completed","model":"qwen3.8-27b-local","output":[{"id":"fc_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO","type":"function_call","status":"completed","arguments":"{\"command\":\"ls -la\"}","call_id":"call_ivzvcjB9Ir5os2FHgrINyxeT9Mbh25VO","name":"bash"}],"usage":{"input_tokens":279,"output_tokens":28,"total_tokens":307,"input_tokens_details":{"cached_tokens":0}}},"timings":{"cache_n":0,"prompt_n":279,"prompt_ms":3174.9,"prompt_per_token_ms":11.37956989247312,"prompt_per_second":87.87678352074082,"predicted_n":28,"predicted_ms":2504.773,"predicted_per_token_ms":92.76937037037038,"predicted_per_second":10.779419931466842}}
+

@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from catalog import DATA, Task
@@ -156,10 +157,10 @@ def apply_gold(task: Task, ws: str) -> None:
         shutil.copyfile(gold_manifest, os.path.join(ws, "Cargo.toml"))
 
 
-def trial_env() -> dict[str, str]:
+def trial_env(base: Mapping[str, str] = os.environ) -> dict[str, str]:
     """The environment tests run in: this interpreter's directory first on PATH, so
     `python3 -m pytest` resolves to the environment that has pytest installed."""
-    env = dict(os.environ)
+    env = dict(base)
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     env["CARGO_NET_OFFLINE"] = "true"
     return env

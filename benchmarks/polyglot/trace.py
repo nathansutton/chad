@@ -159,9 +159,14 @@ def _routes(command: str) -> set[str]:
 
 def load_run(run_dir: str) -> list[tuple[str, JsonValue]]:
     """Every ATIF document under `run_dir`, whatever the layout: this kit's
-    `trajectories/<language>/`, or a Harbor jobs tree of `<trial>/agent/trajectory.json`."""
+    `trajectories/<language>/`, or a Harbor jobs tree of `<trial>/agent/trajectory.json`.
+    A run's `output/` is skipped: it holds harness logs and the proxy's second reading of
+    trials that already have a trajectory, which would count those trials twice."""
     docs: list[tuple[str, JsonValue]] = []
+    output = os.path.join(os.path.normpath(run_dir), "output")
     for root, _dirs, files in sorted(os.walk(run_dir)):
+        if root == output or root.startswith(output + os.sep):
+            continue
         for name in sorted(files):
             if not name.endswith(".json"):
                 continue

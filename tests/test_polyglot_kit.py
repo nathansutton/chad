@@ -146,6 +146,75 @@ def test_pool_is_the_frontier_and_needs_reps():
         stats.pool(_trials({"t": [True]}))
 
 
+def test_subset_is_a_seeded_draw_per_language():
+    names = [f"{lang}/t{i}" for lang in ("go", "rust") for i in range(10)]
+    picked = stats.subset(names, 3, "seed-a")
+    assert picked == sorted(picked) and len(picked) == 6
+    assert sum(n.startswith("go/") for n in picked) == 3
+    assert picked == stats.subset(list(reversed(names)), 3, "seed-a")
+    assert picked != stats.subset(names, 3, "seed-b")
+    with pytest.raises(ValueError, match="only 10 tasks"):
+        stats.subset(names, 11, "seed-a")
+
+
+def test_the_committed_harness_subset_is_the_draw_it_says_it_is():
+    path = os.path.join(REPO, "benchmarks", "polyglot", "subsets", "harness-36.txt")
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    assert "--per-language 6 --seed harness-1" in lines[0]
+    assert lines[1:] == stats.subset(catalog.load_manifest(), 6, "harness-1")
+
+
+def test_spread_covers_as_many_languages_as_it_has_tasks():
+    names = [f"{lang}/t{i}" for lang in ("go", "rust", "cpp", "java") for i in range(5)]
+    picked = stats.spread(names, 3, "seed-a")
+    assert len({n.split("/")[0] for n in picked}) == 3 and picked == sorted(picked)
+    assert picked == stats.spread(list(reversed(names)), 3, "seed-a")
+    with pytest.raises(ValueError, match="cannot span 4 languages"):
+        stats.spread(names, 5, "seed-a")
+
+
+def test_the_committed_three_are_drawn_from_the_committed_thirty_six():
+    kit = os.path.join(REPO, "benchmarks", "polyglot", "subsets")
+    three = stats.read_task_list(os.path.join(kit, "harness-3.txt"))
+    assert three == stats.spread(stats.read_task_list(os.path.join(kit, "harness-36.txt")),
+                                 3, "harness-3")
+
+
+def _arm_run(root, label, outcomes, turns):
+    """A run in `run.py`'s layout: one row per (task, passed), each naming a trajectory
+    whose agent turns are `turns` = [(prompt_tokens, cached_tokens, prefill_s), ...]."""
+    run_dir = root / label
+    rows = []
+    for n, (task, passed) in enumerate(outcomes):
+        rel = f"trajectories/go/t{n}.rep1.json"
+        (run_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+        (run_dir / rel).write_text(json.dumps({"steps": [{"source": "user"}] + [
+            {"source": "agent", "metrics": {"prompt_tokens": p, "cached_tokens": c,
+                                            "completion_tokens": 10, "extra": {"prefill_s": s}}}
+            for p, c, s in turns]}))
+        rows.append({"task": task, "language": "go", "rep": 1, "passed": passed, "capped": not passed,
+                     "wall_s": 60.0, "gen_tokens": 100, "side_requests": 1, "trajectory": rel})
+    (run_dir / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return str(run_dir)
+
+
+def test_a_scorecard_line_separates_the_tax_from_later_turns(tmp_path):
+    ref = _arm_run(tmp_path, "ref", [("go/a", True), ("go/b", True)],
+                   [(2000, 0, 20.0), (2100, 2000, 1.0), (2300, 2100, 2.0)])
+    arm = _arm_run(tmp_path, "arm", [("go/a", True), ("go/b", False)],
+                   [(9000, 0, 90.0), (9500, 9000, 5.0)])
+    c = stats.card(arm)
+    assert (c.trials, c.passed, c.capped, c.tax, c.first_wait_s) == (2, 1, 1, 9000, 90.0)
+    assert (c.later_uncached, c.later_wait_s, c.steps, c.side) == (500, 5.0, 2, 1.0)
+    assert c.reuse == pytest.approx(9000 / 9500)
+    assert stats.card(ref).later_uncached == 150          # median of 100 and 200
+    table = stats.scorecard_report(ref, [ref, arm]).splitlines()
+    assert "| ref | 2/2 | 0 | 2,000 |" in table[2] and table[2].endswith("| reference |")
+    assert table[3].startswith("| arm | 1/2 | 1 | 9,000 | 90.0 s | 500 |")
+    assert table[3].endswith("| 0 / 1 (1.00) |")
+
+
 def _step(name, prompt, cached, command=""):
     return {"source": "agent", "step_id": 3,
             "tool_calls": [{"function_name": name,
@@ -242,6 +311,32 @@ def test_publish_rewrites_every_local_path(tmp_path):
                           f"{b.sha256} |")
 
 
+def test_a_cli_trial_is_rewritten_wherever_its_root_is():
+    """A CLI arm's trials live in the system temp directory, not under the kit."""
+    root = "/private/var/folders/ab/cd_ef/T/chad-polyglot"
+    text = (f"cmake {root}/_work/pi-pool/rep2/cpp/bank-account/build && "
+            f"cat {root}/_home/pi-pool/rep2/cpp/bank-account/.pi/agent/models.json; "
+            "grep -rn x benchmarks/polyglot/_work/arm/rep1/go/bob")
+    assert publish.redact(text, ROOTS) == (
+        "cmake ./build && cat <home>/.pi/agent/models.json; "
+        "grep -rn x benchmarks/polyglot/_work/arm/rep1/go/bob")
+    assert not publish.problems(publish.redact(text, ROOTS), ROOTS)
+
+
+def test_an_isolated_arms_tilde_is_its_throwaway_home(tmp_path):
+    """A foreign harness describing its own config dir wrote `~/.config/...`; in an arm
+    with a throwaway home that is not the maintainer's account, and the bundle says so."""
+    text = "files under ~/.config/opencode/, and /Users/tester/.ssh/config"
+    assert publish.redact(text, ROOTS, isolated=True).startswith("files under <home>/.config")
+    assert publish.problems(publish.redact("under ~/.config/x", ROOTS, isolated=True), ROOTS) == []
+    # chad in process runs in the real home, so the same text is still refused there.
+    assert publish.problems(publish.redact("under ~/.config/x", ROOTS), ROOTS)
+    # A real path into the maintainer's account is still a refusal in an isolated arm.
+    assert publish.problems(publish.redact(text, ROOTS, isolated=True), ROOTS)
+    assert publish.redact(ROOTS.home + "/.cargo/registry", ROOTS, isolated=True) == \
+        "~/.cargo/registry"                       # the real cargo home a trial does use
+
+
 def test_rows_alone_unless_trajectories_are_asked_for(tmp_path):
     publish.bundle(str(_run_dir(tmp_path)), str(tmp_path / "out"), ROOTS)
     assert sorted(os.listdir(tmp_path / "out")) == ["meta.json", "trials.jsonl"]
@@ -299,4 +394,4 @@ def test_fetch_refuses_rows_that_are_not_the_ones_recorded(tmp_path):
 def test_the_committed_ledger_has_the_columns_fetch_reads():
     with open(fetch.LEDGER, encoding="utf-8") as f:
         assert publish.RUNS_HEADER in f.read()
-    assert isinstance(fetch.read_ledger(fetch.LEDGER), dict)
+    assert "design-sample" in fetch.read_ledger(fetch.LEDGER)

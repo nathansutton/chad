@@ -1,0 +1,37 @@
+{
+ "codex": {
+  "version": "0.151.0",
+  "install": "npm i -g @openai/codex@0.151.0",
+  "sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477"
+ },
+ "crush": {
+  "version": "0.92.0",
+  "install": "npm i -g @charmland/crush@0.92.0",
+  "sha256": "2cc1ac87cc237a6383702b59f985160e637d3ec853bbccba2d7ef6bbf4d94361"
+ },
+ "dsh": {
+  "version": "0.1.1-rc.2",
+  "install": "npm i -g @deepseek-ai/dsh@0.1.1-rc.2",
+  "sha256": "c0226687bb20f45c603ec6fe50f3de16d1c3510c3a803304ec575ef9bc366c62"
+ },
+ "goose": {
+  "version": "1.50.0",
+  "install": "curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | GOOSE_VERSION=v1.50.0 CONFIGURE=false bash",
+  "sha256": "a01ab640ab8104d115039054a3ef1332da9040dabe8b9d25d36847f1800fd0f1"
+ },
+ "mini": {
+  "version": "2.4.6",
+  "install": "uv tool install mini-swe-agent==2.4.6",
+  "sha256": "a30f02207d780d3286e192496484ee0e9127b71a6d4ac8e3953960f1279c5455"
+ },
+ "opencode": {
+  "version": "1.17.12",
+  "install": "npm i -g opencode-ai@1.17.12",
+  "sha256": "049c6c1654e1da9eefe32a83590112db9e4fc56f5137c15e3876a13bab1d1231"
+ },
+ "pi": {
+  "version": "0.80.3",
+  "install": "npm i -g @earendil-works/pi-coding-agent@0.80.3",
+  "sha256": "af302f231437eaf6f37691bce4b34234fcb626bcb5eb3910d4fc3f6519bf78ca"
+ }
+}

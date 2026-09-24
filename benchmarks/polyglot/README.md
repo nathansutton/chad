@@ -84,6 +84,67 @@ python stats.py compare _runs/baseline/trials.jsonl _runs/no-manifest/trials.jso
 The pool authorizes a change; the full set only vetoes one, by showing it broke tasks
 that used to be safe.
 
+## Other harnesses
+
+`--harness` runs the same tasks, prompt, wall cap and verification under another coding
+agent's own command line: an entry of `harnesses.py` (pi, opencode, dsh, goose,
+mini-swe-agent, crush, cline, codex), or `chad-llama`, chad's own CLI on the same server
+as them, which is the arm every foreign one is paired against. They all talk to one
+llama-server, started once for the whole llama phase:
+
+```sh
+uv run python benchmarks/polyglot/server.py        # chad's own weights in llama.cpp; Ctrl-C stops it
+uv run python benchmarks/polyglot/run.py --label h3-pi --harness pi \
+    --tasks-file benchmarks/polyglot/subsets/harness-3.txt --reps 3
+```
+
+`stats.py scorecard --ref _runs/h3-chad-llama _runs/h3-*` reads the result the way the
+matrix article did — per arm, the prompt tax of turn 1 and its wait, the tokens the
+prefix cache could not serve on each later turn and their wait, cache reuse, side
+requests — and pairs each arm's pass rate with the reference arm by task.
+
+The llama arms run **the model chad ships**, not a conventional quant of it: Prism ML's
+Ternary Bonsai 2 of Qwen3.8-27B, as `Ternary-Bonsai-2-27B-PQ2_0.gguf` against chad's MLX
+2-bit pack of the same build. That keeps a harness comparison on the weights a chad user
+actually runs, and makes chad-in-process against chad-on-llama an engine comparison
+rather than a weights one. Those files need Prism ML's
+[llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) (stock llama.cpp rejects
+`PQ2_0`); `server.py` looks for it in `_data/llama-prism/`, or at
+`POLYGLOT_LLAMA_SERVER`, and refuses to start a stock binary on these weights.
+
+One engine at a time, enforced: an in-process block refuses while a llama-server is up,
+and a block refuses while another block runs.
+
+Each CLI block puts its own proxy (`proxy.py`) between the harness and the server. It
+writes the shipped sampler into every request explicitly — zeros included, since an
+omitted `min_p` is llama.cpp's 0.05, not chad's 0 — records every request with the
+server's own token counts and timings, and turns each trial's log into its ATIF
+trajectory (`proxy_atif.py`), so `trace.py` reads a foreign trial like chad's. A block
+starts by checking, per endpoint, that the server applied the forced sampler, and by
+emptying the server's slots, so no arm inherits another's prefix cache.
+
+An entry is data: the harness's headless argv, the environment variables it reads, the
+config files its home should hold. Every trial runs it cut off from the machine it runs
+on:
+
+- the workspace is under the system temp directory, not this checkout, because most
+  harnesses read `AGENTS.md` from the directories above the one they start in;
+- `HOME` and the XDG directories are a throwaway home the entry's config is written
+  into, and the environment is rebuilt from an allowlist, so no key or token from your
+  shell reaches the agent;
+- the process runs under `sandbox-exec`, with file writes denied outside the workspace,
+  that home and the temp directories;
+- at the wall cap the harness's whole process group is killed.
+
+chad in process is the one arm not isolated this way: MLX needs Metal, so it keeps the
+real home, and chad sandboxes every bash command the model runs itself.
+
+`harnesses.lock` pins the version of each harness a result is measured with, and
+`run.py` refuses one that has drifted. `python benchmarks/polyglot/harnesses.py` lists
+installed against locked; `harnesses.py lock <name>` pins what is installed. A CLI arm's
+row has the same frame as chad's, with the harness's exit code where chad's own counters
+are; its output is kept in `_runs/<label>/output/`.
+
 ## Publishing a run
 
 Nothing a run produces is committed: `_runs/`, `_work/` and the rest of the underscore
@@ -95,8 +156,8 @@ uv run python benchmarks/polyglot/publish.py --label baseline           # rows o
 uv run python benchmarks/polyglot/publish.py --label baseline --with-trajectories --upload
 ```
 
-`publish.py` rewrites every local path (the workspace becomes `.`, the home directory
-`~`) and refuses the bundle if a home path, a path outside the workspace or a
+`publish.py` rewrites every local path (the workspace becomes `.`, a CLI arm's throwaway
+home `<home>`, the home directory `~`) and refuses the bundle if a home path, a path outside the workspace or a
 credential-shaped string survives. It prints the sha256 of the rows and a row to paste
 into [`RUNS.md`](RUNS.md). It uploads to the dataset repository only with `--upload`.
 `fetch.py --label <label>` downloads a published run into `_runs/<label>/` and refuses it
@@ -111,7 +172,14 @@ compared against a local arm.
 | `workspace.py` | leak-free trial directories, `run-tests.sh`, `verify()` |
 | `prepare.py` | one-time fetch of everything trials need from the network |
 | `gold.py` | the gold gate; writes `manifest.json` |
-| `run.py` | a block of trials: one model load, one row per trial |
+| `run.py` | a block of trials: one arm, one model load, one row per trial |
+| `harness/` | the contract every arm meets (`__init__.py`), chad in process (`chad_inprocess.py`), any CLI agent in isolation (`cli.py`) |
+| `harnesses.py` | every CLI arm as data; `lock` pins the installed versions |
+| `harnesses.lock` | the version, install command and entry-point sha256 each arm is measured with |
+| `server.py` | the one llama-server of a llama phase, and the one-engine-at-a-time rule |
+| `proxy.py` | the sampler forced on every request, and every request recorded with the server's counts |
+| `proxy_atif.py` | a trial's request log as an ATIF trajectory; `crosscheck` against chad's own |
+| `subsets/` | pre-registered task lists (`stats.py subset`), committed before any arm ran on them |
 | `stats.py` | score, pool, paired compare |
 | `trace.py` | one trial's ATIF trajectory as a step table: tokens, think, seconds, why each step ended — readable while the trial is still running |
 | `publish.py` | a finished run as a path-free bundle, uploaded only on request |
