@@ -465,18 +465,16 @@ _MV_SRC = r"""
     for (uint m = 0; m < MM; ++m)
         for (uint r = 0; r < NR; ++r) acc[m][r] = 0.f;
     for (uint c = lane; c < nch; c += 32) {
-        float wv[NR][32];
+        float4 wv[NR][8];
         for (uint r = 0; r < NR; ++r) {
             const uint row = min(row0 + r, (uint)(ND - 1));
-            DEQ(w + (size_t)row * ROWB, c, wv[r]);
+            DEQ(w + (size_t)row * ROWB, c, (thread float*)wv[r]);
         }
         for (uint m = 0; m < MM; ++m) {
-            const device T* xp = x + (size_t)m * KD + 32 * c;
-            for (uint i = 0; i < 32; i += 4) {
-                const float4 xv = float4(xp[i], xp[i + 1], xp[i + 2], xp[i + 3]);
-                for (uint r = 0; r < NR; ++r)
-                    acc[m][r] += dot(xv, float4(wv[r][i], wv[r][i + 1], wv[r][i + 2],
-                                                wv[r][i + 3]));
+            const device vec<T, 4>* xp = (const device vec<T, 4>*)(x + (size_t)m * KD + 32 * c);
+            for (uint i = 0; i < 8; ++i) {
+                const float4 xv = float4(xp[i]);
+                for (uint r = 0; r < NR; ++r) acc[m][r] += dot(xv, wv[r][i]);
             }
         }
     }
@@ -486,6 +484,69 @@ _MV_SRC = r"""
             if (lane == 0 && row0 + r < (uint)ND) out[(size_t)m * ND + row0 + r] = static_cast<T>(s);
         }
 """
+
+# Verify widths (2..MV_MAX_M rows of x). Holding a decoded chunk in registers and
+# walking every row of x over it spills past M≈2 (measured: 6.7x the M=1 time at M=8,
+# worse with more rows per simdgroup), so these widths stage instead: a threadgroup
+# decodes a 32-row x 128-value weight tile into threadgroup memory ONCE (one chunk per
+# thread), stages the matching x tile beside it, and each simdgroup applies its 8 rows
+# with 8x8 simdgroup MMAs to all of x's rows at once (two column tiles cover 16).
+_MM_SG, _MM_TK = 4, 128
+_MM_SRC = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint row0 = (threadgroup_position_in_grid.y * NSG + sg) * 8;
+    threadgroup half Wt_all[NSG * 8 * 128];
+    threadgroup half* Wt = Wt_all + sg * 8 * 128;
+    simdgroup_matrix<float, 8, 8> acc[MT];
+    for (uint t = 0; t < MT; ++t) acc[t] = simdgroup_matrix<float, 8, 8>(0);
+    const uint drow = lane >> 2, dchunk = lane & 3;
+    const device uint8_t* wrow = w + (size_t)min(row0 + drow, (uint)(ND - 1)) * ROWB;
+    for (uint k0 = 0; k0 < KD; k0 += 128) {
+        float4 v[8];
+        DEQ(wrow, k0 / 32 + dchunk, (thread float*)v);
+        threadgroup half4* dst = (threadgroup half4*)(Wt + drow * 128 + dchunk * 32);
+        for (uint i = 0; i < 8; ++i) dst[i] = half4(v[i]);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0; kk < 128; kk += 8) {
+            simdgroup_matrix<half, 8, 8> A, B;
+            simdgroup_load(A, Wt + kk, 128);
+            for (uint t = 0; t < MT; ++t) {
+                simdgroup_load(B, x + (size_t)t * 8 * KD + k0 + kk, KD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc[t], A, B, acc[t]);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float* O = (threadgroup float*)Wt;     // 8 x 16 floats fit in 2 KB
+    for (uint t = 0; t < MT; ++t) simdgroup_store(acc[t], O + t * 8, 16);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = lane; i < 8 * 16; i += 32) {
+        const uint r = i >> 4, m = i & 15;
+        if (m < MM && row0 + r < (uint)ND) out[(size_t)m * ND + row0 + r] = static_cast<T>(O[r * 16 + m]);
+    }
+"""
+
+_mm_kernels: dict[int, _MetalKernel] = {}
+
+
+def _mm_kernel(qtype: int) -> _MetalKernel:
+    k = _mm_kernels.get(qtype)
+    if k is None:
+        import mlx.core as mx
+        fmt = FORMATS[qtype]
+        # SAFETY: the stub types metal_kernel's result as a bare object; it is the
+        # keyword-called kernel _MetalKernel describes.
+        k = cast(_MetalKernel, mx.fast.metal_kernel(
+            name=f"chad_gguf_mm_{fmt.name.lower()}",
+            input_names=["x", "w"],
+            output_names=["out"],
+            source=_MM_SRC.replace("DEQ", fmt.deq_fn),
+            header=metal_header(),
+        ))
+        _mm_kernels[qtype] = k
+    return k
+
 
 _mv_kernels: dict[int, _MetalKernel] = {}
 
@@ -516,6 +577,20 @@ def matmul(x: "mx.array", w: "mx.array", qtype: int, k: int) -> "mx.array":
     lead = x.shape[:-1]
     x2 = x.reshape(-1, k)
     m = x2.shape[0]
+    if 1 < m <= MV_MAX_M and k % _MM_TK == 0:
+        mt = (m + 7) // 8
+        xh = x2.astype(mx.float16)
+        if m < 8 * mt:
+            xh = mx.pad(xh, [(0, 8 * mt - m), (0, 0)])
+        (out,) = _mm_kernel(qtype)(
+            inputs=[xh, w],
+            template=[("T", x.dtype), ("MM", m), ("MT", mt), ("NSG", _MM_SG), ("KD", k),
+                      ("ND", n), ("ROWB", row_bytes(qtype, k))],
+            output_shapes=[(m, n)], output_dtypes=[x.dtype],
+            grid=(32 * _MM_SG, (n + 8 * _MM_SG - 1) // (8 * _MM_SG), 1),
+            threadgroup=(32 * _MM_SG, 1, 1),
+        )
+        return out.reshape(*lead, n)
     if m <= MV_MAX_M:
         rows_per_tg = _MV_ROWS * _MV_SG
         (out,) = _mv_kernel(qtype)(
