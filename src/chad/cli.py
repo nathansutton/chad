@@ -470,6 +470,11 @@ def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL
     source = "--model" if spec is not None else "CHAD_MODEL"
     spec = spec or config.env_str("CHAD_MODEL")
     if spec and spec.strip().lower() != "auto":
+        if spec.endswith(".gguf") and os.path.isfile(spec):
+            # A GGUF is one file; the engine reads a model directory. Build the
+            # directory (config + tokenizer, no weights) once and load through it.
+            from . import gguf_pack
+            return gguf_pack.materialize(spec), f"GGUF file ({source} override)"
         return spec, f"explicitly requested ({source} override)"
     ram = host.ram_gb()
     if ram is None or ram < _MIN_RAM_GB:

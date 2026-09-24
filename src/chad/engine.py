@@ -691,6 +691,15 @@ class Engine:
             from . import mlx_dflash
             self._dflash_ladder = list(mlx_dflash.round_costs(prism_pack.BITS))
             return
+        # A GGUF model directory names a file of llama.cpp blocks; mlx-lm would find
+        # no safetensors at all. chad's own loader keeps the blocks as they are.
+        from . import gguf_pack
+        if gguf_pack.is_gguf_pack(cfg):
+            if override:
+                cfg = {**cfg, "text_config": {**cfg["text_config"], **override}}
+            self.model = gguf_pack.load(str(model_path), cfg)
+            self.reasoning_effort_default = gguf_pack.REASONING_EFFORT_DEFAULT
+            return
         self.model, _ = load_model(model_path, model_config=override)
 
     def _read_model_shape(self, path: str) -> None:
