@@ -4,12 +4,14 @@ decoders, bit for bit, on real blocks of every format the shipped GGUF uses.
 ``fixtures/gguf_blocks.npz`` maps each ggml type name to a uint8 ``[3, row_bytes]``
 array: rows 0, R/2 and R-1 of the first tensor of that type in
 Qwen3.8-27B-UD-IQ3_XXS.gguf, each cut to 4 blocks from the start of the row followed
-by 4 from its middle (16 + 16 for Q8_0's 32-value blocks). Re-extract with::
+by 4 from its middle (16 + 16 for the 32-value blocks of Q8_0 and IQ4_NL). IQ4_NL is
+the one format that file does not use; its rows come from Qwen3.8-27B-UD-Q3_K_XL.gguf.
+Re-extract with::
 
     r = gguf.GGUFReader(path)
     t = next(t for t in r.tensors if int(t.tensor_type) == q and t.data.ndim == 2)
     bb = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(q)][1]
-    nb, mid = (32 if q == 8 else 8), t.data.shape[1] // bb // 2
+    nb, mid = (32 if q in (8, 20) else 8), t.data.shape[1] // bb // 2
     rows = [0, t.data.shape[0] // 2, t.data.shape[0] - 1]
     blk = np.concatenate([t.data[rows, :nb // 2 * bb],
                           t.data[rows, mid * bb:(mid + nb // 2) * bb]], axis=1)

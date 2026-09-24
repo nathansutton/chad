@@ -25,7 +25,9 @@ off for everything that follows it rather than leave exactness to the optimizer.
 
 The codebooks are generated from ``gguf.quants``' packed grids (the same numbers as
 ggml-common.h, 2 bits per entry instead of one byte) and emitted as 32-bit words, four
-grid bytes per word, so a grid row is one or two word loads.
+grid bytes per word, so a grid row is one or two word loads. They stay in ``constant``
+memory: copying them into threadgroup memory at kernel start, as llama.cpp's kernels do,
+measured flat to slightly slower on every format here (M4 Pro).
 """
 
 from dataclasses import dataclass
@@ -60,6 +62,7 @@ FORMATS: dict[int, GGUFFormat] = {
     17: GGUFFormat("IQ2_XS", 256, 74),
     18: GGUFFormat("IQ3_XXS", 256, 98),
     19: GGUFFormat("IQ1_S", 256, 50),
+    20: GGUFFormat("IQ4_NL", 32, 18),
     21: GGUFFormat("IQ3_S", 256, 110),
     22: GGUFFormat("IQ2_S", 256, 82),
     23: GGUFFormat("IQ4_XS", 256, 136),
@@ -193,6 +196,16 @@ static inline void deq32_iq4_xs(device const uint8_t* row, uint c, thread float*
     for (int i = 0; i < 16; ++i) {
         v[i] = dl * float(kvalues_iq4nl[q[i] & 15u]);
         v[i + 16] = dl * float(kvalues_iq4nl[q[i] >> 4]);
+    }
+}
+
+// IQ4_NL: d | qs[16]: one 32-value block per chunk on the same 16-entry table as IQ4_XS.
+static inline void deq32_iq4_nl(device const uint8_t* row, uint c, thread float* v) {
+    device const uint8_t* b = row + 18u * c;
+    const float d = gg_f16(b);
+    for (int i = 0; i < 16; ++i) {
+        v[i] = d * float(kvalues_iq4nl[b[2 + i] & 15u]);
+        v[i + 16] = d * float(kvalues_iq4nl[b[2 + i] >> 4]);
     }
 }
 
