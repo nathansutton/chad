@@ -464,6 +464,15 @@ BLOCK_ROUND_COSTS = (1.0, 1.76, 1.93, 2.30, 2.18, 2.20, 2.19, 2.20)
 BLOCK_ROUND_COSTS_2BIT = (1.0, 1.63, 2.15, 2.52, 2.48, 2.50, 2.50, 2.53)
 
 
+# The ladder on a GGUF checkpoint (gguf_pack), measured the same way on the IQ3_XXS
+# file at 2.5k-7.7k contexts. Its verify widths run a different kernel from mlx's
+# quantized matmul — decoded i-quant blocks into register-operand MMAs, 1.7-1.8x the
+# serial step's matmul at every width from 3 to 8 — so the ladder is flat past depth 2
+# where the affine packs keep climbing, and pricing a GGUF with either affine seed
+# would narrow rounds that cost almost nothing more.
+BLOCK_ROUND_COSTS_GGUF = (1.0, 1.68, 1.90, 1.92, 1.95, 2.00, 2.00, 1.98)
+
+
 def round_costs(weight_bits: Optional[int]) -> tuple:
     """The measured seed ladder for a target quantized at `weight_bits`."""
     return BLOCK_ROUND_COSTS_2BIT if weight_bits == 2 else BLOCK_ROUND_COSTS

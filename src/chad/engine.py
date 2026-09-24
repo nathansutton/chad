@@ -703,6 +703,8 @@ class Engine:
                 cfg = {**cfg, "text_config": {**cfg["text_config"], **override}}
             self.model = gguf_pack.load(str(model_path), cfg)
             self.reasoning_effort_default = gguf_pack.REASONING_EFFORT_DEFAULT
+            from . import mlx_dflash
+            self._dflash_ladder = list(mlx_dflash.BLOCK_ROUND_COSTS_GGUF)
             return
         self.model, _ = load_model(model_path, model_config=override)
 
