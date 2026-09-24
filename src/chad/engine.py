@@ -1268,6 +1268,34 @@ class Engine:
             for k, v in d.items():
                 setattr(c, k, list(v) if isinstance(v, list) else v)
 
+    def _reserve_kv(self, total: int) -> None:
+        """Grow each quantized attention cache's buffers to hold `total` positions in
+        one step, a layer at a time.
+
+        mlx-lm grows a QuantizedKVCache by concatenation whenever a write passes its
+        capacity, which a 512-token prefill chunk does on every chunk. The chunk is
+        one graph, so every layer's pre-growth buffer stays alive until the chunk is
+        evaluated: a transient the size of the whole KV cache, measured at ~34 KB per
+        context token on the 27B — the cache's own 34,816 B/token. Reserving the
+        prompt's final size once leaves every later chunk writing in place. The
+        buffers keep mlx-lm's own shape (capacity rounded up to its step, positions
+        past `offset` zero), which is the state it already leaves between steps."""
+        for c in self._cache or []:
+            if type(c) is not cache_utils.QuantizedKVCache or c.keys is None:
+                continue
+            if total <= c.keys[0].shape[-2]:
+                continue
+            size = (total + c.step - 1) // c.step * c.step
+            live = c.offset
+
+            def grow(x, size=size, live=live):
+                pad = mx.zeros((*x.shape[:-2], size - live, x.shape[-1]), dtype=x.dtype)
+                return mx.concatenate([x[..., :live, :], pad], axis=-2)
+
+            c.keys = tuple(grow(x) for x in c.keys)
+            c.values = tuple(grow(x) for x in c.values)
+            mx.eval(c.keys, c.values)
+
     def _prefill(self, ids: list, should_stop=None, chunk: Optional[int] = None,
                  on_progress=None, on_chunk=None) -> int:
         """Feed token ids through the model into the live cache in chunks, checking
@@ -1298,6 +1326,9 @@ class Engine:
             chunk = config.env_int("CHAD_PREFILL_CHUNK", 0) or None
         kv_base = len(self._cached_ids)
         oom_cap: Optional[int] = None  # halved on each caught Metal OOM
+        # A cold cache has no buffers to size until its first chunk has run.
+        self._reserve_kv(kv_base + n)
+        reserved = False
         i = 0
         while i < n:
             if should_stop and should_stop():
@@ -1320,6 +1351,9 @@ class Engine:
                             "chunk=%d", i, n, kv_base + i, oom_cap)
                 continue
             i += step
+            if not reserved:
+                self._reserve_kv(kv_base + n)
+                reserved = True
             if on_chunk:
                 on_chunk()
             if on_progress:

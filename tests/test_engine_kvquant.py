@@ -226,3 +226,34 @@ class _StubParams:
 
     def parameters(self):
         return {"w": mx.zeros((2, 2), dtype=mx.bfloat16)}
+
+
+def test_reserved_prefill_matches_growing_prefill(tiny):
+    """Prefill reserves the quantized caches' final size once instead of letting
+    every chunk grow them by concatenation. That changes where the bytes live, not
+    what they are: the same chunks leave identical cache contents, offsets and
+    next-token logits either way, and the buffers end sized for the whole prompt."""
+    from chad import mlx_qsdpa
+    mlx_qsdpa.install()
+    ids = [int(t) for t in mx.random.randint(0, 200, (700,), key=mx.random.key(3)).tolist()]
+
+    def run(reserve: bool):
+        eng = _loaded_engine(tiny, kv_bits=8)
+        if not reserve:
+            eng._reserve_kv = lambda total: None
+        eng._prefill(ids, chunk=128)
+        logits = eng.model(mx.array([[ids[-1]]]), cache=eng._cache)
+        return eng, logits
+
+    grown, lg = run(False)
+    reserved, lr = run(True)
+    assert mx.array_equal(lg, lr).item()
+    for a, b in zip(grown._cache, reserved._cache):
+        if type(a) is not cache_utils.QuantizedKVCache:
+            continue
+        assert a.offset == b.offset
+        for x, y in zip(a.state, b.state):
+            for u, v in zip(x, y):
+                assert mx.array_equal(u, v).item()
+    q = next(c for c in reserved._cache if type(c) is cache_utils.QuantizedKVCache)
+    assert q.keys[0].shape[-2] >= len(ids)

@@ -559,3 +559,26 @@ def test_warm_widths_declines_uncovered_shapes():
     assert mlx_qsdpa.warm_widths([4], hq=24, hkv=0, dtype=mx.float16) == 0
     assert mlx_qsdpa.warm_widths([1, 2], hq=24, hkv=4, dtype=mx.float16) == 0
     assert mlx_qsdpa.warm_widths([], hq=24, hkv=4, dtype=mx.float16) == 0
+
+
+@pytest.mark.parametrize("s,n", [(200, 1000), (65, 65), (130, 4096)])
+def test_sliced_prefill_attention_matches_one_call(s, n):
+    """A prefill chunk's causal attention run PREFILL_Q_SLICE rows at a time is the
+    same math as one call — every query row is independent, the slices only bound how
+    much of the score slab is alive at once. mlx picks its SDPA route by shape and the
+    routes accumulate differently, so the bar is the reference's own: the sliced
+    output is no further from fp32 attention than one bf16 call is."""
+    q = mx.random.normal((1, 24, s, 256), key=mx.random.key(s)).astype(mx.bfloat16)
+    k = mx.random.normal((1, 4, n, 256), key=mx.random.key(n)).astype(mx.bfloat16)
+    v = mx.random.normal((1, 4, n, 256), key=mx.random.key(n + 1)).astype(mx.bfloat16)
+    ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=1 / 16, mask="causal")
+    exact = mx.fast.scaled_dot_product_attention(
+        q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32),
+        scale=1 / 16, mask="causal")
+    got = mlx_qsdpa._sliced_causal(q, k, v, 1 / 16).astype(mx.float32)
+    row_scale = mx.max(mx.abs(exact), axis=-1, keepdims=True)
+
+    def err(a) -> float:
+        return float(mx.max(mx.abs(a - exact) / row_scale))
+
+    assert err(got) <= err(ref.astype(mx.float32)) * 1.05 + 1e-4
