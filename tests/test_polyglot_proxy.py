@@ -84,6 +84,7 @@ class _Upstream:
 
     def __init__(self, reply, applied=None):
         self.bodies = []
+        self.paths = []
         upstream = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -98,6 +99,7 @@ class _Upstream:
                 self.wfile.write(body)
 
             def do_GET(self):
+                upstream.paths.append(self.path)
                 if self.path.startswith("/slots"):
                     return self._json([{"id": 0, "id_task": 3, "params": applied or FORCED},
                                        {"id": 1, "id_task": 1, "params": {"min_p": 0.05}}])
@@ -181,6 +183,25 @@ def test_the_thinking_level_is_forced_where_the_server_renders_the_prompt(relay,
     assert records[0]["asked"] == {"chat_template_kwargs": chat["chat_template_kwargs"]}
     assert records[0]["request"] == chat                      # as the harness sent it
     assert [r["asked"] for r in records[1:]] == [{}, {}]
+
+
+def test_only_known_endpoints_are_relayed_and_only_by_their_own_name(relay):
+    p, upstream = relay
+    with urllib.request.urlopen(p.origin + "/props?x=1", timeout=10) as r:
+        assert r.status == 200
+    assert upstream.paths[-1] == "/props"                 # the client's query never goes upstream
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(p.origin + "/admin/anything", timeout=10)
+    assert e.value.code == 404 and upstream.paths == ["/props"]
+
+
+def test_a_reply_carries_only_the_headers_a_client_reads(relay):
+    p, _ = relay
+    req = urllib.request.Request(p.origin + "/v1/chat/completions", headers={"Content-Type": "application/json"},
+                                 data=json.dumps({"model": "m", "messages": []}).encode())
+    with urllib.request.urlopen(req, timeout=10) as r:
+        assert r.headers["Content-Type"] == "text/event-stream"
+        assert r.headers["Server"] is None and r.headers["Date"] is None
 
 
 def test_a_request_belongs_to_the_trial_it_arrived_in_and_ends_with_it(relay, tmp_path):
@@ -351,7 +372,8 @@ def test_the_server_binary_is_the_fork_these_weights_need(tmp_path):
         server.binary({"PATH": str(tmp_path / "empty")}, "/nowhere")
 
 
-def test_the_server_is_started_so_its_slots_can_be_erased(tmp_path):
+def test_the_server_is_started_so_its_slots_can_be_erased(tmp_path, monkeypatch):
+    monkeypatch.setenv("POLYGLOT_LLAMA_SERVER", "/opt/llama-server")   # no fork on this box needed
     argv = server.LlamaServer("m.gguf", str(tmp_path / "server.log")).argv()
     assert argv[argv.index("--slot-save-path") + 1] == str(tmp_path / "llama-slots")
     assert argv[argv.index("-c") + 1] == "32768" and "--jinja" in argv

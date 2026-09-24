@@ -58,6 +58,17 @@ GEN_PATHS = frozenset({"/completion", "/completions", "/v1/completions", "/chat/
 # The subset of those whose prompt llama-server renders itself, from the request's messages.
 RENDERED_PATHS = frozenset({"/chat/completions", "/v1/chat/completions", "/responses",
                             "/v1/responses"})
+# Every endpoint a harness may reach through the proxy, keyed by the path it asks for. The
+# upstream request line is built from these constants alone, so a client's own path string —
+# its query included — never reaches llama-server; anything else is answered 404 here.
+_ROUTES: dict[str, str] = {path: path for path in (
+    *GEN_PATHS, "/health", "/v1/health", "/props", "/models", "/v1/models", "/slots",
+    "/metrics", "/tokenize", "/detokenize", "/apply-template")}
+# The response headers a client is handed, by lowercased name, spelled from these constants:
+# what a client needs to read a reply (its type, its length when it has one) and no more.
+_REPLY_HEADERS: dict[str, str] = {"content-type": "Content-Type",
+                                  "content-length": "Content-Length",
+                                  "cache-control": "Cache-Control"}
 # Request headers that describe one hop, not the request; Content-Length is recomputed
 # because a forced body is a different length.
 _HOP = frozenset({"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -383,6 +394,11 @@ def _handler(proxy: Proxy) -> type[BaseHTTPRequestHandler]:
             t0 = time.time()
             body = self._body()
             path = urllib.parse.urlsplit(self.path).path
+            target = _ROUTES.get(path)
+            if target is None:
+                self.close_connection = True
+                self.send_error(404, "not an endpoint this proxy relays")
+                return
             sent: JsonValue = None
             if self.command == "POST" and path in GEN_PATHS:
                 try:
@@ -402,14 +418,15 @@ def _handler(proxy: Proxy) -> type[BaseHTTPRequestHandler]:
                 threading.Thread(target=_watch, args=(self.connection, conn, done, left),
                                  daemon=True).start()
             try:
-                conn.request(self.command, self.path, body=body, headers=headers)
+                conn.request(self.command, target, body=body, headers=headers)
                 upstream = conn.getresponse()
                 status = upstream.status
                 self.send_response_only(upstream.status, upstream.reason)
                 chunked = "chunked" in (upstream.getheader("Transfer-Encoding") or "").lower()
                 for name, value in upstream.getheaders():
-                    if name.lower() not in _HOP or (name.lower() == "content-length" and not chunked):
-                        self.send_header(name, value)
+                    known = _REPLY_HEADERS.get(name.lower())
+                    if known and not (known == "Content-Length" and chunked):
+                        self.send_header(known, value.replace("\r", "").replace("\n", ""))
                 self.send_header("Connection", "close")
                 self.end_headers()
                 while True:
