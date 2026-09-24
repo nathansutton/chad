@@ -453,10 +453,10 @@ def dequantize(w: "mx.array", qtype: int, k: int, dtype: "mx.Dtype") -> "mx.arra
 
 # ---------------------------------------------------------------- matmul
 
-# Widths route three ways: one row (decode) takes the register kernel below; 2..MM_MAX_M
-# rows (speculative verify, short prompt tails) take the staged MMA kernel, or the
-# register kernel up to MV_MAX_M when K is not a whole number of MMA tiles; anything
-# wider expands the weight to x's dtype piece by piece and runs the stock GEMM.
+# Widths route three ways: one or two rows take the register kernel below; 3..MM_MAX_M
+# rows (speculative verify, short prompt tails) take the MMA kernel, or the register
+# kernel up to MV_MAX_M when K is not a whole number of MMA steps; anything wider
+# expands the weight to x's dtype piece by piece and runs the stock GEMM.
 MV_MAX_M = 16
 # Output rows per simdgroup and simdgroups per threadgroup of the fused kernel.
 _MV_ROWS, _MV_SG = 2, 4
@@ -499,50 +499,76 @@ _MV_SRC = r"""
         }
 """
 
-# Verify widths (2..MM_MAX_M rows of x). Holding a decoded chunk in registers and
-# walking every row of x over it spills past M≈2 (measured: 6.7x the M=1 time at M=8,
-# worse with more rows per simdgroup), so these widths stage instead: a threadgroup
-# decodes a 32-row x 128-value weight tile into threadgroup memory ONCE (one chunk per
-# thread), stages the matching x tile beside it, and each simdgroup applies its 8 rows
-# with 8x8 simdgroup MMAs to all of x's rows at once (four column tiles cover 32).
-# fp16 carries the activations: the residual stream's rare outliers can pass its
-# 65504 range, and one inf there poisons the whole output row — and, through a
-# verify forward, the KV cache and recurrent state for the rest of the session — so
-# x is saturated first. llama.cpp's own tiled kernel casts to half without it.
+# Verify widths (3..MM_MAX_M rows of x; two rows are cheapest on the register kernel).
+# Holding a decoded chunk in registers and walking every row of x over it spills past
+# M of about 2, so these widths go through 8x8 simdgroup MMAs, four column tiles
+# covering 32 rows. fp16 carries the activations: the residual stream's rare outliers
+# can pass its 65504 range, and one inf there poisons the whole output row — and,
+# through a verify forward, the KV cache and recurrent state for the rest of the
+# session — so x is saturated first. llama.cpp's own tiled kernel casts to half
+# without it.
 MM_MAX_M = 32
 _MM_SG, _MM_TK = 4, 128
+
+# Register operands, no staging: in an 8x8 simdgroup fragment lane
+# (fm, fn) holds row fm, columns fn and fn+1, and the four lanes of one row differ only
+# in fn/2. Permuting k inside each 128-value step so that column c of tile t is
+# k = (c/2)*32 + 2t + (c%2) makes each lane's sixteen A elements of a step exactly
+# the 32 contiguous values of chunk fn/2 of its row: one deq32 call, straight into
+# the fragments. x gets the same permutation — lane (fm, fn) needs rows fn, fn+1 of
+# chunk fm/2 at parity fm%2 — and the accumulator lands in registers already laid out
+# as out[m][row]. No threadgroup memory, no barriers, each weight decoded once.
 _MM_SRC = r"""
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint row0 = (threadgroup_position_in_grid.y * NSG + sg) * 8;
-    threadgroup half Wt_all[NSG * 8 * 128];
-    threadgroup half* Wt = Wt_all + sg * 8 * 128;
+    const uint qid = lane >> 2;
+    const uint fm = (qid & 4) + ((lane >> 1) & 3);
+    const uint fn = ((qid & 2) << 1) + ((lane & 1) << 1);
+    const device uint8_t* wrow = w + (size_t)min(row0 + fm, (uint)(ND - 1)) * ROWB;
+    const uint xbase = (fm >> 1) * 32;
+    const uint par = fm & 1;
     simdgroup_matrix<float, 8, 8> acc[MT];
+#pragma clang loop unroll(full)
     for (uint t = 0; t < MT; ++t) acc[t] = simdgroup_matrix<float, 8, 8>(0);
-    const uint drow = lane >> 2, dchunk = lane & 3;
-    const device uint8_t* wrow = w + (size_t)min(row0 + drow, (uint)(ND - 1)) * ROWB;
     for (uint k0 = 0; k0 < KD; k0 += 128) {
-        float4 v[8];
-        DEQ(wrow, k0 / 32 + dchunk, (thread float*)v);
-        threadgroup half4* dst = (threadgroup half4*)(Wt + drow * 128 + dchunk * 32);
-        for (uint i = 0; i < 8; ++i) dst[i] = half4(v[i]);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < 128; kk += 8) {
-            simdgroup_matrix<half, 8, 8> A, B;
-            simdgroup_load(A, Wt + kk, 128);
-            for (uint t = 0; t < MT; ++t) {
-                simdgroup_load(B, x + (size_t)t * 8 * KD + k0 + kk, KD, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(acc[t], A, B, acc[t]);
+        float wv[32];
+        DEQ(wrow, k0 / 32 + (fn >> 1), wv);
+        simdgroup_matrix<half, 8, 8> A[16];
+#pragma clang loop unroll(full)
+        for (uint kt = 0; kt < 16; ++kt) {
+            thread auto& ea = A[kt].thread_elements();
+            ea[0] = half(wv[2 * kt]);
+            ea[1] = half(wv[2 * kt + 1]);
+        }
+#pragma clang loop unroll(full)
+        for (uint t = 0; t < MT; ++t) {
+            // rows fn, fn+1 of x's chunk fm/2: 32 halves each, four 16-byte loads
+            const device uint4* pa = (const device uint4*)(x + (size_t)(t * 8 + fn) * KD + k0 + xbase);
+            const device uint4* pb = (const device uint4*)((const device half*)pa + KD);
+            uint4 va[4] = {pa[0], pa[1], pa[2], pa[3]};
+            uint4 vb[4] = {pb[0], pb[1], pb[2], pb[3]};
+#pragma clang loop unroll(full)
+            for (uint kt = 0; kt < 16; ++kt) {
+                // halves 2kt+par of the 32: word kt/2... each uint holds two halves
+                const uint wa = va[kt >> 2][kt & 3], wb = vb[kt >> 2][kt & 3];
+                simdgroup_matrix<half, 8, 8> B;
+                thread auto& eb = B.thread_elements();
+                eb[0] = as_type<half>(ushort(par ? (wa >> 16) : (wa & 0xffffu)));
+                eb[1] = as_type<half>(ushort(par ? (wb >> 16) : (wb & 0xffffu)));
+                simdgroup_multiply_accumulate(acc[t], A[kt], B, acc[t]);
             }
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup float* O = (threadgroup float*)Wt;     // 8 x 32 floats fit in 2 KB
-    for (uint t = 0; t < MT; ++t) simdgroup_store(acc[t], O + t * 8, 32);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = lane; i < 8 * 32; i += 32) {
-        const uint r = i >> 5, m = i & 31;
-        if (m < MM && row0 + r < (uint)ND) out[(size_t)m * ND + row0 + r] = static_cast<T>(O[r * 32 + m]);
+    const uint row = row0 + fm;
+#pragma clang loop unroll(full)
+    for (uint t = 0; t < MT; ++t) {
+        thread auto& ec = acc[t].thread_elements();
+        const uint m = t * 8 + fn;
+        if (row < (uint)ND) {
+            if (m < MM) out[(size_t)m * ND + row] = static_cast<T>(ec[0]);
+            if (m + 1 < MM) out[(size_t)(m + 1) * ND + row] = static_cast<T>(ec[1]);
+        }
     }
 """
 
@@ -596,7 +622,7 @@ def matmul(x: "mx.array", w: "mx.array", qtype: int, k: int) -> "mx.array":
     lead = x.shape[:-1]
     x2 = x.reshape(-1, k)
     m = x2.shape[0]
-    if 1 < m <= MM_MAX_M and k % _MM_TK == 0:
+    if 2 < m <= MM_MAX_M and k % _MM_TK == 0:
         mt = (m + 7) // 8
         # In fp32: bf16 has no 65504, and its nearest value rounds up to fp16's inf.
         xh = mx.clip(x2.astype(mx.float32), -65504.0, 65504.0).astype(mx.float16)
