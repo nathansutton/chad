@@ -453,10 +453,11 @@ def dequantize(w: "mx.array", qtype: int, k: int, dtype: "mx.Dtype") -> "mx.arra
 
 # ---------------------------------------------------------------- matmul
 
-# Widths route three ways: one or two rows take the register kernel below; 3..MM_MAX_M
-# rows (speculative verify, short prompt tails) take the MMA kernel, or the register
-# kernel up to MV_MAX_M when K is not a whole number of MMA steps; anything wider
-# expands the weight to x's dtype piece by piece and runs the stock GEMM.
+# Widths route four ways: one or two rows take the register kernel below; 3..MM_MAX_M
+# rows (speculative verify) take the MMA kernel, or the register kernel up to MV_MAX_M
+# when K is not a whole number of MMA steps; up to SLICE_MAX_M rows (short prompt
+# tails) take the MMA kernel slice by slice; anything wider expands the weight to x's
+# dtype piece by piece and runs the stock GEMM.
 MV_MAX_M = 16
 # Output rows per simdgroup and simdgroups per threadgroup of the fused kernel.
 _MV_ROWS, _MV_SG = 2, 4
@@ -509,6 +510,11 @@ _MV_SRC = r"""
 # without it.
 MM_MAX_M = 32
 _MM_SG, _MM_TK = 4, 128
+# Past MM_MAX_M the MMA kernel runs in MM_MAX_M-row slices, re-reading the weight per
+# slice, up to this width: it holds ~4.6 TFLOPS flat, where expanding the weight and
+# running mlx's GEMM only amortizes the expansion from a few hundred rows (3.5 TFLOPS
+# at 64-96 rows, 5.5 at 512). Short prompt tails after a warm-prefix hit live here.
+SLICE_MAX_M = 128
 
 # Register operands, no staging: in an 8x8 simdgroup fragment lane
 # (fm, fn) holds row fm, columns fn and fn+1, and the four lanes of one row differ only
@@ -648,6 +654,9 @@ def matmul(x: "mx.array", w: "mx.array", qtype: int, k: int) -> "mx.array":
             threadgroup=(32 * _MV_SG, 1, 1),
         )
         return out.reshape(*lead, n)
+    if m <= SLICE_MAX_M and k % _MM_TK == 0:
+        parts = [matmul(x2[i:i + MM_MAX_M], w, qtype, k) for i in range(0, m, MM_MAX_M)]
+        return mx.concatenate(parts, axis=0).reshape(*lead, n)
     step = max(1, _EXPAND_BYTES // (x.dtype.size * k))
     parts = [x2 @ dequantize(w[i:i + step], qtype, k, x.dtype).T
              for i in range(0, n, step)]

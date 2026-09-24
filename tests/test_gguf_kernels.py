@@ -70,11 +70,12 @@ def test_rejects_wrong_row_bytes():
 
 
 @pytest.mark.parametrize("name", sorted(f.name for f in mlx_gguf.FORMATS.values()))
-@pytest.mark.parametrize("m", [1, 2, 8, 11, 16, 17, 32, 33])
+@pytest.mark.parametrize("m", [1, 2, 8, 11, 16, 17, 32, 33, 128, 129])
 @pytest.mark.parametrize("n", [3, 37])
 def test_matmul_matches_the_dequantized_product(name, m, n):
-    """Every width route — the register kernel (1), the staged MMA kernel (2..32,
-    one to four column tiles, padded rows) and dequantize-then-matmul (33) — against
+    """Every width route — the register kernel (1, 2), the MMA kernel (3..32, one to
+    four column tiles, padded rows), the MMA kernel in slices (33..128) and
+    dequantize-then-matmul (129) — against
     x @ W.T on the exact float32 weights, at a row count that fills no tile evenly.
     The MMA route multiplies in fp16, so the tolerance is fp16's, not bf16's."""
     mx = pytest.importorskip("mlx.core")
