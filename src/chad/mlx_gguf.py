@@ -453,9 +453,10 @@ def dequantize(w: "mx.array", qtype: int, k: int, dtype: "mx.Dtype") -> "mx.arra
 
 # ---------------------------------------------------------------- matmul
 
-# Rows of x up to which the fused kernel runs; past it the weight is expanded to
-# bf16 once and multiplied by the stock GEMM. Decode (1) and the speculative verify
-# widths (up to the drafter's block) live below it, prefill above.
+# Widths route three ways: one row (decode) takes the register kernel below; 2..MM_MAX_M
+# rows (speculative verify, short prompt tails) take the staged MMA kernel, or the
+# register kernel up to MV_MAX_M when K is not a whole number of MMA tiles; anything
+# wider expands the weight to x's dtype piece by piece and runs the stock GEMM.
 MV_MAX_M = 16
 # Output rows per simdgroup and simdgroups per threadgroup of the fused kernel.
 _MV_ROWS, _MV_SG = 2, 4
@@ -498,12 +499,17 @@ _MV_SRC = r"""
         }
 """
 
-# Verify widths (2..MV_MAX_M rows of x). Holding a decoded chunk in registers and
+# Verify widths (2..MM_MAX_M rows of x). Holding a decoded chunk in registers and
 # walking every row of x over it spills past M≈2 (measured: 6.7x the M=1 time at M=8,
 # worse with more rows per simdgroup), so these widths stage instead: a threadgroup
 # decodes a 32-row x 128-value weight tile into threadgroup memory ONCE (one chunk per
 # thread), stages the matching x tile beside it, and each simdgroup applies its 8 rows
-# with 8x8 simdgroup MMAs to all of x's rows at once (two column tiles cover 16).
+# with 8x8 simdgroup MMAs to all of x's rows at once (four column tiles cover 32).
+# fp16 carries the activations: the residual stream's rare outliers can pass its
+# 65504 range, and one inf there poisons the whole output row — and, through a
+# verify forward, the KV cache and recurrent state for the rest of the session — so
+# x is saturated first. llama.cpp's own tiled kernel casts to half without it.
+MM_MAX_M = 32
 _MM_SG, _MM_TK = 4, 128
 _MM_SRC = r"""
     const uint lane = thread_index_in_simdgroup;
@@ -531,12 +537,12 @@ _MM_SRC = r"""
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup float* O = (threadgroup float*)Wt;     // 8 x 16 floats fit in 2 KB
-    for (uint t = 0; t < MT; ++t) simdgroup_store(acc[t], O + t * 8, 16);
+    threadgroup float* O = (threadgroup float*)Wt;     // 8 x 32 floats fit in 2 KB
+    for (uint t = 0; t < MT; ++t) simdgroup_store(acc[t], O + t * 8, 32);
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = lane; i < 8 * 16; i += 32) {
-        const uint r = i >> 4, m = i & 15;
-        if (m < MM && row0 + r < (uint)ND) out[(size_t)m * ND + row0 + r] = static_cast<T>(O[r * 16 + m]);
+    for (uint i = lane; i < 8 * 32; i += 32) {
+        const uint r = i >> 5, m = i & 31;
+        if (m < MM && row0 + r < (uint)ND) out[(size_t)m * ND + row0 + r] = static_cast<T>(O[r * 32 + m]);
     }
 """
 
@@ -590,9 +596,10 @@ def matmul(x: "mx.array", w: "mx.array", qtype: int, k: int) -> "mx.array":
     lead = x.shape[:-1]
     x2 = x.reshape(-1, k)
     m = x2.shape[0]
-    if 1 < m <= MV_MAX_M and k % _MM_TK == 0:
+    if 1 < m <= MM_MAX_M and k % _MM_TK == 0:
         mt = (m + 7) // 8
-        xh = x2.astype(mx.float16)
+        # In fp32: bf16 has no 65504, and its nearest value rounds up to fp16's inf.
+        xh = mx.clip(x2.astype(mx.float32), -65504.0, 65504.0).astype(mx.float16)
         if m < 8 * mt:
             xh = mx.pad(xh, [(0, 8 * mt - m), (0, 0)])
         (out,) = _mm_kernel(qtype)(
@@ -615,7 +622,7 @@ def matmul(x: "mx.array", w: "mx.array", qtype: int, k: int) -> "mx.array":
             threadgroup=(32 * _MV_SG, 1, 1),
         )
         return out.reshape(*lead, n)
-    step = max(1, _EXPAND_BYTES // (2 * k))
+    step = max(1, _EXPAND_BYTES // (x.dtype.size * k))
     parts = [x2 @ dequantize(w[i:i + step], qtype, k, x.dtype).T
              for i in range(0, n, step)]
     out = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=-1)

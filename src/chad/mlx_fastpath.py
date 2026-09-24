@@ -89,8 +89,8 @@ def install(model: "nn.Module", model_path: Optional[str] = None) -> bool:
             return True
         if _gguf_decline_reason(model) is None:
             _install_gguf(model)
-            log.info("FASTPATH installed (GGUF hybrid): same-format gate|up and "
-                     "qkv|z fused, GDN gates fused, S=1 layer step")
+            log.info("FASTPATH installed (GGUF hybrid): S=1 layer step with "
+                     "same-format gate|up and qkv|z fused, GDN gates fused")
             return True
         declined = _prism_decline_reason(model)
         if declined is None:
@@ -510,6 +510,7 @@ def _gdn_body(layer):
 
 
 def _gguf_decline_reason(model) -> Optional[str]:
+    import mlx.nn as nn
     from mlx_lm.models import qwen3_5 as q35
 
     if not isinstance(model, q35.Model):
@@ -529,6 +530,8 @@ def _gguf_decline_reason(model) -> Optional[str]:
             if not (gguf_pack.is_gguf_linear(gd.in_proj_qkv)
                     and gguf_pack.is_gguf_linear(gd.in_proj_z)):
                 return "GDN projections not in GGUF blocks"
+            if not (isinstance(gd.in_proj_b, nn.Linear) and isinstance(gd.in_proj_a, nn.Linear)):
+                return "GDN gate projections not dense"
     return None
 
 
@@ -556,7 +559,6 @@ def _gguf_qkv_z(gd, x):
 
 def _install_gguf(model) -> None:
     import mlx.core as mx
-    import mlx.nn as nn
 
     for layer in model.language_model.model.layers:
         mlp = layer.mlp
@@ -569,8 +571,6 @@ def _install_gguf(model) -> None:
             if qz is not None:
                 gd._gguf_qkvz = qz
             b, a = gd.in_proj_b, gd.in_proj_a
-            if not (isinstance(b, nn.Linear) and isinstance(a, nn.Linear)):
-                raise ValueError("GDN gate projections are not dense")
             ba = mx.contiguous(mx.concatenate([b.weight, a.weight], axis=0))
             mx.eval(ba)
             gd._gguf_ba = ba

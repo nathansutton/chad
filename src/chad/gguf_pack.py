@@ -38,6 +38,7 @@ with DFlash2, which reads the target's residual stream and does not care how the
 target is quantized.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -61,9 +62,15 @@ _TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.ji
 REASONING_EFFORT_DEFAULT = "medium"
 
 
+# Bump when what `materialize()` writes changes (the derived config, the donor files):
+# it is part of the directory's name, so a stale directory is never reused.
+_SCHEMA = 1
+_KEY = "chad_gguf"
+
+
 def is_gguf_pack(config: dict) -> bool:
     """True for a model directory `materialize()` built around a GGUF file."""
-    return "gguf" in config
+    return _KEY in config
 
 
 @dataclass(frozen=True)
@@ -109,7 +116,9 @@ def read_geometry(reader) -> Geometry:
     nextn = reader.fields.get(f"{_ARCH}.nextn_predict_layers")
     n_mtp = int(nextn.contents()) if nextn is not None else 0
     v_heads, inner = int(a("ssm.time_step_rank")), int(a("ssm.inner_size"))
-    embd = next(t for t in reader.tensors if t.name == "token_embd.weight")
+    embd = next((t for t in reader.tensors if t.name == "token_embd.weight"), None)
+    if embd is None:
+        raise ValueError("GGUF has no token_embd.weight")
     return Geometry(
         n_layers=int(a("block_count")) - n_mtp,
         hidden=int(a("embedding_length")),
@@ -274,24 +283,30 @@ def materialize(gguf_path: str, cache_root: Optional[str] = None,
 
     The directory holds no weights: `config.json` names the GGUF file, and the
     tokenizer files come from `donor_dir` (default: the cached donor checkpoint).
-    Rebuilt when the GGUF's size or mtime changes."""
+    The directory's name carries a hash of the file's path, size and mtime and of
+    `_SCHEMA`, because it is the engine's model id: warm-prefix checkpoints are keyed on
+    it, and a checkpoint of one file's hybrid cache must never load into another's (an
+    upload fixed under the same filename, a second copy elsewhere). Two processes
+    building it at once write identical bytes, and the config lands by rename."""
     import gguf
 
     gguf_path = os.path.abspath(gguf_path)
     st = os.stat(gguf_path)
-    stamp = {"file": gguf_path, "size": st.st_size, "mtime": int(st.st_mtime)}
+    stamp = {"file": gguf_path, "size": st.st_size, "mtime": int(st.st_mtime),
+             "schema": _SCHEMA}
+    digest = hashlib.sha256(json.dumps(stamp, sort_keys=True).encode()).hexdigest()[:12]
     root = cache_root or os.path.join(os.path.expanduser("~/.cache/chad"), "gguf")
-    out = os.path.join(root, os.path.splitext(os.path.basename(gguf_path))[0])
+    out = os.path.join(root, f"{os.path.splitext(os.path.basename(gguf_path))[0]}-{digest}")
     cfg_path = os.path.join(out, "config.json")
     if os.path.isfile(cfg_path):
-        with open(cfg_path) as f:
-            if json.load(f).get("gguf") == stamp:
-                return out
+        return out
     if donor_dir is None:
         from huggingface_hub import snapshot_download
         donor_dir = snapshot_download(TOKENIZER_DONOR, allow_patterns=list(_TOKENIZER_FILES))
     g = read_geometry(gguf.GGUFReader(gguf_path))
     os.makedirs(out, exist_ok=True)
+    if not os.path.isfile(os.path.join(donor_dir, "tokenizer.json")):
+        raise ValueError(f"tokenizer donor {donor_dir} has no tokenizer.json")
     for name in _TOKENIZER_FILES:
         src = os.path.join(donor_dir, name)
         if os.path.isfile(src):
@@ -302,10 +317,12 @@ def materialize(gguf_path: str, cache_root: Optional[str] = None,
         "tie_word_embeddings": False,
         "eos_token_id": [g.eos, g.bos],
         "text_config": text_config(g),
-        "gguf": stamp,
+        _KEY: stamp,
     }
-    with open(cfg_path, "w") as f:
+    tmp = f"{cfg_path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
         json.dump(config, f, indent=1)
+    os.replace(tmp, cfg_path)
     log.info("GGUF model directory built at %s for %s", out, gguf_path)
     return out
 
@@ -413,7 +430,7 @@ def load(model_path: str, config: Optional[dict] = None) -> "nn.Module":
             config = json.load(f)
     if not is_gguf_pack(config):
         raise ValueError(f"{model_path} is not a GGUF model directory")
-    reader = gguf.GGUFReader(config["gguf"]["file"])
+    reader = gguf.GGUFReader(config[_KEY]["file"])
     g = read_geometry(reader)
     model = q35.Model(q35.ModelArgs(model_type="qwen3_5",
                                     text_config=config["text_config"]))
@@ -436,9 +453,12 @@ def load(model_path: str, config: Optional[dict] = None) -> "nn.Module":
             continue
         raw = np.asarray(t.data)
         qtype = int(t.tensor_type)
+        if t.tensor_type == gguf.GGMLQuantizationType.BF16:
+            # gguf-py hands BF16 back as raw bytes, twice the element count: read as
+            # floats they would be garbage of the wrong shape, not an error.
+            raise ValueError(f"{t.name}: BF16 tensors are not supported")
         quantized = t.tensor_type not in (gguf.GGMLQuantizationType.F32,
-                                          gguf.GGMLQuantizationType.F16,
-                                          gguf.GGMLQuantizationType.BF16)
+                                          gguf.GGMLQuantizationType.F16)
         perm = row_order(p, g, raw.shape[0])
         if perm is not None:
             raw = raw[perm]
@@ -489,6 +509,6 @@ def load(model_path: str, config: Optional[dict] = None) -> "nn.Module":
                          f"{sorted(missing)[:3]}")
     model.eval()
     mx.eval(model.parameters())
-    log.info("GGUF loaded: %s, %d layers, formats %s", config["gguf"]["file"],
+    log.info("GGUF loaded: %s, %d layers, formats %s", config[_KEY]["file"],
              g.n_layers, ", ".join(f"{k}x{v}" for k, v in sorted(formats.items())))
     return model

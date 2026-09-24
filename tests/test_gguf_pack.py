@@ -83,7 +83,8 @@ def test_an_unknown_tensor_raises_instead_of_dropping():
 
 
 def test_routing_predicate():
-    assert gguf_pack.is_gguf_pack({"model_type": "qwen3_5", "gguf": {"file": "x.gguf"}})
+    assert gguf_pack.is_gguf_pack({"model_type": "qwen3_5", "chad_gguf": {"file": "x.gguf"}})
+    assert not gguf_pack.is_gguf_pack({"model_type": "qwen3_5", "gguf": {"file": "x.gguf"}})
     assert not gguf_pack.is_gguf_pack({"model_type": "qwen3_5"})
 
 
@@ -221,6 +222,7 @@ def tiny(tmp_path):
     donor = tmp_path / "donor"
     donor.mkdir()
     (donor / "tokenizer_config.json").write_text("{}")
+    (donor / "tokenizer.json").write_text("{}")
     out = gguf_pack.materialize(path, cache_root=str(tmp_path / "cache"),
                                 donor_dir=str(donor))
     return g, expect, out
@@ -290,3 +292,28 @@ def test_fastpath_decode_matches_the_unfused_model(tiny, tmp_path):
     fast = run(fast_model)
     err = float(mx.linalg.norm(fast - stock)) / float(mx.linalg.norm(stock))
     assert err < 0.02, err
+
+
+def test_a_changed_file_gets_its_own_directory(tiny, tmp_path):
+    """The directory is the engine's model id, and warm-prefix checkpoints are keyed on
+    it: a file replaced under the same name must not inherit the old one's."""
+    _, _, out = tiny
+    with open(os.path.join(out, "config.json")) as f:
+        path = json.load(f)["chad_gguf"]["file"]
+    donor = str(tmp_path / "donor")
+    again = gguf_pack.materialize(path, cache_root=str(tmp_path / "cache"), donor_dir=donor)
+    assert again == out
+    with open(path, "ab") as f:          # same name, different bytes
+        f.write(b"\0" * 32)
+    assert gguf_pack.materialize(path, cache_root=str(tmp_path / "cache"),
+                                 donor_dir=donor) != out
+
+
+def test_materialize_needs_a_tokenizer(tiny, tmp_path):
+    _, _, out = tiny
+    with open(os.path.join(out, "config.json")) as f:
+        path = json.load(f)["chad_gguf"]["file"]
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="tokenizer.json"):
+        gguf_pack.materialize(path, cache_root=str(tmp_path / "other"), donor_dir=str(empty))

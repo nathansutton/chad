@@ -70,14 +70,15 @@ def test_rejects_wrong_row_bytes():
 
 
 @pytest.mark.parametrize("name", sorted(f.name for f in mlx_gguf.FORMATS.values()))
-@pytest.mark.parametrize("m", [1, 2, 8, 11, 16, 17])
-def test_matmul_matches_the_dequantized_product(name, m):
-    """Every width route — the register kernel (1), the staged MMA kernel (2..16,
-    one and two column tiles, padded rows) and dequantize-then-matmul (17) — against
-    x @ W.T on the exact float32 weights. The MMA route multiplies in fp16, so the
-    tolerance is fp16's, not bf16's."""
+@pytest.mark.parametrize("m", [1, 2, 8, 11, 16, 17, 32, 33])
+@pytest.mark.parametrize("n", [3, 37])
+def test_matmul_matches_the_dequantized_product(name, m, n):
+    """Every width route — the register kernel (1), the staged MMA kernel (2..32,
+    one to four column tiles, padded rows) and dequantize-then-matmul (33) — against
+    x @ W.T on the exact float32 weights, at a row count that fills no tile evenly.
+    The MMA route multiplies in fp16, so the tolerance is fp16's, not bf16's."""
     mx = pytest.importorskip("mlx.core")
-    raw = _blocks()[name]
+    raw = np.resize(_blocks()[name], (n, _blocks()[name].shape[1]))
     qtype = GGMLQuantizationType[name].value
     fmt = mlx_gguf.FORMATS[qtype]
     k = raw.shape[1] // fmt.block_bytes * fmt.block_values
@@ -87,3 +88,15 @@ def test_matmul_matches_the_dequantized_product(name, m):
     got = mlx_gguf.matmul(x, w, qtype, k).astype(mx.float32)
     err = float(mx.abs(got - ref).max()) / float(mx.abs(ref).max())
     assert got.shape == (m, raw.shape[0]) and err < 1e-2, (name, m, err)
+
+
+def test_verify_kernel_saturates_instead_of_overflowing_fp16():
+    """An activation past fp16's range must not turn the verify widths' output into
+    inf: in a verify forward that would reach the KV cache and recurrent state."""
+    mx = pytest.importorskip("mlx.core")
+    raw = _blocks()["Q4_K"]
+    k = raw.shape[1] // 144 * 256
+    x = mx.random.normal((4, k), key=mx.random.key(0)).astype(mx.bfloat16)
+    x = mx.where(mx.arange(k) == 5, mx.array(1.0e5, dtype=mx.bfloat16), x)
+    got = mlx_gguf.matmul(x, mx.array(raw), 12, k)
+    assert bool(mx.all(mx.isfinite(got)).item())

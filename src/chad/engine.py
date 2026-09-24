@@ -105,7 +105,11 @@ def _local_path(model_id: str) -> str:
     `_read_config`) skip the hub revision check — a ~1s network/stat round-trip on every
     launch, pure overhead once the weights are local. A local dir or an uncached id
     passes through unchanged; the uncached case is downloaded by `cli._ensure_model`
-    before `load()` runs, so by then it's a cache hit here too."""
+    before `load()` runs, so by then it's a cache hit here too. A `.gguf` file resolves
+    to the model directory gguf_pack builds around it."""
+    if model_id.endswith(".gguf") and os.path.isfile(model_id):
+        from . import gguf_pack
+        return gguf_pack.materialize(model_id)
     if os.path.isdir(model_id):
         return model_id
     try:
