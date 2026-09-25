@@ -148,7 +148,7 @@ def test_model_download_gb():
     shipped = cli._model_download_gb(cli._HF_MODEL)
     check("shipped file -> its size plus the sidecar", shipped == 13.2 + gguf_pack.SIDECAR_GB,
           shipped)
-    check("an unknown hub file is priced at the heaviest known",
+    check("an unknown hub file offline falls back to the heaviest known",
           cli._model_download_gb("unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_0.gguf")
           == 14.3 + gguf_pack.SIDECAR_GB)
     check("a packed repo keeps the packed figure", cli._model_download_gb("some/repo") == 8.3)
@@ -181,7 +181,9 @@ def test_cached_weights_complete_for_a_hub_gguf():
     check("file without sidecar is not complete", complete() is False)
     have.add((gguf_pack.TOKENIZER_DONOR, "dflash/model.safetensors"))
     have.add((gguf_pack.TOKENIZER_DONOR, "tokenizer.json"))
-    check("file + sidecar is complete", complete() is True)
+    check("drafter + tokenizer without the template is not complete", complete() is False)
+    have.update((gguf_pack.TOKENIZER_DONOR, f) for f in gguf_pack._SIDECAR_FILES)
+    check("file + whole sidecar is complete", complete() is True)
 
 
 def test_ensure_model_hub_gguf(monkeypatch, capsys, tmp_path):

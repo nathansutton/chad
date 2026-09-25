@@ -115,8 +115,34 @@ def test_resolve_file_finds_a_cached_hub_file():
 
 
 def test_hub_download_gb_prices_file_plus_sidecar():
-    assert gguf_pack.hub_download_gb("o/r/Qwen3.8-27B-UD-IQ3_XXS.gguf") == 10.9 + gguf_pack.SIDECAR_GB
-    assert gguf_pack.hub_download_gb("o/r/unknown.gguf") == 14.3 + gguf_pack.SIDECAR_GB
+    """A known file is priced from the table without a network call; any other file
+    by the hub, so a 28 GB Q8_0 cannot pass the disk preflight as ~15 GB."""
+    asked: list[tuple[str, str]] = []
+
+    def hub(repo, filename):
+        asked.append((repo, filename))
+        return 28.7
+    assert gguf_pack.hub_download_gb("o/r/Qwen3.8-27B-UD-IQ3_XXS.gguf",
+                                     ask_hub=hub) == 10.9 + gguf_pack.SIDECAR_GB
+    assert asked == []
+    assert gguf_pack.hub_download_gb("o/r/Q8_0.gguf", ask_hub=hub) == 28.7 + gguf_pack.SIDECAR_GB
+    assert asked == [("o/r", "Q8_0.gguf")]
+    assert gguf_pack.hub_download_gb("o/r/Q8_0.gguf",
+                                     ask_hub=lambda r, f: None) == 14.3 + gguf_pack.SIDECAR_GB
+
+
+def test_hub_cached_needs_the_whole_sidecar():
+    """A sidecar cut short before its chat template or drafter config is not
+    downloaded: the pack built from it would be reused without them."""
+    present = {("o/r", "f.gguf")} | {(gguf_pack.TOKENIZER_DONOR, f)
+                                     for f in gguf_pack._SIDECAR_FILES}
+
+    def cache(repo, filename):
+        return "/c" if (repo, filename) in present else None
+    assert gguf_pack.hub_cached("o/r/f.gguf", cached=cache)
+    for missing in ("chat_template.jinja", "dflash/config.json"):
+        present.discard((gguf_pack.TOKENIZER_DONOR, missing))
+        assert not gguf_pack.hub_cached("o/r/f.gguf", cached=cache), missing
 
 
 def test_resolve_file_expands_and_casefolds(tmp_path, monkeypatch):

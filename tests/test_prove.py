@@ -194,8 +194,8 @@ def test_a_task_that_raises_becomes_a_failed_row(tmp_path, monkeypatch, capsys):
     (snapshot / "config.json").write_text("{}")
     (snapshot / "model.safetensors").write_text("x")
     (snapshot / gguf_pack.hub_spec(cli._HF_MODEL)[1]).write_text("x")
-    (snapshot / "dflash" / "model.safetensors").write_text("x")
-    (snapshot / "tokenizer.json").write_text("{}")
+    for name in gguf_pack._SIDECAR_FILES:
+        (snapshot / name).write_text("{}")
 
     def cached_file(repo_id, filename):
         path = snapshot / filename

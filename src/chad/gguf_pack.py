@@ -60,6 +60,10 @@ _DENSE_ROWS = 64
 TOKENIZER_DONOR = "nathansutton/Qwen3.8-27B-DFlash2-MLX"
 _TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
                     "generation_config.json")
+# Everything a GGUF session reads from the sidecar. `materialize()` copies whichever
+# tokenizer files exist, so a download cut short before the template must not count
+# as done: the pack directory built from it would be reused without one.
+_SIDECAR_FILES = _TOKENIZER_FILES + ("dflash/config.json", "dflash/model.safetensors")
 # The donor template renders medium by default; the GGUF's own template says xhigh.
 REASONING_EFFORT_DEFAULT = "medium"
 
@@ -81,7 +85,8 @@ HUB_REPO = "unsloth/Qwen3.8-27B-GGUF"
 # What one GGUF session downloads besides the file: the drafter (1.15 GB) and tokenizer.
 SIDECAR_GB = 1.2
 # Download sizes for the disk preflight and the consent line — display honesty, not
-# accounting: the files this loader has run, and the heaviest of them for any other.
+# accounting: the files this loader has run. Any other file is sized by the hub, since
+# the same repo holds 28 GB Q8_0 and 54 GB BF16 files that no table default covers.
 _HUB_GB = {"Qwen3.8-27B-UD-Q2_K_XL.gguf": 9.8, "Qwen3.8-27B-UD-IQ3_XXS.gguf": 10.9,
            "Qwen3.8-27B-UD-IQ3_S.gguf": 12.0, "Qwen3.8-27B-UD-Q3_K_XL.gguf": 13.2,
            "Qwen3.8-27B-UD-IQ4_XS.gguf": 14.3}
@@ -134,8 +139,7 @@ def hub_cached(spec: str,
     if hub is None:
         return False
     return cached(*hub) is not None and all(
-        cached(TOKENIZER_DONOR, f) is not None
-        for f in ("dflash/model.safetensors", "tokenizer.json"))
+        cached(TOKENIZER_DONOR, f) is not None for f in _SIDECAR_FILES)
 
 
 def fetch_hub(spec: str) -> str:
@@ -149,11 +153,29 @@ def fetch_hub(spec: str) -> str:
     return hf_hub_download(*hub)
 
 
-def hub_download_gb(spec: str) -> float:
-    """Approximate download for the hub GGUF `spec` names plus its sidecar."""
+def _hub_file_gb(repo_id: str, filename: str) -> Optional[float]:
+    """The size in GB the hub reports for `filename` of `repo_id`, or None when the
+    hub cannot be asked (offline, not found, network down)."""
+    import httpx
+    from huggingface_hub import get_hf_file_metadata, hf_hub_url
+    try:
+        size = get_hf_file_metadata(hf_hub_url(repo_id, filename)).size
+    except (OSError, httpx.HTTPError):
+        return None
+    return size / 1e9 if size is not None else None
+
+
+def hub_download_gb(spec: str,
+                    ask_hub: Callable[[str, str], Optional[float]] = _hub_file_gb) -> float:
+    """Approximate download for the hub GGUF `spec` names plus its sidecar. A file
+    outside the table is sized by the hub; when the hub cannot answer, the download
+    cannot start either, so the heaviest known file stands in for the message."""
     hub = hub_spec(spec)
-    name = os.path.basename(hub[1]) if hub else ""
-    return _HUB_GB.get(name, max(_HUB_GB.values())) + SIDECAR_GB
+    if hub is None:
+        return max(_HUB_GB.values()) + SIDECAR_GB
+    known = _HUB_GB.get(os.path.basename(hub[1]))
+    gb = known if known is not None else ask_hub(*hub)
+    return (gb if gb is not None else max(_HUB_GB.values())) + SIDECAR_GB
 
 
 def file_size(config: dict) -> int:
