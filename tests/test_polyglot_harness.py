@@ -150,7 +150,8 @@ def test_the_lock_round_trips_and_pins_only_lockable_arms(tmp_path):
 def test_server_context_reads_the_window_llama_server_reports():
     class Props(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            body = json.dumps({"default_generation_settings": {"n_ctx": 65536}}).encode()
+            body = json.dumps({"default_generation_settings": {"n_ctx": 65536},
+                               "model_path": "/models/m.gguf"}).encode()
             self.send_response(200)
             self.end_headers()
             self.wfile.write(body)
@@ -162,6 +163,7 @@ def test_server_context_reads_the_window_llama_server_reports():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         assert cli.server_context(f"http://127.0.0.1:{server.server_port}") == 65536
+        assert cli.served_file(f"http://127.0.0.1:{server.server_port}") == "/models/m.gguf"
     finally:
         server.shutdown()
         server.server_close()
