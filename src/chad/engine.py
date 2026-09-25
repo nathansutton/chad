@@ -633,6 +633,14 @@ class Engine:
         # Resolve a cached repo id to its local snapshot dir once, then load from disk —
         # skips the per-launch hub revision check on both the weights and _read_config.
         path = _local_path(self.model_id)
+        from . import gguf_pack
+        if gguf_pack.resolve_file(self.model_id) is not None:
+            # A GGUF arrives as a file path or a hub spec; its identity is the model
+            # directory built around it, whose name hashes the file. That is what
+            # warm-prefix checkpoints key on (a file replaced under the same name must
+            # not inherit them) and what tells the drafter loader there is no repo to
+            # complete a bundle from.
+            self.model_id = path
         self._model_path = path
         self._load_weights(path)
         self._read_model_shape(path)

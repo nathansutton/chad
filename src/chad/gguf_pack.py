@@ -43,7 +43,7 @@ import json
 import os
 import shutil
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from .diag import log
 
@@ -54,8 +54,10 @@ if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module l
 _ARCH = "qwen35"
 # Projections with fewer output rows than this load as plain bf16 linears.
 _DENSE_ROWS = 64
-# Chat template and tokenizer donor: the same Qwen3.8-27B vocabulary as every GGUF of it.
-TOKENIZER_DONOR = "nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX"
+# Chat template and tokenizer donor: the same Qwen3.8-27B vocabulary as every GGUF of
+# it, from the repo that also carries the drafter (mlx_dflash.DONORS) and no target
+# weights, so a GGUF session depends on ~1.2 GB of sidecar and never on another pack.
+TOKENIZER_DONOR = "nathansutton/Qwen3.8-27B-DFlash2-MLX"
 _TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
                     "generation_config.json")
 # The donor template renders medium by default; the GGUF's own template says xhigh.
@@ -73,15 +75,85 @@ def is_gguf_pack(config: dict) -> bool:
     return _KEY in config
 
 
-def resolve_file(spec: str) -> Optional[str]:
-    """The absolute path of the GGUF file `spec` names, or None when it names anything
-    else (a model directory, an HF repo id, a path that is not there). `~` is expanded
-    and the suffix matched case-insensitively, so `--model ~/x.GGUF` routes here
-    instead of falling through to the hub as a repo id and failing there."""
+# The default file is one of Unsloth's, fetched from their repo: re-hosting 13 GB that
+# they revise would only go stale. A hub GGUF is spelled `owner/repo/file.gguf`.
+HUB_REPO = "unsloth/Qwen3.8-27B-GGUF"
+# What one GGUF session downloads besides the file: the drafter (1.15 GB) and tokenizer.
+SIDECAR_GB = 1.2
+# Download sizes for the disk preflight and the consent line — display honesty, not
+# accounting: the files this loader has run, and the heaviest of them for any other.
+_HUB_GB = {"Qwen3.8-27B-UD-Q2_K_XL.gguf": 9.8, "Qwen3.8-27B-UD-IQ3_XXS.gguf": 10.9,
+           "Qwen3.8-27B-UD-IQ3_S.gguf": 12.0, "Qwen3.8-27B-UD-Q3_K_XL.gguf": 13.2,
+           "Qwen3.8-27B-UD-IQ4_XS.gguf": 14.3}
+
+
+def hub_spec(spec: str) -> Optional[tuple[str, str]]:
+    """`(repo_id, filename)` when `spec` names a GGUF inside a hub repo,
+    `owner/repo/path/to/file.gguf`; None for a local path or a plain repo id. A local
+    file always wins: `resolve_file` looks at the disk first."""
+    s = spec.strip()
+    if not s.lower().endswith(".gguf") or s.startswith(("/", "~", ".")):
+        return None
+    parts = s.split("/")
+    if len(parts) < 3 or not all(parts):
+        return None
+    return "/".join(parts[:2]), "/".join(parts[2:])
+
+
+def _hub_cached(repo_id: str, filename: str) -> Optional[str]:
+    """`filename` of `repo_id` in the local HF cache, or None (the hub's "known
+    missing upstream" sentinel folded into None)."""
+    from huggingface_hub import try_to_load_from_cache
+    hit = try_to_load_from_cache(repo_id, filename)
+    return hit if isinstance(hit, str) else None
+
+
+def resolve_file(spec: str,
+                 cached: Callable[[str, str], Optional[str]] = _hub_cached) -> Optional[str]:
+    """The absolute path of the GGUF file `spec` names — a local path, or a hub file
+    (`hub_spec`) already in the HF cache — or None when it names anything else (a model
+    directory, a plain repo id, a path that is not there, a hub file not yet fetched).
+    `~` is expanded and the suffix matched case-insensitively, so `--model ~/x.GGUF`
+    routes here instead of falling through to the hub as a repo id and failing there."""
     path = os.path.expanduser(spec.strip())
     if path.lower().endswith(".gguf") and os.path.isfile(path):
         return os.path.abspath(path)
+    hub = hub_spec(spec)
+    if hub is not None:
+        hit = cached(*hub)
+        return os.path.abspath(hit) if hit else None
     return None
+
+
+def hub_cached(spec: str,
+               cached: Callable[[str, str], Optional[str]] = _hub_cached) -> bool:
+    """True when the hub GGUF `spec` names AND the sidecar it decodes with (the
+    drafter and tokenizer from `TOKENIZER_DONOR`) are on this disk — what "the model
+    is downloaded" means for a GGUF session."""
+    hub = hub_spec(spec)
+    if hub is None:
+        return False
+    return cached(*hub) is not None and all(
+        cached(TOKENIZER_DONOR, f) is not None
+        for f in ("dflash/model.safetensors", "tokenizer.json"))
+
+
+def fetch_hub(spec: str) -> str:
+    """Download the hub GGUF `spec` names and the sidecar repo into the HF cache
+    (resumable, progress on stderr); returns the file's local path."""
+    from huggingface_hub import hf_hub_download, snapshot_download
+    hub = hub_spec(spec)
+    if hub is None:
+        raise ValueError(f"{spec!r} is not owner/repo/file.gguf")
+    snapshot_download(TOKENIZER_DONOR)
+    return hf_hub_download(*hub)
+
+
+def hub_download_gb(spec: str) -> float:
+    """Approximate download for the hub GGUF `spec` names plus its sidecar."""
+    hub = hub_spec(spec)
+    name = os.path.basename(hub[1]) if hub else ""
+    return _HUB_GB.get(name, max(_HUB_GB.values())) + SIDECAR_GB
 
 
 def file_size(config: dict) -> int:

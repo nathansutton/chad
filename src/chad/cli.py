@@ -38,25 +38,26 @@ if TYPE_CHECKING:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
 
-# The shipped model, on Hugging Face. The repo carries the weights AND the DFlash2
-# block drafter, pre-quantized, in `dflash/` (~1.1 GB): one download gets the model
-# and its speculative decoder, with nothing built on first run (mlx_dflash.py).
-#
-# Qwen3.8-27B is `qwen3_5` — DENSE (64 layers: 48 GatedDeltaNet + 16 full attention),
-# so every parameter is on the critical path for every token and shrinking the model
-# is the only decode lever there is. The shipped weights are Prism ML's ternary build:
-# every projection Hadamard-rotated offline and stored as 2-bit affine group-128 whose
-# three levels are {-s, 0, +s}, ~7.2 GB resident against the 3-bit recipe's 12.1 — and
-# on a dense model those 5 GB are context, at the governor's measured 34,816 B/token.
-# The rotation has to be undone on the activations at runtime (prism_pack.py); the
-# repo is our repack of the pack with the base tokenizer and the drafter bundled.
-_HF_MODEL = "nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX"
-# A dev clone that already built the weights locally should use them rather than
-# re-download — prefer this dir when present.
-_LOCAL_MODEL = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-Ternary-Bonsai-2")
+# The shipped model: one of Unsloth's GGUF files of Qwen3.8-27B, read from their repo
+# as it is. Qwen3.8-27B is `qwen3_5` — DENSE (64 layers: 48 GatedDeltaNet + 16 full
+# attention), so every parameter is on the critical path for every token and the
+# quantization recipe decides both the quality and the window. Unsloth's recipe is
+# i-quants and K-quants fitted against an importance matrix, which MLX's affine
+# `scale * q + bias` container cannot hold: re-quantizing threw the gain away (their
+# file 9/9 on the agent tasks that chad's own MLX repack of the same bits passed 6/9
+# and the ternary pack 4/9), so chad decodes the GGUF blocks natively (gguf_pack.py,
+# mlx_gguf.py). UD-Q3_K_XL is the best file measured: ~13.2 GB resident, ~74k of
+# context on 24 GB with the drafter. The lighter UD-IQ3_XXS (10.9 GB, ~138k) is one
+# `--model` away, and this one constant is the whole switch. The drafter and the
+# tokenizer come from the 1.2 GB sidecar repo `gguf_pack.TOKENIZER_DONOR`, which
+# carries no target weights.
+_HF_MODEL = f"{gguf_pack.HUB_REPO}/Qwen3.8-27B-UD-Q3_K_XL.gguf"
+# A dev clone that already has the file locally should use it rather than re-download
+# — prefer this path when present.
+_LOCAL_MODEL = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-UD-Q3_K_XL.gguf")
 # chad targets 24 GB Apple Silicon and nothing smaller. Below this the model still
-# loads, but the context governor has little left to spend after ~7.2 GB of weights,
-# the ~1.1 GB drafter and the ~2 GB prefill transient, so the window shrinks toward
+# loads, but the context governor has little left to spend after ~13.2 GB of weights,
+# the ~1.2 GB drafter and the ~2 GB prefill transient, so the window shrinks toward
 # its floor. We warn and proceed rather than refuse: the harness advises, the caller
 # decides.
 _MIN_RAM_GB = 23.5
@@ -472,8 +473,9 @@ def _preflight(backend="mlx", *, host: Host = HOST):
 
 
 def _resolve(local, repo):
-    """Prefer a locally-built models/ dir over the HF repo when it exists."""
-    return local if os.path.isdir(local) else repo
+    """Prefer a local copy under models/ (a dir, or the GGUF file itself) over the hub
+    when it exists."""
+    return local if os.path.exists(local) else repo
 
 
 def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL,
@@ -506,16 +508,19 @@ def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL
         got = "undetectable" if ram is None else f"{ram:.0f} GB"
         sys.stderr.write(
             f"chad: RAM {got}, below the ~{_MIN_RAM_GB:.0f} GB chad is built for. The "
-            f"model needs ~12 GB resident plus its KV cache, so expect a small context "
+            f"model needs ~14 GB resident plus its KV cache, so expect a small context "
             f"window and possible thrashing. Proceeding.\n")
     return _resolve(local_model, _HF_MODEL), "default"
 
 
 def _model_download_gb(model_id):
-    """Approximate download size in GiB for the shipped model (for the disk preflight
-    and the confirm prompt — display honesty, not accounting): ~7.2 GB of weights
-    plus the ~1.1 GB bundled DFlash2 drafter. An arbitrary `--model` is unknowable
-    ahead of the resolve, so it gets the same figure."""
+    """Approximate download size in GiB (for the disk preflight and the confirm prompt
+    — display honesty, not accounting). A hub GGUF is its file plus the 1.2 GB drafter
+    and tokenizer sidecar (`gguf_pack.hub_download_gb`; the shipped Q3_K_XL is ~14.4).
+    An arbitrary `--model` repo is unknowable ahead of the resolve, so it gets the
+    figure of the last packed default, ~7.2 GB of weights plus a bundled drafter."""
+    if gguf_pack.hub_spec(model_id) is not None:
+        return gguf_pack.hub_download_gb(model_id)
     return 8.3
 
 
@@ -529,8 +534,12 @@ def _cached_weights_complete(
     guard returns, and the failure surfaces minutes later inside mlx_lm as a
     FileNotFoundError naming an internal blob path. There is no way back from that
     state except hand-deleting the cache. So verify what the loader will actually
-    read: every shard the index names, or a single-file/loose layout on disk.
+    read: every shard the index names, or a single-file/loose layout on disk. A hub
+    GGUF (`owner/repo/file.gguf`) is complete when the file and its drafter/tokenizer
+    sidecar are both cached.
     """
+    if gguf_pack.hub_spec(model_id) is not None:
+        return gguf_pack.hub_cached(model_id, cached_file)
     index = cached_file(model_id, "model.safetensors.index.json")
     if index is not None:
         try:
@@ -559,6 +568,9 @@ def _ensure_model(model_id, *, host: Host = HOST):
     disk is the worst first-run outcome (devex review T2)."""
     if os.path.isdir(model_id):
         return  # a local path — nothing to fetch
+    hub = gguf_pack.hub_spec(model_id)
+    if hub is None and gguf_pack.resolve_file(model_id) is not None:
+        return  # a local GGUF file; the drafter is borrowed at load if it is missing
     from huggingface_hub import snapshot_download
     if _cached_weights_complete(model_id, cached_file=host.cached_file):
         return  # already in the HF cache
@@ -579,7 +591,7 @@ def _ensure_model(model_id, *, host: Host = HOST):
     # Say WHICH of the two situations this is. "Downloading again" on a machine the
     # user believes already has the model reads as a bug unless the partial cache is
     # named; only the completed blobs are re-used, so the second run is also shorter.
-    partial = host.cached_file(model_id, "config.json") is not None
+    partial = hub is None and host.cached_file(model_id, "config.json") is not None
     sys.stderr.write(
         (f"\nchad: the cached copy of '{model_id}' is incomplete (an interrupted "
          f"download left its metadata but not all of its weights).\nResuming — only "
@@ -600,7 +612,10 @@ def _ensure_model(model_id, *, host: Host = HOST):
     else:
         sys.stderr.write("[headless: downloading automatically]\n")
     try:
-        snapshot_download(model_id)  # tqdm progress to stderr
+        if hub is not None:
+            gguf_pack.fetch_hub(model_id)  # the file and its sidecar; tqdm to stderr
+        else:
+            snapshot_download(model_id)  # tqdm progress to stderr
     except Exception as e:  # noqa: BLE001 — offline / gated / typo'd repo / full disk → guidance, not a traceback
         no_space = isinstance(e, OSError) and e.errno == 28
         extra = ("  note:  the disk filled up mid-download — free space and re-run "

@@ -144,7 +144,63 @@ def test_pick_model_small_box_warns(monkeypatch, capsys, tmp_path):
 
 
 def test_model_download_gb():
-    check("shipped repo -> ~8 GB", cli._model_download_gb(cli._HF_MODEL) == 8.3)
+    from chad import gguf_pack
+    shipped = cli._model_download_gb(cli._HF_MODEL)
+    check("shipped file -> its size plus the sidecar", shipped == 13.2 + gguf_pack.SIDECAR_GB,
+          shipped)
+    check("an unknown hub file is priced at the heaviest known",
+          cli._model_download_gb("unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_0.gguf")
+          == 14.3 + gguf_pack.SIDECAR_GB)
+    check("a packed repo keeps the packed figure", cli._model_download_gb("some/repo") == 8.3)
+
+
+def test_default_model_is_a_hub_gguf():
+    """The shipped model is one of Unsloth's files, named inside their repo, and the
+    dev clone's local shortcut is the same file under models/."""
+    from chad import gguf_pack
+    check("default is owner/repo/file.gguf",
+          gguf_pack.hub_spec(cli._HF_MODEL) == (gguf_pack.HUB_REPO, "Qwen3.8-27B-UD-Q3_K_XL.gguf"),
+          cli._HF_MODEL)
+    check("local shortcut is the same file", cli._LOCAL_MODEL.endswith("Qwen3.8-27B-UD-Q3_K_XL.gguf"))
+
+
+def test_cached_weights_complete_for_a_hub_gguf():
+    """A GGUF session is downloaded when the file AND its drafter/tokenizer sidecar are
+    cached; the file alone would load, then fetch 1.2 GB inside the engine."""
+    from chad import gguf_pack
+    have = set()
+
+    def fake_cache(repo, filename):
+        return f"/c/{filename}" if (repo, filename) in have else None
+
+    def complete():
+        return cli._cached_weights_complete(cli._HF_MODEL, cached_file=fake_cache)
+
+    check("nothing cached", complete() is False)
+    have.add((gguf_pack.HUB_REPO, "Qwen3.8-27B-UD-Q3_K_XL.gguf"))
+    check("file without sidecar is not complete", complete() is False)
+    have.add((gguf_pack.TOKENIZER_DONOR, "dflash/model.safetensors"))
+    have.add((gguf_pack.TOKENIZER_DONOR, "tokenizer.json"))
+    check("file + sidecar is complete", complete() is True)
+
+
+def test_ensure_model_hub_gguf(monkeypatch, capsys, tmp_path):
+    """Cached: returns without touching the network. Uncached at a TTY: names the
+    download and its size, and a `n` aborts before any fetch."""
+    monkeypatch.chdir(tmp_path)
+    cached = cli.Host(cached_file=lambda repo, filename: f"/c/{filename}",
+                      free_disk_gb=lambda path: 500.0,
+                      stdin_isatty=lambda: True, ask=_Terminal("n").ask)
+    check("cached hub file returns", cli._ensure_model(cli._HF_MODEL, host=cached) is None)
+    fresh = cli.Host(cached_file=lambda repo, filename: None,
+                     free_disk_gb=lambda path: 500.0,
+                     stdin_isatty=lambda: True, ask=_Terminal("n").ask)
+    with pytest.raises(SystemExit):
+        cli._ensure_model(cli._HF_MODEL, host=fresh)
+    err = capsys.readouterr().err
+    check("names the file", "Qwen3.8-27B-UD-Q3_K_XL.gguf" in err, err)
+    check("states the size with the sidecar", "~14 GB" in err, err)
+    check("a fresh fetch is not called a resume", "Resuming" not in err, err)
 
 
 def test_free_disk_gb():
@@ -182,7 +238,7 @@ def test_ensure_model_disk_preflight(monkeypatch, capsys, tmp_path):
     check("refused before the consent prompt", terminal.asked == [], terminal.asked)
     err = capsys.readouterr().err
     check("names the shortfall", "not enough free disk" in err, err)
-    check("names required space", "~8 GB" in err, err)
+    check("names required space", "~14 GB" in err, err)
     check("points at cache GC", "hf cache" in err, err)
 
 
@@ -267,6 +323,11 @@ def test_pick_model_prefers_local_dir(monkeypatch, tmp_path):
     # `--model auto` takes the same path (it means "the default", not "ignore local").
     model, _ = cli._pick_model("auto", host=_host(64.0), local_model=str(local))
     check("auto also prefers the local build", model == str(local), model)
+    # ...and a local copy of the GGUF file itself counts the same way.
+    gguf = tmp_path / "models" / "Qwen3.8-27B-UD-Q3_K_XL.gguf"
+    gguf.write_bytes(b"GGUF")
+    model, _ = cli._pick_model(host=_host(64.0), local_model=str(gguf))
+    check("local GGUF file preferred over the hub", model == str(gguf), model)
     # ...and the build looked for by default is the dev clone's own models/ dir.
     default = inspect.signature(cli._pick_model).parameters["local_model"].default
     check("default local build is the dev clone's", default == cli._LOCAL_MODEL, default)

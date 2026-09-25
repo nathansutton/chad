@@ -185,11 +185,17 @@ def test_a_task_that_raises_becomes_a_failed_row(tmp_path, monkeypatch, capsys):
         def load(self):
             return 1.0
 
-    # A complete single-file snapshot in the cache: the model check passes, no download.
+    # A complete cache: the model check passes, no download. The shipped default is a hub
+    # GGUF, so "complete" is the file plus its drafter/tokenizer sidecar; a packed repo's
+    # single-file layout is here too so the check reads the same either way.
+    from chad import gguf_pack
     snapshot = tmp_path / "hf-snapshot"
-    snapshot.mkdir()
+    (snapshot / "dflash").mkdir(parents=True)
     (snapshot / "config.json").write_text("{}")
     (snapshot / "model.safetensors").write_text("x")
+    (snapshot / gguf_pack.hub_spec(cli._HF_MODEL)[1]).write_text("x")
+    (snapshot / "dflash" / "model.safetensors").write_text("x")
+    (snapshot / "tokenizer.json").write_text("{}")
 
     def cached_file(repo_id, filename):
         path = snapshot / filename

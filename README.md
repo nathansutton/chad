@@ -16,7 +16,8 @@ uvx chad-code          # runs anywhere; the command is still `chad`
 uvx chad-code prove    # offline smoke test: 4 tiny fix-it tasks, verified, timed 🗿
 ```
 
-The first run asks, then downloads the model once (~8 GB). The PyPI package is `chad-code`.
+The first run asks, then downloads the model once (~14 GB: Unsloth's `UD-Q3_K_XL` GGUF of
+Qwen3.8-27B, read natively, plus a 1.2 GB drafter). The PyPI package is `chad-code`.
 
 ![chad fixing a failing test end to end: reason, read, edit, run pytest, confirm green, all on a local model](docs/demo.gif)
 

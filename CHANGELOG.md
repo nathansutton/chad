@@ -4,6 +4,36 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+### Model bump: Unsloth's UD-Q3_K_XL GGUF, read natively
+
+**The shipped weights are now Unsloth's [`Qwen3.8-27B-UD-Q3_K_XL.gguf`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF).**
+A re-download is coming (~14 GB against ~8); the old ternary snapshot can be freed with
+`hf cache rm`. Why: on the polyglot agent tasks the file scores 9/9 where the ternary pack
+scored 4/9 (half its trials ran out the wall clock inside one think) and chad's own MLX
+repack of the same bits 6/9; chad-corpus perplexity 3.95 against the ternary's 4.86. The
+gain is Unsloth's quantization recipe — i-quants and K-quants fitted against an importance
+matrix — which MLX's affine container cannot hold, so chad now reads GGUF files as they
+are: every projection stays in its llama.cpp blocks and decodes in chad's own Metal
+kernels (`gguf_pack.py`, `mlx_gguf.py`; 15 block formats, bit-exact to llama.cpp's
+dequantizers, MIT-licensed port noted in `NOTICE`). Drafted decode is ~2× llama.cpp's
+serial on the same file; serial decode is weight-bandwidth bound at ~13 tok/s.
+
+- **`--model` takes a GGUF**: a local `path/to/file.gguf`, or `owner/repo/file.gguf` for
+  chad to fetch. Any Unsloth file of this model loads; `UD-IQ3_XXS` (10.9 GB) gets ~138k
+  of context on 24 GB against the default's ~74k, at 8/9 on the same tasks. The tokenizer
+  and the DFlash2 drafter come from a 1.2 GB sidecar repo,
+  [`nathansutton/Qwen3.8-27B-DFlash2-MLX`](https://huggingface.co/nathansutton/Qwen3.8-27B-DFlash2-MLX),
+  which carries no target weights. The ternary and the affine packs still load via `--model`.
+- **The prefill transient is flat.** A per-chunk OOM-rollback snapshot was holding every
+  KV buffer, so no chunk could write in place and each one copied the whole cache; a
+  prefill chunk's attention also materialized its full score slab. On the quantized cache
+  the snapshot is gone and attention runs in 64-row slices: 1.4–1.9 GB from 8k to 64k
+  where it used to saturate at ~4.15 GB. Every model gains context (the ternary 172k →
+  238k on 24 GB). A Metal OOM inside a prefill chunk on the quantized cache now rebuilds
+  the cache by re-prefilling at half the chunk instead of rolling back one chunk.
+- The banner sizes a GGUF from the file; the governor charges the flat 2.0 GB transient
+  only when both mechanisms are in (quantized cache and sliced attention), 4.3 GB otherwise.
+
 ### One benchmark, and no run output in the repository
 
 - **`benchmarks/polyglot` is the one agent eval.** Terminal-Bench (`benchmarks/tb2`), the

@@ -281,9 +281,9 @@ default:
 | Context | KV cache (8-bit, default) | Notes |
 |---|---|---|
 | 32k | 1.1 GB | |
-| ~56k | 2.0 GB | roughly where a 24 GB Mac's window lands on the 3-bit `--model` alternative |
+| ~74k | 2.6 GB | roughly where a 24 GB Mac's window lands on the shipped `UD-Q3_K_XL` file, drafter on |
 | 128k | 4.6 GB | |
-| ~150k | 5.2 GB | roughly where a 24 GB Mac's window lands on the shipped ternary weights |
+| ~138k | 4.8 GB | roughly where it lands on `UD-IQ3_XXS` (`--model`), drafter on |
 | 262k (native) | 9.1 GB | the checkpoint's max; unreachable on 24 GB |
 
 That is **34,816 bytes per token**. A pure-attention transformer of the same shape (all 64
@@ -344,13 +344,14 @@ re-prefill on this non-trimmable cache, so we do it as rarely as RAM allows) is 
 automatically** from the live Metal memory budget and the model's measured per-token
 cost, then capped at the model's window. Three things are subtracted before the division:
 the resident weights, a headroom band (`CHAD_CTX_SAFETY`), and the prefill transient, the attention scratch that is live at the same moment the cache is. That last one is fixed,
-not per-token: it climbs with context and then flattens once the adaptive chunker starts
-shrinking the chunk (measured: 1.8 GB at 8k, 4.15 GB at 49k, flat thereafter), and past
-that point peak memory grows at exactly the KV rate. On a 24 GB Mac the shipped ternary
-weights (7.2 GB) plus the drafter (1.1 GB) and that 4.3 GB transient spend ~72% of the
-budget before the first cached token, which is why it lands around ~150k rather than the
-262k native window; the 3-bit alternative's 12.3 GB of weights spent 87% and landed near
-~56k. It
+not per-token: on the default quantized cache a prefill chunk writes into the cache in
+place and runs its attention in 64-row slices, so it is flat (measured 1.4–1.9 GB from 8k
+to 64k; the governor charges 2.0 GB), and peak memory grows at exactly the KV rate. On an
+fp16 cache (`CHAD_KV_BITS=0`) or with the fused attention patch absent it climbs with
+context and saturates at ~4.15 GB, and the governor charges 4.3 GB. On a 24 GB Mac the
+shipped weights (13.2 GB) plus the drafter (1.2 GB) and the 2 GB transient spend ~86% of
+the budget before the first cached token, which is why it lands around ~74k rather than
+the 262k native window; the lighter `UD-IQ3_XXS` (10.9 GB) lands near ~138k. It
 self-calibrates per machine: less RAM compacts sooner, more RAM runs nearer the full
 window. `CHAD_CTX_LIMIT` forces an
 exact threshold (used by tests); `CHAD_CTX_SAFETY` (default 0.975) is the single
@@ -382,18 +383,35 @@ that the Metal budget can't see) and is re-checked between turns.
 
 ### The model
 
-chad ships exactly one: [`nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX`][model],
-Qwen3.8-27B (a dense `qwen3_5` hybrid: 64 layers, 48 GatedDeltaNet and 16 full attention)
-in Prism ML's ternary build. Every projection is Hadamard-rotated offline and stored as
-2-bit affine group-128 whose three levels are {−s, 0, +s}: **7.2 GB resident**, 262k native
-context. The repo also carries the DFlash2 block drafter, pre-quantized to 4-bit in
-`dflash/` (~1.1 GB resident), so one download gets the model and its
-[speculative decoder](#speculative-decoding--kernel-knobs) with nothing built on first run.
+chad ships exactly one: Unsloth's [`Qwen3.8-27B-UD-Q3_K_XL.gguf`][model], Qwen3.8-27B (a
+dense `qwen3_5` hybrid: 64 layers, 48 GatedDeltaNet and 16 full attention) in Unsloth's
+dynamic quantization — K-quants and i-quants fitted against an importance matrix, mostly
+3-bit: **~13.2 GB resident**, 262k native context. chad reads the file as it is: every
+projection stays in its llama.cpp blocks and is decoded by chad's own Metal kernels
+(`gguf_pack.py`, `mlx_gguf.py`), bit-exact to llama.cpp's dequantizers, because MLX's
+affine `scale * q + bias` container cannot hold those formats and re-quantizing into it
+measurably threw the quality away (9/9 on the agent tasks for the file against 6/9 for an
+MLX repack of the same bits and 4/9 for the ternary pack it replaced). The drafter and the
+tokenizer come from a second, small repo, [`nathansutton/Qwen3.8-27B-DFlash2-MLX`][sidecar]
+(1.2 GB, no target weights): the DFlash2 block drafter pre-quantized to 4-bit in
+`dflash/`, plus Qwen's tokenizer and a chat template that renders `reasoning_effort=medium`
+(the GGUF's own defaults to xhigh, and a byte-stable prompt is what keeps the prefix cache
+warm). Together the two downloads are ~14 GB, and nothing is built on first run.
 
-[model]: https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX
+Any other Unsloth file of this model loads the same way — `--model ~/models/Qwen3.8-27B-UD-IQ3_XXS.gguf`
+for ~138k of context at 10.9 GB, or `--model unsloth/Qwen3.8-27B-GGUF/<file>.gguf` to have
+chad fetch it. The two earlier MLX packs (the ternary build and the affine 3-bit repack)
+still load via `--model` too.
+
+[model]: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF
+[sidecar]: https://huggingface.co/nathansutton/Qwen3.8-27B-DFlash2-MLX
+[ternary]: https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX
 [q3]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX
 
-The rotation is folded into the weights, so the matching transform has to hit the
+**The ternary pack** ([`nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX`][ternary])
+was the default before the native GGUF loader: Prism ML's build, every projection
+Hadamard-rotated offline and stored as 2-bit affine group-128 whose three levels are
+{−s, 0, +s}, 7.2 GB resident. The rotation is folded into the weights, so the matching transform has to hit the
 activations at runtime and be inverted after the embedding lookup. mlx-lm's plain affine
 loader finds tensors of exactly the right shapes, skips it, and returns plausible garbage
 without raising; chad routes the pack on its declared `model_type` to its own loader
@@ -411,14 +429,15 @@ this model.
 
 **chad targets 24 GB Apple Silicon and nothing smaller.** There is no low-RAM fallback,
 because there is no second model to fall back to. On a smaller box chad prints a one-line
-warning at startup and runs anyway (it advises, it does not gate), but ~8 GB of weights and
-drafter plus the ~4.3 GB prefill transient leave little for a KV cache, so the window
-shrinks toward its floor. At 24 GB the honest figure is roughly ~150k of the model's 262k
+warning at startup and runs anyway (it advises, it does not gate), but ~14 GB of weights and
+drafter plus the ~2 GB prefill transient leave little for a KV cache, so the window
+shrinks toward its floor. At 24 GB the honest figure is roughly ~74k of the model's 262k
 window; the banner states what you actually got, and the
 [context window](#context-window-agentic-coding-needs-room) section explains the sizing.
 
-**The 3-bit alternative.** [`nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX`][q3] is the
-same model at 3-bit group-64 with `lm_head` held at 5-bit (the bit map follows what the
+**The affine 3-bit repack.** [`nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX`][q3] is
+chad's own MLX quantization of the same model — the bit map of Unsloth's file, not its
+recipe, and it measured 6/9 on the agent tasks where the real file scores 9/9 — at 3-bit group-64 with `lm_head` held at 5-bit (the bit map follows what the
 calibrated GGUF builds of this checkpoint agree on: the head is a second full 1.27B-param
 tensor worth protecting, the embedding a lookup table that is cheapest to cut), ~12.3 GB
 resident, the same drafter bundled, and ~56k of window on 24 GB. It is one flag away
@@ -443,7 +462,7 @@ shipped checkpoint (the DFlash2 drafter, the fused-attention coverage, the fastp
 check, the measured per-token KV cost the governor sizes against) either declines to
 install or falls back to a stock path. The harness itself does not change.
 
-#### What the engine does with the ternary weights
+#### What the engine does with the ternary weights (`--model`)
 
 - the decode fast-path fuses `gate|up`, `qkv|z` and `q|k|v` behind **one** rotation each,
   and folds the sign vectors into the weights once, at install: the residual-width vectors

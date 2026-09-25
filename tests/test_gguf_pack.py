@@ -86,6 +86,39 @@ def test_routing_predicate():
     assert gguf_pack.is_gguf_pack({"model_type": "qwen3_5", "chad_gguf": {"file": "x.gguf"}})
 
 
+def test_tokenizer_and_drafter_come_from_one_repo():
+    """The tokenizer donor and the drafter donor for the 27B shape are the same
+    drafter-only repo: one ~1.2 GB fetch per GGUF session, and never a target pack."""
+    from chad import mlx_dflash
+    assert gguf_pack.TOKENIZER_DONOR == mlx_dflash.DONORS[(5120, 64, 248320)]
+    assert "Ternary" not in gguf_pack.TOKENIZER_DONOR
+
+
+def test_hub_spec_names_a_file_inside_a_repo():
+    assert gguf_pack.hub_spec("unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf") == \
+        ("unsloth/Qwen3.8-27B-GGUF", "Qwen3.8-27B-UD-Q3_K_XL.gguf")
+    assert gguf_pack.hub_spec("o/r/sub/dir/f.GGUF") == ("o/r", "sub/dir/f.GGUF")
+    for not_hub in ("/abs/f.gguf", "~/f.gguf", "./f.gguf", "f.gguf", "o/r", "o//f.gguf",
+                    "o/r/f.safetensors"):
+        assert gguf_pack.hub_spec(not_hub) is None, not_hub
+
+
+def test_resolve_file_finds_a_cached_hub_file():
+    """A hub spec resolves to the cached file, so everything downstream of the
+    download (the banner's footprint, the engine's model path) reads the same path a
+    local `--model` would."""
+    def cache(repo, filename):
+        return "/cache/f.gguf" if (repo, filename) == ("o/r", "f.gguf") else None
+    assert gguf_pack.resolve_file("o/r/f.gguf", cached=cache) == "/cache/f.gguf"
+    assert gguf_pack.resolve_file("o/r/missing.gguf", cached=cache) is None
+    assert gguf_pack.resolve_file("o/r", cached=cache) is None
+
+
+def test_hub_download_gb_prices_file_plus_sidecar():
+    assert gguf_pack.hub_download_gb("o/r/Qwen3.8-27B-UD-IQ3_XXS.gguf") == 10.9 + gguf_pack.SIDECAR_GB
+    assert gguf_pack.hub_download_gb("o/r/unknown.gguf") == 14.3 + gguf_pack.SIDECAR_GB
+
+
 def test_resolve_file_expands_and_casefolds(tmp_path, monkeypatch):
     """The one resolver behind `--model` and the engine's model-id lookup: a `~` and
     an upper-case suffix still name the file; a directory, a missing path or a repo
