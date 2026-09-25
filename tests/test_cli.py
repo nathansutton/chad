@@ -144,7 +144,80 @@ def test_pick_model_small_box_warns(monkeypatch, capsys, tmp_path):
 
 
 def test_model_download_gb():
-    check("shipped repo -> ~8 GB", cli._model_download_gb(cli._HF_MODEL) == 8.3)
+    from chad import gguf_pack
+    shipped = cli._model_download_gb(cli._HF_MODEL)
+    check("shipped file -> its size plus the sidecar", shipped == 13.2 + gguf_pack.SIDECAR_GB,
+          shipped)
+    check("an unknown hub file offline falls back to the heaviest known",
+          cli._model_download_gb("unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_0.gguf")
+          == 14.3 + gguf_pack.SIDECAR_GB)
+    check("a packed repo keeps the packed figure", cli._model_download_gb("some/repo") == 8.3)
+
+
+def test_default_model_is_a_hub_gguf():
+    """The shipped model is one of Unsloth's files, named inside their repo, and the
+    dev clone's local shortcut is the same file under models/."""
+    from chad import gguf_pack
+    check("default is owner/repo/file.gguf",
+          gguf_pack.hub_spec(cli._HF_MODEL) == (gguf_pack.HUB_REPO, "Qwen3.8-27B-UD-Q3_K_XL.gguf"),
+          cli._HF_MODEL)
+    check("local shortcut is the same file", cli._LOCAL_MODEL.endswith("Qwen3.8-27B-UD-Q3_K_XL.gguf"))
+
+
+def test_cached_weights_complete_for_a_hub_gguf():
+    """A GGUF session is downloaded when the file AND its drafter/tokenizer sidecar are
+    cached; the file alone would load, then fetch 1.2 GB inside the engine."""
+    from chad import gguf_pack
+    have = set()
+
+    def fake_cache(repo, filename):
+        return f"/c/{filename}" if (repo, filename) in have else None
+
+    def complete():
+        return cli._cached_weights_complete(cli._HF_MODEL, cached_file=fake_cache)
+
+    check("nothing cached", complete() is False)
+    have.add((gguf_pack.HUB_REPO, "Qwen3.8-27B-UD-Q3_K_XL.gguf"))
+    check("file without sidecar is not complete", complete() is False)
+    have.add((gguf_pack.TOKENIZER_DONOR, "dflash/model.safetensors"))
+    have.add((gguf_pack.TOKENIZER_DONOR, "tokenizer.json"))
+    check("drafter + tokenizer without the template is not complete", complete() is False)
+    have.update((gguf_pack.TOKENIZER_DONOR, f) for f in gguf_pack._SIDECAR_FILES)
+    check("file + whole sidecar is complete", complete() is True)
+
+
+def test_ensure_model_hub_gguf(monkeypatch, capsys, tmp_path):
+    """Cached: returns without touching the network. Uncached at a TTY: names the
+    download and its size, and a `n` aborts before any fetch."""
+    monkeypatch.chdir(tmp_path)
+    cached = cli.Host(cached_file=lambda repo, filename: f"/c/{filename}",
+                      free_disk_gb=lambda path: 500.0,
+                      stdin_isatty=lambda: True, ask=_Terminal("n").ask)
+    check("cached hub file returns", cli._ensure_model(cli._HF_MODEL, host=cached) is None)
+    fresh = cli.Host(cached_file=lambda repo, filename: None,
+                     free_disk_gb=lambda path: 500.0,
+                     stdin_isatty=lambda: True, ask=_Terminal("n").ask)
+    with pytest.raises(SystemExit):
+        cli._ensure_model(cli._HF_MODEL, host=fresh)
+    err = capsys.readouterr().err
+    check("names the file", "Qwen3.8-27B-UD-Q3_K_XL.gguf" in err, err)
+    check("states the size with the sidecar", "~14 GB" in err, err)
+    check("a fresh fetch is not called a resume", "Resuming" not in err, err)
+    check("names the converted copy", "converted copy (~13 GB)" in err, err)
+
+
+def test_hub_gguf_preflight_counts_the_converted_copy(monkeypatch, capsys, tmp_path):
+    """The first start saves the converted model beside the pack, the file's size
+    again: room for the download alone is not room for the model."""
+    monkeypatch.chdir(tmp_path)
+    tight = cli.Host(cached_file=lambda repo, filename: None,
+                     free_disk_gb=lambda path: 20.0,          # > 14.4 + 2, < 14.4 + 13.2 + 2
+                     stdin_isatty=lambda: True, ask=_Terminal("n").ask)
+    with pytest.raises(SystemExit):
+        cli._ensure_model(cli._HF_MODEL, host=tight)
+    err = capsys.readouterr().err
+    check("refused before asking", "not enough free disk" in err, err)
+    check("names both parts", "converted copy in ~/.cache/chad" in err, err)
 
 
 def test_free_disk_gb():
@@ -182,7 +255,7 @@ def test_ensure_model_disk_preflight(monkeypatch, capsys, tmp_path):
     check("refused before the consent prompt", terminal.asked == [], terminal.asked)
     err = capsys.readouterr().err
     check("names the shortfall", "not enough free disk" in err, err)
-    check("names required space", "~8 GB" in err, err)
+    check("names required space", "~14 GB" in err, err)
     check("points at cache GC", "hf cache" in err, err)
 
 
@@ -267,6 +340,11 @@ def test_pick_model_prefers_local_dir(monkeypatch, tmp_path):
     # `--model auto` takes the same path (it means "the default", not "ignore local").
     model, _ = cli._pick_model("auto", host=_host(64.0), local_model=str(local))
     check("auto also prefers the local build", model == str(local), model)
+    # ...and a local copy of the GGUF file itself counts the same way.
+    gguf = tmp_path / "models" / "Qwen3.8-27B-UD-Q3_K_XL.gguf"
+    gguf.write_bytes(b"GGUF")
+    model, _ = cli._pick_model(host=_host(64.0), local_model=str(gguf))
+    check("local GGUF file preferred over the hub", model == str(gguf), model)
     # ...and the build looked for by default is the dev clone's own models/ dir.
     default = inspect.signature(cli._pick_model).parameters["local_model"].default
     check("default local build is the dev clone's", default == cli._LOCAL_MODEL, default)
@@ -319,7 +397,7 @@ def test_ram_aware_ctx_limit():
     # closes), and past that point peak grows 33,936 B/token against a 34,816 B/token
     # cache. So the cost model is a fixed transient plus KV at its raw rate, which is
     # what the governor subtracts and divides by.
-    BUDGET, ACTIVE, KV, TRANSIENT = 19.07 * GB, 12.329 * GB, 34_816, 4.3 * GB
+    BUDGET, ACTIVE, KV, TRANSIENT = 19.07 * GB, 12.329 * GB, 34_816, cli.PREFILL_TRANSIENT_BYTES
 
     def peak_at(ctx):
         """The measured cost model, extrapolated to a candidate trigger."""
@@ -329,8 +407,8 @@ def test_ram_aware_ctx_limit():
     check("27B on 24GB: below the window", n < 262144 - 2048, n)
     # This is the assertion that keeps the defaults honest: whatever trigger the governor
     # picks, the measured peak at that trigger must stay inside the Metal budget. It is
-    # the reason `safety` alone cannot be the whole story — the 4.3 GB transient and the
-    # 12.3 GB of weights spend 87% of the budget before the first cached token.
+    # the reason `safety` alone cannot be the whole story — the prefill transient and the
+    # 12.3 GB of weights spend most of the budget before the first cached token.
     check("27B: measured peak at the trigger is under budget", peak_at(n) < BUDGET,
           peak_at(n) / GB)
     check("27B: and is not leaving the box idle", peak_at(n) > 0.95 * BUDGET,
@@ -388,18 +466,60 @@ def test_host_band_is_a_guard_not_the_primary_constraint():
     BUDGET, ACTIVE, KV = 19.07 * GB, 12.329 * GB, 34_816
     metal = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV)
     # Measured right after a 12.3 GB load the reclaimable band reads 3.9 GB — the weights
-    # took it and nothing has been reclaimed yet. The host branch must NOT bind there:
-    # it is a soft pressure signal the OS compresses around, so it sizes the resident KV
-    # cache only and never charges the short-lived prefill transient against it. Charging
-    # it there put a box with room to spare on the 8192 floor.
+    # took it and nothing has been reclaimed yet. The band is a soft pressure signal the
+    # OS compresses around, so it sizes the resident KV cache only and never charges the
+    # short-lived prefill transient against it: charging it there put a box with room to
+    # spare on the 8192 floor. The invariant is therefore "exactly the uncharged band, or
+    # the Metal window if that is smaller" — with the flat 2 GB transient the Metal
+    # window is the wider of the two here (122k against 110k), so the stale band trims
+    # it by about a tenth until the next live recheck. It binds, but lightly.
     just_loaded = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
                                           host_avail_bytes=3.936 * GB)
-    check("band right after load does not bind", just_loaded == metal,
-          (just_loaded, metal))
+    uncharged = int(3.936 * GB * 0.975 / KV)
+    check("band right after load binds uncharged, if at all",
+          just_loaded == min(metal, uncharged), (just_loaded, metal, uncharged))
+    check("and binds lightly", 0.85 * metal <= just_loaded < metal, (just_loaded, metal))
+    # Charged, the same reading would halve it.
+    charged = int((3.936 * GB * 0.975 - cli.PREFILL_TRANSIENT_BYTES) / KV)
+    check("charging the transient to the band would halve the window",
+          charged < 0.5 * metal, (charged, metal))
     # It still bites when the box is genuinely oversubscribed by another process.
     squeezed = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
                                        host_avail_bytes=1.2 * GB)
     check("real pressure still binds", squeezed < metal, (squeezed, metal))
+
+
+def test_prefill_transient_floor_tracks_the_cache_mode():
+    """The flat floor was measured with BOTH mechanisms in — a quantized cache (no
+    per-chunk snapshot pinning the buffers) and sliced prefill attention. Each alone
+    leaves one growing term, so the governor must charge the tall floor for an fp16
+    cache (CHAD_KV_BITS=0, an uncovered shape) or unsliced attention."""
+    flat, tall = cli.PREFILL_TRANSIENT_BYTES, cli.PREFILL_TRANSIENT_BYTES_UNSLICED
+    check("floors are ordered", flat < tall, (flat, tall))
+    check("quantized + sliced -> flat", cli.prefill_transient_bytes(8, True) == flat)
+    check("fp16 cache -> tall", cli.prefill_transient_bytes(None, True) == tall)
+    check("explicit 0 -> tall", cli.prefill_transient_bytes(0, True) == tall)
+    check("unsliced attention -> tall", cli.prefill_transient_bytes(8, False) == tall)
+
+
+def test_pick_model_routes_a_gguf_file(monkeypatch, tmp_path):
+    """A `.gguf` path goes through gguf_pack.materialize, however it is spelled: with
+    a `~` and an upper-case suffix included. A path that is not a file falls through
+    as an ordinary explicit request rather than being materialized."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "m.GGUF").write_bytes(b"GGUF")
+    local = tmp_path / "local"
+    local.mkdir()
+    built = lambda path: "built:" + path  # noqa: E731 — the seam under test
+    model, why = cli._pick_model("~/m.GGUF", host=_host(8.0), local_model=str(local),
+                                 materialize=built)
+    check("tilde + upper-case suffix route to materialize",
+          model == "built:" + str(tmp_path / "m.GGUF"), model)
+    check("reason names the source", why == "GGUF file (--model override)", why)
+    missing = str(tmp_path / "missing.gguf")
+    model, why = cli._pick_model(missing, host=_host(8.0), local_model=str(local),
+                                 materialize=built)
+    check("a missing .gguf is an ordinary explicit request", model == missing, model)
 
 
 def test_host_avail_bytes():

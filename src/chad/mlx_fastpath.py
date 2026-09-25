@@ -56,7 +56,7 @@ CHAD_NO_FASTPATH=1.
 
 from typing import TYPE_CHECKING, Callable, Optional
 
-from . import config, mlx_qmm_mma, prism_pack
+from . import config, gguf_pack, mlx_qmm_mma, prism_pack
 from .diag import log
 
 if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module loads on Linux
@@ -86,6 +86,11 @@ def install(model: "nn.Module", model_path: Optional[str] = None) -> bool:
             _install_layer_fastpath(model)
             log.info("FASTPATH installed (dense hybrid): fused MLP + fused GDN "
                      "projections + S=1 layer step")
+            return True
+        if _gguf_decline_reason(model) is None:
+            _install_gguf(model)
+            log.info("FASTPATH installed (GGUF hybrid): S=1 layer step with "
+                     "same-format gate|up and qkv|z fused, GDN gates fused")
             return True
         declined = _prism_decline_reason(model)
         if declined is None:
@@ -262,10 +267,13 @@ def _patch_gdn_call() -> None:
     stock_call = q35.GatedDeltaNet.__call__
 
     def call(self, inputs, mask=None, cache=None):
-        if not hasattr(self, "_fused_w"):
+        gguf = hasattr(self, "_gguf_ba")
+        if not hasattr(self, "_fused_w") and not gguf:
             return stock_call(self, inputs, mask=mask, cache=cache)
         B, S, _ = inputs.shape
-        if hasattr(self, "_fused_signs"):
+        if gguf:
+            qkv, z, b, a = _gguf_gdn_projections(self)[0](inputs)
+        elif hasattr(self, "_fused_signs"):
             # Prism: qkv|z share one rotation; b|a read the unrotated input. The
             # input arrives signed (folded into the layernorm), which is the
             # rotation's sign multiply already done and is why b|a are re-signed.
@@ -344,9 +352,6 @@ def _install_layer_fastpath(model) -> None:
     """Per-layer compiled decode step (S==1 only): norms+residuals+block bodies
     fold into one compiled call for the MLP and one for the GDN. Prefill and
     any unexpected cache state fall back to the stock DecoderLayer body."""
-    global _layer_call
-    from mlx_lm.models import qwen3_5 as q35
-
     for layer in model.language_model.model.layers:
         if hasattr(layer.mlp, "_fused_w"):
             layer._mlp_fast = _compile_dense_step(layer)
@@ -354,6 +359,13 @@ def _install_layer_fastpath(model) -> None:
             continue  # unknown mlp shape: layer stays stock
         if layer.is_linear and hasattr(layer.linear_attn, "_fused_w"):
             layer._gdn_fast = _compile_gdn_step(layer)
+    _patch_layer_call()
+
+
+def _patch_layer_call() -> None:
+    """Route S==1 decode through each layer's compiled `_mlp_fast`/`_gdn_fast`."""
+    global _layer_call
+    from mlx_lm.models import qwen3_5 as q35
 
     if q35.DecoderLayer.__call__ is _layer_call:
         return
@@ -394,9 +406,10 @@ def _install_layer_fastpath(model) -> None:
 
 def _compile_gdn_step(layer):
     import mlx.core as mx
-    body = (_prism_gdn_body if hasattr(layer.linear_attn, "_fused_signs")
-            else _gdn_body)
-    return mx.compile(body(layer))
+    gd = layer.linear_attn
+    if hasattr(gd, "_fused_signs"):
+        return mx.compile(_prism_gdn_body(layer))
+    return mx.compile(_gdn_body(layer, *_affine_gdn_projections(gd)))
 
 
 def _compile_dense_step(layer):
@@ -431,9 +444,37 @@ def _dense_mlp_body(layer):
     return fwd
 
 
-def _gdn_body(layer):
+def _affine_gdn_projections(gd):
+    """`(project, out_proj)` of a GDN layer whose fused in_proj and out_proj are mlx
+    affine blocks: `project(inputs) -> (qkv, z, b, a)`, one quantized matmul split
+    four ways."""
+    import mlx.core as mx
+
+    fw, fs, fb = gd._fused_w, gd._fused_s, gd._fused_b
+    gs_, bits = gd._fused_gs, gd._fused_bits
+    conv_dim, value_dim, Hv = gd.conv_dim, gd.value_dim, gd.num_v_heads
+    op = gd.out_proj
+
+    def project(inputs):
+        big = mx.quantized_matmul(inputs, fw, scales=fs, biases=fb,
+                                  transpose=True, group_size=gs_, bits=bits)
+        return mx.split(big, [conv_dim, conv_dim + value_dim,
+                              conv_dim + value_dim + Hv], axis=-1)
+
+    def out_proj(x):
+        return mx.quantized_matmul(x, op.weight, scales=op.scales, biases=op.biases,
+                                   transpose=True, group_size=op.group_size,
+                                   bits=op.bits)
+
+    return project, out_proj
+
+
+def _gdn_body(layer, project, out_proj):
     """input_layernorm + full GDN forward + residual, UNCOMPILED, with explicit
-    (conv_state, recurrent_state) threading."""
+    (conv_state, recurrent_state) threading. `project(inputs) -> (qkv, z, b, a)` and
+    `out_proj(x)` are the layer's projections in whatever container the checkpoint
+    keeps them (mlx affine blocks, GGUF blocks); everything between them is the same
+    arithmetic."""
     import mlx.core as mx
     import mlx.nn as nn
     from mlx_lm.models.qwen3_5 import gated_delta_update
@@ -441,26 +482,19 @@ def _gdn_body(layer):
     gd = layer.linear_attn
     ln_w = layer.input_layernorm.weight
     ln_eps = layer.input_layernorm.eps
-    fw, fs, fb = gd._fused_w, gd._fused_s, gd._fused_b
-    gs_, bits = gd._fused_gs, gd._fused_bits
     conv_w = gd.conv1d.weight
     n_keep = gd.conv_kernel_size - 1
     A_log, dt_bias = gd.A_log, gd.dt_bias
     norm_w = gd.norm.weight
-    op = gd.out_proj
     Hk, Hv = gd.num_k_heads, gd.num_v_heads
     Dk, Dv = gd.head_k_dim, gd.head_v_dim
-    key_dim, value_dim, conv_dim = gd.key_dim, gd.value_dim, gd.conv_dim
+    key_dim, conv_dim = gd.key_dim, gd.conv_dim
     eps = gd.layer_norm_epsilon
 
     def fwd(xin, conv_state, rec_state):
         inputs = mx.fast.rms_norm(xin, ln_w, ln_eps)
         B, S, _ = inputs.shape
-        big = mx.quantized_matmul(inputs, fw, scales=fs, biases=fb,
-                                  transpose=True, group_size=gs_, bits=bits)
-        qkv, z, b, a = mx.split(
-            big, [conv_dim, conv_dim + value_dim,
-                  conv_dim + value_dim + Hv], axis=-1)
+        qkv, z, b, a = project(inputs)
         z = z.reshape(B, S, Hv, Dv)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
         new_conv = mx.contiguous(conv_input[:, -n_keep:, :])
@@ -476,13 +510,128 @@ def _gdn_body(layer):
         # RMSNormGated, matching stock's fp32 _precise_swiglu exactly
         xn = mx.fast.rms_norm(out, norm_w, eps)
         out = (nn.silu(z.astype(mx.float32)) * xn.astype(mx.float32)).astype(xin.dtype)
-        out = mx.quantized_matmul(out.reshape(B, S, -1), op.weight,
-                                  scales=op.scales, biases=op.biases,
-                                  transpose=True, group_size=op.group_size,
-                                  bits=op.bits)
-        return xin + out, new_conv, new_rec
+        return xin + out_proj(out.reshape(B, S, -1)), new_conv, new_rec
 
     return fwd
+
+
+# ---------------------------------------------------------------- GGUF checkpoints
+#
+# A GGUF (gguf_pack) is the same dense hybrid with every projection in llama.cpp
+# blocks, and its formats vary per role and per layer: layer 0's gate|up may be IQ1_S
+# while its down is IQ2_XS, and qkv and z often differ. Fusion therefore happens only
+# between same-format partners, per layer, and a layer whose partners differ runs them
+# as two matmuls inside the same compiled step. Stacking block rows is exact, and the
+# originals become row views of the fused weight, so fusing costs no memory. The GDN's
+# two per-head gate projections are small dense bf16 linears (gguf_pack) and always fuse.
+
+
+def _gguf_decline_reason(model) -> Optional[str]:
+    import mlx.nn as nn
+    from mlx_lm.models import qwen3_5 as q35
+
+    if not isinstance(model, q35.Model):
+        return "not a qwen3_5 model"
+    layers = model.language_model.model.layers
+    if not layers:
+        return "no layers"
+    for layer in layers:
+        mlp = layer.mlp
+        if not isinstance(mlp, q35.MLP):
+            return "a non-dense MLP"
+        if not all(gguf_pack.is_gguf_linear(m)
+                   for m in (mlp.gate_proj, mlp.up_proj, mlp.down_proj)):
+            return "MLP projections not in GGUF blocks"
+        if layer.is_linear:
+            gd = layer.linear_attn
+            if not (gguf_pack.is_gguf_linear(gd.in_proj_qkv)
+                    and gguf_pack.is_gguf_linear(gd.in_proj_z)):
+                return "GDN projections not in GGUF blocks"
+            if not (isinstance(gd.in_proj_b, nn.Linear) and isinstance(gd.in_proj_a, nn.Linear)):
+                return "GDN gate projections not dense"
+    return None
+
+
+def _fuse_gguf_pair(owner, first: str, second: str):
+    """Fuse owner.<first>|owner.<second> when they share a format; the originals are
+    rebound to row views of the fused weight. None when they differ."""
+    a, b = owner[first], owner[second]
+    if a.qtype != b.qtype or a.in_dims != b.in_dims or "gather" in a or "gather" in b:
+        return None
+    fused = gguf_pack.fuse_rows([a, b])
+    n = a.out_dims
+    owner[first] = gguf_pack.row_slice(fused, 0, n)
+    owner[second] = gguf_pack.row_slice(fused, n, fused.out_dims)
+    return fused
+
+
+def _gguf_qkv_z(gd, x):
+    """The GDN's qkv and z projections: one fused matmul when they share a format."""
+    import mlx.core as mx
+    if "_gguf_qkvz" in gd:
+        qkv, z = mx.split(gd._gguf_qkvz(x), [gd.conv_dim], axis=-1)
+        return qkv, z
+    return gd.in_proj_qkv(x), gd.in_proj_z(x)
+
+
+def _install_gguf(model) -> None:
+    import mlx.core as mx
+
+    for layer in model.language_model.model.layers:
+        mlp = layer.mlp
+        gu = _fuse_gguf_pair(mlp, "gate_proj", "up_proj")
+        if gu is not None:
+            mlp._gguf_gu = gu
+        if layer.is_linear:
+            gd = layer.linear_attn
+            qz = _fuse_gguf_pair(gd, "in_proj_qkv", "in_proj_z")
+            if qz is not None:
+                gd._gguf_qkvz = qz
+            b, a = gd.in_proj_b, gd.in_proj_a
+            ba = mx.contiguous(mx.concatenate([b.weight, a.weight], axis=0))
+            mx.eval(ba)
+            gd._gguf_ba = ba
+            layer._gdn_fast = mx.compile(_gdn_body(layer, *_gguf_gdn_projections(gd)))
+        layer._mlp_fast = mx.compile(_gguf_mlp_body(layer))
+    _patch_gdn_call()
+    _patch_layer_call()
+
+
+def _gguf_mlp_body(layer):
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    mlp = layer.mlp
+    ln_w = layer.post_attention_layernorm.weight
+    ln_eps = layer.post_attention_layernorm.eps
+    gu = mlp["_gguf_gu"] if "_gguf_gu" in mlp else None
+    gate, up, down = mlp.gate_proj, mlp.up_proj, mlp.down_proj
+
+    def fwd(h):
+        x = mx.fast.rms_norm(h, ln_w, ln_eps)
+        if gu is not None:
+            g, u = mx.split(gu(x), 2, axis=-1)
+        else:
+            g, u = gate(x), up(x)
+        return h + down(nn.silu(g) * u)
+
+    return fwd
+
+
+def _gguf_gdn_projections(gd):
+    """`(project, out_proj)` of a GDN layer in GGUF blocks: qkv|z from the fused
+    pair when the formats matched, else two matmuls; b|a from the small dense pair;
+    out_proj is the module itself."""
+    import mlx.core as mx
+
+    ba = gd._gguf_ba
+
+    def project(inputs):
+        qkv, z = _gguf_qkv_z(gd, inputs)
+        b, a = mx.split(inputs @ ba.T, 2, axis=-1)
+        return qkv, z, b, a
+
+    return project, gd.out_proj
 
 
 # ---------------------------------------------------------------- Prism packs

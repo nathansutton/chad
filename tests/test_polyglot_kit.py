@@ -337,6 +337,21 @@ def test_an_isolated_arms_tilde_is_its_throwaway_home(tmp_path):
         "~/.cargo/registry"                       # the real cargo home a trial does use
 
 
+@pytest.mark.parametrize("model, named", [
+    ("/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca7/"
+     "Qwen3.8-27B-UD-Q3_K_XL.gguf", "unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf"),
+    ("/.cache/huggingface/hub/models--nathansutton--Qwen3.8-27B-DFlash2-MLX/snapshots/cb1c/",
+     "nathansutton/Qwen3.8-27B-DFlash2-MLX"),
+])
+def test_a_hub_model_is_named_by_its_repo(tmp_path, model, named):
+    """Weights loaded from the Hugging Face cache are a public repo, not a local path."""
+    run_dir = _run_dir(tmp_path)
+    meta = json.loads((run_dir / "meta.json").read_text())
+    (run_dir / "meta.json").write_text(json.dumps({**meta, "model": ROOTS.home + model}))
+    b = publish.bundle(str(run_dir), str(tmp_path / "out"), ROOTS)
+    assert f"| chad | {named} | 2 × 1 |" in b.runs_row
+
+
 def test_rows_alone_unless_trajectories_are_asked_for(tmp_path):
     publish.bundle(str(_run_dir(tmp_path)), str(tmp_path / "out"), ROOTS)
     assert sorted(os.listdir(tmp_path / "out")) == ["meta.json", "trials.jsonl"]
@@ -346,6 +361,8 @@ def test_a_prefix_is_only_rewritten_whole():
     assert publish.redact("/Users/testerson/notes.txt", ROOTS) == "/Users/testerson/notes.txt"
     assert publish.problems("/Users/testerson/notes.txt", ROOTS)
     assert not publish.problems("the earlier `ls -la /Users/.../bob/` failed", ROOTS)
+    assert not publish.problems(publish.redact("I wrote to /Users/tester/.../java-rectangle",
+                                               ROOTS), ROOTS)
 
 
 @pytest.mark.parametrize("message, reason", [

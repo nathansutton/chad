@@ -75,6 +75,11 @@ dependencies = [
     # negotiates protocol 2026-07-28; the 1.x line tops out at 2025-11-25. Capped <3:
     # the same class of break will happen again.
     "mcp>=2,<3",
+    # GGUF checkpoints (gguf_pack.py): the header reader and the numpy block decoders the
+    # Metal kernels are tested against. Capped <0.20: the reader's field layout and the
+    # quant-type enum are what the loader routes on, and 0.19.0 is the line it was
+    # written and checked against.
+    "gguf>=0.19.0,<0.20",
 ]
 
 # Extras ride on the INSTALL SPEC, so the command depends on how chad was installed:

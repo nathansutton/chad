@@ -1,21 +1,21 @@
 {
   "engine": "chad",
-  "version": "2.1.0",
-  "model": "nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX",
+  "version": "2.2.0",
+  "model": "unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf (native)",
   "prompt_tokens": 512,
   "gen_tokens": 128,
   "serial": {
-    "prefill_tps": 100.0,
-    "decode_tps": 17.9,
+    "prefill_tps": 102.0,
+    "decode_tps": 11.7,
     "warm_step_new_tokens": 16,
-    "warm_step_prefill_s": 0.53,
+    "warm_step_prefill_s": 0.49,
     "flags": "CHAD_NO_DFLASH=1"
   },
   "default": {
     "prefill_tps": 101.0,
-    "decode_tps": 62.9,
+    "decode_tps": 48.2,
     "warm_step_new_tokens": 16,
-    "warm_step_prefill_s": 0.56,
+    "warm_step_prefill_s": 0.51,
     "flags": "DFlash2 block drafter, per-round width schedule"
   }
 }

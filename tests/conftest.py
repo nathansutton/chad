@@ -8,6 +8,11 @@ import sys
 
 import pytest
 
+# The suite loads no model and must fetch nothing: a fake cache that fails to answer
+# a question the download guard asks would otherwise send `_ensure_model` headless
+# into a multi-GB hub fetch inside pytest. A test that needs the hub sets this itself.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_ROOT, "src")
 if _SRC not in sys.path:

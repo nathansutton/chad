@@ -16,7 +16,7 @@ uvx chad-code          # runs anywhere; the command is still `chad`
 uvx chad-code prove    # offline smoke test: 4 tiny fix-it tasks, verified, timed 🗿
 ```
 
-The first run asks, then downloads the model once (~8 GB). The PyPI package is `chad-code`.
+The first run asks, then downloads the model once (~14 GB). The PyPI package is `chad-code`.
 
 ![chad fixing a failing test end to end: reason, read, edit, run pytest, confirm green, all on a local model](docs/demo.gif)
 
@@ -29,7 +29,7 @@ for the same reason llama.cpp is: it works with everything. chad is moving the o
 
 **1 set of silicon**.  This project is focused on making the macbook pro you already have usable.  Not a $10K GPU.
 
-**1 capable model**. `Qwen 3.8 27B`.  This isn't the frontier, but you probably aren't solving frontier problems.  Focus on 1 model buys _speed_.  You'll experience ~ 30 tokens/second generation instead of ~ 10 tokens/second for stock llama.cpp implementations.  This speed comes from MLX, a couple of targeted custom kernels for this model, and a bundled dflash2 drafter.
+**1 capable model**. `Qwen 3.8 27B`.  This isn't the frontier, but you probably aren't solving frontier problems.  Focus on 1 model buys _speed_.  You'll experience ~ 20 tokens/second generation in a real session instead of ~ 10 tokens/second for stock llama.cpp implementations.  This speed comes from MLX, a couple of targeted custom kernels for this model, and a bundled dflash2 drafter.  The weights are Unsloth's `UD-Q3_K_XL` GGUF, read natively in MLX.  We shipped a smaller ternary build first and it was measurably worse; [here's why we switched](docs/design.md#the-weights).
 
 **1 tightly-coupled agent loop**.  Instead of a standard /completions endpoint, the agent loop in chad owns the backend process.  This comes with nice advantages that make the KV cache more stable and the coding experience measurably better (no long prefills!).  
 

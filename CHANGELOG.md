@@ -4,6 +4,39 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+### The ternary default was a mistake; the default is now Unsloth's UD-Q3_K_XL GGUF
+
+**We shipped the wrong weights.** The ternary pack bought a big context window, and the
+tasks we tested it on were too easy to show what it cost. On 36 paired polyglot tasks it passes 24 where Unsloth's
+[`Qwen3.8-27B-UD-Q3_K_XL.gguf`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) passes
+34 (10 up, 0 down, p = 0.002), and the GGUF gets there in 0.30× the generated tokens and
+0.38× the wall clock. All twelve ternary failures ran out the 20-minute wall clock.
+[Design](docs/design.md#the-weights) has the account; every run cited is in
+`benchmarks/polyglot/RUNS.md`.
+
+**chad now reads GGUF files natively.** Converting Unsloth's file to MLX's affine format
+passes 6 of 9 trials where the file passes 9: its i-quants have no MLX equivalent. Serving it
+from llama.cpp would give up the engine-owned cache. So the llama.cpp blocks load as
+they are, and chad's Metal kernels decode them (`gguf_pack.py`, `mlx_gguf.py`; 15
+formats, bit-exact to llama.cpp, MIT port credited in `NOTICE`).
+
+- **Re-download: ~14 GB, up from ~8.** The GGUF plus a 1.2 GB sidecar
+  ([`nathansutton/Qwen3.8-27B-DFlash2-MLX`](https://huggingface.co/nathansutton/Qwen3.8-27B-DFlash2-MLX))
+  with the tokenizer and drafter. Free the old snapshot with `hf cache rm`.
+- **Less context: ~74k on 24 GB, down from ~150k.** The median trial peaked at 8.6k.
+  `--model` takes any Unsloth file of this model, as a local `.gguf` path or
+  `owner/repo/file.gguf`: `UD-IQ3_XXS` (10.9 GB) gets ~138k and passed 8 of 9.
+  The ternary and affine packs still load.
+- **Serial decode is ~12 tok/s, level with llama.cpp on the same file; drafted, ~46.**
+  The affine repacks decoded faster serially (18-21 tok/s) and lost on the tasks. A real
+  agent session decodes at a ~21 tok/s median.
+- **First start ~75 s, later starts ~9 s.** The first load saves its converted arrays
+  to `~/.cache/chad/gguf/` (~13 GB more disk, counted by the preflight).
+- **Prefill memory is flat at ~2 GB, down from ~4.15.** A per-chunk OOM snapshot held
+  every KV buffer, so each chunk copied the whole cache; on the quantized cache it is
+  gone, and prefill attention runs in 64-row slices. Every model gains window (the
+  ternary: 172k → 238k). A Metal OOM mid-prefill now re-prefills at half the chunk.
+
 ### One benchmark, and no run output in the repository
 
 - **`benchmarks/polyglot` is the one agent eval.** Terminal-Bench (`benchmarks/tb2`), the

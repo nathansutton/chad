@@ -350,7 +350,7 @@ def run(args, *, host: cli.Host = cli.HOST,
     model_id = cli._HF_MODEL
     invoking_dir = os.getcwd()
 
-    cached = host.cached_file(model_id, "config.json") is not None
+    cached = cli._cached_weights_complete(model_id, cached_file=host.cached_file)
     try:
         cli._ensure_model(model_id, host=host)  # consent + disk preflight + resumable download
     except SystemExit:

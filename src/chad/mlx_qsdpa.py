@@ -1473,6 +1473,35 @@ def warm_widths(widths, hq: int, hkv: int, dtype, n: int = _SGM_MIN_N + 8) -> in
 _patched_sdpa: Optional[Callable[..., "mx.array"]] = None
 
 
+# Query rows per attention call on a prefill chunk. At head_dim 256 mx.fast SDPA has no
+# fused kernel and materializes the chunk's (heads, rows, context) score slab, which
+# is what the engine's prefill transient grows with (~60 KB per context token at a
+# 512-row chunk). Each query row's attention is independent of the others, so running
+# the chunk in slices and evaluating each before the next holds one slice's slab
+# instead of the chunk's (1.64 GB -> 0.19 GB at 64k context) at no measurable cost.
+# It is the same math, not always the same kernel: mlx picks its SDPA route by shape,
+# so outputs match one call exactly at the engine's 512-row chunks and to within bf16
+# rounding of the row on small ones. CHAD_NO_PREFILL_SLICE restores the single call.
+PREFILL_Q_SLICE = 64
+
+
+def _sliced_causal(queries, kd, vd, scale):
+    """Causal attention of `queries` (the LAST S positions of kd/vd) in
+    PREFILL_Q_SLICE-row slices, each evaluated before the next is built."""
+    import mlx.core as mx
+    S, N = queries.shape[2], kd.shape[2]
+    kpos = mx.arange(N)
+    outs = []
+    for a in range(0, S, PREFILL_Q_SLICE):
+        b = min(S, a + PREFILL_Q_SLICE)
+        allowed = kpos[None, :] <= (N - S + mx.arange(a, b))[:, None]
+        o = mx.fast.scaled_dot_product_attention(
+            queries[:, :, a:b], kd, vd, scale=scale, mask=allowed)
+        mx.eval(o)
+        outs.append(o)
+    return mx.concatenate(outs, axis=2)
+
+
 def installed() -> bool:
     """True when mlx_lm's attention helper is this module's fused-kernel patch."""
     try:
@@ -1480,6 +1509,13 @@ def installed() -> bool:
     except ImportError:
         return False
     return lm_base.scaled_dot_product_attention is _patched_sdpa
+
+
+def prefill_sliced() -> bool:
+    """True when a prefill chunk's attention over a quantized cache runs in
+    PREFILL_Q_SLICE-row slices: the patch is in and the slice is not switched off.
+    What the context governor reads to pick its prefill-transient floor."""
+    return installed() and not config.flag("CHAD_NO_PREFILL_SLICE")
 
 
 def install(kernel_ok: Callable[[], bool] = kernel_healthy) -> bool:
@@ -1529,6 +1565,10 @@ def install(kernel_ok: Callable[[], bool] = kernel_healthy) -> bool:
                                        bits=cache.bits)
                     vd = mx.dequantize(*values, group_size=cache.group_size,
                                        bits=cache.bits)
+                    if isinstance(mask, str) and mask == "causal" \
+                            and queries.shape[2] > PREFILL_Q_SLICE \
+                            and not config.flag("CHAD_NO_PREFILL_SLICE"):
+                        return _sliced_causal(queries, kd, vd, scale)
                     return mx.fast.scaled_dot_product_attention(
                         queries, kd, vd, scale=scale, mask=mask)
                 except Exception as e:  # noqa: BLE001 — same contract as above
