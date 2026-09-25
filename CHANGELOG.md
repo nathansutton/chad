@@ -10,7 +10,9 @@ Notable, user-visible changes.
 A re-download is coming (~14 GB against ~8); the old ternary snapshot can be freed with
 `hf cache rm`. Why: on the polyglot agent tasks the file scores 9/9 where the ternary pack
 scored 4/9 (half its trials ran out the wall clock inside one think) and chad's own MLX
-repack of the same bits 6/9; chad-corpus perplexity 3.95 against the ternary's 4.86. The
+repack of the same bits 6/9; on a wider 36-task set, 34/36 against the ternary's 24/36
+(10 tasks up, none down, p = 0.002) in 0.30× the generated tokens and 0.38× the wall
+clock; chad-corpus perplexity 3.95 against the ternary's 4.86. The
 gain is Unsloth's quantization recipe — i-quants and K-quants fitted against an importance
 matrix — which MLX's affine container cannot hold, so chad now reads GGUF files as they
 are: every projection stays in its llama.cpp blocks and decodes in chad's own Metal
