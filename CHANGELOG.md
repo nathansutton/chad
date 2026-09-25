@@ -4,6 +4,8 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-09-25
+
 ### The ternary default was a mistake; the default is now Unsloth's UD-Q3_K_XL GGUF
 
 **We shipped the wrong weights.** The ternary pack bought a big context window, and the
