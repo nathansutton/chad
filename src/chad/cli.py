@@ -56,7 +56,7 @@ _HF_MODEL = "nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX"
 _LOCAL_MODEL = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-Ternary-Bonsai-2")
 # chad targets 24 GB Apple Silicon and nothing smaller. Below this the model still
 # loads, but the context governor has little left to spend after ~7.2 GB of weights,
-# the ~1.1 GB drafter and the ~4.3 GB prefill transient, so the window shrinks toward
+# the ~1.1 GB drafter and the ~2 GB prefill transient, so the window shrinks toward
 # its floor. We warn and proceed rather than refuse: the harness advises, the caller
 # decides.
 _MIN_RAM_GB = 23.5
@@ -225,15 +225,17 @@ def _host_avail_bytes():
         return None
 
 
-# Prefill/decode scratch that is live at the same moment the KV cache is: chunked
-# prefill materializes an attention transient sized by chunk x kv_len, and the adaptive
-# chunker shrinks the chunk as the free band closes, so it climbs with context and then
-# SATURATES rather than growing per-token. Measured on the 27B (q3, 8-bit KV, clamp on,
-# one load): 1.82 GB at 8k, 3.19 at 32k, 4.15 at 49k, 4.14 at 65k — flat by 49k, and past
-# that point peak grows at 33,936 B/token against a 34,816 B/token KV cache, i.e. the
-# marginal cost of a token IS its KV cost. Used as a floor only; `_compute_ctx_limit`
-# prefers the live `peak - active` once a real prefill has been through.
-PREFILL_TRANSIENT_BYTES = 4.3e9
+# Prefill/decode scratch that is live at the same moment the KV cache is. It used to
+# climb with context to ~4.15 GB: a per-chunk copy of the whole quantized KV cache (the
+# OOM-rollback snapshot held the pre-chunk buffers, so no chunk could write in place)
+# plus the chunk's full attention score slab. With neither — no snapshot on a quantized
+# cache (`Engine._snapshot_cache_refs`) and attention in row slices (`mlx_qsdpa`) — it is
+# flat: measured on the 27B (IQ3_XXS GGUF, 8-bit KV, drafter resident, one load) at
+# 1.44 / 1.81 / 1.47 / 1.81 / 1.55 / 1.82 / 1.90 GB at 8k / 16k / 24k / 32k / 40k / 48k /
+# 64k. The floor sits just above the largest. Used as a floor only;
+# `_compute_ctx_limit` prefers the live `peak - active` once a real prefill has been
+# through.
+PREFILL_TRANSIENT_BYTES = 2.0e9
 
 
 def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
@@ -283,8 +285,8 @@ def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
         # branch sizes. Charging the transient here instead turns a guard meant to bite
         # only under real pressure into the primary constraint: measured right after a
         # 12.3 GB load the reclaimable band reads 3.9 GB (down from 11.4 — the weights
-        # just took it, and nothing has been reclaimed yet), and subtracting a 4.3 GB
-        # transient from that lands negative, i.e. the floor, on a box with room to spare.
+        # just took it, and nothing has been reclaimed yet), and subtracting a multi-GB
+        # transient from that lands near the floor on a box with room to spare.
         usable = min(usable, host_avail_bytes * safety)
     if usable <= 0:
         return floor

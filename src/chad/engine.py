@@ -1255,7 +1255,17 @@ class Engine:
         free. Snapshot the raw `__dict__` (lists copied one level, since ArraysCache
         mutates its list elements in place) rather than the `.state` property — the
         KVCache getter RAISES on an empty cache (keys is None before token one),
-        and a snapshot helper must work at every point in the cache lifecycle."""
+        and a snapshot helper must work at every point in the cache lifecycle.
+
+        None when the cache holds a QuantizedKVCache. Holding its pre-chunk buffers is
+        exactly what stops mlx writing the chunk into them in place: every chunk then
+        copies the whole cache, a transient of the full KV size (~34 KB per context
+        token on the 27B) that grows until it is the largest thing prefill allocates.
+        Without it the transient is flat (~1.35 GB from 16k to 41k context, against
+        3.3 GB at 41k with it). A caught OOM there rebuilds the cache instead
+        (`_replay_after_oom`)."""
+        if any(type(c) is cache_utils.QuantizedKVCache for c in self._cache):
+            return None
         snap = []
         for c in self._cache:
             d = {k: (list(v) if isinstance(v, list) else v)
@@ -1267,6 +1277,19 @@ class Engine:
         for c, d in snap:
             for k, v in d.items():
                 setattr(c, k, list(v) if isinstance(v, list) else v)
+
+    def _replay_after_oom(self, fed: list, chunk: int) -> None:
+        """Rebuild the cache after a Metal OOM inside a prefill chunk that had no
+        snapshot to roll back to: reset it and re-feed every token it held before the
+        chunk — the cached prefix plus this call's fed part — at the reduced chunk
+        size, then put back the bookkeeping the reset clears. The rebuilt contents are
+        the ones the failed chunk started from, so the turn-boundary rewind point is
+        still valid. Slow (a full re-prefill) and meant to be rare: the transient it
+        replaces the snapshot for was the thing most likely to cause the OOM."""
+        cached, rewind = list(self._cached_ids), self._rewind_snap
+        self._reset_cache()
+        self._prefill(cached + fed, chunk=chunk)
+        self._cached_ids, self._rewind_snap = cached, rewind
 
     def _reserve_kv(self, total: int) -> None:
         """Grow each quantized attention cache's buffers to hold `total` positions in
@@ -1344,9 +1367,16 @@ class Engine:
             except RuntimeError as e:
                 if "memory" not in str(e).lower() or step <= 64:
                     raise
+                oom_cap = max(64, step // 2)
+                if snap is None:
+                    mx.clear_cache()
+                    log.warning("PREFILL Metal OOM at %d/%d (kv=%d): rebuilding the "
+                                "cache with chunk=%d", i, n, kv_base + i, oom_cap)
+                    self._replay_after_oom(ids[:i], oom_cap)
+                    mc = self._cache           # the rebuild replaced the cache object
+                    continue
                 self._restore_cache_refs(snap)
                 mx.clear_cache()
-                oom_cap = max(64, step // 2)
                 log.warning("PREFILL Metal OOM at %d/%d (kv=%d): retrying with "
                             "chunk=%d", i, n, kv_base + i, oom_cap)
                 continue

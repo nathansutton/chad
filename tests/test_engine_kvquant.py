@@ -257,3 +257,52 @@ def test_reserved_prefill_matches_growing_prefill(tiny):
                 assert mx.array_equal(u, v).item()
     q = next(c for c in reserved._cache if type(c) is cache_utils.QuantizedKVCache)
     assert q.keys[0].shape[-2] >= len(ids)
+
+
+def test_prefill_oom_on_a_quantized_cache_rebuilds_it(tiny):
+    """A quantized cache takes no per-chunk snapshot (holding its buffers would make
+    every chunk copy the whole cache), so a caught Metal OOM rebuilds it instead: the
+    prefill still completes, and leaves the same cache — contents, offsets, next-token
+    logits and the cached-ids bookkeeping — as a prefill that never failed."""
+    from chad import mlx_qsdpa
+    mlx_qsdpa.install()
+    ids = [int(t) for t in mx.random.randint(0, 200, (600,), key=mx.random.key(5)).tolist()]
+
+    class Flaky:
+        """The tiny model, failing its third 128-wide forward like a Metal OOM."""
+
+        def __init__(self, m):
+            self.m, self.calls = m, 0
+
+        def make_cache(self):
+            return self.m.make_cache()
+
+        def __call__(self, x, cache=None):
+            if x.shape[1] == 128:
+                self.calls += 1
+                if self.calls == 3:
+                    raise RuntimeError("[METAL] Command buffer execution failed: "
+                                       "Insufficient Memory")
+            return self.m(x, cache=cache)
+
+    flaky = _loaded_engine(tiny, kv_bits=8)
+    flaky._prefill(ids[:40], chunk=128)
+    flaky._cached_ids = ids[:40]
+    flaky.model = Flaky(tiny)
+    assert flaky._snapshot_cache_refs() is None
+    assert flaky._prefill(ids[40:], chunk=128) == len(ids) - 40
+    assert flaky.model.calls >= 3 and flaky._cached_ids == ids[:40]
+    flaky.model = tiny
+
+    # The rebuild replays the 40 cached + 256 fed tokens from scratch at the halved
+    # chunk and carries on at it; chunking moves a hybrid's rounding, so the clean
+    # reference follows the same schedule.
+    clean = _loaded_engine(tiny, kv_bits=8)
+    clean._prefill(ids[:296], chunk=64)
+    clean._prefill(ids[296:], chunk=64)
+    probe = mx.array([[ids[-1]]])
+    assert mx.array_equal(clean.model(probe, cache=clean._cache),
+                          flaky.model(probe, cache=flaky._cache)).item()
+    for a, b in zip(clean._cache, flaky._cache):
+        if type(a) is cache_utils.QuantizedKVCache:
+            assert a.offset == b.offset

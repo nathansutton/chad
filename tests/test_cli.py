@@ -319,7 +319,7 @@ def test_ram_aware_ctx_limit():
     # closes), and past that point peak grows 33,936 B/token against a 34,816 B/token
     # cache. So the cost model is a fixed transient plus KV at its raw rate, which is
     # what the governor subtracts and divides by.
-    BUDGET, ACTIVE, KV, TRANSIENT = 19.07 * GB, 12.329 * GB, 34_816, 4.3 * GB
+    BUDGET, ACTIVE, KV, TRANSIENT = 19.07 * GB, 12.329 * GB, 34_816, cli.PREFILL_TRANSIENT_BYTES
 
     def peak_at(ctx):
         """The measured cost model, extrapolated to a candidate trigger."""
@@ -329,8 +329,8 @@ def test_ram_aware_ctx_limit():
     check("27B on 24GB: below the window", n < 262144 - 2048, n)
     # This is the assertion that keeps the defaults honest: whatever trigger the governor
     # picks, the measured peak at that trigger must stay inside the Metal budget. It is
-    # the reason `safety` alone cannot be the whole story — the 4.3 GB transient and the
-    # 12.3 GB of weights spend 87% of the budget before the first cached token.
+    # the reason `safety` alone cannot be the whole story — the prefill transient and the
+    # 12.3 GB of weights spend most of the budget before the first cached token.
     check("27B: measured peak at the trigger is under budget", peak_at(n) < BUDGET,
           peak_at(n) / GB)
     check("27B: and is not leaving the box idle", peak_at(n) > 0.95 * BUDGET,
@@ -391,10 +391,14 @@ def test_host_band_is_a_guard_not_the_primary_constraint():
     # took it and nothing has been reclaimed yet. The host branch must NOT bind there:
     # it is a soft pressure signal the OS compresses around, so it sizes the resident KV
     # cache only and never charges the short-lived prefill transient against it. Charging
-    # it there put a box with room to spare on the 8192 floor.
+    # it there put a box with room to spare on the 8192 floor. (With the ~2 GB transient
+    # the Metal window is wide enough that the band may trim it a little here; what it
+    # must not do is collapse it.)
     just_loaded = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
                                           host_avail_bytes=3.936 * GB)
-    check("band right after load does not bind", just_loaded == metal,
+    uncharged = int(3.936 * GB * 0.975 / KV)
+    check("band right after load does not collapse the window",
+          just_loaded >= min(metal, uncharged - 2048) and just_loaded > 0.85 * metal,
           (just_loaded, metal))
     # It still bites when the box is genuinely oversubscribed by another process.
     squeezed = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
