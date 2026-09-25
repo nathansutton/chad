@@ -365,8 +365,9 @@ tens of thousands of tokens once the weights and the KV cache are paid for), and
 native number is context the run can never spend. When the governor is what bound it,
 the banner says so: `84k of 262k context`.
 
-`--model` (or `CHAD_MODEL`) takes `auto` (the shipped model) or any Hugging Face repo id /
-local MLX model directory, and nothing else. There are no size shorthands: `--model 9b` is a
+`--model` (or `CHAD_MODEL`) takes `auto` (the shipped model), a Hugging Face repo id or
+local MLX model directory, or a GGUF (a local `.gguf` path, or `owner/repo/file.gguf`), and
+nothing else. There are no size shorthands: `--model 9b` is a
 literal (and nonexistent) repo id, not an alias, and fails as one. Pointing it at other
 weights is supported and kept on purpose: one shipped model is a default, not a restriction,
 but the harness is *tuned* to the shipped model, so the realistic cost is throughput, not
@@ -376,80 +377,54 @@ run.
 **Memory safety.** At load the engine wires the Metal working set and caps
 the allocator slightly below it (`mx.set_wired_limit`/`set_memory_limit`), so a
 transient spike back-pressures instead of escalating to a jetsam SIGKILL; a Metal OOM
-caught inside a prefill chunk rolls the cache back exactly, halves the chunk, and
-retries. `CHAD_NO_MEMORY_CLAMP=1` disables the clamps (A/B). The compaction threshold
+caught inside a prefill chunk halves the chunk and retries: on the default 8-bit cache by
+re-prefilling from the start, on an fp16 cache by rolling back the one chunk. `CHAD_NO_MEMORY_CLAMP=1` disables the clamps (A/B). The compaction threshold
 additionally respects host-physical free memory (pressure from Docker or other apps
 that the Metal budget can't see) and is re-checked between turns.
 
 ### The model
 
-chad ships exactly one: Unsloth's [`Qwen3.8-27B-UD-Q3_K_XL.gguf`][model], Qwen3.8-27B (a
-dense `qwen3_5` hybrid: 64 layers, 48 GatedDeltaNet and 16 full attention) in Unsloth's
-dynamic quantization — K-quants and i-quants fitted against an importance matrix, mostly
-3-bit: **~13.2 GB resident**, 262k native context. chad reads the file as it is: every
-projection stays in its llama.cpp blocks and is decoded by chad's own Metal kernels
-(`gguf_pack.py`, `mlx_gguf.py`), bit-exact to llama.cpp's dequantizers, because MLX's
-affine `scale * q + bias` container cannot hold those formats and re-quantizing into it
-measurably threw the quality away (9/9 on the agent tasks for the file against 6/9 for an
-MLX repack of the same bits and 4/9 for the ternary pack it replaced). The drafter and the
-tokenizer come from a second, small repo, [`nathansutton/Qwen3.8-27B-DFlash2-MLX`][sidecar]
-(1.2 GB, no target weights): the DFlash2 block drafter pre-quantized to 4-bit in
-`dflash/`, plus Qwen's tokenizer and a chat template that renders `reasoning_effort=medium`
-(the GGUF's own defaults to xhigh, and a byte-stable prompt is what keeps the prefix cache
-warm). Together the two downloads are ~14 GB. The first start converts the file into
-MLX arrays (the same blocks, in the same bytes) and saves them beside the model directory
-under `~/.cache/chad/gguf/`, another ~13 GB: that start takes ~75 s, every later one ~9 s.
-A new upstream revision of the file gets a new directory, and the stale copy is deleted.
+chad ships one: Qwen3.8-27B (a dense `qwen3_5` hybrid: 64 layers, 48 GatedDeltaNet and 16
+full attention, 262k native context) as Unsloth's [`UD-Q3_K_XL`][model] GGUF, **~13.2 GB
+resident**. chad reads the GGUF natively: the llama.cpp blocks load unchanged and chad's
+Metal kernels (`mlx_gguf.py`) decode them, bit-exact to llama.cpp's dequantizers.
+[Design](design.md#the-weights) explains why an MLX engine reads a GGUF, and why this
+replaced the ternary default.
 
-Any other Unsloth file of this model loads the same way — `--model ~/models/Qwen3.8-27B-UD-IQ3_XXS.gguf`
-for ~138k of context at 10.9 GB, or `--model unsloth/Qwen3.8-27B-GGUF/<file>.gguf` to have
-chad fetch it. The two earlier MLX packs (the ternary build and the affine 3-bit repack)
-still load via `--model` too.
+The tokenizer, chat template and DFlash2 drafter (4-bit, in `dflash/`) come from a 1.2 GB
+sidecar, [`nathansutton/Qwen3.8-27B-DFlash2-MLX`][sidecar], which holds no target weights.
+Its template renders `reasoning_effort=medium`; the GGUF's own defaults to xhigh. The first
+start converts the GGUF into MLX arrays (same blocks, same bytes) and saves them under
+`~/.cache/chad/gguf/`: ~13 GB more disk, ~75 s once, ~9 s every start after. A new upstream
+revision gets a fresh directory and the stale one is deleted.
+
+`--model` also takes any other Unsloth file of this model, as a local `.gguf` path or
+`unsloth/Qwen3.8-27B-GGUF/<file>.gguf`, and the two earlier MLX packs:
+
+| weights | resident | window, 24 GB | [polyglot][runs], 3 tasks × 3 | 36 tasks |
+|---|---|---|---|---|
+| `UD-Q3_K_XL` GGUF (default) | 13.2 GB | ~74k | 9/9 | 34/36 |
+| `UD-IQ3_XXS` GGUF | 10.9 GB | ~138k | 8/9 | — |
+| [affine 3-bit repack][q3] | 12.3 GB | — | 6/9 | — |
+| [ternary pack][ternary] (the old default) | 7.2 GB | ~238k | 4/9 | 24/36 |
+
+The affine repack is chad's MLX quantization using the bit map of Unsloth's file, not its
+recipe; the table is why it lost. The ternary pack is Prism ML's build
+([`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit),
+Apache-2.0; created using Bonsai by Prism ML), repacked text-only with the base tokenizer,
+a medium-effort template and the drafter bundled.
 
 [model]: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF
 [sidecar]: https://huggingface.co/nathansutton/Qwen3.8-27B-DFlash2-MLX
 [ternary]: https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX
 [q3]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX
+[runs]: ../benchmarks/polyglot/RUNS.md
 
-**The ternary pack** ([`nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX`][ternary])
-was the default before the native GGUF loader: Prism ML's build, every projection
-Hadamard-rotated offline and stored as 2-bit affine group-128 whose three levels are
-{−s, 0, +s}, 7.2 GB resident. The rotation is folded into the weights, so the matching transform has to hit the
-activations at runtime and be inverted after the embedding lookup. mlx-lm's plain affine
-loader finds tensors of exactly the right shapes, skips it, and returns plausible garbage
-without raising; chad routes the pack on its declared `model_type` to its own loader
-(`prism_pack.py`), which does not import the Python the upstream pack bundles. The repo
-is chad's repack of [`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit)
-(Apache-2.0; created using Bonsai by Prism ML): text-only (the pack's vision tower
-dropped), the base model's tokenizer in place of the pack's (same vocabulary, different
-merges: the pack's trips transformers' regex warning and diverges on combining marks),
-the chat template's `reasoning_effort` defaulting to medium rather than xhigh, and the
-drafter bundled. Pointing `--model` at the upstream pack directly also works: the loader,
-the fast-path and the verify kernel attach the same way, the drafter is borrowed from the
-shipped repo (`mlx_dflash.DONORS`), and the engine passes medium unless
-`CHAD_REASONING_EFFORT` says otherwise, since think-token decode is two thirds of wall on
-this model.
-
-**chad targets 24 GB Apple Silicon and nothing smaller.** There is no low-RAM fallback,
-because there is no second model to fall back to. On a smaller box chad prints a one-line
-warning at startup and runs anyway (it advises, it does not gate), but ~14 GB of weights and
-drafter plus the ~2 GB prefill transient leave little for a KV cache, so the window
-shrinks toward its floor. At 24 GB the honest figure is roughly ~74k of the model's 262k
-window; the banner states what you actually got, and the
-[context window](#context-window-agentic-coding-needs-room) section explains the sizing.
-
-**The affine 3-bit repack.** [`nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX`][q3] is
-chad's own MLX quantization of the same model — the bit map of Unsloth's file, not its
-recipe, and it measured 6/9 on the agent tasks where the real file scores 9/9 — at 3-bit group-64 with `lm_head` held at 5-bit (the bit map follows what the
-calibrated GGUF builds of this checkpoint agree on: the head is a second full 1.27B-param
-tensor worth protecting, the embedding a lookup table that is cheapest to cut), ~12.3 GB
-resident, the same drafter bundled, and ~56k of window on 24 GB. It is one flag away
-(`--model`), and it is the quality reference: on code, teacher-forced perplexity is 3.99
-against the ternary's 4.49 (+12%), while the private eval tiers tie at 56/56. Every projection's
-weights are on the critical path for every token on a dense model, so the governor's
-34,816 B/token prices a gigabyte of weights at about **29k tokens of context**; the 5 GB the
-ternary build gives back is where its window comes from, and its speed matches because the
-verify kernel and the drafter carry over.
+**chad targets 24 GB Apple Silicon and nothing smaller.** On a smaller box it warns once
+and runs anyway, but ~14 GB of weights and drafter plus the ~2 GB prefill transient leave
+little for a KV cache, so the window shrinks toward its floor. The banner states what you
+actually got; [context window](#context-window-agentic-coding-needs-room) explains the
+sizing.
 
 To run different weights through the same engine:
 
@@ -465,41 +440,28 @@ shipped checkpoint (the DFlash2 drafter, the fused-attention coverage, the fastp
 check, the measured per-token KV cost the governor sizes against) either declines to
 install or falls back to a stock path. The harness itself does not change.
 
-#### What the engine does with the ternary weights (`--model`)
+#### Running the ternary pack
 
-- the decode fast-path fuses `gate|up`, `qkv|z` and `q|k|v` behind **one** rotation each,
-  and folds the sign vectors into the weights once, at install: the residual-width vectors
-  into the two layernorms, `down_proj`'s into the rows of `up_proj` (a sign flip of those
-  rows' scales and biases). All exact, since the vectors are ±1. A rotation is then one
-  kernel, the transform itself in the activation dtype, on **every** path: the serial
-  step, the width-2..8 verify forward a drafted round actually spends its time in, and
-  prefill. The pack's own rotation is four (two fp32 casts, the sign multiply, the
-  transform). Serial and verify forwards also rotate identically now, so they write the
-  cache at the same precision. `CHAD_PRISM_ROT_FP32=1` restores the fp32 transform
-  everywhere (an A/B arm: teacher-forced code NLL moves by ≤0.002 in no consistent
-  direction, and the native rotation prefills 1-3% faster);
-- the small-M verify kernel (`mlx_qmm_mma.py`) covers 2-bit g128, which is what makes an
-  8-wide DFlash2 verify cost ~2.2 serial steps here as on the 3-bit. mlx's stock 2-bit
-  matmul re-pays the weight read per row, made that verify 9× a decode step, and turned
-  drafting into a net loss (12 tok/s against 18 serial) until the kernel covered it. Past
-  one 8-row tile the same cliff came back (a 9-token forward cost 5.4 steps against 2.2
-  at 8), so widths 9-24 now run as several 8-row kernel calls: 1.2-1.8× faster on exactly
-  the forwards an agent step is made of (a warm tail, a short tool-result suffix);
-- the speculative schedule is seeded with a round-cost ladder measured on *this* weight
-  width, and each turn starts from the ladder the last one measured. The 3-bit ladder
-  prices every width past one 9-18% too cheap here. On low-acceptance prose (20-30% of
-  drafted positions accepted) the schedule sits at break-even with serial decoding on
-  either seed, within run-to-run noise, so this is a correctness-of-the-model fix, not
-  a measured tok/s one;
-- when the fast-path declines a Prism pack it says so, and why, as a warning. An unfused
-  pack decodes correctly and several times slower, which is not a thing to learn from a
-  stopwatch;
-- the residual stream runs in bf16. As the upstream pack ships, its fp32 norms and fp16
-  scales promote every activation to fp32 from the first RMSNorm on; the loader casts the
-  side tensors once, as mlx-lm's own loader does, at no cost in NLL (1.502 vs 1.500);
-- the serial step is bounded by mlx's 2-bit GEMV rate rather than by dispatch, so the
-  fast-path's kernel-count win is smaller here than on the 3-bit (21 vs 18 tok/s); the
-  weights, the verify and the window are where the build pays.
+Every projection is Hadamard-rotated offline and stored as 2-bit affine group-128 with
+levels {−s, 0, +s}, so the matching transform has to hit the activations at runtime and be
+inverted after the embedding lookup. mlx-lm's plain loader finds tensors of the right
+shapes, skips the rotation, and returns plausible garbage without raising, so chad routes
+the pack on its `model_type` to its own loader (`prism_pack.py`). Pointing `--model` at the
+upstream pack also works; the drafter is borrowed from the shipped sidecar
+(`mlx_dflash.DONORS`). On top of that:
+
+- the fast path fuses `gate|up`, `qkv|z` and `q|k|v` behind one rotation each and folds the
+  ±1 sign vectors into the weights at install, so a rotation is one kernel on every path
+  (serial, verify, prefill). `CHAD_PRISM_ROT_FP32=1` restores the fp32 transform, an A/B
+  arm inside the noise;
+- the small-M verify kernel (`mlx_qmm_mma.py`) covers 2-bit g128, tiled past 8 rows. Stock
+  2-bit matmul re-pays the weight read per row, which made an 8-wide verify cost 9× a
+  decode step and drafting a net loss;
+- the speculative schedule is seeded with a round-cost ladder measured at this bit width;
+- the side tensors are cast to bf16 at load, since the pack's fp32 norms would otherwise
+  promote every activation to fp32 (NLL 1.502 against 1.500);
+- when the fast path declines a Prism pack it warns and says why: an unfused pack decodes
+  correctly and several times slower.
 
 ### Smoke test (`chad prove`)
 
@@ -757,7 +719,7 @@ CHAD_PROTECT_GIT=1          uv run chad  # also write-DENY .git inside the yolo 
 - `CHAD_NO_FASTPATH`: disables the fused-projection + compiled decode step installed
   at load for the dense `qwen3_5` hybrid (`mlx_fastpath.py`): the MLP `gate|up` concat, the
   GDN `in_proj` concat, and the compiled S=1 layer step; on the
-  [shipped ternary weights](#what-the-engine-does-with-the-ternary-weights) also the
+  [ternary pack](#running-the-ternary-pack) also the
   `q|k|v` concat and the one-rotation-per-fused-matmul bodies. It is a silent no-op on any
   other checkpoint, so an arbitrary `--model` neither gains nor loses anything here. Pure speed,
   no behavior change, so this is an A/B and bisection knob rather than something to run
@@ -780,7 +742,7 @@ are chasing a behaviour change:
   and a serial step is an S=1 forward, and those run different matmul and attention
   kernels, so their logits agree to rounding, not to the bit: a greedy run therefore
   follows serial until the first near-tie and can take the other branch there. Measured
-  on the shipped model (`benchmarks/spec_decode.py`, greedy, 10 repo-text seeds): 4/10
+  on the ternary pack (`benchmarks/spec_decode.py`, greedy, 10 repo-text seeds): 4/10
   160-token generations token-identical to serial, the rest diverging 10-95 tokens in at
   the same positions whether or not the cache is shared, and at *different* positions
   with `CHAD_NO_QMM_MMA=1`, the signature of rounding, not of a logic bug. A divergence
@@ -810,38 +772,26 @@ CHAD_NO_QMM_MMA=1         uv run chad  # stock quantized_matmul at every verify 
 CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on this machine
 ```
 
-- `CHAD_NO_DFLASH`: disables **DFlash2 block speculation** (`mlx_dflash.py`), the
-  speculative path on the shipped model, and decodes one token per forward. A 1.9B drafter
-  (an MLX port of [z-lab's DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2),
-  pre-quantized to 4-bit and shipped inside the model repo as `dflash/`) reads the main
-  model's residual stream at five layers and proposes a whole block of tokens in **one**
-  forward. The block is verified in one batched target forward and accepted by exact
-  rejection sampling: every emitted token is the target's own choice and sampled output
-  keeps the model's true distribution at any temperature (to kernel rounding; see the
-  exactness note above: greedy runs follow serial until the first near-tie). Measured on an
-  M4 Pro with the 3-bit quant, 10 prompts × 384-token decodes, medians: greedy
-  serial 17.7 → **47.7 tok/s** (2.7×); at the thinking sampling preset (temp 1.0, top_p
-  0.95, top_k 20) 22.4 → **41.4**; non-thinking 23.7 → 42-43; code 24 → 35-37. It engages
-  when the drafter ships with the loaded weights: the shipped model and the 3-bit
-  alternative both bundle it; a checkpoint of the same shape with no bundle (the upstream
-  Prism pack) borrows the shipped model's (`mlx_dflash.DONORS`, keyed on hidden size, layer
-  count and vocab); any other `--model` decodes serially unless you point
-  `CHAD_DFLASH_PATH` at a drafter built for it.
+- `CHAD_NO_DFLASH`: disables **DFlash2 block speculation** (`mlx_dflash.py`) and decodes one
+  token per forward. A 1.9B drafter (an MLX port of
+  [z-lab's DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), pre-quantized to
+  4-bit in the sidecar's `dflash/`) reads the main model's residual stream at five layers
+  and proposes a whole block of tokens in **one** forward. The block is verified in one
+  batched target forward and accepted by exact rejection sampling: every emitted token is
+  the target's own choice and sampled output keeps the model's true distribution at any
+  temperature (to kernel rounding; see above). On the shipped GGUF, `chad-bench` decodes at
+  11.6 tok/s serial and 46.1 drafted, and real agent tasks at a 21.2 tok/s median
+  ([benchmarks](benchmarks.md#two-throughput-levers)). Any checkpoint of this model's shape
+  borrows the sidecar's drafter (`mlx_dflash.DONORS`, keyed on hidden size, layer count and
+  vocab); any other `--model` decodes serially unless `CHAD_DFLASH_PATH` points at a
+  drafter built for it.
 - `CHAD_DFLASH_DRAFT` / `CHAD_DFLASH_ADAPTIVE`: the verified width. The drafter always
   proposes its full block of 7; by default a per-round schedule (a cost model over the
-  measured round costs and recent acceptance) picks how many of those proposals to verify,
-  narrowing or skipping a round when acceptance drops. That default was chosen on the
-  **floor**, not the median: under the small-M matmul kernel below a full-block round
-  costs ~2.2 serial steps whatever it commits, so on low-acceptance text a fixed block
-  lands *below* serial decoding (worst measured prompts: 11.7 tok/s at the thinking
-  preset against 15.2 serial; 17.5 greedy on a real session context where the schedule
-  held 21.4), while the schedule never measured under serial. It pays for that with ~12%
-  at the greedy median (31.7 vs 36.0 tok/s on real contexts) and ties at the thinking
-  preset. `CHAD_DFLASH_ADAPTIVE=0` verifies the full block every round, the faster
-  arm if you decode greedily on text the drafter knows. `CHAD_DFLASH_DRAFT=N` caps the
-  width (and implies the fixed arm). Without the kernel (`CHAD_NO_QMM_MMA=1`) each extra
-  verify row costs ~33 ms and width 4 is the optimum. `benchmarks/spec_decode.py` measures
-  all three arms in one load, on this repo's text and on real mid-session contexts.
+  measured round costs and recent acceptance) picks how many to verify, narrowing or
+  skipping a round when acceptance drops, so low-acceptance text never pays for a full
+  block it mostly rejects. `CHAD_DFLASH_ADAPTIVE=0` verifies the full block every round,
+  the faster arm on text the drafter knows well. `CHAD_DFLASH_DRAFT=N` caps the width (and
+  implies the fixed arm). `benchmarks/spec_decode.py` measures the arms in one load.
 - `CHAD_DFLASH_PATH`: point the loader at a drafter outside the model repo: either an
   HF-layout checkpoint dir (quantized on first use into `~/.cache/chad/dflash/`) or an
   already-built sidecar dir. `python -m chad.mlx_dflash <dir> --out <model_dir>/dflash`
@@ -885,7 +835,7 @@ CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on t
   each width), and routes only the (shape, width) pairs that won; the verdict is cached
   under `~/.cache/chad/qmm_mma/`. Same exactness class as the attention-kernel knobs
   above: within rounding of the stock kernel, not bit-identical to it. Measured on the
-  shipped model's shapes (dependent chains, M4 Pro): the 3-bit MLP matmuls 1.31× at six rows
+  this model's shapes (dependent chains, M4 Pro): the 3-bit MLP matmuls 1.31× at six rows
   and 1.64× at eight, the 5-bit `lm_head` 1.55× / 1.87×, and below five rows the stock
   kernel wins, so verify widths 6-8 now cost about what width 5 does, which is what lets
   the block drafter verify its full block (see `CHAD_DFLASH_DRAFT`). Past one tile the

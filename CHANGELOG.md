@@ -4,42 +4,38 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
-### Model bump: Unsloth's UD-Q3_K_XL GGUF, read natively
+### The ternary default was a mistake; the default is now Unsloth's UD-Q3_K_XL GGUF
 
-**The shipped weights are now Unsloth's [`Qwen3.8-27B-UD-Q3_K_XL.gguf`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF).**
-A re-download is coming (~14 GB against ~8); the old ternary snapshot can be freed with
-`hf cache rm`. Why: on the polyglot agent tasks the file scores 9/9 where the ternary pack
-scored 4/9 (half its trials ran out the wall clock inside one think) and chad's own MLX
-repack of the same bits 6/9; on a wider 36-task set, 34/36 against the ternary's 24/36
-(10 tasks up, none down, p = 0.002) in 0.30× the generated tokens and 0.38× the wall
-clock; chad-corpus perplexity 3.95 against the ternary's 4.86. The
-gain is Unsloth's quantization recipe — i-quants and K-quants fitted against an importance
-matrix — which MLX's affine container cannot hold, so chad now reads GGUF files as they
-are: every projection stays in its llama.cpp blocks and decodes in chad's own Metal
-kernels (`gguf_pack.py`, `mlx_gguf.py`; 15 block formats, bit-exact to llama.cpp's
-dequantizers, MIT-licensed port noted in `NOTICE`). Drafted decode is ~2× llama.cpp's
-serial on the same file; serial decode is weight-bandwidth bound at ~13 tok/s.
+**We shipped the wrong weights.** The ternary pack bought a big context window, and the
+tasks we tested it on were too easy to show what it cost. On 36 paired polyglot tasks it passes 24 where Unsloth's
+[`Qwen3.8-27B-UD-Q3_K_XL.gguf`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) passes
+34 (10 up, 0 down, p = 0.002), and the GGUF gets there in 0.30× the generated tokens and
+0.38× the wall clock. All twelve ternary failures ran out the 20-minute wall clock.
+[Design](docs/design.md#the-weights) has the account; every run cited is in
+`benchmarks/polyglot/RUNS.md`.
 
-- **`--model` takes a GGUF**: a local `path/to/file.gguf`, or `owner/repo/file.gguf` for
-  chad to fetch. Any Unsloth file of this model loads; `UD-IQ3_XXS` (10.9 GB) gets ~138k
-  of context on 24 GB against the default's ~74k, at 8/9 on the same tasks. The tokenizer
-  and the DFlash2 drafter come from a 1.2 GB sidecar repo,
-  [`nathansutton/Qwen3.8-27B-DFlash2-MLX`](https://huggingface.co/nathansutton/Qwen3.8-27B-DFlash2-MLX),
-  which carries no target weights. The ternary and the affine packs still load via `--model`.
-- **The prefill transient is flat.** A per-chunk OOM-rollback snapshot was holding every
-  KV buffer, so no chunk could write in place and each one copied the whole cache; a
-  prefill chunk's attention also materialized its full score slab. On the quantized cache
-  the snapshot is gone and attention runs in 64-row slices: 1.4–1.9 GB from 8k to 64k
-  where it used to saturate at ~4.15 GB. Every model gains context (the ternary 172k →
-  238k on 24 GB). A Metal OOM inside a prefill chunk on the quantized cache now rebuilds
-  the cache by re-prefilling at half the chunk instead of rolling back one chunk.
-- **A GGUF loads in ~9 s after its first start.** The first load converts the file and
-  saves the result, ~13 GB more disk, in `~/.cache/chad/gguf/`; later loads read it
-  through MLX's own loader, bit-identical, where converting took ~51 s every time. The
-  disk preflight counts the copy. A pack directory now records the transformers version,
-  which silences a spurious Mistral-regex tokenizer warning at every load.
-- The banner sizes a GGUF from the file; the governor charges the flat 2.0 GB transient
-  only when both mechanisms are in (quantized cache and sliced attention), 4.3 GB otherwise.
+**chad now reads GGUF files natively.** Converting Unsloth's file to MLX's affine format
+passes 6 of 9 trials where the file passes 9: its i-quants have no MLX equivalent. Serving it
+from llama.cpp would give up the engine-owned cache. So the llama.cpp blocks load as
+they are, and chad's Metal kernels decode them (`gguf_pack.py`, `mlx_gguf.py`; 15
+formats, bit-exact to llama.cpp, MIT port credited in `NOTICE`).
+
+- **Re-download: ~14 GB, up from ~8.** The GGUF plus a 1.2 GB sidecar
+  ([`nathansutton/Qwen3.8-27B-DFlash2-MLX`](https://huggingface.co/nathansutton/Qwen3.8-27B-DFlash2-MLX))
+  with the tokenizer and drafter. Free the old snapshot with `hf cache rm`.
+- **Less context: ~74k on 24 GB, down from ~150k.** The median trial peaked at 8.6k.
+  `--model` takes any Unsloth file of this model, as a local `.gguf` path or
+  `owner/repo/file.gguf`: `UD-IQ3_XXS` (10.9 GB) gets ~138k and passed 8 of 9.
+  The ternary and affine packs still load.
+- **Serial decode is ~12 tok/s, level with llama.cpp on the same file; drafted, ~46.**
+  The affine repacks decoded faster serially (18-21 tok/s) and lost on the tasks. A real
+  agent session decodes at a ~21 tok/s median.
+- **First start ~75 s, later starts ~9 s.** The first load saves its converted arrays
+  to `~/.cache/chad/gguf/` (~13 GB more disk, counted by the preflight).
+- **Prefill memory is flat at ~2 GB, down from ~4.15.** A per-chunk OOM snapshot held
+  every KV buffer, so each chunk copied the whole cache; on the quantized cache it is
+  gone, and prefill attention runs in 64-row slices. Every model gains window (the
+  ternary: 172k → 238k). A Metal OOM mid-prefill now re-prefills at half the chunk.
 
 ### One benchmark, and no run output in the repository
 

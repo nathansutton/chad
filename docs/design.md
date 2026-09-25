@@ -47,8 +47,8 @@ directory starts warm.
 ## The cache only appends
 
 Qwen3.8-27B is a hybrid. 48 of its 64 layers are recurrent, and a recurrent layer's state
-is a fixed-size summary of everything so far. That is why 150k tokens of context fit
-beside the weights in 24 GB. It is also why the cache cannot be rewound: an attention
+is a fixed-size summary of everything so far. That is why 128k tokens of cache cost 4.6 GB
+rather than ~17. It is also why the cache cannot be rewound: an attention
 layer can drop rows, and a recurrent state has no rows to drop.
 
 Everything in the loop is arranged so the transcript only grows at the end. Nothing above
@@ -69,6 +69,34 @@ same engine at other weights and it still runs, slower, with each of those missi
 A model menu is the first thing most local harnesses show you. We would rather the first
 thing be the task. `--model` will load other weights and `--backend llama` will talk to a
 llama.cpp server. They are there so the fit can be measured, not as a menu.
+
+## The weights
+
+We shipped the wrong weights first. 2.x defaulted to a ternary build of this model: 7.2 GB,
+as fast as a 3-bit quant, and room for ~150k of context on 24 GB. The tasks we tested on
+could not tell the two apart, so we took the window. Harder tasks could. On 36 paired
+polyglot tasks the ternary passed 24 and Unsloth's 3-bit GGUF of the same model passed 34,
+ten tasks up and none down. All twelve ternary failures ran out the 20-minute wall clock,
+and it generated 3.3× the tokens getting there. The window was not what ran out: the median trial peaked under 20k
+on either.
+
+The obvious fix failed next. Converting Unsloth's file into MLX's own format, the same
+bits per weight in the same places, passed 6 of 9 trials where the file passes 9. The bit map was
+never the good part; the quantizer was. Unsloth fits i-quants and K-quants against an
+importance matrix, three quarters of the file's bytes are i-quants, and an i-quant is a
+codebook that MLX's `scale * q + bias` format cannot express. Re-quantizing throws away
+exactly what made the file worth having.
+
+Serving the GGUF from llama.cpp keeps the quant and loses the engine-owned cache this page
+opens with. So chad reads the GGUF itself. The llama.cpp blocks load byte for byte, and a
+port of llama.cpp's dequantizers to Metal decodes them inside chad's own kernels, bit-exact
+for all 15 block formats; the drafter, the attention kernel and the append-only cache run
+unchanged on top. It is an odd thing for an MLX project to do, and the only way we found
+to keep both the quant and the loop.
+
+The cost is 6 GB of weights: ~74k of context on 24 GB instead of the ternary's ~238k.
+`UD-IQ3_XXS` is one `--model` away at 10.9 GB and ~138k, passing 8 of the same 9. Every
+run cited here is published; see [`RUNS.md`](../benchmarks/polyglot/RUNS.md).
 
 ## Five tools
 

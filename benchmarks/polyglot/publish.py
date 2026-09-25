@@ -62,9 +62,14 @@ _WORKSPACE, _TRIAL_HOME = _trial_dir("work"), _trial_dir("home")
 _HOME_PATH = re.compile(r"(?<![\w.])~/[^\s\"'\\]*")
 # A concrete account's directory. The model's own elisions (`/Users/.../bob/`) name nobody.
 _USER_DIR = re.compile(r"/Users/[\w-]")
-# Where a trial reaches under `~` by design: chad's own spill files and the toolchains'
-# package caches. Anything else under the home directory is a trial worth reading first.
-_HOME_ALLOWED = ("~/.cache/chad/", "~/.cargo/", "~/.rustup/", "~/go/pkg/")
+# Where a trial reaches under `~` by design: chad's own spill files, the Hugging Face cache
+# the weights load from, and the toolchains' package caches. Anything else under the home
+# directory is a trial worth reading first.
+# `~/.../` is the model eliding a path it quotes, which names nothing, as `/Users/.../` does.
+_HOME_ALLOWED = ("~/.cache/chad/", "~/.cache/huggingface/hub/", "~/.cargo/", "~/.rustup/",
+                 "~/go/pkg/", "~/.../")
+# A file in a Hugging Face cache snapshot, named in a RUNS.md row as `owner/repo[/file]`.
+_HUB_SNAPSHOT = re.compile(r"/models--([^/]+)--([^/]+)/snapshots/[^/]+/?(.*)$")
 _SECRET = re.compile(
     r"AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,}"
     r"|hf_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}"
@@ -158,7 +163,10 @@ def runs_row(label: str, meta: dict[str, JsonValue], rows: str, sha256: str, dat
         return value if is_text(value) else default
 
     model = text("model")
-    if model.startswith(("<repo>", "~", "/")):
+    hub = _HUB_SNAPSHOT.search(model)
+    if hub:
+        model = "/".join(part for part in hub.groups() if part)
+    elif model.startswith(("<repo>", "~", "/")):
         model = os.path.basename(model)
     dirty = "+dirty" if meta.get("git_dirty") is True else ""
     chad = f"{text('chad_version')} ({text('git_rev')}{dirty})"

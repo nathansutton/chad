@@ -254,7 +254,7 @@ def arm_chad() -> None:
     default = _chad_bench({})
     _save("chad", {
         "engine": "chad", "version": chad.__version__,
-        "model": "nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX",
+        "model": "unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf (native)",
         "prompt_tokens": PROMPT_TOKENS, "gen_tokens": GEN_TOKENS,
         "serial": {**serial, "flags": "CHAD_NO_DFLASH=1"},
         "default": {**default, "flags": "DFlash2 block drafter, per-round width schedule"},
