@@ -214,10 +214,7 @@ def test_a_request_belongs_to_the_trial_it_arrived_in_and_ends_with_it(relay, tm
     t0 = time.time()
     p.route(str(tmp_path / "trial-b.jsonl"))              # trial A is over
     caller.join(timeout=10)
-    deadline = time.time() + 5
-    while not (tmp_path / "trial-a.jsonl").exists() and time.time() < deadline:
-        time.sleep(0.05)
-    record = proxy_atif.load(str(tmp_path / "trial-a.jsonl"))[0]
+    record = _first_record(str(tmp_path / "trial-a.jsonl"))
     assert record["aborted"] is True and time.time() - t0 < 4    # hung up, not waited out
     assert not (tmp_path / "trial-b.jsonl").exists()
     doc = proxy_atif.convert([*_chat_log()[:1], record], "x", "0", "m")
@@ -240,10 +237,7 @@ def test_a_client_that_hangs_up_takes_its_generation_with_it(relay, tmp_path):
     time.sleep(0.5)
     t0 = time.time()
     client.close()                                     # the client's own timeout
-    deadline = time.time() + 5
-    while not (tmp_path / "trial.jsonl").exists() and time.time() < deadline:
-        time.sleep(0.05)
-    record = proxy_atif.load(str(tmp_path / "trial.jsonl"))[0]
+    record = _first_record(str(tmp_path / "trial.jsonl"))
     assert record["client_gone"] is True and record["aborted"] is False
     assert time.time() - t0 < 3                        # hung up, not left to finish
     doc = proxy_atif.convert([*_chat_log()[:1], record], "x", "0", "m")
@@ -256,6 +250,22 @@ def _post_quietly(origin, body):
         _post(origin, "/v1/chat/completions", body)
     except OSError:
         pass                           # the proxy hung up, as it should
+
+
+def _first_record(path, timeout=5.0):
+    """The first record the proxy writes to `path`. The file exists before its first line
+    does, and a long line can land in pieces, so waiting on the file alone reads an empty
+    or half-written log on a slow runner."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            records = proxy_atif.load(path)
+        except (FileNotFoundError, json.JSONDecodeError):
+            records = []
+        if records:
+            return records[0]
+        time.sleep(0.05)
+    raise AssertionError(f"no record written to {path} within {timeout} s")
 
 
 def test_the_audit_reads_the_slot_that_served_each_probe(relay):

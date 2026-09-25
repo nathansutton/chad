@@ -5,17 +5,17 @@
   "prompt_tokens": 512,
   "gen_tokens": 128,
   "serial": {
-    "prefill_tps": 99.0,
-    "decode_tps": 11.8,
+    "prefill_tps": 102.0,
+    "decode_tps": 11.7,
     "warm_step_new_tokens": 16,
-    "warm_step_prefill_s": 0.5,
+    "warm_step_prefill_s": 0.49,
     "flags": "CHAD_NO_DFLASH=1"
   },
   "default": {
-    "prefill_tps": 102.0,
-    "decode_tps": 48.3,
+    "prefill_tps": 101.0,
+    "decode_tps": 48.2,
     "warm_step_new_tokens": 16,
-    "warm_step_prefill_s": 0.49,
+    "warm_step_prefill_s": 0.51,
     "flags": "DFlash2 block drafter, per-round width schedule"
   }
 }

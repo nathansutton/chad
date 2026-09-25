@@ -73,10 +73,22 @@ does](#why-decode-sits-where-it-does).
 ## Same model, same Mac, stock engine
 
 The question chad has to answer is what its engine buys over a generic local-model tool
-pointed at the **same weights on the same laptop**. So: Qwen3.8-27B at the `UD-Q3_K_XL`
-file, Unsloth's GGUF, which both engines now read as it is, on the same M4 Pro (24 GB), one
-engine resident at a time, each measured with its own native benchmark on a 512-token
-prompt and a 128-token generation. Ollama was measured once on the same 
+pointed at the **same weights on the same laptop**. Both engines now read the same file,
+Unsloth's `UD-Q3_K_XL` GGUF, and both can speculate with the same DFlash2 drafter. The
+comparison that matters is drafted against drafted:
+
+| same GGUF, same M4 Pro, same prompt | serial | **DFlash2** | speedup |
+|---|---|---|---|
+| llama.cpp `llama-server` b11184 (2026-09-25) | 11.4 tok/s | 11.1 tok/s (96.5% accepted) | 0.97× |
+| chad 2.2.0 | 11.7 tok/s | **48.2 tok/s** | 4.1× |
+
+Serial decode is the same on both, since the same bytes stream through the same bandwidth.
+The drafter works on both: llama.cpp accepts 96.5% of what it drafts. The difference is
+what a verify round costs, explained below. The tiled prompt is the drafter's best case on
+either engine; on real agent work chad's drafted median is ~21 tok/s (above).
+
+The full table, one engine resident at a time, each measured with its own native benchmark
+on a 512-token prompt and a 128-token generation. Ollama was measured once on the same 
 GGUF (0.32.15, a `FROM`-only Modelfile, `num_ctx` 2048, temperature 0, timed from 
 `/api/generate`'s own counters) at 96 tok/s prefill and 10.9 tok/s decode, the llama.cpp 
 number, as expected. The row is kept under `_runs/ollama.json`. There is no script arm 
@@ -85,10 +97,10 @@ because importing a GGUF into Ollama needs ~45 GB of scratch disk for nothing ne
 | Engine | Prefill (512-tok prompt) | Decode (128 tok) | Speculative decoding |
 |---|---|---|---|
 | llama.cpp `llama-bench` (stock, build 10470) | 102 tok/s | 10.9 tok/s | off in this benchmark |
-| llama.cpp `llama-server` (build 10917), serial | 97 tok/s | 11.3 tok/s | off |
-| llama.cpp `llama-server` (build 10917) | 95 tok/s | 11.1 tok/s | DFlash2 drafter (Q4_K_M GGUF) |
-| **chad**, serial (`CHAD_NO_DFLASH=1`) | 99 tok/s | 11.8 tok/s | off |
-| **chad**, default | 102 tok/s | **48.3 tok/s** | DFlash2 block drafter |
+| llama.cpp `llama-server` (build 11184), serial | 96 tok/s | 11.4 tok/s | off |
+| llama.cpp `llama-server` (build 11184) | 95 tok/s | 11.1 tok/s | DFlash2 drafter (Q4_K_M GGUF) |
+| **chad**, serial (`CHAD_NO_DFLASH=1`) | 102 tok/s | 11.7 tok/s | off |
+| **chad**, default | 101 tok/s | **48.2 tok/s** | DFlash2 block drafter |
 
 Reproduce it with `uv run python benchmarks/stock/stock.py llama`, `… llama-dflash` and
 `… chad`, one arm at a time since each loads ~13 GB, then `… table` to render the rows.
@@ -100,7 +112,7 @@ committed under `benchmarks/stock/_runs/`. How to read it:
 - Prefill is a wash. Both engines read a 512-token prompt at ~100 tok/s: a dense 27B
   reads every parameter for every prompt token, and that is the chip's compute roofline,
   not anyone's tuning.
-- Serial decode is a wash too. Same bytes, same bandwidth wall: 11.8 against 11.3 tok/s.
+- Serial decode is a wash too. Same bytes, same bandwidth wall: 11.7 against 11.4 tok/s.
   chad's fused single-token step (below) buys little here, because decoding the GGUF's
   codebook formats, not kernel dispatch, is what bounds it. An MLX affine repack of the
   same model decoded 17.9 tok/s serially and passed 6 of 9 agent trials where this file passes 9
@@ -109,9 +121,9 @@ committed under `benchmarks/stock/_runs/`. How to read it:
   llama.cpp has run DFlash2 drafters since build 10658 (`--spec-type draft-dflash`), and
   the drafter is published in GGUF form (`incoai/Qwen3.8-27B-DFlash2-GGUF`, BF16 / Q8_0 /
   Q4_K_M). On this checkpoint it works as a drafter, 96.5% of drafted tokens accepted on
-  the tiled prompt, and decodes at 11.1 tok/s against 11.3 serial anyway. A round verifies
+  the tiled prompt, and decodes at 11.1 tok/s against 11.4 serial anyway. A round verifies
   8 tokens in one batch, and llama.cpp's Metal path runs a batch of 1 / 2 / 4 / 8 / 16 at
-  11.2 / 12.8 / 13.5 / 14.0 / 45.5 tok/s (`llama-bench -p 1,2,4,8,16 -n 0`, recorded in
+  11.3 / 12.8 / 13.6 / 14.0 / 45.5 tok/s (`llama-bench -p 1,2,4,8,16 -n 0`, recorded in
   `_runs/llama-dflash.json`): the 8-token verify alone costs ~6.4 serial steps, so no
   acceptance rate can pay for the round, and the jump at 16 is a kernel switch the round
   sits just below. chad's whole round at the same width, drafter included, costs ~2.0
