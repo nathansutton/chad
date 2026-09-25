@@ -33,6 +33,11 @@ serial on the same file; serial decode is weight-bandwidth bound at ~13 tok/s.
   where it used to saturate at ~4.15 GB. Every model gains context (the ternary 172k →
   238k on 24 GB). A Metal OOM inside a prefill chunk on the quantized cache now rebuilds
   the cache by re-prefilling at half the chunk instead of rolling back one chunk.
+- **A GGUF loads in ~9 s after its first start.** The first load converts the file and
+  saves the result, ~13 GB more disk, in `~/.cache/chad/gguf/`; later loads read it
+  through MLX's own loader, bit-identical, where converting took ~51 s every time. The
+  disk preflight counts the copy. A pack directory now records the transformers version,
+  which silences a spurious Mistral-regex tokenizer warning at every load.
 - The banner sizes a GGUF from the file; the governor charges the flat 2.0 GB transient
   only when both mechanisms are in (quantized cache and sliced attention), 4.3 GB otherwise.
 

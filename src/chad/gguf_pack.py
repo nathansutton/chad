@@ -42,12 +42,13 @@ import hashlib
 import json
 import os
 import shutil
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING, Callable, Optional, cast
 
 from .diag import log
 
 if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module loads on Linux
+    import mlx.core as mx
     import mlx.nn as nn
     import numpy as np
 
@@ -70,7 +71,7 @@ REASONING_EFFORT_DEFAULT = "medium"
 
 # Bump when what `materialize()` writes changes (the derived config, the donor files):
 # it is part of the directory's name, so a stale directory is never reused.
-_SCHEMA = 2
+_SCHEMA = 3
 _KEY = "chad_gguf"
 
 
@@ -433,9 +434,13 @@ def materialize(gguf_path: str, cache_root: Optional[str] = None,
         src = os.path.join(donor_dir, name)
         if os.path.isfile(src):
             _place(src, os.path.join(out, name))
+    from importlib.metadata import version
     config = {
         "model_type": "qwen3_5",
         "architectures": ["Qwen3_5ForConditionalGeneration"],
+        # transformers 5 takes a local tokenizer whose config names no version for a
+        # Mistral one with a known-bad split regex, and warns at every load.
+        "transformers_version": version("transformers"),
         "tie_word_embeddings": False,
         "eos_token_id": [g.eos, g.bos],
         "text_config": text_config(g),
@@ -533,41 +538,193 @@ def row_slice(module: "nn.Module", start: int, stop: int) -> "nn.Module":
     return GGUFLinear(w, module.qtype, module.in_dims)
 
 
+# The loaded model, saved once beside the config. Reading the GGUF means parsing its
+# header in Python and copying every tensor out of a numpy memmap into its own Metal
+# buffer (rows permuted on the way), ~50 s for the 13 GB default on every start; the
+# saved arrays load through mlx's own reader like any safetensors pack. They are the
+# same GGUF blocks in the same bytes, not a requantization. Bump the version when
+# `_convert` builds different arrays or modules from the same file.
+_REPACK = "weights.safetensors"
+_REPACK_KEY = "chad_gguf_repack"
+_REPACK_VERSION = 1
+# Free space left on the volume after the repack is written.
+_REPACK_HEADROOM = 2 << 30
+
+
+@dataclass(frozen=True)
+class Slot:
+    """One module `_convert` put in place of mlx-lm's default: what the repack
+    needs to build it again around the saved weight."""
+    kind: str           # "linear" (GGUF blocks), "embedding", or "dense" (bf16 Linear)
+    qtype: int
+    in_dims: int
+    out_dims: int
+
+
 def load(model_path: str, config: Optional[dict] = None) -> "nn.Module":
     """Build mlx-lm's qwen3_5 model around the GGUF that `model_path`'s config names.
 
     Every quantized tensor stays in its blocks; float tensors (norms, the conv kernel,
-    `dt_bias`) are cast to bf16, and `A_log` stays float32 as mlx-lm keeps it."""
-    import gguf
-    import mlx.core as mx
-    import mlx.nn as nn
-    import numpy as np
-    from mlx.utils import tree_flatten
-    from mlx_lm.models import qwen3_5 as q35
-
-    from . import mlx_gguf
-
+    `dt_bias`) are cast to bf16, and `A_log` stays float32 as mlx-lm keeps it. The
+    first load converts from the file and saves the result in `model_path`; every
+    later one reads that."""
     if config is None:
         with open(os.path.join(model_path, "config.json")) as f:
             config = json.load(f)
     if not is_gguf_pack(config):
         raise ValueError(f"{model_path} is not a GGUF model directory")
+    model = _load_repack(model_path, config)
+    if model is not None:
+        return model
+    model, slots = _convert(config)
+    _save_repack(model_path, model, slots)
+    return model
+
+
+def _assign(model: "nn.Module", path: str, value: "nn.Module | mx.array") -> None:
+    parts = path.split(".")
+    parent = model
+    for part in parts[:-1]:
+        parent = parent[int(part)] if part.isdigit() else parent[part]
+    parent[parts[-1]] = value
+
+
+def _empty_model(config: dict) -> "nn.Module":
+    from mlx_lm.models import qwen3_5 as q35
+    return q35.Model(q35.ModelArgs(model_type="qwen3_5", text_config=config["text_config"]))
+
+
+def _load_repack(model_path: str, config: dict) -> "Optional[nn.Module]":
+    """The model from the saved repack, or None when there is none or it was written
+    by another version of `_convert` (the caller converts again and overwrites it)."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    path = os.path.join(model_path, _REPACK)
+    if not os.path.isfile(path):
+        return None
+    try:
+        # SAFETY: mx.load's stub unions .npy/.npz returns; a .safetensors path with
+        # return_metadata=True returns (name -> array, name -> string metadata).
+        arrays, meta = cast("tuple[dict[str, mx.array], dict[str, str]]",
+                            mx.load(path, return_metadata=True))
+        slots = _parse_slots(meta.get(_REPACK_KEY, ""))
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as e:
+        log.warning("GGUF repack at %s unreadable (%s); converting again", path, e)
+        return None
+    if slots is None:
+        return None
+    GGUFLinear, GGUFEmbedding = _module_classes()
+    model = _empty_model(config)
+    for name, s in slots.items():
+        w = arrays[name + ".weight"]
+        if s.kind == "linear":
+            _assign(model, name, GGUFLinear(w, s.qtype, s.in_dims, arrays.get(name + ".gather")))
+        elif s.kind == "embedding":
+            _assign(model, name, GGUFEmbedding(w, s.qtype, s.in_dims, mx.bfloat16))
+        else:
+            lin = nn.Linear(s.in_dims, s.out_dims, bias=False)
+            lin.weight = w
+            _assign(model, name, lin)
+    try:
+        model.load_weights(list(arrays.items()), strict=True)
+    except ValueError as e:
+        log.warning("GGUF repack at %s does not fit the model (%s); converting again",
+                    path, e)
+        return None
+    model.eval()
+    mx.eval(model.parameters())
+    log.info("GGUF loaded from repack %s (%s)", path, config[_KEY]["file"])
+    return model
+
+
+def _parse_slots(text: str) -> Optional[dict[str, Slot]]:
+    """The repack's module table, or None when it is missing or another version's.
+    A malformed table raises KeyError/TypeError/ValueError for the caller to treat
+    as unreadable."""
+    if not text:
+        return None
+    head = json.loads(text)
+    if head["version"] != _REPACK_VERSION:
+        return None
+    return {name: Slot(kind=str(s["kind"]), qtype=int(s["qtype"]), in_dims=int(s["in_dims"]),
+                       out_dims=int(s["out_dims"]))
+            for name, s in head["slots"].items()}
+
+
+def _save_repack(model_path: str, model: "nn.Module", slots: dict[str, Slot]) -> None:
+    """Write the converted model beside its config, by rename so a reader never sees
+    half a file. Best effort: without the space for it every start converts, as
+    before, and says so."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    arrays = dict(tree_flatten(model.parameters()))
+    need = sum(a.nbytes for a in arrays.values())
+    free = shutil.disk_usage(model_path).free
+    if free < need + _REPACK_HEADROOM:
+        log.warning("GGUF repack skipped: %.1f GB free at %s, needs %.1f GB; every start "
+                    "will convert the file again", free / 1e9, model_path, need / 1e9)
+        return
+    _prune_stale_repacks(os.path.dirname(os.path.abspath(model_path)))
+    head = {"version": _REPACK_VERSION,
+            "slots": {name: asdict(s) for name, s in slots.items()}}
+    final = os.path.join(model_path, _REPACK)
+    tmp = os.path.join(model_path, f"weights.{os.getpid()}.tmp.safetensors")
+    try:
+        mx.save_safetensors(tmp, arrays, metadata={_REPACK_KEY: json.dumps(head)})
+        os.replace(tmp, final)
+        log.info("GGUF repack written: %s (%.1f GB)", final, need / 1e9)
+    except OSError as e:
+        log.warning("GGUF repack not written (%s); every start will convert again", e)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _prune_stale_repacks(root: str) -> None:
+    """Delete the repacks no load can reach again: a directory whose GGUF is gone or
+    was replaced (a new upstream revision), or that an older schema built. Each is
+    the size of the model; the small config and tokenizer files stay."""
+    for entry in os.scandir(root):
+        weights = os.path.join(entry.path, _REPACK)
+        if not os.path.isfile(weights):
+            continue
+        try:
+            with open(os.path.join(entry.path, "config.json")) as f:
+                stamp = json.load(f).get(_KEY, {})
+            st = os.stat(stamp["file"])
+            live = (stamp.get("schema") == _SCHEMA and st.st_size == stamp.get("size")
+                    and st.st_mtime_ns == stamp.get("mtime_ns"))
+        except (OSError, ValueError, KeyError, TypeError):
+            live = False
+        if not live:
+            os.remove(weights)
+            log.info("GGUF repack removed, its file changed or is gone: %s", weights)
+
+
+def _convert(config: dict) -> "tuple[nn.Module, dict[str, Slot]]":
+    """The model built from the GGUF file itself, and the modules it placed."""
+    import gguf
+    import mlx.core as mx
+    import mlx.nn as nn
+    import numpy as np
+    from mlx.utils import tree_flatten
+
+    from . import mlx_gguf
+
     reader = gguf.GGUFReader(config[_KEY]["file"])
     g = read_geometry(reader)
-    model = q35.Model(q35.ModelArgs(model_type="qwen3_5",
-                                    text_config=config["text_config"]))
+    model = _empty_model(config)
     want = set(dict(tree_flatten(model.parameters())))
     GGUFLinear, GGUFEmbedding = _module_classes()
     dtype = mx.bfloat16
     got: set[str] = set()
     formats: dict[str, int] = {}
+    slots: dict[str, Slot] = {}
 
-    def assign(path: str, value) -> None:
-        parts = path.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = parent[int(part)] if part.isdigit() else parent[part]
-        parent[parts[-1]] = value
+    def assign(path: str, value: "nn.Module | mx.array") -> None:
+        _assign(model, path, value)
 
     for t in reader.tensors:
         p = place(t.name, g)
@@ -600,8 +757,10 @@ def load(model_path: str, config: Optional[dict] = None) -> "nn.Module":
                     dense = dense[:, mx.array(v_head_order(g, g.v_head_dim))]
                 lin.weight = dense
                 assign(p.path, lin)
+                slots[p.path] = Slot("dense", qtype, in_dims, raw.shape[0])
                 got.add(p.path + ".weight")
                 continue
+            slots[p.path] = Slot(p.kind, qtype, in_dims, raw.shape[0])
             if p.kind == "embedding":
                 assign(p.path, GGUFEmbedding(w, qtype, in_dims, dtype))
             else:
@@ -633,4 +792,4 @@ def load(model_path: str, config: Optional[dict] = None) -> "nn.Module":
     mx.eval(model.parameters())
     log.info("GGUF loaded: %s, %d layers, formats %s", config[_KEY]["file"],
              g.n_layers, ", ".join(f"{k}x{v}" for k, v in sorted(formats.items())))
-    return model
+    return model, slots

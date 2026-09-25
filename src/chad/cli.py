@@ -575,13 +575,18 @@ def _ensure_model(model_id, *, host: Host = HOST):
     if _cached_weights_complete(model_id, cached_file=host.cached_file):
         return  # already in the HF cache
     need_gb = _model_download_gb(model_id)
+    # The first load of a hub GGUF saves the converted model beside its pack (the same
+    # blocks again, so later starts skip the conversion): the file's size once more.
+    repack_gb = need_gb - gguf_pack.SIDECAR_GB if hub is not None else 0.0
     hf_home = os.environ.get("HF_HOME", "~/.cache/huggingface")
     free_gb = host.free_disk_gb(hf_home)
     # need + 2 GB headroom: the HF cache writes temp blobs beside the final files.
-    if free_gb is not None and free_gb < need_gb + 2.0:
+    if free_gb is not None and free_gb < need_gb + repack_gb + 2.0:
+        copy = (f" + ~{repack_gb:.0f} GB converted copy in ~/.cache/chad"
+                if repack_gb else "")
         sys.stderr.write(
             f"\nchad: not enough free disk for the model download\n"
-            f"  cause: '{model_id}' needs ~{need_gb:.0f} GB (+2 GB headroom); "
+            f"  cause: '{model_id}' needs ~{need_gb:.0f} GB{copy} (+2 GB headroom); "
             f"{free_gb:.1f} GB free at {hf_home}\n"
             "  fix:   free up space, or clear old model revisions: `hf cache ls` /\n"
             "         `hf cache rm` (older CLIs: `huggingface-cli delete-cache`).\n"
@@ -598,7 +603,9 @@ def _ensure_model(model_id, *, host: Host = HOST):
          f"the missing files are fetched, up to {size}.\n" if partial else
          f"\nchad needs the model '{model_id}' "
          f"({size} — minutes on fast fiber, ~20 min on 100 Mbit; resumable).\n"
-         "It downloads once into ~/.cache/huggingface and is reused across projects.\n"))
+         "It downloads once into ~/.cache/huggingface and is reused across projects.\n"
+         + (f"The first start also saves a converted copy (~{repack_gb:.0f} GB) in "
+            "~/.cache/chad, so later starts skip the conversion.\n" if repack_gb else "")))
     if host.stdin_isatty():
         ans = host.ask("Download now? [Y/n] ").strip().lower()
         if ans and ans not in ("y", "yes"):

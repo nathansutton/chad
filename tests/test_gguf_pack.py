@@ -407,3 +407,84 @@ def test_materialize_needs_a_tokenizer(tiny, tmp_path):
     empty.mkdir()
     with pytest.raises(ValueError, match="tokenizer.json"):
         gguf_pack.materialize(path, cache_root=str(tmp_path / "other"), donor_dir=str(empty))
+
+
+def test_the_second_load_reads_the_repack_and_computes_the_same(tiny):
+    """The first load converts the GGUF and saves the result; the next reads that
+    instead, with the same modules and bit-identical logits."""
+    mx = pytest.importorskip("mlx.core")
+    g, _, out = tiny
+    with open(os.path.join(out, "config.json")) as f:
+        cfg = json.load(f)
+    repack = os.path.join(out, gguf_pack._REPACK)
+    assert not os.path.exists(repack)
+    first = gguf_pack.load(out, cfg)
+    assert os.path.isfile(repack)
+    assert not [n for n in os.listdir(out) if ".tmp" in n]
+    stamp = os.stat(repack).st_mtime_ns
+    second = gguf_pack.load(out, cfg)
+    assert os.stat(repack).st_mtime_ns == stamp          # read, not rewritten
+
+    def kinds(model):
+        return {name: type(m).__name__ for name, m in model.named_modules()}
+    assert kinds(first) == kinds(second)
+    ids = mx.array(np.random.default_rng(11).integers(0, g.vocab, (1, 7)))
+    for n in (1, 7):
+        assert mx.array_equal(first(ids[:, :n]), second(ids[:, :n])), n
+
+
+def test_a_repack_from_another_version_is_converted_again(tiny):
+    mx = pytest.importorskip("mlx.core")
+    _, _, out = tiny
+    with open(os.path.join(out, "config.json")) as f:
+        cfg = json.load(f)
+    gguf_pack.load(out, cfg)
+    repack = os.path.join(out, gguf_pack._REPACK)
+    arrays, meta = mx.load(repack, return_metadata=True)
+    head = json.loads(meta[gguf_pack._REPACK_KEY])
+    head["version"] = gguf_pack._REPACK_VERSION + 1
+    mx.eval(arrays)                     # mx.load is lazy: read before overwriting
+    mx.save_safetensors(repack, arrays, metadata={gguf_pack._REPACK_KEY: json.dumps(head)})
+    assert gguf_pack._load_repack(out, cfg) is None
+    gguf_pack.load(out, cfg)
+    assert gguf_pack._load_repack(out, cfg) is not None
+
+
+def test_a_garbled_repack_is_converted_again(tiny):
+    pytest.importorskip("mlx.core")
+    _, _, out = tiny
+    with open(os.path.join(out, "config.json")) as f:
+        cfg = json.load(f)
+    with open(os.path.join(out, gguf_pack._REPACK), "wb") as f:
+        f.write(b"not a safetensors file")
+    assert gguf_pack.load(out, cfg) is not None
+    assert gguf_pack._load_repack(out, cfg) is not None
+
+
+def test_a_replaced_file_drops_the_old_repack(tiny, tmp_path):
+    """A new upstream revision gets a new directory; the old one's model-sized repack
+    can never load again, so the next save deletes it."""
+    pytest.importorskip("mlx.core")
+    _, _, out = tiny
+    with open(os.path.join(out, "config.json")) as f:
+        cfg = json.load(f)
+    gguf_pack.load(out, cfg)
+    old = os.path.join(out, gguf_pack._REPACK)
+    path = cfg["chad_gguf"]["file"]
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
+    new_dir = gguf_pack.materialize(path, cache_root=str(tmp_path / "cache"),
+                                    donor_dir=str(tmp_path / "donor"))
+    with open(os.path.join(new_dir, "config.json")) as f:
+        gguf_pack.load(new_dir, json.load(f))
+    assert not os.path.exists(old)
+    assert os.path.isfile(os.path.join(new_dir, gguf_pack._REPACK))
+    assert os.path.isfile(os.path.join(out, "config.json"))
+
+
+def test_the_config_names_a_transformers_version(tiny):
+    """Without one, transformers 5 takes the local tokenizer for a Mistral one with
+    a bad split regex and warns at every load."""
+    _, _, out = tiny
+    with open(os.path.join(out, "config.json")) as f:
+        assert json.load(f)["transformers_version"]

@@ -396,7 +396,10 @@ tokenizer come from a second, small repo, [`nathansutton/Qwen3.8-27B-DFlash2-MLX
 (1.2 GB, no target weights): the DFlash2 block drafter pre-quantized to 4-bit in
 `dflash/`, plus Qwen's tokenizer and a chat template that renders `reasoning_effort=medium`
 (the GGUF's own defaults to xhigh, and a byte-stable prompt is what keeps the prefix cache
-warm). Together the two downloads are ~14 GB, and nothing is built on first run.
+warm). Together the two downloads are ~14 GB. The first start converts the file into
+MLX arrays (the same blocks, in the same bytes) and saves them beside the model directory
+under `~/.cache/chad/gguf/`, another ~13 GB: that start takes ~75 s, every later one ~9 s.
+A new upstream revision of the file gets a new directory, and the stale copy is deleted.
 
 Any other Unsloth file of this model loads the same way — `--model ~/models/Qwen3.8-27B-UD-IQ3_XXS.gguf`
 for ~138k of context at 10.9 GB, or `--model unsloth/Qwen3.8-27B-GGUF/<file>.gguf` to have

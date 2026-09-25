@@ -203,6 +203,21 @@ def test_ensure_model_hub_gguf(monkeypatch, capsys, tmp_path):
     check("names the file", "Qwen3.8-27B-UD-Q3_K_XL.gguf" in err, err)
     check("states the size with the sidecar", "~14 GB" in err, err)
     check("a fresh fetch is not called a resume", "Resuming" not in err, err)
+    check("names the converted copy", "converted copy (~13 GB)" in err, err)
+
+
+def test_hub_gguf_preflight_counts_the_converted_copy(monkeypatch, capsys, tmp_path):
+    """The first start saves the converted model beside the pack, the file's size
+    again: room for the download alone is not room for the model."""
+    monkeypatch.chdir(tmp_path)
+    tight = cli.Host(cached_file=lambda repo, filename: None,
+                     free_disk_gb=lambda path: 20.0,          # > 14.4 + 2, < 14.4 + 13.2 + 2
+                     stdin_isatty=lambda: True, ask=_Terminal("n").ask)
+    with pytest.raises(SystemExit):
+        cli._ensure_model(cli._HF_MODEL, host=tight)
+    err = capsys.readouterr().err
+    check("refused before asking", "not enough free disk" in err, err)
+    check("names both parts", "converted copy in ~/.cache/chad" in err, err)
 
 
 def test_free_disk_gb():
