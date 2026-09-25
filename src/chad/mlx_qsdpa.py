@@ -1511,6 +1511,13 @@ def installed() -> bool:
     return lm_base.scaled_dot_product_attention is _patched_sdpa
 
 
+def prefill_sliced() -> bool:
+    """True when a prefill chunk's attention over a quantized cache runs in
+    PREFILL_Q_SLICE-row slices: the patch is in and the slice is not switched off.
+    What the context governor reads to pick its prefill-transient floor."""
+    return installed() and not config.flag("CHAD_NO_PREFILL_SLICE")
+
+
 def install(kernel_ok: Callable[[], bool] = kernel_healthy) -> bool:
     """Patch the QuantizedKVCache branch of mlx_lm's attention helper to use
     the fused kernels on eligible decode steps. Safe no-op on failure (import

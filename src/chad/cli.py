@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional, TypeVar
 
-from . import config, guardrails, levers
+from . import config, gguf_pack, guardrails, levers
 from .base_engine import BackendError
 from .diag import log
 
@@ -225,17 +225,28 @@ def _host_avail_bytes():
         return None
 
 
-# Prefill/decode scratch that is live at the same moment the KV cache is. It used to
-# climb with context to ~4.15 GB: a per-chunk copy of the whole quantized KV cache (the
-# OOM-rollback snapshot held the pre-chunk buffers, so no chunk could write in place)
-# plus the chunk's full attention score slab. With neither — no snapshot on a quantized
-# cache (`Engine._snapshot_cache_refs`) and attention in row slices (`mlx_qsdpa`) — it is
-# flat: measured on the 27B (IQ3_XXS GGUF, 8-bit KV, drafter resident, one load) at
-# 1.44 / 1.81 / 1.47 / 1.81 / 1.55 / 1.82 / 1.90 GB at 8k / 16k / 24k / 32k / 40k / 48k /
-# 64k. The floor sits just above the largest. Used as a floor only;
+# Prefill/decode scratch that is live at the same moment the KV cache is. Two floors,
+# because two load-time decisions set it. On a quantized cache no OOM-rollback snapshot
+# holds the pre-chunk buffers (`Engine._snapshot_cache_refs`), so chunks write in place
+# instead of copying the whole cache, and the fused-kernel patch runs a prefill chunk's
+# attention in row slices (`mlx_qsdpa`) instead of one score slab: with both, the
+# transient is flat — measured on the 27B (IQ3_XXS GGUF, 8-bit KV, drafter resident,
+# one load) at 1.44 / 1.81 / 1.47 / 1.81 / 1.55 / 1.82 / 1.90 GB at 8k / 16k / 24k /
+# 32k / 40k / 48k / 64k, and the floor sits just above the largest. Without either — an
+# fp16 cache (CHAD_KV_BITS=0, a shape the fused kernel does not cover), the patch absent
+# or CHAD_NO_PREFILL_SLICE — it climbs with context and saturates: 1.82 GB at 8k, 3.19
+# at 32k, 4.15 at 49k and 65k (27B, q3, 8-bit KV, snapshot on). Floors only:
 # `_compute_ctx_limit` prefers the live `peak - active` once a real prefill has been
 # through.
 PREFILL_TRANSIENT_BYTES = 2.0e9
+PREFILL_TRANSIENT_BYTES_UNSLICED = 4.3e9
+
+
+def prefill_transient_bytes(kv_bits, sliced):
+    """The transient floor a session gets: the flat one only when the cache is
+    quantized (`kv_bits`) AND prefill attention runs in slices (`sliced`); each alone
+    still leaves one of the two growing terms in place."""
+    return PREFILL_TRANSIENT_BYTES if kv_bits and sliced else PREFILL_TRANSIENT_BYTES_UNSLICED
 
 
 def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
@@ -285,8 +296,12 @@ def ram_aware_ctx_limit(eff_ctx, budget_bytes, active_bytes, kv_bytes_per_token,
         # branch sizes. Charging the transient here instead turns a guard meant to bite
         # only under real pressure into the primary constraint: measured right after a
         # 12.3 GB load the reclaimable band reads 3.9 GB (down from 11.4 — the weights
-        # just took it, and nothing has been reclaimed yet), and subtracting a multi-GB
-        # transient from that lands near the floor on a box with room to spare.
+        # just took it, and nothing has been reclaimed yet), and subtracting the
+        # transient from that would halve the window with the 2 GB floor and land on
+        # the 8192 floor with the 4.3 GB one, on a box with room to spare. Uncharged,
+        # that same stale reading may still trim the Metal window by a tenth right
+        # after load; the next live recheck reads the band again once the OS has
+        # reclaimed, and the window opens back up.
         usable = min(usable, host_avail_bytes * safety)
     if usable <= 0:
         return floor
@@ -312,20 +327,23 @@ def _compute_ctx_limit(eng):
             # does — otherwise the limit would shrink as the cache approaches it.
             active_floor = (mx.get_active_memory()
                             - eng.kv_bytes_per_token * eng.resident_tokens)
+            from . import mlx_qsdpa
+            transient = prefill_transient_bytes(eng.kv_bits, mlx_qsdpa.prefill_sliced())
             ctx_limit = ram_aware_ctx_limit(
                 eng.effective_ctx,
                 mx.device_info()["max_recommended_working_set_size"],
                 active_floor, eng.kv_bytes_per_token,
                 safety=_env_float("CHAD_CTX_SAFETY") or 0.975,
                 host_avail_bytes=_host_avail_bytes(),
-                slope_factor=_env_float("CHAD_CTX_SLOPE_FACTOR") or 1.0)
+                slope_factor=_env_float("CHAD_CTX_SLOPE_FACTOR") or 1.0,
+                transient_bytes=transient)
             # The governor sets the shape of the whole session and used to explain
             # nothing, which made a wrong pick indistinguishable from a tight box.
             log.info("GOVERNOR ctx_limit=%s | budget=%.2f GB active=%.2f GB "
                      "transient=%.2f GB host_avail=%.2f GB kv=%.0f B/tok",
                      f"{ctx_limit:,}" if ctx_limit else ctx_limit,
                      mx.device_info()["max_recommended_working_set_size"] / 1e9,
-                     active_floor / 1e9, PREFILL_TRANSIENT_BYTES / 1e9,
+                     active_floor / 1e9, transient / 1e9,
                      (_host_avail_bytes() or 0) / 1e9, eng.kv_bytes_per_token)
         except Exception:  # noqa: BLE001 — never let memory probing break startup
             ctx_limit = None
@@ -348,19 +366,23 @@ def peek_ctx_limit(model_id, window):
         import mlx.core as mx
 
         from .engine import peek_kv_footprint
-        kv_bpt, weights = peek_kv_footprint(model_id)
+        kv_bpt, weights, kv_bits = peek_kv_footprint(model_id)
         if not (kv_bpt and weights):
             return None
         # The weights are not resident yet, so the host's reclaimable band still counts
         # the pages they are about to take. Subtract them, or this reads the box as
-        # roomier than the session will ever see it.
+        # roomier than the session will ever see it. The fused-kernel patch is not
+        # installed yet either: it installs on every shape it picks 8-bit for, so the
+        # sliced floor is expected exactly when the cache will be quantized.
         avail = _host_avail_bytes()
+        sliced = bool(kv_bits) and not config.flag("CHAD_NO_PREFILL_SLICE")
         return ram_aware_ctx_limit(
             window, mx.device_info()["max_recommended_working_set_size"],
             weights, kv_bpt,
             safety=_env_float("CHAD_CTX_SAFETY") or 0.975,
             host_avail_bytes=max(0, avail - weights) if avail else None,
-            slope_factor=_env_float("CHAD_CTX_SLOPE_FACTOR") or 1.0)
+            slope_factor=_env_float("CHAD_CTX_SLOPE_FACTOR") or 1.0,
+            transient_bytes=prefill_transient_bytes(kv_bits, sliced))
     except Exception:  # noqa: BLE001 — never let a banner estimate break startup
         return None
 
@@ -454,7 +476,8 @@ def _resolve(local, repo):
     return local if os.path.isdir(local) else repo
 
 
-def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL):
+def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL,
+                materialize: Callable[[str], str] = gguf_pack.materialize):
     """Resolve the model id and a human label for *why* it was chosen.
 
     Order: explicit `--model` (`spec`) → CHAD_MODEL → the shipped default. There are no
@@ -472,11 +495,11 @@ def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL
     source = "--model" if spec is not None else "CHAD_MODEL"
     spec = spec or config.env_str("CHAD_MODEL")
     if spec and spec.strip().lower() != "auto":
-        if spec.endswith(".gguf") and os.path.isfile(spec):
+        gguf = gguf_pack.resolve_file(spec)
+        if gguf is not None:
             # A GGUF is one file; the engine reads a model directory. Build the
             # directory (config + tokenizer, no weights) once and load through it.
-            from . import gguf_pack
-            return gguf_pack.materialize(spec), f"GGUF file ({source} override)"
+            return materialize(gguf), f"GGUF file ({source} override)"
         return spec, f"explicitly requested ({source} override)"
     ram = host.ram_gb()
     if ram is None or ram < _MIN_RAM_GB:

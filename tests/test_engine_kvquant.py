@@ -259,6 +259,84 @@ def test_reserved_prefill_matches_growing_prefill(tiny):
     assert q.keys[0].shape[-2] >= len(ids)
 
 
+class _Flaky:
+    """The tiny model, failing its third 128-wide forward like a Metal OOM."""
+
+    def __init__(self, m):
+        self.m, self.calls = m, 0
+
+    def make_cache(self):
+        return self.m.make_cache()
+
+    def __call__(self, x, cache=None):
+        if x.shape[1] == 128:
+            self.calls += 1
+            if self.calls == 3:
+                raise RuntimeError("[METAL] Command buffer execution failed: "
+                                   "Insufficient Memory")
+        return self.m(x, cache=cache)
+
+
+def _flaky_engine(tiny, ids):
+    """A quantized-cache engine with ids[:40] resident, a model that OOMs on its
+    third 128-wide chunk, and a record of every `_reserve_kv` total asked for."""
+    eng = _loaded_engine(tiny, kv_bits=8)
+    eng._prefill(ids[:40], chunk=128)
+    eng._cached_ids = ids[:40]
+    eng.model = _Flaky(tiny)
+    totals: list[int] = []
+    reserve = eng._reserve_kv
+
+    def recording(total):
+        totals.append(total)
+        return reserve(total)
+
+    eng._reserve_kv = recording
+    return eng, totals
+
+
+def test_prefill_oom_replay_is_interruptible_and_reports_progress(tiny):
+    """The replay re-feeds the resident prefix whole (every caller's ledger is "prefix
+    plus the count returned"), then this call's own tokens under the caller's
+    should_stop: a stop there is a short count for the caller, with the prefix and
+    the replayed part in the cache. Progress walks back and climbs again on the
+    call's own scale rather than freezing for the duration."""
+    from chad import mlx_qsdpa
+    mlx_qsdpa.install()
+    ids = [int(t) for t in mx.random.randint(0, 200, (600,), key=mx.random.key(5)).tolist()]
+    flaky, _ = _flaky_engine(tiny, ids)
+    bound = flaky._cache
+    # Two 128-chunks pass, the third OOMs; the replay's fed half then runs two
+    # 64-chunks before the stop lands.
+    answers = iter([False] * 5 + [True] * 8)
+    progress: list[tuple[int, int]] = []
+    fed = flaky._prefill(ids[40:], should_stop=lambda: next(answers), chunk=128,
+                         on_progress=lambda d, n: progress.append((d, n)))
+    assert fed == 128 and flaky.model.calls == 3
+    assert flaky._cache is bound and flaky._cached_ids == ids[:40]
+    qkv = [c for c in flaky._cache if type(c) is cache_utils.QuantizedKVCache]
+    assert all(c.offset == 40 + fed for c in qkv)
+    assert all(n == 560 for _, n in progress)
+    done = [d for d, _ in progress]
+    assert done[:2] == [128, 256]                      # the two chunks before the OOM
+    replay = done[2:]
+    assert replay and replay == sorted(replay) and max(replay) < 256
+    # and the cache still works: the fed part is there to build on
+    assert flaky._prefill(ids[40 + fed:40 + fed + 8], chunk=8) == 8
+    assert all(c.offset == 48 + fed for c in qkv)
+
+
+def test_prefill_cancelled_before_it_starts_reserves_nothing(tiny):
+    """A call entered with should_stop already true must not pay the full-cache copy
+    that sizing the quantized buffers for a prompt it will never feed costs."""
+    from chad import mlx_qsdpa
+    mlx_qsdpa.install()
+    ids = list(range(1, 300))
+    eng, totals = _flaky_engine(tiny, ids)
+    assert eng._prefill(ids[40:], should_stop=lambda: True, chunk=64) == 0
+    assert totals == []
+
+
 def test_prefill_oom_on_a_quantized_cache_rebuilds_it(tiny):
     """A quantized cache takes no per-chunk snapshot (holding its buffers would make
     every chunk copy the whole cache), so a caught Metal OOM rebuilds it instead: the
@@ -268,30 +346,16 @@ def test_prefill_oom_on_a_quantized_cache_rebuilds_it(tiny):
     mlx_qsdpa.install()
     ids = [int(t) for t in mx.random.randint(0, 200, (600,), key=mx.random.key(5)).tolist()]
 
-    class Flaky:
-        """The tiny model, failing its third 128-wide forward like a Metal OOM."""
-
-        def __init__(self, m):
-            self.m, self.calls = m, 0
-
-        def make_cache(self):
-            return self.m.make_cache()
-
-        def __call__(self, x, cache=None):
-            if x.shape[1] == 128:
-                self.calls += 1
-                if self.calls == 3:
-                    raise RuntimeError("[METAL] Command buffer execution failed: "
-                                       "Insufficient Memory")
-            return self.m(x, cache=cache)
-
-    flaky = _loaded_engine(tiny, kv_bits=8)
-    flaky._prefill(ids[:40], chunk=128)
-    flaky._cached_ids = ids[:40]
-    flaky.model = Flaky(tiny)
+    flaky, totals = _flaky_engine(tiny, ids)
+    bound = flaky._cache                  # what generate/_generate_spec decode against
     assert flaky._snapshot_cache_refs() is None
     assert flaky._prefill(ids[40:], chunk=128) == len(ids) - 40
     assert flaky.model.calls >= 3 and flaky._cached_ids == ids[:40]
+    # Rebuilt inside the list the callers hold, not into a new one.
+    assert flaky._cache is bound
+    # The rebuilt cache was sized to what it held (the replay's own 296); the rest of
+    # the prompt is reserved again afterwards instead of growing chunk by chunk.
+    assert 296 in totals and totals[-1] == 600 and totals.index(296) < len(totals) - 1
     flaky.model = tiny
 
     # The rebuild replays the 40 cached + 256 fed tokens from scratch at the halved

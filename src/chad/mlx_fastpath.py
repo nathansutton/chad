@@ -272,8 +272,7 @@ def _patch_gdn_call() -> None:
             return stock_call(self, inputs, mask=mask, cache=cache)
         B, S, _ = inputs.shape
         if gguf:
-            qkv, z = _gguf_qkv_z(self, inputs)
-            b, a = mx.split(inputs @ self._gguf_ba.T, 2, axis=-1)
+            qkv, z, b, a = _gguf_gdn_projections(self)[0](inputs)
         elif hasattr(self, "_fused_signs"):
             # Prism: qkv|z share one rotation; b|a read the unrotated input. The
             # input arrives signed (folded into the layernorm), which is the
@@ -407,9 +406,10 @@ def _patch_layer_call() -> None:
 
 def _compile_gdn_step(layer):
     import mlx.core as mx
-    body = (_prism_gdn_body if hasattr(layer.linear_attn, "_fused_signs")
-            else _gdn_body)
-    return mx.compile(body(layer))
+    gd = layer.linear_attn
+    if hasattr(gd, "_fused_signs"):
+        return mx.compile(_prism_gdn_body(layer))
+    return mx.compile(_gdn_body(layer, *_affine_gdn_projections(gd)))
 
 
 def _compile_dense_step(layer):
@@ -444,9 +444,37 @@ def _dense_mlp_body(layer):
     return fwd
 
 
-def _gdn_body(layer):
+def _affine_gdn_projections(gd):
+    """`(project, out_proj)` of a GDN layer whose fused in_proj and out_proj are mlx
+    affine blocks: `project(inputs) -> (qkv, z, b, a)`, one quantized matmul split
+    four ways."""
+    import mlx.core as mx
+
+    fw, fs, fb = gd._fused_w, gd._fused_s, gd._fused_b
+    gs_, bits = gd._fused_gs, gd._fused_bits
+    conv_dim, value_dim, Hv = gd.conv_dim, gd.value_dim, gd.num_v_heads
+    op = gd.out_proj
+
+    def project(inputs):
+        big = mx.quantized_matmul(inputs, fw, scales=fs, biases=fb,
+                                  transpose=True, group_size=gs_, bits=bits)
+        return mx.split(big, [conv_dim, conv_dim + value_dim,
+                              conv_dim + value_dim + Hv], axis=-1)
+
+    def out_proj(x):
+        return mx.quantized_matmul(x, op.weight, scales=op.scales, biases=op.biases,
+                                   transpose=True, group_size=op.group_size,
+                                   bits=op.bits)
+
+    return project, out_proj
+
+
+def _gdn_body(layer, project, out_proj):
     """input_layernorm + full GDN forward + residual, UNCOMPILED, with explicit
-    (conv_state, recurrent_state) threading."""
+    (conv_state, recurrent_state) threading. `project(inputs) -> (qkv, z, b, a)` and
+    `out_proj(x)` are the layer's projections in whatever container the checkpoint
+    keeps them (mlx affine blocks, GGUF blocks); everything between them is the same
+    arithmetic."""
     import mlx.core as mx
     import mlx.nn as nn
     from mlx_lm.models.qwen3_5 import gated_delta_update
@@ -454,26 +482,19 @@ def _gdn_body(layer):
     gd = layer.linear_attn
     ln_w = layer.input_layernorm.weight
     ln_eps = layer.input_layernorm.eps
-    fw, fs, fb = gd._fused_w, gd._fused_s, gd._fused_b
-    gs_, bits = gd._fused_gs, gd._fused_bits
     conv_w = gd.conv1d.weight
     n_keep = gd.conv_kernel_size - 1
     A_log, dt_bias = gd.A_log, gd.dt_bias
     norm_w = gd.norm.weight
-    op = gd.out_proj
     Hk, Hv = gd.num_k_heads, gd.num_v_heads
     Dk, Dv = gd.head_k_dim, gd.head_v_dim
-    key_dim, value_dim, conv_dim = gd.key_dim, gd.value_dim, gd.conv_dim
+    key_dim, conv_dim = gd.key_dim, gd.conv_dim
     eps = gd.layer_norm_epsilon
 
     def fwd(xin, conv_state, rec_state):
         inputs = mx.fast.rms_norm(xin, ln_w, ln_eps)
         B, S, _ = inputs.shape
-        big = mx.quantized_matmul(inputs, fw, scales=fs, biases=fb,
-                                  transpose=True, group_size=gs_, bits=bits)
-        qkv, z, b, a = mx.split(
-            big, [conv_dim, conv_dim + value_dim,
-                  conv_dim + value_dim + Hv], axis=-1)
+        qkv, z, b, a = project(inputs)
         z = z.reshape(B, S, Hv, Dv)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
         new_conv = mx.contiguous(conv_input[:, -n_keep:, :])
@@ -489,11 +510,7 @@ def _gdn_body(layer):
         # RMSNormGated, matching stock's fp32 _precise_swiglu exactly
         xn = mx.fast.rms_norm(out, norm_w, eps)
         out = (nn.silu(z.astype(mx.float32)) * xn.astype(mx.float32)).astype(xin.dtype)
-        out = mx.quantized_matmul(out.reshape(B, S, -1), op.weight,
-                                  scales=op.scales, biases=op.biases,
-                                  transpose=True, group_size=op.group_size,
-                                  bits=op.bits)
-        return xin + out, new_conv, new_rec
+        return xin + out_proj(out.reshape(B, S, -1)), new_conv, new_rec
 
     return fwd
 
@@ -574,7 +591,7 @@ def _install_gguf(model) -> None:
             ba = mx.contiguous(mx.concatenate([b.weight, a.weight], axis=0))
             mx.eval(ba)
             gd._gguf_ba = ba
-            layer._gdn_fast = mx.compile(_gguf_gdn_body(layer))
+            layer._gdn_fast = mx.compile(_gdn_body(layer, *_gguf_gdn_projections(gd)))
         layer._mlp_fast = mx.compile(_gguf_mlp_body(layer))
     _patch_gdn_call()
     _patch_layer_call()
@@ -601,47 +618,20 @@ def _gguf_mlp_body(layer):
     return fwd
 
 
-def _gguf_gdn_body(layer):
+def _gguf_gdn_projections(gd):
+    """`(project, out_proj)` of a GDN layer in GGUF blocks: qkv|z from the fused
+    pair when the formats matched, else two matmuls; b|a from the small dense pair;
+    out_proj is the module itself."""
     import mlx.core as mx
-    import mlx.nn as nn
-    from mlx_lm.models.qwen3_5 import gated_delta_update
 
-    gd = layer.linear_attn
-    ln_w = layer.input_layernorm.weight
-    ln_eps = layer.input_layernorm.eps
     ba = gd._gguf_ba
-    conv_w = gd.conv1d.weight
-    n_keep = gd.conv_kernel_size - 1
-    A_log, dt_bias = gd.A_log, gd.dt_bias
-    norm_w = gd.norm.weight
-    op = gd.out_proj
-    Hk, Hv = gd.num_k_heads, gd.num_v_heads
-    Dk, Dv = gd.head_k_dim, gd.head_v_dim
-    key_dim, conv_dim = gd.key_dim, gd.conv_dim
-    eps = gd.layer_norm_epsilon
 
-    def fwd(xin, conv_state, rec_state):
-        inputs = mx.fast.rms_norm(xin, ln_w, ln_eps)
-        B, S, _ = inputs.shape
+    def project(inputs):
         qkv, z = _gguf_qkv_z(gd, inputs)
         b, a = mx.split(inputs @ ba.T, 2, axis=-1)
-        z = z.reshape(B, S, Hv, Dv)
-        conv_input = mx.concatenate([conv_state, qkv], axis=1)
-        new_conv = mx.contiguous(conv_input[:, -n_keep:, :])
-        conv_out = nn.silu(mx.conv1d(conv_input, conv_w, groups=conv_dim))
-        q, k, v = [t.reshape(B, S, h, d) for t, h, d in zip(
-            mx.split(conv_out, [key_dim, 2 * key_dim], -1),
-            [Hk, Hk, Hv], [Dk, Dk, Dv])]
-        inv_scale = Dk ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-        out, new_rec = gated_delta_update(q, k, v, a, b, A_log, dt_bias,
-                                          rec_state, None, use_kernel=True)
-        xn = mx.fast.rms_norm(out, norm_w, eps)
-        out = (nn.silu(z.astype(mx.float32)) * xn.astype(mx.float32)).astype(xin.dtype)
-        return xin + op(out.reshape(B, S, -1)), new_conv, new_rec
+        return qkv, z, b, a
 
-    return fwd
+    return project, gd.out_proj
 
 
 # ---------------------------------------------------------------- Prism packs

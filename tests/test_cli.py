@@ -388,22 +388,60 @@ def test_host_band_is_a_guard_not_the_primary_constraint():
     BUDGET, ACTIVE, KV = 19.07 * GB, 12.329 * GB, 34_816
     metal = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV)
     # Measured right after a 12.3 GB load the reclaimable band reads 3.9 GB — the weights
-    # took it and nothing has been reclaimed yet. The host branch must NOT bind there:
-    # it is a soft pressure signal the OS compresses around, so it sizes the resident KV
-    # cache only and never charges the short-lived prefill transient against it. Charging
-    # it there put a box with room to spare on the 8192 floor. (With the ~2 GB transient
-    # the Metal window is wide enough that the band may trim it a little here; what it
-    # must not do is collapse it.)
+    # took it and nothing has been reclaimed yet. The band is a soft pressure signal the
+    # OS compresses around, so it sizes the resident KV cache only and never charges the
+    # short-lived prefill transient against it: charging it there put a box with room to
+    # spare on the 8192 floor. The invariant is therefore "exactly the uncharged band, or
+    # the Metal window if that is smaller" — with the flat 2 GB transient the Metal
+    # window is the wider of the two here (122k against 110k), so the stale band trims
+    # it by about a tenth until the next live recheck. It binds, but lightly.
     just_loaded = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
                                           host_avail_bytes=3.936 * GB)
     uncharged = int(3.936 * GB * 0.975 / KV)
-    check("band right after load does not collapse the window",
-          just_loaded >= min(metal, uncharged - 2048) and just_loaded > 0.85 * metal,
-          (just_loaded, metal))
+    check("band right after load binds uncharged, if at all",
+          just_loaded == min(metal, uncharged), (just_loaded, metal, uncharged))
+    check("and binds lightly", 0.85 * metal <= just_loaded < metal, (just_loaded, metal))
+    # Charged, the same reading would halve it.
+    charged = int((3.936 * GB * 0.975 - cli.PREFILL_TRANSIENT_BYTES) / KV)
+    check("charging the transient to the band would halve the window",
+          charged < 0.5 * metal, (charged, metal))
     # It still bites when the box is genuinely oversubscribed by another process.
     squeezed = cli.ram_aware_ctx_limit(262144, BUDGET, ACTIVE, KV,
                                        host_avail_bytes=1.2 * GB)
     check("real pressure still binds", squeezed < metal, (squeezed, metal))
+
+
+def test_prefill_transient_floor_tracks_the_cache_mode():
+    """The flat floor was measured with BOTH mechanisms in — a quantized cache (no
+    per-chunk snapshot pinning the buffers) and sliced prefill attention. Each alone
+    leaves one growing term, so the governor must charge the tall floor for an fp16
+    cache (CHAD_KV_BITS=0, an uncovered shape) or unsliced attention."""
+    flat, tall = cli.PREFILL_TRANSIENT_BYTES, cli.PREFILL_TRANSIENT_BYTES_UNSLICED
+    check("floors are ordered", flat < tall, (flat, tall))
+    check("quantized + sliced -> flat", cli.prefill_transient_bytes(8, True) == flat)
+    check("fp16 cache -> tall", cli.prefill_transient_bytes(None, True) == tall)
+    check("explicit 0 -> tall", cli.prefill_transient_bytes(0, True) == tall)
+    check("unsliced attention -> tall", cli.prefill_transient_bytes(8, False) == tall)
+
+
+def test_pick_model_routes_a_gguf_file(monkeypatch, tmp_path):
+    """A `.gguf` path goes through gguf_pack.materialize, however it is spelled: with
+    a `~` and an upper-case suffix included. A path that is not a file falls through
+    as an ordinary explicit request rather than being materialized."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "m.GGUF").write_bytes(b"GGUF")
+    local = tmp_path / "local"
+    local.mkdir()
+    built = lambda path: "built:" + path  # noqa: E731 — the seam under test
+    model, why = cli._pick_model("~/m.GGUF", host=_host(8.0), local_model=str(local),
+                                 materialize=built)
+    check("tilde + upper-case suffix route to materialize",
+          model == "built:" + str(tmp_path / "m.GGUF"), model)
+    check("reason names the source", why == "GGUF file (--model override)", why)
+    missing = str(tmp_path / "missing.gguf")
+    model, why = cli._pick_model(missing, host=_host(8.0), local_model=str(local),
+                                 materialize=built)
+    check("a missing .gguf is an ordinary explicit request", model == missing, model)
 
 
 def test_host_avail_bytes():

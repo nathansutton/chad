@@ -64,13 +64,30 @@ REASONING_EFFORT_DEFAULT = "medium"
 
 # Bump when what `materialize()` writes changes (the derived config, the donor files):
 # it is part of the directory's name, so a stale directory is never reused.
-_SCHEMA = 1
+_SCHEMA = 2
 _KEY = "chad_gguf"
 
 
 def is_gguf_pack(config: dict) -> bool:
     """True for a model directory `materialize()` built around a GGUF file."""
     return _KEY in config
+
+
+def resolve_file(spec: str) -> Optional[str]:
+    """The absolute path of the GGUF file `spec` names, or None when it names anything
+    else (a model directory, an HF repo id, a path that is not there). `~` is expanded
+    and the suffix matched case-insensitively, so `--model ~/x.GGUF` routes here
+    instead of falling through to the hub as a repo id and failing there."""
+    path = os.path.expanduser(spec.strip())
+    if path.lower().endswith(".gguf") and os.path.isfile(path):
+        return os.path.abspath(path)
+    return None
+
+
+def file_size(config: dict) -> int:
+    """The GGUF file's size in bytes, from the stamp `materialize()` wrote: the weight
+    bytes of a model directory that has no safetensors to measure."""
+    return int(config[_KEY]["size"])
 
 
 @dataclass(frozen=True)
@@ -277,22 +294,33 @@ def row_order(p: Placement, g: Geometry, rows: int) -> Optional["np.ndarray"]:
 
 # ---------------------------------------------------------------- model directory
 
+def _place(src: str, dst: str) -> None:
+    """Copy `src` to `dst` through a private temp file and a rename, so `dst` is
+    never seen half-written by a process that builds the same directory at once."""
+    tmp = f"{dst}.{os.getpid()}.tmp"
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+
+
 def materialize(gguf_path: str, cache_root: Optional[str] = None,
                 donor_dir: Optional[str] = None) -> str:
     """Build (once) the model directory the engine loads a GGUF through; return it.
 
     The directory holds no weights: `config.json` names the GGUF file, and the
     tokenizer files come from `donor_dir` (default: the cached donor checkpoint).
-    The directory's name carries a hash of the file's path, size and mtime and of
-    `_SCHEMA`, because it is the engine's model id: warm-prefix checkpoints are keyed on
-    it, and a checkpoint of one file's hybrid cache must never load into another's (an
-    upload fixed under the same filename, a second copy elsewhere). Two processes
-    building it at once write identical bytes, and the config lands by rename."""
+    The directory's name carries a hash of the file's path, size and mtime (to the
+    nanosecond: a file replaced by one of the same size within the same second must
+    not be mistaken for it) and of `_SCHEMA`, because it is the engine's model id:
+    warm-prefix checkpoints are keyed on it, and a checkpoint of one file's hybrid
+    cache must never load into another's (an upload fixed under the same filename, a
+    second copy elsewhere). Two processes building it at once write identical bytes,
+    and every file lands by rename, the config last: a reader that finds the config
+    finds whole tokenizer files."""
     import gguf
 
     gguf_path = os.path.abspath(gguf_path)
     st = os.stat(gguf_path)
-    stamp = {"file": gguf_path, "size": st.st_size, "mtime": int(st.st_mtime),
+    stamp = {"file": gguf_path, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
              "schema": _SCHEMA}
     digest = hashlib.sha256(json.dumps(stamp, sort_keys=True).encode()).hexdigest()[:12]
     root = cache_root or os.path.join(os.path.expanduser("~/.cache/chad"), "gguf")
@@ -310,7 +338,7 @@ def materialize(gguf_path: str, cache_root: Optional[str] = None,
     for name in _TOKENIZER_FILES:
         src = os.path.join(donor_dir, name)
         if os.path.isfile(src):
-            shutil.copyfile(src, os.path.join(out, name))
+            _place(src, os.path.join(out, name))
     config = {
         "model_type": "qwen3_5",
         "architectures": ["Qwen3_5ForConditionalGeneration"],

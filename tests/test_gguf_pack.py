@@ -84,6 +84,20 @@ def test_an_unknown_tensor_raises_instead_of_dropping():
 
 def test_routing_predicate():
     assert gguf_pack.is_gguf_pack({"model_type": "qwen3_5", "chad_gguf": {"file": "x.gguf"}})
+
+
+def test_resolve_file_expands_and_casefolds(tmp_path, monkeypatch):
+    """The one resolver behind `--model` and the engine's model-id lookup: a `~` and
+    an upper-case suffix still name the file; a directory, a missing path or a repo
+    id do not, and fall through to the ordinary model-directory route."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "m.GGUF").write_bytes(b"GGUF")
+    (tmp_path / "dir.gguf").mkdir()
+    assert gguf_pack.resolve_file("~/m.GGUF") == str(tmp_path / "m.GGUF")
+    assert gguf_pack.resolve_file(str(tmp_path / "m.GGUF") + " ") == str(tmp_path / "m.GGUF")
+    assert gguf_pack.resolve_file(str(tmp_path / "dir.gguf")) is None
+    assert gguf_pack.resolve_file(str(tmp_path / "missing.gguf")) is None
+    assert gguf_pack.resolve_file("unsloth/Qwen3.8-27B-GGUF") is None
     assert not gguf_pack.is_gguf_pack({"model_type": "qwen3_5", "gguf": {"file": "x.gguf"}})
     assert not gguf_pack.is_gguf_pack({"model_type": "qwen3_5"})
 
@@ -305,8 +319,25 @@ def test_a_changed_file_gets_its_own_directory(tiny, tmp_path):
     assert again == out
     with open(path, "ab") as f:          # same name, different bytes
         f.write(b"\0" * 32)
+    grown = gguf_pack.materialize(path, cache_root=str(tmp_path / "cache"), donor_dir=donor)
+    assert grown != out
+    # Same size, same second, a nanosecond later: still a different file.
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
     assert gguf_pack.materialize(path, cache_root=str(tmp_path / "cache"),
-                                 donor_dir=donor) != out
+                                 donor_dir=donor) not in (out, grown)
+
+
+def test_materialize_leaves_whole_files_only(tiny):
+    """Every file lands by rename, so a directory whose config exists holds no
+    half-written tokenizer file and no temp file."""
+    _, _, out = tiny
+    names = sorted(os.listdir(out))
+    assert not [n for n in names if n.endswith(".tmp")], names
+    assert {"config.json", "tokenizer.json", "tokenizer_config.json"} <= set(names)
+    with open(os.path.join(out, "config.json")) as f:
+        cfg = json.load(f)
+    assert gguf_pack.file_size(cfg) == os.path.getsize(cfg["chad_gguf"]["file"])
 
 
 def test_materialize_needs_a_tokenizer(tiny, tmp_path):

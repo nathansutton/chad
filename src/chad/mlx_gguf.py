@@ -403,24 +403,27 @@ class _MetalKernel(Protocol):
                  output_dtypes: list["mx.Dtype"]) -> list["mx.array"]: ...
 
 
-_kernels: dict[int, _MetalKernel] = {}
+_kernels: dict[tuple[str, int], _MetalKernel] = {}
 
 
-def _kernel(qtype: int) -> _MetalKernel:
-    k = _kernels.get(qtype)
+def _kernel(tag: str, src: str, input_names: list[str], qtype: int) -> _MetalKernel:
+    """The memoized kernel for one (body, format) pair: `src` with its ``DEQ``
+    placeholder bound to the format's decoder, over the shared header."""
+    key = (tag, qtype)
+    k = _kernels.get(key)
     if k is None:
         import mlx.core as mx
         fmt = FORMATS[qtype]
         # SAFETY: the stub types metal_kernel's result as a bare object; it is the
         # keyword-called kernel _MetalKernel describes.
         k = cast(_MetalKernel, mx.fast.metal_kernel(
-            name=f"chad_gguf_deq_{fmt.name.lower()}",
-            input_names=["w"],
+            name=f"chad_gguf_{tag}_{fmt.name.lower()}",
+            input_names=input_names,
             output_names=["out"],
-            source=_SRC.replace("DEQ", fmt.deq_fn),
+            source=src.replace("DEQ", fmt.deq_fn),
             header=metal_header(),
         ))
-        _kernels[qtype] = k
+        _kernels[key] = k
     return k
 
 
@@ -442,7 +445,7 @@ def dequantize(w: "mx.array", qtype: int, k: int, dtype: "mx.Dtype") -> "mx.arra
         raise ValueError(f"expected uint8 [R, {rb}] for {FORMATS[qtype].name}, "
                          f"got {w.dtype} {tuple(w.shape)}")
     chunks = k // 32
-    (out,) = _kernel(qtype)(
+    (out,) = _kernel("deq", _SRC, ["w"], qtype)(
         inputs=[w],
         template=[("T", dtype), ("KD", k), ("ROWB", rb)],
         output_shapes=[(rows, k)], output_dtypes=[dtype],
@@ -578,48 +581,6 @@ _MM_SRC = r"""
     }
 """
 
-_mm_kernels: dict[int, _MetalKernel] = {}
-
-
-def _mm_kernel(qtype: int) -> _MetalKernel:
-    k = _mm_kernels.get(qtype)
-    if k is None:
-        import mlx.core as mx
-        fmt = FORMATS[qtype]
-        # SAFETY: the stub types metal_kernel's result as a bare object; it is the
-        # keyword-called kernel _MetalKernel describes.
-        k = cast(_MetalKernel, mx.fast.metal_kernel(
-            name=f"chad_gguf_mm_{fmt.name.lower()}",
-            input_names=["x", "w"],
-            output_names=["out"],
-            source=_MM_SRC.replace("DEQ", fmt.deq_fn),
-            header=metal_header(),
-        ))
-        _mm_kernels[qtype] = k
-    return k
-
-
-_mv_kernels: dict[int, _MetalKernel] = {}
-
-
-def _mv_kernel(qtype: int) -> _MetalKernel:
-    k = _mv_kernels.get(qtype)
-    if k is None:
-        import mlx.core as mx
-        fmt = FORMATS[qtype]
-        # SAFETY: the stub types metal_kernel's result as a bare object; it is the
-        # keyword-called kernel _MetalKernel describes.
-        k = cast(_MetalKernel, mx.fast.metal_kernel(
-            name=f"chad_gguf_mv_{fmt.name.lower()}",
-            input_names=["x", "w"],
-            output_names=["out"],
-            source=_MV_SRC.replace("DEQ", fmt.deq_fn),
-            header=metal_header(),
-        ))
-        _mv_kernels[qtype] = k
-    return k
-
-
 def matmul(x: "mx.array", w: "mx.array", qtype: int, k: int) -> "mx.array":
     """``x @ W.T`` for a GGUF weight ``w`` (uint8 ``[N, row_bytes]`` of ``k``-value
     rows); ``x`` is ``[..., k]`` and the result ``[..., N]`` in x's dtype."""
@@ -634,7 +595,7 @@ def matmul(x: "mx.array", w: "mx.array", qtype: int, k: int) -> "mx.array":
         xh = mx.clip(x2.astype(mx.float32), -65504.0, 65504.0).astype(mx.float16)
         if m < 8 * mt:
             xh = mx.pad(xh, [(0, 8 * mt - m), (0, 0)])
-        (out,) = _mm_kernel(qtype)(
+        (out,) = _kernel("mm", _MM_SRC, ["x", "w"], qtype)(
             inputs=[xh, w],
             template=[("T", x.dtype), ("MM", m), ("MT", mt), ("NSG", _MM_SG), ("KD", k),
                       ("ND", n), ("ROWB", row_bytes(qtype, k))],
@@ -645,7 +606,7 @@ def matmul(x: "mx.array", w: "mx.array", qtype: int, k: int) -> "mx.array":
         return out.reshape(*lead, n)
     if m <= MV_MAX_M:
         rows_per_tg = _MV_ROWS * _MV_SG
-        (out,) = _mv_kernel(qtype)(
+        (out,) = _kernel("mv", _MV_SRC, ["x", "w"], qtype)(
             inputs=[x2, w],
             template=[("T", x.dtype), ("MM", m), ("NR", _MV_ROWS), ("NSG", _MV_SG),
                       ("KD", k), ("ND", n), ("ROWB", row_bytes(qtype, k))],

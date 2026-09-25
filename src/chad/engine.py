@@ -107,9 +107,10 @@ def _local_path(model_id: str) -> str:
     passes through unchanged; the uncached case is downloaded by `cli._ensure_model`
     before `load()` runs, so by then it's a cache hit here too. A `.gguf` file resolves
     to the model directory gguf_pack builds around it."""
-    if model_id.endswith(".gguf") and os.path.isfile(model_id):
-        from . import gguf_pack
-        return gguf_pack.materialize(model_id)
+    from . import gguf_pack
+    gguf = gguf_pack.resolve_file(model_id)
+    if gguf is not None:
+        return gguf_pack.materialize(gguf)
     if os.path.isdir(model_id):
         return model_id
     try:
@@ -146,8 +147,8 @@ def peek_context_window(model_id: str, max_context: Optional[int] = None) -> Opt
 
 
 def peek_kv_footprint(model_id: str) -> tuple:
-    """`(kv_bytes_per_token, weight_bytes)` from `config.json` plus the on-disk weight
-    file sizes alone — no weights loaded, no MLX allocation. These are the two model-side
+    """`(kv_bytes_per_token, weight_bytes, kv_bits)` from `config.json` plus the on-disk
+    weight file sizes alone — no weights loaded, no MLX allocation. These are the two model-side
     inputs the RAM governor needs, so the startup banner can state the window the box
     will ACTUALLY give this session instead of advertising a native window it cannot
     hold. Both are re-derived exactly once the weights are in (the measured
@@ -157,13 +158,15 @@ def peek_kv_footprint(model_id: str) -> tuple:
     Only the attention layers grow with context — on the hybrid checkpoints most layers
     are `linear_attention` and hold a fixed recurrent state — so the per-token cost is
     `n_full_attention * n_kv_heads * head_dim * 2 (K+V)`, at the width `_resolve_kv_bits`
-    will pick for this shape. Returns `(None, None)` if the config or the weight files
-    can't be read locally, which puts the caller back on the model window."""
+    will pick for this shape; `kv_bits` is that width (0 for the fp16 cache), which
+    also decides the prefill transient the governor charges. Returns `(None, None,
+    None)` if the config or the weight files can't be read locally, which puts the
+    caller back on the model window."""
     try:
         import glob
         import json
 
-        from . import mlx_qsdpa
+        from . import gguf_pack, mlx_qsdpa
         path = _local_path(model_id)
         cfg_path = os.path.join(path, "config.json")
         if not os.path.isfile(cfg_path):
@@ -186,7 +189,7 @@ def peek_kv_footprint(model_id: str) -> tuple:
         if not head_dim and n_q and tc.get("hidden_size"):
             head_dim = int(tc["hidden_size"]) // n_q
         if not (n_full and n_kv and head_dim):
-            return None, None
+            return None, None, None
         # Mirror _resolve_kv_bits: 8-bit group-64 exactly when the fused decode kernel
         # covers the shape, else the fp16 cache. Read from the same `covers` predicate so
         # the estimate cannot drift from the decision — but WITHOUT `mlx_qsdpa.install()`,
@@ -203,11 +206,15 @@ def peek_kv_footprint(model_id: str) -> tuple:
         else:
             per_head = head_dim * 2    # fp16 cache
         kv_bpt = n_full * n_kv * per_head * 2      # K and V
-        weights = sum(os.path.getsize(f)
-                      for f in glob.glob(os.path.join(path, "*.safetensors")))
-        return kv_bpt, (weights or None)
+        if gguf_pack.is_gguf_pack(cfg):
+            # One file of llama.cpp blocks, named by the config: nothing to glob.
+            weights = gguf_pack.file_size(cfg)
+        else:
+            weights = sum(os.path.getsize(f)
+                          for f in glob.glob(os.path.join(path, "*.safetensors")))
+        return kv_bpt, (weights or None), bits
     except Exception:  # noqa: BLE001 — an estimate for a banner is never worth a crash
-        return None, None
+        return None, None, None
 
 
 def prompt_lookup_draft(context, num_draft, ngram_max=3, ngram_min=1):
@@ -1278,20 +1285,46 @@ class Engine:
             for k, v in d.items():
                 setattr(c, k, list(v) if isinstance(v, list) else v)
 
-    def _replay_after_oom(self, fed: list, chunk: int) -> None:
+    def _replay_after_oom(self, fed: list, chunk: int, should_stop=None,
+                          report=None) -> int:
         """Rebuild the cache after a Metal OOM inside a prefill chunk that had no
-        snapshot to roll back to: reset it and re-feed every token it held before the
-        chunk — the cached prefix plus this call's fed part — at the reduced chunk
-        size, then put back the bookkeeping the reset clears. The rebuilt contents are
-        the ones the failed chunk started from, so the turn-boundary rewind point is
-        still valid. Slow (a full re-prefill) and meant to be rare: the transient it
-        replaces the snapshot for was the thing most likely to cause the OOM."""
-        cached, rewind = list(self._cached_ids), self._rewind_snap
-        self._reset_cache()
-        self._prefill(cached + fed, chunk=chunk)
-        self._cached_ids, self._rewind_snap = cached, rewind
+        snapshot to roll back to; returns how many of `fed` are back in it.
 
-    def _reserve_kv(self, total: int) -> None:
+        The cache objects are rebuilt INSIDE the existing list: callers bind
+        `self._cache` before `_prefill` (generate's `prompt_cache`, the speculative
+        loop's `mc`) and decode against that binding afterwards, so a fresh list would
+        leave them on the poisoned one. The resident prefix (`_cached_ids`) is re-fed
+        first and not interruptibly — every caller reconciles its ledger as "prefix
+        plus the count returned", so the prefix must be whole when this returns.
+        `fed`, this call's own tokens before the failed chunk, follows under
+        `should_stop`, and a short count here is a short count for the caller.
+        `report(done)`, if given, gets the replay's progress on `fed`'s scale, so a
+        caller's progress bar walks back and climbs again instead of freezing. Both
+        halves run at the reduced chunk. The rewind point the reset clears goes back
+        as it was: the rebuilt contents are the ones it was taken over. The drafter's
+        tap is overwritten by every forward and drained only by `on_chunk`, which the
+        replay never fires, so its context stays whole too. Slow (a full re-prefill)
+        and meant to be rare: the transient the missing snapshot removes was the thing
+        most likely to have caused the OOM."""
+        cached, rewind, cache = list(self._cached_ids), self._rewind_snap, self._cache
+        self._reset_cache()
+        cache[:] = self._cache
+        self._cache = cache
+        total = max(1, len(cached) + len(fed))
+
+        def scaled(base: int):
+            if report is None:
+                return None
+            return lambda done, _total: report((base + done) * len(fed) // total)
+
+        if cached:
+            self._prefill(cached, chunk=chunk, on_progress=scaled(0))
+        self._cached_ids = cached
+        done = self._prefill(fed, should_stop, chunk=chunk, on_progress=scaled(len(cached)))
+        self._cached_ids, self._rewind_snap = cached, rewind
+        return done
+
+    def _reserve_kv(self, total: int) -> bool:
         """Grow each quantized attention cache's buffers to hold `total` positions in
         one step, a layer at a time.
 
@@ -1302,9 +1335,15 @@ class Engine:
         context token on the 27B — the cache's own 34,816 B/token. Reserving the
         prompt's final size once leaves every later chunk writing in place. The
         buffers keep mlx-lm's own shape (capacity rounded up to its step, positions
-        past `offset` zero), which is the state it already leaves between steps."""
+        past `offset` zero), which is the state it already leaves between steps.
+        False while a quantized layer has no buffers yet (a cold cache before its
+        first chunk), so the caller asks again once it has."""
+        sized = True
         for c in self._cache or []:
-            if type(c) is not cache_utils.QuantizedKVCache or c.keys is None:
+            if type(c) is not cache_utils.QuantizedKVCache:
+                continue
+            if c.keys is None:
+                sized = False
                 continue
             if total <= c.keys[0].shape[-2]:
                 continue
@@ -1318,6 +1357,7 @@ class Engine:
             c.keys = tuple(grow(x) for x in c.keys)
             c.values = tuple(grow(x) for x in c.values)
             mx.eval(c.keys, c.values)
+        return sized
 
     def _prefill(self, ids: list, should_stop=None, chunk: Optional[int] = None,
                  on_progress=None, on_chunk=None) -> int:
@@ -1331,7 +1371,8 @@ class Engine:
         free band (see `_adaptive_chunk`). A Metal OOM inside a chunk (catchable on
         mlx>=0.32) rolls the cache back to the pre-chunk snapshot, drops the scratch
         pool, and retries at half the size — turning the old process-killing spike
-        into a slower-but-alive step.
+        into a slower-but-alive step. A quantized cache takes no snapshot and is
+        rebuilt instead (`_replay_after_oom`), inside the same list object.
 
         on_progress(done, total), if given, fires once per chunk with the tokens fed
         so far (monotonic, ending at `total` on a clean pass) so a caller can show a
@@ -1349,13 +1390,16 @@ class Engine:
             chunk = config.env_int("CHAD_PREFILL_CHUNK", 0) or None
         kv_base = len(self._cached_ids)
         oom_cap: Optional[int] = None  # halved on each caught Metal OOM
-        # A cold cache has no buffers to size until its first chunk has run.
-        self._reserve_kv(kv_base + n)
-        reserved = False
+        reserved = False               # quantized caches sized for the whole prompt
         i = 0
         while i < n:
             if should_stop and should_stop():
                 break
+            # After the stop check, so a call cancelled before it starts pays no
+            # full-cache copy; asked again until a cold cache's first chunk has given
+            # it buffers to size.
+            if not reserved:
+                reserved = self._reserve_kv(kv_base + n)
             step = chunk if chunk else self._adaptive_chunk(kv_base + i)
             if oom_cap:
                 step = min(step, oom_cap)
@@ -1372,8 +1416,12 @@ class Engine:
                     mx.clear_cache()
                     log.warning("PREFILL Metal OOM at %d/%d (kv=%d): rebuilding the "
                                 "cache with chunk=%d", i, n, kv_base + i, oom_cap)
-                    self._replay_after_oom(ids[:i], oom_cap)
-                    mc = self._cache           # the rebuild replaced the cache object
+                    done = self._replay_after_oom(
+                        ids[:i], oom_cap, should_stop,
+                        (lambda d: on_progress(d, n)) if on_progress else None)
+                    reserved = False       # the rebuilt cache is sized to what it holds
+                    if done < i:           # interrupted inside the replay
+                        return done
                     continue
                 self._restore_cache_refs(snap)
                 mx.clear_cache()
@@ -1381,9 +1429,6 @@ class Engine:
                             "chunk=%d", i, n, kv_base + i, oom_cap)
                 continue
             i += step
-            if not reserved:
-                self._reserve_kv(kv_base + n)
-                reserved = True
             if on_chunk:
                 on_chunk()
             if on_progress:
