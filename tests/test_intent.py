@@ -16,7 +16,13 @@ import tempfile
 import pytest
 
 from chad.agent import _has_open_tool_call, expand_mentions
-from chad.prompt import _detect_test_command, build_system_prompt, classify_intent
+from chad.prompt import (
+    _detect_test_command,
+    build_system_prompt,
+    classify_intent,
+    instructions_notice,
+    project_instructions,
+)
 
 PASS = 0
 FAIL = 0
@@ -222,6 +228,105 @@ def test_non_utf8_project_docs_dont_crash(tmp_path, monkeypatch):
     check("latin-1 doc surfaced (bytes replaced, not crashed)", "Guide" in prompt)
 
 
+def _write(name, text):
+    with open(name, "w") as f:
+        f.write(text)
+
+
+def test_project_instructions_prompt_bytes_pinned(tmp_path, monkeypatch):
+    # The rendered prompt is checkpointed and reused across sessions, so the section
+    # an ordinary project's instructions produce must not move by a byte.
+    monkeypatch.chdir(tmp_path)
+    _write("CLAUDE.md", "x" * 5000)
+    prompt = build_system_prompt()
+    assert prompt.endswith("\n# Project instructions (CLAUDE.md)\n" + "x" * 4000)
+
+
+def test_project_instructions_none(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    check("no file -> None", project_instructions() is None)
+
+
+def test_project_instructions_short_claude_md(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write("CLAUDE.md", "Use tabs.")
+    doc = project_instructions()
+    check("CLAUDE.md read", doc is not None and doc.fname == "CLAUDE.md", doc)
+    check("not truncated", doc is not None and doc.truncated is False, doc)
+    check("nothing ignored", doc is not None and doc.ignored == (), doc)
+
+
+def test_project_instructions_long_agents_md(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write("AGENTS.md", "y" * 4631)
+    doc = project_instructions()
+    assert doc is not None
+    check("length before the cut", doc.chars == 4631, doc.chars)
+    check("cut at the cap", len(doc.text) == 4000, len(doc.text))
+    check("reported as truncated", doc.truncated is True)
+
+
+def test_project_instructions_both_present(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write("CLAUDE.md", "Claude rules.")
+    _write("AGENTS.md", "Agent rules.")
+    doc = project_instructions()
+    assert doc is not None
+    check("CLAUDE.md comes first", doc.fname == "CLAUDE.md", doc.fname)
+    check("AGENTS.md reported ignored", doc.ignored == ("AGENTS.md",), doc.ignored)
+
+
+def test_project_instructions_empty_first_file_skipped(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write("CLAUDE.md", "")
+    _write("AGENTS.md", "Rules.")
+    doc = project_instructions()
+    assert doc is not None
+    check("empty CLAUDE.md does not hide AGENTS.md", doc.fname == "AGENTS.md", doc.fname)
+    check("AGENTS.md text read", doc.text == "Rules.", doc.text)
+
+
+def test_project_instructions_whitespace_first_file_skipped(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write("CLAUDE.md", "\n \n")
+    _write("AGENTS.md", "Rules.")
+    doc = project_instructions()
+    check("whitespace-only CLAUDE.md skipped", doc is not None and doc.fname == "AGENTS.md",
+          doc)
+
+
+def test_empty_claude_md_prompt_uses_agents_md(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write("CLAUDE.md", "")
+    _write("AGENTS.md", "Rules.")
+    check("AGENTS.md reaches the prompt",
+          "# Project instructions (AGENTS.md)" in build_system_prompt())
+
+
+def test_instructions_notice_none(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    check("no file -> no lines", instructions_notice() == [])
+
+
+def test_instructions_notice_truncated(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write("AGENTS.md", "y" * 4631)
+    lines = instructions_notice()
+    check("one line", len(lines) == 1, lines)
+    check("names both lengths", "4,000" in lines[0] and "4,631" in lines[0], lines)
+    check("says what the model misses", "not seen by the model" in lines[0], lines)
+
+
+def test_instructions_notice_ignored_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write("CLAUDE.md", "Claude rules.")
+    _write("AGENTS.md", "Agent rules.")
+    lines = instructions_notice()
+    check("two lines", len(lines) == 2, lines)
+    check("second names the ignored file", "AGENTS.md is present and ignored" in lines[1],
+          lines)
+
+
 def test_plan_prefix():
     """Plan mode must ANSWER a question in prose, not manufacture a plan file (the
     '84-line plan for a 3-sentence tour' regression); a real change request still gets
@@ -324,7 +429,18 @@ if __name__ == "__main__":
     test_run_intent()
     test_open_tool_call()
     for test in (test_mentions, test_detect_test_command,
-                 test_non_utf8_project_docs_dont_crash):
+                 test_non_utf8_project_docs_dont_crash,
+                 test_project_instructions_prompt_bytes_pinned,
+                 test_project_instructions_none,
+                 test_project_instructions_short_claude_md,
+                 test_project_instructions_long_agents_md,
+                 test_project_instructions_both_present,
+                 test_project_instructions_empty_first_file_skipped,
+                 test_project_instructions_whitespace_first_file_skipped,
+                 test_empty_claude_md_prompt_uses_agents_md,
+                 test_instructions_notice_none,
+                 test_instructions_notice_truncated,
+                 test_instructions_notice_ignored_file):
         with tempfile.TemporaryDirectory() as d, pytest.MonkeyPatch.context() as mp:
             test(pathlib.Path(d), mp)
     test_plan_prefix()

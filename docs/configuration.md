@@ -14,13 +14,17 @@ names in the **working directory**, in this order:
 | 1     | `CLAUDE.md` |
 | 2     | `AGENTS.md` |
 
-**The first one that exists wins, and that is the only one read.** `CLAUDE.md` shadows
-`AGENTS.md`; they are never merged, and a repo that carries both is only using the first.
-Only the working directory is searched — not parent directories, not `~` — so the file
-you get is the one belonging to the project you launched chad in.
+**The first one with content wins, and that is the only one read.** An empty or
+whitespace-only file is skipped, so an empty `CLAUDE.md` does not hide the `AGENTS.md`
+beside it. Otherwise `CLAUDE.md` shadows `AGENTS.md`; they are never merged, and a repo
+that carries both is only using the first — chad says so at startup. Only the working
+directory is searched — not parent directories, not `~` — so the file you get is the one
+belonging to the project you launched chad in.
 
-The first **4000 characters** are used and the rest is dropped silently, so put what
-matters at the top. The text is appended to the system prompt under a
+The first **4,000 characters** are used and the rest is dropped, so put what matters at
+the top. At startup chad prints which file it read, and when the file is longer than the
+cap, how much of it the model sees. The file is read when a session starts: an edit made
+during a session applies after `/reset` or in the next session. The text is appended to the system prompt under a
 `# Project instructions (<filename>)` heading, below the cache boundary with the other
 per-project context (working directory, workspace listing). That placement is the whole
 cost story: the static half of the prompt stays byte-identical across projects and keeps
@@ -30,11 +34,13 @@ checkpoint — not re-sent on every turn.
 
 **`/init` writes one for you.** It orients itself with `bash`, reads whichever of
 `README` / `pyproject.toml` / `package.json` / `go.mod` / `Cargo.toml` / `Makefile` exist,
-and writes a concise `CLAUDE.md` — an overview, the main components, the *actual*
+and writes a concise instructions file — an overview, the main components, the *actual*
 build/run/test commands copied out of the config it read, and any conventions worth
-noting. If a `CLAUDE.md` is already there it reads and improves it rather than clobbering
-it. The file is an ordinary write, so it goes through the usual confirmation in `normal`
-mode.
+noting. It writes the instructions file the project already has, so a project that uses
+`AGENTS.md` gets its `AGENTS.md` improved rather than a new `CLAUDE.md` that would shadow
+it; only when there is neither does it write `CLAUDE.md`. An existing file is read and
+improved rather than clobbered. The file is an ordinary write, so it goes through the
+usual confirmation in `normal` mode, and like any edit it applies after `/reset`.
 
 ## Agent Skills (agentskills.io)
 

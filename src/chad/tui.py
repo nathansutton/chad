@@ -52,9 +52,10 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
 from . import config, guardrails
-from .agent import INIT_PROMPT, MODE_LABEL, Agent
+from .agent import INIT_RELOAD_NOTICE, MODE_LABEL, Agent, init_prompt, init_target
 from .base_engine import BaseEngine
 from .ignore import IGNORE_DIRS
+from .prompt import instructions_notice
 from .render import (
     C_RST,
     C_YEL,
@@ -1259,9 +1260,11 @@ class TUI:
                                f"· mode {self.agent.mode}")
             return False
         if text == "/init":
-            self._queue.append(INIT_PROMPT)
-            self._emit("user", "/init — analyzing the project to write CLAUDE.md"
+            target = init_target()
+            self._queue.append(init_prompt(target))
+            self._emit("user", f"/init — analyzing the project to write {target}"
                        + ("   (queued)" if self._busy else ""))
+            self._emit("info", INIT_RELOAD_NOTICE)
             self._wake.set()
             return False
         if text == "/skills":
@@ -1473,6 +1476,8 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
         with self._lock:
             self._pending.append("\n" + art + "\n")
         self._emit("info", "shift-tab for modes · /help")
+        for ln in instructions_notice():
+            self._emit("info", ln)
         self._emit_first_task_hint()
         if self._finalize is not None:
             self._emit("info", f"loading {self.engine.model_id.split('/')[-1]}… "
