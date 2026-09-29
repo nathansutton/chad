@@ -78,6 +78,30 @@ def _env_float(name):
     return float(val) if val else None
 
 
+# The knobs that size memory. A value that does not parse must stop the run before any
+# weights load: read lazily, the same typo is either a traceback or — inside the
+# governor's probe guard — a silent fall back to a window the box cannot hold.
+_STRICT_INTS = ("CHAD_MAX_CONTEXT", "CHAD_KV_BITS", "CHAD_KV_CACHE_MAX_GB",
+                "CHAD_CTX_LIMIT")
+_STRICT_FLOATS = ("CHAD_CTX_SAFETY", "CHAD_CTX_SLOPE_FACTOR")
+
+
+def _check_numeric_env() -> None:
+    """Exit with problem / cause / fix if a memory-sizing knob is set to a non-number."""
+    for names, parse, kind in ((_STRICT_INTS, _env_int, "a whole number"),
+                               (_STRICT_FLOATS, _env_float, "a number")):
+        for name in names:
+            try:
+                parse(name)
+            except ValueError:
+                sys.stderr.write(
+                    f"chad: {name} is not {kind}\n"
+                    f"  cause: {name}={os.environ.get(name)!r}\n"
+                    f"  fix:   unset it, or set it to {kind} "
+                    f"(for example {name}={'131072' if parse is _env_int else '0.9'}).\n")
+                sys.exit(1)
+
+
 # Qwen3.8's two published sampling recipes. The model card gives DIFFERENT settings
 # per mode, and the difference is not cosmetic: non-thinking mode has no reasoning
 # block to absorb a loop, so the card calls for a presence penalty ("adjust
@@ -816,9 +840,16 @@ def _levers_parser():
 
 def _run_levers():
     """No _preflight and no model: an ablation driver enumerating levers should not need
-    an Apple-Silicon box or a loadable model just to read the registry."""
-    print(json.dumps({"levers": levers.as_dict(),
-                      "active": levers.active()}, indent=2))
+    an Apple-Silicon box or a loadable model just to read the registry. The registry
+    prints even when CHAD_DISABLE is wrong — this is the command a mistyped name sends
+    people to."""
+    try:
+        active = levers.active()
+    except levers.UnknownLever as e:
+        print(json.dumps({"levers": levers.as_dict(), "active": None}, indent=2))
+        sys.stderr.write(f"chad: {e}\n")
+        return 1
+    print(json.dumps({"levers": levers.as_dict(), "active": active}, indent=2))
     return 0
 
 
@@ -884,6 +915,7 @@ def _main(argv, host, load_backend):
     except levers.UnknownLever as e:
         sys.stderr.write(f"chad: {e}\n")
         sys.exit(1)
+    _check_numeric_env()
     _preflight(args.backend, host=host)  # Apple Silicon only for MLX; remote runs anywhere
     # --think-budget reaches the TUI/REPL Agents through the same env knob
     # their __init__ reads, so the flag works on every entrypoint, not just headless.

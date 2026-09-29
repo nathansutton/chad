@@ -2,7 +2,7 @@
 
 Typed accessors so every flag parses env the same way, and one place docs/tests can point
 at (the substrate the docs drifted away from). The int/float helpers fold in
-the lenient-parse contract used in `agent.py`: a non-numeric value warns and degrades
+the lenient-parse contract used in `agent.py`: a non-numeric value says so once on stderr and degrades
 to the default instead of raising, so a typo in a budget knob can't abort startup.
 
 Callers that resolve a value ONCE at import for hot-loop reasons keep doing so
@@ -14,8 +14,11 @@ per-call path unless the caller chooses to; these are thin wrappers, not a live 
 import logging
 import os
 import shutil
+import sys
 
 log = logging.getLogger("chad")  # same named logger as diag.log; no chad-module imports
+
+_warned: set[str] = set()
 
 
 def flag(name: str) -> bool:
@@ -75,7 +78,7 @@ def env_str(name, default=None):
 
 def env_int(name, default=None):
     """Parse an int from env var `name`, or fall back to `default`. Unset/empty → default;
-    a non-numeric value warns and degrades to the default instead of raising (lenient-parse
+    a non-numeric value says so once on stderr and degrades to the default instead of raising (lenient-parse
     rule) so a typo can't abort startup."""
     v = os.environ.get(name)
     if not v:
@@ -84,6 +87,13 @@ def env_int(name, default=None):
         return int(v)
     except ValueError:
         log.warning("ignoring non-integer %s=%r; using default %r", name, v, default)
+        if name not in _warned:
+            # These are read each time an agent is built. Say it once: the log that
+            # log.warning writes to is off by default, so without this a typo'd budget
+            # knob is dropped and nothing anywhere says so.
+            _warned.add(name)
+            sys.stderr.write(f"[ignoring {name}={v!r}: not a number; "
+                             f"using {default!r}]\n")
         return default
 
 
@@ -96,4 +106,11 @@ def env_float(name, default=None):
         return float(v)
     except ValueError:
         log.warning("ignoring non-float %s=%r; using default %r", name, v, default)
+        if name not in _warned:
+            # These are read each time an agent is built. Say it once: the log that
+            # log.warning writes to is off by default, so without this a typo'd budget
+            # knob is dropped and nothing anywhere says so.
+            _warned.add(name)
+            sys.stderr.write(f"[ignoring {name}={v!r}: not a number; "
+                             f"using {default!r}]\n")
         return default

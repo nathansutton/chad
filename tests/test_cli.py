@@ -72,6 +72,38 @@ def test_env_int(monkeypatch):
     check("non-numeric raises ValueError", raised)
 
 
+@pytest.mark.parametrize("name, bad", [
+    ("CHAD_MAX_CONTEXT", "128k"), ("CHAD_KV_BITS", "eight"),
+    ("CHAD_KV_CACHE_MAX_GB", "8GB"), ("CHAD_CTX_LIMIT", "lots"),
+    ("CHAD_CTX_SAFETY", "0,9"), ("CHAD_CTX_SLOPE_FACTOR", "x"),
+])
+def test_a_garbled_memory_knob_stops_startup_with_guidance(monkeypatch, capsys, name, bad):
+    monkeypatch.setenv(name, bad)
+    with pytest.raises(SystemExit) as stop:
+        cli._check_numeric_env()
+    err = capsys.readouterr().err
+    check("exits non-zero", stop.value.code == 1, stop.value.code)
+    check("names the variable", name in err, err)
+    check("shows the bad value", bad in err, err)
+    check("says how to fix it", "fix:" in err, err)
+    check("no traceback", "Traceback" not in err, err)
+
+
+def test_valid_memory_knobs_pass_the_startup_check(monkeypatch):
+    monkeypatch.setenv("CHAD_MAX_CONTEXT", "131072")
+    monkeypatch.setenv("CHAD_CTX_SAFETY", "0.9")
+    cli._check_numeric_env()  # returns, does not exit
+
+
+def test_levers_prints_the_registry_even_when_chad_disable_is_wrong(monkeypatch, capsys):
+    monkeypatch.setenv("CHAD_DISABLE", "not_a_lever")
+    code = cli._run_levers()
+    out, err = capsys.readouterr()
+    check("exits non-zero", code == 1, code)
+    check("registry still printed", "levers" in json.loads(out), out)
+    check("names the bad lever", "not_a_lever" in err, err)
+
+
 def test_pick_model_override(monkeypatch, tmp_path):
     # An explicit CHAD_MODEL wins outright, regardless of RAM or local dirs, and the
     # reason says the choice was requested rather than defaulted.

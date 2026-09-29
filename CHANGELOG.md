@@ -4,6 +4,12 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**A mistyped `CHAD_*` number no longer depends on which variable it was.** The
+memory-sizing knobs are checked at startup and stop the run with the variable, the value
+and the fix. A garbled `CHAD_CTX_SAFETY` used to be swallowed and replaced the RAM
+governor with a fixed 120k window. The budget knobs say once on stderr when a value is
+ignored, and `chad levers` prints the registry when `CHAD_DISABLE` is wrong.
+
 **The TUI stopped saving after a reset.** `/reset`, `/clear`, `/accept`, `/resume <n>`
 and the continue-fresh handoff all replaced the agent with one that never wrote the
 session, so `chad -c` resumed the conversation from before the reset. Every agent the TUI

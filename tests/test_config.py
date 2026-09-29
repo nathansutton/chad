@@ -97,6 +97,17 @@ def test_env_float(monkeypatch):
     check("non-numeric -> default, no raise", config.env_float("CHAD_X", 1.5) == 1.5)
 
 
+def test_an_ignored_budget_knob_is_reported_once_on_stderr(monkeypatch, capsys):
+    # The chad log is off by default, so stderr is the only place a dropped value shows.
+    # Cleared first so an earlier test's warning cannot hide this one.
+    config._warned.clear()
+    monkeypatch.setenv("CHAD_X_BUDGET", "10m")
+    check("first read -> default", config.env_float("CHAD_X_BUDGET", 5.0) == 5.0)
+    check("second read -> default", config.env_float("CHAD_X_BUDGET", 5.0) == 5.0)
+    err = capsys.readouterr().err
+    check("reported exactly once", err.count("CHAD_X_BUDGET") == 1, err)
+
+
 def test_env_reads_go_through_config():
     """Nothing outside the three deliberate exceptions parses a CHAD_* var by hand.
 
