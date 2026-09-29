@@ -30,7 +30,12 @@ from . import (
 )
 from .base_engine import BaseEngine
 from .diag import args_preview, log, redact, result_preview
-from .prompt import build_system_prompt, classify_intent, static_system_prompt
+from .prompt import (
+    build_system_prompt,
+    classify_intent,
+    instructions_notice,
+    static_system_prompt,
+)
 from .render import (
     C_DIM,
     C_RED,
@@ -437,17 +442,36 @@ def format_ctx_breakdown(bd: dict) -> list[str]:
 # Canned task behind the /init slash command (Claude-Code parity): scaffold a CLAUDE.md
 # the way `claude /init` does. Runs through the normal agentic loop (orient → read the
 # config files → write), so it benefits from every reliability fix above.
-INIT_PROMPT = (
-    "Create a CLAUDE.md file at the root of this project to help an AI coding assistant "
-    "work here effectively. First orient yourself with bash (ls, rg --files), then read the key "
-    "config/entry files that exist (README, pyproject.toml/package.json/go.mod/Cargo.toml, "
-    "Makefile). Then write CLAUDE.md with the `write` tool containing, concisely (aim for "
-    "under 60 lines): a one-paragraph overview of what the project does; the main "
-    "components and how they fit together; the ACTUAL commands to build, run, and test it "
-    "(copy them from the config you read, don't invent); and any conventions worth noting. "
-    "If a CLAUDE.md already exists, read it first and improve it rather than clobbering it. "
-    "After writing, call done."
-)
+def init_prompt(target: str = "CLAUDE.md") -> str:
+    """The /init task, aimed at `target`: the instructions file this project already
+    has, so a generated CLAUDE.md never appears beside an AGENTS.md and replaces it."""
+    return (
+        f"Create a {target} file at the root of this project to help an AI coding assistant "
+        "work here effectively. First orient yourself with bash (ls, rg --files), then read the key "
+        "config/entry files that exist (README, pyproject.toml/package.json/go.mod/Cargo.toml, "
+        f"Makefile). Then write {target} with the `write` tool containing, concisely (aim for "
+        "under 60 lines): a one-paragraph overview of what the project does; the main "
+        "components and how they fit together; the ACTUAL commands to build, run, and test it "
+        "(copy them from the config you read, don't invent); and any conventions worth noting. "
+        f"If a {target} already exists, read it first and improve it rather than clobbering it. "
+        "After writing, call done."
+    )
+
+
+INIT_PROMPT = init_prompt()
+
+# /init writes a new instructions file, but the system prompt read the old one when the
+# session started.
+INIT_RELOAD_NOTICE = ("  instructions are read when a session starts: /reset "
+                      "(or a new session) to use the new file")
+
+
+def init_target() -> str:
+    """The file /init should write: the instructions file already present, else CLAUDE.md."""
+    for fname in ("CLAUDE.md", "AGENTS.md"):
+        if os.path.isfile(fname):
+            return fname
+    return "CLAUDE.md"
 
 
 class Agent:
@@ -1833,6 +1857,8 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
                   resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn)
     print(banner(engine.model_id.split("/")[-1], ctx_limit, mode=agent.mode))
     print(f"{C_DIM}type a task, or /reset, /exit.{C_RST}")
+    for ln in instructions_notice():
+        print(f"{C_DIM}{ln}{C_RST}")
     while True:
         try:
             line = input(f"{C_YEL}» {C_RST}").strip()
@@ -1890,8 +1916,9 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
                   f"@path attaches a file/dir{C_RST}")
             continue
         if line == "/init":
-            agent.run_turn(INIT_PROMPT)
+            agent.run_turn(init_prompt(init_target()))
             agent.save()
+            print(f"{C_DIM}{INIT_RELOAD_NOTICE}{C_RST}")
             continue
         # `/<skill>` — checked after every builtin, so a builtin always wins the name.
         # The skill body becomes the turn itself (see skills.load); its token cost is

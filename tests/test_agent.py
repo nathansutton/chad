@@ -17,10 +17,13 @@ import tempfile
 import pytest
 
 from chad.agent import (
+    INIT_PROMPT,
     Agent,
     _has_open_tool_call,
     close_unclosed_think,
     expand_mentions,
+    init_prompt,
+    init_target,
     split_inline_reasoning,
 )
 
@@ -35,6 +38,21 @@ def check(name, cond, detail=""):
     else:
         FAIL += 1
         raise AssertionError(f"{name}  {detail}")
+
+
+def test_init_prompt_default_is_the_claude_md_prompt():
+    check("init_prompt('CLAUDE.md') is INIT_PROMPT", init_prompt("CLAUDE.md") == INIT_PROMPT)
+
+
+def test_init_target_follows_the_existing_file(monkeypatch, tmp_path):
+    monkeypatch.chdir(str(tmp_path))
+    check("neither -> CLAUDE.md", init_target() == "CLAUDE.md")
+    with open("AGENTS.md", "w") as f:
+        f.write("Rules.\n")
+    check("only AGENTS.md -> AGENTS.md", init_target() == "AGENTS.md")
+    with open("CLAUDE.md", "w") as f:
+        f.write("Rules.\n")
+    check("both -> CLAUDE.md", init_target() == "CLAUDE.md")
 
 
 def test_expand_mentions_resolves_file(monkeypatch, tmp_path):
@@ -257,6 +275,10 @@ if __name__ == "__main__":
     with pytest.MonkeyPatch.context() as mp:
         with tempfile.TemporaryDirectory() as d:
             test_expand_mentions_dedupes(mp, d)
+    test_init_prompt_default_is_the_claude_md_prompt()
+    with pytest.MonkeyPatch.context() as mp:
+        with tempfile.TemporaryDirectory() as d:
+            test_init_target_follows_the_existing_file(mp, d)
     test_has_open_tool_call()
     test_close_unclosed_think()
     test_split_inline_reasoning()

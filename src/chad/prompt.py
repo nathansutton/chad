@@ -11,6 +11,7 @@ import glob
 import os
 import platform
 import re
+from dataclasses import dataclass
 
 # Premise: the model already knows the unix toolbox and the exact-match editor
 # dialect from pretraining, so the prompt's job shrinks to two things — the
@@ -167,6 +168,62 @@ def classify_intent(user_text: str) -> dict:
     return {"action": action, "read_only": read_only, "run": run}
 
 
+_INSTRUCTION_FILES = ("CLAUDE.md", "AGENTS.md")
+_INSTRUCTION_CHARS = 4000
+
+
+@dataclass(frozen=True)
+class ProjectInstructions:
+    """The project-instructions file a session reads, and what happened to it."""
+
+    fname: str                 # the file the model sees
+    text: str                  # what the model sees of it
+    chars: int                 # the file's length before the cut
+    ignored: tuple[str, ...]   # other instruction files present and not read
+
+    @property
+    def truncated(self) -> bool:
+        return self.chars > len(self.text)
+
+
+def project_instructions() -> ProjectInstructions | None:
+    """The first instructions file in the working directory that has content.
+
+    An empty file does not count: it used to end the search, so an empty CLAUDE.md
+    silenced the AGENTS.md beside it."""
+    present = [f for f in _INSTRUCTION_FILES if os.path.isfile(f)]
+    for fname in present:
+        try:
+            # errors="replace": these are prompt text, not code we execute — a
+            # non-UTF-8 project doc must not crash build_system_prompt (agent won't
+            # construct); replacement chars in a stray byte are harmless here.
+            with open(fname, encoding="utf-8", errors="replace") as fh:
+                doc = fh.read().strip()
+        except OSError:
+            continue
+        if doc:
+            return ProjectInstructions(
+                fname=fname, text=doc[:_INSTRUCTION_CHARS], chars=len(doc),
+                ignored=tuple(f for f in present if f != fname))
+    return None
+
+
+def instructions_notice() -> list[str]:
+    """What to tell the user about project instructions at session start: one line for
+    the file in use, and one for each thing they would not otherwise find out."""
+    doc = project_instructions()
+    if doc is None:
+        return []
+    lines = [f"instructions: {doc.fname}"]
+    if doc.truncated:
+        lines = [f"instructions: {doc.fname} — only the first {len(doc.text):,} of "
+                 f"{doc.chars:,} characters are read; the rest is not seen by the model"]
+    for other in doc.ignored:
+        lines.append(f"  {other} is present and ignored: only one instructions file "
+                     f"is read, and {doc.fname} comes first")
+    return lines
+
+
 def _dynamic_context() -> list:
     """The volatile, per-session tail of the system prompt (cwd, workspace snapshot,
     test command, project docs, skills catalog) — the project grounding that sits
@@ -197,18 +254,9 @@ def _dynamic_context() -> list:
             "- Use that exact command to verify your changes. Do NOT rediscover the "
             "runner by trial-and-error and do NOT install packages."
         )
-    for fname in ("CLAUDE.md", "AGENTS.md"):
-        if os.path.isfile(fname):
-            try:
-                # errors="replace": these are prompt text, not code we execute — a
-                # non-UTF-8 project doc must not crash build_system_prompt (agent won't
-                # construct); replacement chars in a stray byte are harmless here.
-                doc = open(fname, encoding="utf-8", errors="replace").read().strip()[:4000]
-            except OSError:
-                continue
-            if doc:
-                dynamic.append(f"\n# Project instructions ({fname})\n{doc}")
-            break
+    doc = project_instructions()
+    if doc is not None:
+        dynamic.append(f"\n# Project instructions ({doc.fname})\n{doc.text}")
     # Agent Skills contribute NOTHING here on purpose. A catalog of every installed
     # skill's description measured 4,751 tokens — 60% of the whole system prompt — just
     # to let the model pick one. The user picks instead, by typing `/name` (see

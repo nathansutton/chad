@@ -656,6 +656,19 @@ def test_ctx_command_prints_a_breakdown():
     assert "compact at" in out, out
 
 
+
+def test_init_targets_the_existing_agents_md(tmp_path, monkeypatch):
+    # A project steered by AGENTS.md must not grow a generated CLAUDE.md, which would
+    # shadow it from the next session on.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "AGENTS.md").write_text("Rules.\n")
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    tui._on_accept(_Buff("/init"))
+    queued = list(tui._queue)
+    assert len(queued) == 1, queued
+    assert "AGENTS.md" in queued[0] and "CLAUDE.md" not in queued[0], queued[0]
+
 def test_ctx_command_survives_an_unpriceable_prompt():
     # The fake engine has no tokenizer at all — the gauge must degrade to one line,
     # not raise out of the key handler and kill the UI.

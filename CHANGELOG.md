@@ -4,6 +4,12 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**chad says which project instructions it read.** A `CLAUDE.md` or `AGENTS.md` longer than
+4,000 characters was cut without a word, an empty `CLAUDE.md` hid the `AGENTS.md` beside
+it, and `/init` wrote a `CLAUDE.md` that replaced an existing `AGENTS.md`. The session
+now names the file, says when it was cut or when a second file is ignored, skips empty
+files, and `/init` improves the file the project already has.
+
 **A keystroke meant for a sentence can no longer approve a command.** `y` and `n` answer a
 pending approval only on an empty input box, and not in the first 0.4 s the panel is on
 screen. `v` prints the complete command or diff: the panel cut bash commands at 400
