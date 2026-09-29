@@ -26,6 +26,11 @@ and the continue-fresh handoff all replaced the agent with one that never wrote 
 session, so `chad -c` resumed the conversation from before the reset. Every agent the TUI
 builds now saves.
 
+**A stopped turn says why.** The loop guard and the repetition guard ended a turn without
+printing anything: the explanation was returned to callers that discarded it. Both now
+print, the other four stops lost their jargon, and the TUI's handoff line says what typing
+will do instead of calling every stop a budget.
+
 ## [2.3.0] — 2026-09-25
 
 ### The ternary default was a mistake; the default is now Unsloth's UD-Q3_K_XL GGUF

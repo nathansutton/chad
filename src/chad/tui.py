@@ -1394,15 +1394,19 @@ class TUI:
                     self.agent.save()  # persist conversation for --continue
                     if self.speech_on and self._speaker:
                         self._speak_reply()
-                    # Governor hard-stop: the turn ran out of budget with no
-                    # landed+verified change. Surface the banked progress note and arm the
-                    # fresh-continue handoff — the next typed message starts clean, seeded.
+                    # A guard ended the turn with no landed+verified change and banked a
+                    # progress note: arm the fresh-continue handoff — the next typed
+                    # message starts clean, seeded. Loop and repetition stops bank no note
+                    # and keep the conversation, so they get their own line.
                     if self.agent.budget_note:
                         self._pending_budget_note = self.agent.budget_note
                         self.agent.budget_note = None
-                        self._emit("info", "turn hit its budget — no verified change landed.")
-                        self._emit("info", "  type to continue fresh (context cleared, "
-                                           "seeded with what was learned) — or start a new task")
+                        self._emit("info", "  type anything to try again in a fresh context "
+                                           "(it starts with a short note of what was tried) "
+                                           "· /reset starts clean without the note")
+                    elif self.agent.stop_kind in ("loop", "repetition"):
+                        self._emit("info", "  the conversation is kept — type a smaller, "
+                                           "more specific request, or /reset to start clean")
                     # A finished plan-mode turn that wrote a plan file -> offer the
                     # steer (type) / accept (ctrl-g or /accept) handoff.
                     if self.agent.mode == "plan" and self.agent.last_plan_path:

@@ -591,6 +591,10 @@ class Agent:
         # note so the caller (TUI / one-shot / evals) can relaunch a fresh turn seeded
         # with it. Reset at the start of every run_turn.
         self.budget_note: str | None = None
+        # Which guard ended the last turn early, for the front end to explain in plain
+        # words: "budget" | "no_change" | "done_rejected" | "step_cap" | "loop" |
+        # "repetition". None when the turn finished on its own.
+        self.stop_kind: str | None = None
         self.messages = [{"role": "system", "content": build_system_prompt()}]
         if resume:
             self.messages += [m for m in resume if m.get("role") != "system"]
@@ -1067,6 +1071,7 @@ class Agent:
         # a checkpoint is crossed, so every band must re-earn progress); gov_soft_fired
         # bounds the soft nudge to one per turn.
         self.budget_note = None
+        self.stop_kind = None
         turn_start = time.monotonic()
         gov_band = 0
         gov_progress = False
@@ -1125,12 +1130,13 @@ class Agent:
                 gov, gov_band, gov_progress = guardrails.advance_governor(
                     gov_band, new_band, gov_progress, gov_soft_fired)
                 if gov == "hard":
+                    self.stop_kind = "budget"
                     self.budget_note = guardrails.progress_note(self.messages)
                     log.info("GOVERNOR hard-stop at step %d: %d/%s prefill tokens, %.0fs — "
                              "banking progress note, ending turn", step, self.prefill_tokens,
                              self._turn_budget_tokens, time.monotonic() - turn_start)
-                    self._emit("info", "  [turn hit its budget with no landed+verified "
-                                       "change — stopping and banking a progress note]")
+                    self._emit("info", "  [stopped: this turn used its budget without "
+                                       "making a change that passed a check]")
                     return f"{guardrails.BUDGET_SENTINEL} {self.budget_note}"
                 if gov == "soft":
                     gov_soft_fired = True
@@ -1435,6 +1441,10 @@ class Agent:
                 if guardrails.repeat_stop_abort(repeat_stops):
                     log.info("END step %d: REPEAT ABORT (nudges not breaking the loop)",
                              step)
+                    self.stop_kind = "repetition"
+                    self._emit("info", "  [stopped: the model kept producing repetitive "
+                                       "output. Rephrase the request, or split it into "
+                                       "smaller steps.]")
                     return ("[stopped: the model keeps degenerating into repetitive "
                             "output. Try rephrasing the request or breaking it into "
                             "smaller steps (docs/troubleshooting.md maps symptom → "
@@ -1518,14 +1528,15 @@ class Agent:
                     # and end as a hard stop, so --auto-continue (headless) or the
                     # user's 'continue' (TUI) relaunches a fresh attempt with the
                     # note instead of silently shipping nothing.
+                    self.stop_kind = "no_change"
                     self.budget_note = guardrails.progress_note(
                         self.messages,
                         rejected_claim=strip_think(text).strip())
                     log.info("END step %d: FINAL ANSWER blocked by no-empty-diff gate "
                              "(made_edit=%s, unverified_edit=%s) — progress note banked",
                              step, made_edit, unverified_edit)
-                    self._emit("info", "  [turn ended without a landed+verified change "
-                                       "— progress note banked; say 'continue' to retry]")
+                    self._emit("info", "  [stopped: the model said it was finished, but "
+                                       "no change passed a check]")
                     return ("[stopped: the turn ended without applying a verified "
                             "change — say 'continue' to resume]")
                 log.info("END step %d: model produced a FINAL ANSWER, no tool calls "
@@ -1558,6 +1569,10 @@ class Agent:
                              step, seen_before + 1, self._loop_nudges)
                     if guardrails.loop_should_abort(self._loop_nudges):
                         log.info("END step %d: LOOP ABORT (nudges exhausted)", step)
+                        self.stop_kind = "loop"
+                        self._emit("info", "  [stopped: the model repeated the same command "
+                                           "without making progress. Ask for something "
+                                           "smaller and name the file you want changed.]")
                         return ("[stopped: the model is stuck in a loop, repeating the same "
                                 "tool calls without making progress. Tip: a smaller, scoped "
                                 "ask recovers this — name the exact file you want changed "
@@ -1805,14 +1820,15 @@ class Agent:
                     # nudges ran out) becomes a resumable hard stop, not a success
                     # (measured: done accepted at 84s with edits in tree and zero
                     # successful post-edit commands).
+                    self.stop_kind = "done_rejected"
                     self.budget_note = guardrails.progress_note(
                         self.messages,
                         rejected_claim=str(terminal.get("summary") or ""))
                     log.info("END step %d: DONE blocked by no-empty-diff gate "
                              "(made_edit=%s, unverified_edit=%s) — progress note banked",
                              step, made_edit, unverified_edit)
-                    self._emit("info", "  [done rejected: no landed+verified change — "
-                                       "progress note banked; say 'continue' to retry]")
+                    self._emit("info", "  [stopped: the model called done, but no change "
+                                       "passed a check]")
                     return ("[stopped: `done` was called without a landed+verified "
                             "change — say 'continue' to resume]")
                 log.info("END step %d: DONE accepted | summary=%r", step,
@@ -1822,11 +1838,11 @@ class Agent:
         # absolute ceiling hit). Bank a progress note — same contract as the governor
         # hard-stop — so the TUI's "continue" and one-shot --auto-continue can resume
         # instead of silently dropping the half-done task at the prompt.
+        self.stop_kind = "step_cap"
         self.budget_note = guardrails.progress_note(self.messages)
         log.info("END: hit step cap (%d, ceiling %d) | did_work=%s unverified_edit=%s",
                  step_cap, hard_ceiling, did_work, unverified_edit)
-        self._emit("info", "  [turn stopped at its step cap — progress note banked; "
-                           "say 'continue' to resume]")
+        self._emit("info", "  [stopped: reached the step limit without finishing]")
         return ("[stopped: hit the step cap before finishing — say 'continue' to "
                 "resume, or re-scope the ask smaller (docs/troubleshooting.md)]")
 
