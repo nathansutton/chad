@@ -612,3 +612,24 @@ def test_fresh_agent_clears_the_pinned_todo_panel():
     tui._todos = [{"content": "from the previous session", "status": "in_progress"}]
     assert tui._fresh_agent("normal") is True
     assert tui._todos == []
+
+
+def test_fresh_agent_keeps_persisting():
+    # The first Agent saves every turn; a replacement that does not would make
+    # `chad -c` resume the conversation from before the reset.
+    tui, _ = _worker_tui()
+    tui.engine.reset = lambda: None
+    assert tui._fresh_agent("normal") is True
+    assert tui.agent.persist is True
+
+
+def test_a_turn_after_reset_is_saved(tmp_path, monkeypatch):
+    from chad import session
+    monkeypatch.chdir(tmp_path)  # the session store is keyed on cwd
+    tui, _ = _worker_tui()
+    tui.engine.reset = lambda: None
+    assert tui._fresh_agent("normal") is True
+    tui.agent.messages.append({"role": "user", "content": "after the reset"})
+    tui.agent.save()
+    (item,) = session.list_sessions(str(tmp_path))
+    assert item["title"].startswith("after the reset")
