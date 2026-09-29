@@ -55,7 +55,15 @@ from . import config, guardrails
 from .agent import INIT_PROMPT, MODE_LABEL, Agent
 from .base_engine import BaseEngine
 from .ignore import IGNORE_DIRS
-from .render import C_RST, C_YEL, ansi_fragment, banner, confirm_preview, render_tool_result
+from .render import (
+    C_RST,
+    C_YEL,
+    _emit_diff,
+    ansi_fragment,
+    banner,
+    confirm_preview,
+    render_tool_result,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -90,6 +98,9 @@ MODE_STYLE = {"normal": "status.normal", "auto": "status.auto", "yolo": "status.
 # whole point is that a one-line clipped preview means approving blind.
 _CONFIRM_MAX_LINES = 10
 _CONFIRM_MAX_CHARS = 600
+# How long a confirm must be on screen before y/n count. Long enough that the key
+# already on its way down when the panel appeared cannot answer it.
+_CONFIRM_GRACE_S = 0.4
 
 
 def _confirm_body_lines(name: str, args) -> list:
@@ -432,6 +443,7 @@ class TUI:
         self._confirm_req: Optional[tuple] = None  # (name, args) awaiting a y/n answer
         self._confirm_event = threading.Event()
         self._confirm_answer = False
+        self._confirm_shown_at = 0.0
 
         self.agent = Agent(
             engine, ctx_limit=ctx_limit, mode=mode, thinking=thinking,
@@ -619,6 +631,7 @@ class TUI:
         self._confirm_answer = False
         self._confirm_event.clear()
         self._confirm_req = (name, args)
+        self._confirm_shown_at = time.monotonic()
         self.app.invalidate()
         while not self._confirm_event.wait(timeout=0.1):
             if self._shutdown or self._interrupt.is_set():
@@ -626,6 +639,18 @@ class TUI:
                 return False
         self._confirm_req = None
         return self._confirm_answer
+
+    def _show_full_confirm(self):
+        if not self._confirm_req:
+            return
+        name, args = self._confirm_req
+        self._emit("info", f"  full {name} awaiting approval:")
+        if name == "edit":
+            _emit_diff(self._emit, str(args.get("old", "")), str(args.get("new", "")),
+                       max_lines=2000, filename=str(args.get("path", "")))
+            return
+        for ln in confirm_preview(name, args, full=True).splitlines():
+            self._emit("muted", "    " + ln)
 
     # -- UI rendering ----------------------------------------------------
 
@@ -651,8 +676,12 @@ class TUI:
             name, _ = self._confirm_req
             # The command itself lives in the confirm panel above (multi-line, readable);
             # this row is just the question and the keys.
+            if self.input.text:
+                return [("class:confirm",
+                         f" approve {name}?  send or clear your text first, "
+                         f"then y / n  (esc denies) ")]
             return [("class:confirm",
-                     f" approve {name}?  [y]es  [n]o  (esc denies) ")]
+                     f" approve {name}?  [y]es  [n]o  [v]iew all  (esc denies) ")]
         mode = self.agent.mode
         pct = int(100 * self._cur_prompt_tokens / self.ctx_limit) if self.ctx_limit else 0
         qn = len(self._queue)
@@ -763,10 +792,18 @@ class TUI:
         confirming = Condition(lambda: self._confirm_req is not None)
         busy = Condition(lambda: self._busy)
         in_input = has_focus(self.input)
+        # An approval must be a deliberate keypress. While text is being typed, y and n
+        # are letters in a sentence; and a panel that appeared under the user's fingers
+        # has not been read yet.
+        input_empty = Condition(lambda: not self.input.text)
+        answering = confirming & input_empty
+        has_text = Condition(lambda: bool(self.input.text.strip()))
 
         # Enter submits (eager, so it beats the multiline buffer's newline insert);
-        # alt-enter and ctrl-j insert a literal newline for multiline prompts.
-        @kb.add("enter", filter=in_input & ~confirming, eager=True)
+        # alt-enter and ctrl-j insert a literal newline for multiline prompts. Text typed
+        # while a confirm is pending can still be sent: a confirm only exists mid-turn,
+        # so it goes to the steering queue rather than starting a turn.
+        @kb.add("enter", filter=in_input & (~confirming | has_text), eager=True)
         def _(event):
             self.input.buffer.validate_and_handle()
 
@@ -788,15 +825,33 @@ class TUI:
             self._accept_plan()
             event.app.invalidate()
 
-        # eager=True so y/n answer the prompt instead of being typed into the input box
-        @kb.add("y", filter=confirming, eager=True)
-        @kb.add("Y", filter=confirming, eager=True)
+        # eager=True so y/n answer the prompt instead of being typed into the input box;
+        # inside the grace period the key is still consumed, it just doesn't count.
+        @kb.add("y", filter=answering, eager=True)
+        @kb.add("Y", filter=answering, eager=True)
         def _(event):
+            if time.monotonic() - self._confirm_shown_at < _CONFIRM_GRACE_S:
+                return
             self._confirm_answer = True
             self._confirm_event.set()
 
-        @kb.add("n", filter=confirming, eager=True)
-        @kb.add("N", filter=confirming, eager=True)
+        @kb.add("n", filter=answering, eager=True)
+        @kb.add("N", filter=answering, eager=True)
+        def _(event):
+            if time.monotonic() - self._confirm_shown_at < _CONFIRM_GRACE_S:
+                return
+            self._confirm_answer = False
+            self._confirm_event.set()
+
+        # v prints everything the panel had to cut, into the scrollback above it. The
+        # confirm stays pending: reading is not answering.
+        @kb.add("v", filter=answering, eager=True)
+        @kb.add("V", filter=answering, eager=True)
+        def _(event):
+            self._show_full_confirm()
+            event.app.invalidate()
+
+        # Denying by accident is the safe direction, so esc denies whatever is typed.
         @kb.add("escape", filter=confirming, eager=True)
         def _(event):
             self._confirm_answer = False

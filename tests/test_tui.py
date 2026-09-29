@@ -351,6 +351,13 @@ def _escape_binding_matching(tui):
     return None
 
 
+def _key_binding_matching(tui, key):
+    """The binding for a plain character `key` whose filter is active right now."""
+    for b in tui._bindings().bindings:
+        if tuple(b.keys) == (key,) and b.filter():
+            return b
+    return None
+
 def test_escape_interrupts_when_busy():
     tui, _ = _worker_tui()
     tui._busy = True
@@ -372,6 +379,74 @@ def test_escape_does_not_interrupt_when_idle():
     assert binding is None, "an escape binding was active while idle"
     assert not tui._interrupt.is_set()
 
+
+# -- approving a confirm takes a deliberate keypress -------------------------
+
+def _pending_confirm(text):
+    tui, _ = _worker_tui()
+    tui._busy = True
+    tui._confirm_req = ("bash", {"command": "ls"})
+    tui._confirm_shown_at = 0.0  # on screen long ago: past the grace period
+    tui.input.text = text
+    return tui
+
+
+def test_y_approves_on_an_empty_input_box():
+    tui = _pending_confirm("")
+    binding = _key_binding_matching(tui, "y")
+    assert binding is not None, "no y binding on an empty input box"
+    binding.handler(None)
+    assert tui._confirm_answer is True
+    assert tui._confirm_event.is_set()
+
+
+def test_y_is_a_letter_while_text_is_being_typed():
+    tui = _pending_confirm("wh")
+    assert _key_binding_matching(tui, "y") is None
+
+
+def test_n_is_a_letter_while_text_is_being_typed():
+    tui = _pending_confirm("do")
+    assert _key_binding_matching(tui, "n") is None
+
+
+def test_escape_denies_even_with_text_typed():
+    tui = _pending_confirm("wh")
+    tui._confirm_answer = True
+    binding = _escape_binding_matching(tui)
+    assert binding is not None, "esc must deny whatever is typed"
+    binding.handler(None)
+    assert tui._confirm_answer is False
+    assert tui._confirm_event.is_set()
+
+
+def test_an_answer_inside_the_grace_period_is_ignored():
+    tui = _pending_confirm("")
+    tui._confirm_shown_at = time.monotonic()
+    binding = _key_binding_matching(tui, "y")
+    assert binding is not None
+    binding.handler(None)
+    assert not tui._confirm_event.is_set()
+
+
+def test_v_prints_the_whole_command_and_keeps_the_confirm_pending():
+    tui, _ = _worker_tui()
+    tui._confirm_req = ("bash", {"command": "echo " + "x" * 3000})
+    tui._show_full_confirm()
+    assert "x" * 3000 in "".join(tui._pending)
+    assert tui._confirm_req is not None
+    assert not tui._confirm_event.is_set()
+
+
+def test_v_shows_an_edit_as_a_diff():
+    tui, _ = _worker_tui()
+    tui._confirm_req = ("edit", {"path": "notes.txt",
+                                 "old": "keep\nold line\nkeep",
+                                 "new": "keep\nnew line\nkeep"})
+    tui._show_full_confirm()
+    out = "".join(tui._pending)
+    assert "+ new line" in out
+    assert "- old line" in out
 
 # -- Step 4: confirm handshake rendezvous ------------------------------------
 

@@ -58,8 +58,21 @@ def test_preview_names_where_the_write_really_lands():
         check("plain path is not decorated", "→" not in p, f"p={p!r}")
 
 
+def test_full_preview_shows_what_the_default_clips():
+    cmd = "echo " + "z" * 2995
+    p = confirm_preview("bash", {"command": cmd})
+    check("default bash preview still clips", p.endswith(" …") and len(p) == 402,
+          f"len={len(p)}")
+    check("full bash preview is the whole command",
+          confirm_preview("bash", {"command": cmd}, full=True) == cmd)
+    lines = [f"line {i}" for i in range(40)]
+    p = confirm_preview("write", {"path": "x", "content": "\n".join(lines)}, full=True)
+    check("full write shows every line", all(ln in p for ln in lines), f"p={p!r}")
+    check("full write has no elision", "more lines" not in p, f"p={p!r}")
+
 if __name__ == "__main__":
     test_preview()
     test_preview_names_where_the_write_really_lands()
+    test_full_preview_shows_what_the_default_clips()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

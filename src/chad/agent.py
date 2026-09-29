@@ -903,7 +903,8 @@ class Agent:
                 return False
         if self._confirm_cb is not None:
             return self._confirm_cb(name, args)
-        preview = confirm_preview(name, args)
+        # The REPL has ordinary scrollback, so nothing needs clipping.
+        preview = confirm_preview(name, args, full=True)
         warn = f"{C_RED}  ⚠ looks destructive — review carefully\n{C_RST}" if dangerous else ""
         ans = input(f"{C_YEL}  allow {name}:\n{preview}\n{warn}  approve? [y/N] {C_RST}").strip().lower()
         return ans in ("y", "yes")
