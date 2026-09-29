@@ -885,7 +885,7 @@ class TUI:
             self.engine, ctx_limit=self.ctx_limit, mode=mode,
             thinking=self.thinking, emit=self._emit, confirm=self._confirm,
             should_stop=self._interrupt.is_set, drain_steering=self._drain_steering,
-            ctx_limit_fn=self._ctx_limit_fn,
+            persist=True, ctx_limit_fn=self._ctx_limit_fn,
         )
         self._pending_plan = None
         self._pending_budget_note = None

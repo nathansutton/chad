@@ -4,6 +4,11 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**The TUI stopped saving after a reset.** `/reset`, `/clear`, `/accept`, `/resume <n>`
+and the continue-fresh handoff all replaced the agent with one that never wrote the
+session, so `chad -c` resumed the conversation from before the reset. Every agent the TUI
+builds now saves.
+
 ## [2.3.0] — 2026-09-25
 
 ### The ternary default was a mistake; the default is now Unsloth's UD-Q3_K_XL GGUF
