@@ -55,16 +55,18 @@ def _highlight_code(code: str, filename: str = "", highlight: bool = True) -> st
         return code
 
 
-def confirm_preview(name: str, args: dict, max_lines: int = 6) -> str:
+def confirm_preview(name: str, args: dict, max_lines: int = 6, full: bool = False) -> str:
     """A short, human-readable summary of what a mutating tool will do, shown before
-    the y/n approval. Bounded to a few lines so it never floods the prompt."""
+    the y/n approval. Bounded to a few lines so it never floods the prompt, unless
+    `full` asks for every character of it."""
     def clip(s, n=400):
         s = str(s)
-        return s if len(s) <= n else s[:n] + " …"
+        return s if full or len(s) <= n else s[:n] + " …"
     def head(s):
         lines = str(s).splitlines() or [str(s)]
-        body = "\n".join("    " + clip(ln) for ln in lines[:max_lines])
-        if len(lines) > max_lines:
+        shown = lines if full else lines[:max_lines]
+        body = "\n".join("    " + clip(ln) for ln in shown)
+        if len(lines) > len(shown):
             body += f"\n    … (+{len(lines) - max_lines} more lines)"
         return body
     def where(p):

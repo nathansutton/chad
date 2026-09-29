@@ -53,6 +53,9 @@ weights**, runs in seconds, and is what CI runs. For throughput on your own mach
   A finished plan lands in `./plans/`; ctrl-g (or `/accept`) clears the context and starts
   implementing it ([details](configuration.md#plan-mode)).
 - Type-ahead message queue. Keep typing while the agent works; messages run in order.
+- Approving takes a deliberate key. `y` and `n` answer a pending approval only when the
+  input box is empty; **v** prints the whole command or diff first, and **esc** denies at
+  any time. Text you were typing can still be sent with Enter.
 - ctrl-c interrupts the running turn without killing the session. **↑prefilled /
   ↓generated** token counts show an advancing **%** on an unavoidable full re-prefill, so it
   is never silent.

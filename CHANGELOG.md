@@ -4,6 +4,11 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**A keystroke meant for a sentence can no longer approve a command.** `y` and `n` answer a
+pending approval only on an empty input box, and not in the first 0.4 s the panel is on
+screen. `v` prints the complete command or diff: the panel cut bash commands at 400
+characters and showed edits as two clipped blobs.
+
 **A mistyped `CHAD_*` number no longer depends on which variable it was.** The
 memory-sizing knobs are checked at startup and stop the run with the variable, the value
 and the fix. A garbled `CHAD_CTX_SAFETY` used to be swallowed and replaced the RAM
