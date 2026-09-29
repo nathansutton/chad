@@ -184,6 +184,21 @@ def test_agent_loop_terminates_on_a_plain_final_answer(tmp_path):
     assert "42" in agent.messages[-2]["content"]
 
 
+def test_a_clean_finish_leaves_no_stop_kind(tmp_path):
+    """A turn that ends on its own final answer was not stopped by any guard."""
+    target = tmp_path / "data.txt"
+    target.write_text("42\n")
+    script = [
+        _tool_call("read", path=str(target)),
+        "The file contains the number 42.",
+    ]
+    agent = _agent(script, max_steps=10)
+
+    agent.run_turn("what's in data.txt?")
+
+    assert agent.stop_kind is None
+
+
 def test_agent_loop_surfaces_a_real_dispatch_failure(tmp_path, monkeypatch):
     """Negative control (verify): if a dispatch genuinely fails, the loop
     must NOT silently 'succeed'. Pointing `write` at a path under a non-existent file (so
@@ -900,6 +915,7 @@ def test_hard_governor_returns_budget_sentinel(monkeypatch):
     assert agent.budget_note and result.endswith(agent.budget_note)
     nudges = [m for m in agent.messages if m.get("content") == guardrails.GOVERNOR_SOFT_NUDGE]
     assert len(nudges) == 1
+    assert agent.stop_kind == "budget"
 
 
 def test_loop_abort_returns_stuck_message():
@@ -913,6 +929,19 @@ def test_loop_abort_returns_stuck_message():
     nudges = [m for m in agent.messages if "[loop detected" in m.get("content", "")]
     assert len(nudges) == 2
     assert agent.engine._i == len(script)
+
+
+def test_loop_abort_is_shown_to_the_user():
+    """The explanation must reach the emitter: every caller discards run_turn's return."""
+    shown = []
+    script = [_tool_call("bash", command="echo same")] * 5
+    agent = _agent(script, emit=lambda kind, text: shown.append((kind, text)))
+
+    agent.run_turn("fix the crash in utils.py")
+
+    assert agent.stop_kind == "loop"
+    assert any(kind == "info" and "repeated the same command" in text
+               for kind, text in shown), shown
 
 
 def test_repeated_invalid_call_escalates(tmp_path):
