@@ -1142,8 +1142,8 @@ def _main(argv, host, load_backend):
             agent.run_turn(task + guardrails.REVIEW_PASS_PROMPT)
         agent.save()  # persist so a follow-up `chad -c "..."` picks up the thread
     elif args.repl:
-        backend.repl(eng, yolo=args.yolo, ctx_limit=ctx_limit, resume=resume,
-                     thinking=thinking, ctx_limit_fn=ctx_limit_fn)
+        backend.repl(eng, mode=start_mode, yolo=args.yolo, ctx_limit=ctx_limit,
+                     resume=resume, thinking=thinking, ctx_limit_fn=ctx_limit_fn)
     else:
         from .engine import peek_context_window
         _maybe_home_dir_note()

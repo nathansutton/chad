@@ -4,6 +4,12 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**`--repl --plan` was not read-only.** The plain REPL never received the start mode, so
+`--plan` and `--repl` together ran in normal mode. It now starts in the mode asked for.
+A slash command that does not exist (`/hepl`, `/undo 2`, or `/undo` in the REPL, which
+only the TUI implements) is reported with a suggestion instead of being sent to the
+model as a task.
+
 **chad says which project instructions it read.** A `CLAUDE.md` or `AGENTS.md` longer than
 4,000 characters was cut without a word, an empty `CLAUDE.md` hid the `AGENTS.md` beside
 it, and `/init` wrote a `CLAUDE.md` that replaced an existing `AGENTS.md`. The session

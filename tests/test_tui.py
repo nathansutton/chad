@@ -567,6 +567,36 @@ def test_idle_input_still_starts_a_turn():
     assert list(tui._steer_queue) == []
 
 
+def test_a_mistyped_command_is_reported_not_sent_to_the_model():
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    tui._on_accept(_Buff("/hepl"))
+    assert list(tui._queue) == [] and list(tui._steer_queue) == []
+    assert "unknown command /hepl" in "".join(tui._pending)
+
+
+def test_a_stray_argument_on_a_builtin_is_reported():
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    tui._on_accept(_Buff("/compact now"))
+    assert list(tui._queue) == [] and list(tui._steer_queue) == []
+    assert "/compact takes no argument" in "".join(tui._pending)
+
+
+def test_a_path_that_starts_the_message_still_reaches_the_model():
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    tui._on_accept(_Buff("/usr/local/bin is broken"))
+    assert list(tui._queue) == ["/usr/local/bin is broken"]
+
+
+def test_plain_text_still_reaches_the_model():
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    tui._on_accept(_Buff("fix the bug"))
+    assert list(tui._queue) == ["fix the bug"]
+
+
 def test_midturn_shell_passthrough_keeps_typeahead():
     # `!cmd` is a shell side-channel, not a message to the model — steering it into
     # the transcript would hand the model a literal "!ls" as an instruction.

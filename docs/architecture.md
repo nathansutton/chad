@@ -50,6 +50,7 @@ it through a re-export).
 | `seatbelt.py` | macOS Seatbelt confinement for yolo-mode bash: the spawned shell (never the chad process, which needs Metal) is denied writes outside the workspace. | `test_seatbelt.py` |
 | `session.py` | Conversation persistence per project directory, so `--continue`, `--resume` and the TUI `/resume` picker survive across runs. | `test_session.py`, `test_cli_modes.py`, `conftest.py` |
 | `skills.py` | Agent Skills: discover `SKILL.md` dirs, parse frontmatter leniently, offer each as a slash command, and load only the one the user asks for as a user turn. | `test_skills.py`, `test_validate.py`, `test_ignore.py` |
+| `slash.py` | The check both front ends run before a line reaches the model: a command-shaped first word that no builtin or skill owns is reported with a suggestion, not sent as a task. | `test_slash.py`, `test_tui.py` |
 | `speech.py` | All-local speech I/O for the TUI — Parakeet-on-MLX dictation and macOS `say` replies — with the heavy audio/MLX imports deferred to first use. | `test_speech.py`, `test_speech_tui.py` |
 | `spill.py` | Spill files: every truncation writes the dropped body to disk first and the notice names the path, so a clip is a loan rather than a deletion. | `test_spill.py`, `test_compaction.py`, `test_intent.py` |
 | `syntaxgate.py` | The post-mutation syntax warning: a landed edit/write that *newly* breaks a file's parse says so in the same result the model is about to read. | `test_syntaxgate.py` (through `tools.tool_edit`/`tool_write`) |

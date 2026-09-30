@@ -1867,9 +1867,14 @@ def skill_token_cost(engine, text: str) -> int:
     return token_len(engine, text)
 
 
+_REPL_COMMANDS = ("/exit", "/quit", "/reset", "/clear", "/mode", "/compact", "/model",
+                  "/skills", "/mcp", "/help", "/init")
+_TUI_ONLY_COMMANDS = ("/undo", "/restore", "/resume", "/ctx", "/accept", "/speech")
+
+
 def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = None,
-         thinking: bool = True, ctx_limit_fn=None):
-    agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking,
+         thinking: bool = True, ctx_limit_fn=None, mode: str = None):
+    agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking, mode=mode,
                   resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn)
     print(banner(engine.model_id.split("/")[-1], ctx_limit, mode=agent.mode))
     print(f"{C_DIM}type a task, or /reset, /exit.{C_RST}")
@@ -1886,7 +1891,7 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             break
         if line in ("/reset", "/clear"):
             agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking,
-                          persist=True, ctx_limit_fn=ctx_limit_fn)
+                          mode=agent.mode, persist=True, ctx_limit_fn=ctx_limit_fn)
             engine.reset()
             print(f"{C_DIM}session reset.{C_RST}")
             continue
@@ -1929,7 +1934,8 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             print(f"{C_DIM}/init /skills /mcp /mcp trust /mcp login <server> /reset /clear "
                   f"/compact /model /mode /exit · /<skill> runs an installed skill "
                   f"(/skills lists them) · !cmd runs a shell command · "
-                  f"@path attaches a file/dir{C_RST}")
+                  f"@path attaches a file/dir · /undo /restore /resume /ctx /accept "
+                  f"/speech are TUI-only{C_RST}")
             continue
         if line == "/init":
             agent.run_turn(init_prompt(init_target()))
@@ -1940,6 +1946,12 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
         # The skill body becomes the turn itself (see skills.load); its token cost is
         # printed because a large skill can be most of the window.
         from . import skills
+        if skills.is_skill_command(line) is None:
+            from . import slash
+            msg = slash.unknown_message(line, _REPL_COMMANDS, _TUI_ONLY_COMMANDS)
+            if msg is not None:
+                print(f"{C_DIM}{msg}{C_RST}")
+                continue
         hit = skills.is_skill_command(line)
         if hit:
             name, task = hit
