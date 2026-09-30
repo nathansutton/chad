@@ -224,8 +224,8 @@ def _fake_engine():
 class _FakeAgent:
     """Drop-in for `TUI.agent`. Records each `run_turn` message and can run a caller-
     supplied hook *inside* the turn (to block, or to observe the interrupt). `save`,
-    `budget_note`, `mode`, and `last_plan_path` are the only other members the worker
-    reads. `_should_stop` is the SAME callback the real Agent was built with, so an
+    `budget_note`, `stop_kind`, `mode`, and `last_plan_path` are the only other members
+    the worker reads. `_should_stop` is the SAME callback the real Agent was built with, so an
     interrupt set on the TUI is visible here — this proves the wiring, not a copy of it."""
 
     def __init__(self, should_stop):
@@ -234,6 +234,7 @@ class _FakeAgent:
         self.saved = 0
         self.mode = "normal"
         self.budget_note = None
+        self.stop_kind = None
         self.last_plan_path = None
         self.on_call = None  # optional callable(msg) executed within run_turn
 
@@ -306,6 +307,44 @@ def test_worker_drains_queue_in_order():
     assert fake.calls == msgs  # FIFO, no reordering
     assert fake.saved == len(msgs)  # each turn persisted
     _stop_worker(tui, th)
+
+
+def _run_one_turn(tui, fake, on_call):
+    """Run a single queued turn through the real worker with `on_call` inside it, and
+    return once the worker is idle again."""
+    fake.on_call = on_call
+    th = _start_worker(tui)
+    tui._queue.append("fix it")
+    tui._wake.set()
+    assert _spin_until(lambda: fake.calls and not tui._busy), "turn never finished"
+    _stop_worker(tui, th)
+
+
+def test_budget_stop_handoff_says_what_typing_does():
+    tui, fake = _worker_tui()
+
+    def stop_at_step_cap(_msg):
+        fake.budget_note = "note"
+        fake.stop_kind = "step_cap"
+
+    _run_one_turn(tui, fake, stop_at_step_cap)
+
+    out = "".join(tui._pending)
+    assert "fresh context" in out, out
+    assert "hit its budget" not in out
+    assert tui._pending_budget_note == "note"
+
+
+def test_loop_stop_handoff_keeps_the_conversation():
+    tui, fake = _worker_tui()
+
+    def stop_on_loop(_msg):
+        fake.stop_kind = "loop"
+
+    _run_one_turn(tui, fake, stop_on_loop)
+
+    assert "the conversation is kept" in "".join(tui._pending), tui._pending
+    assert tui._pending_budget_note is None
 
 
 # -- Step 3: interrupt delivery ----------------------------------------------
