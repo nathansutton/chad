@@ -4,6 +4,11 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**`/undo` can be undone.** It restored over whatever was in the workspace, including
+your own edits since the last checkpoint, without saving it. It now snapshots that
+state first and names the checkpoint, says "nothing to undo" when nothing differs, and
+reminds you that the model has not been told about the revert.
+
 **MCP and skill problems are shown when they happen.** The first turn of a session
 prints one line with how many MCP servers connected, failed or are waiting, and names
 the wait while it connects. `/mcp` and `/skills` list every warning, with skipped files

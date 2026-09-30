@@ -55,8 +55,40 @@ def test_restore_leaves_files_created_after_snapshot(ws):
     checkpoint.snapshot(str(ws), "s1")
     (ws / "new.py").write_text("created later\n")
     msg = checkpoint.restore(str(ws))
-    assert msg.startswith("restored")
+    assert msg.startswith("nothing to undo")
     assert (ws / "new.py").read_text() == "created later\n"
+
+
+def test_restore_saves_the_state_it_overwrites(ws):
+    checkpoint.snapshot(str(ws), "before edit")
+    (ws / "a.py").write_text("A2 the agent's edit\n")
+    msg = checkpoint.restore(str(ws))
+    assert msg.startswith("restored 1 file(s)")
+    assert (ws / "a.py").read_text() == "A1\n"
+    # The overwritten state is itself a checkpoint now, and the message names it.
+    newest = checkpoint.snapshots(str(ws))[0]
+    assert newest[2].startswith("before restore")
+    assert newest[0] in msg
+    assert checkpoint.restore(str(ws), newest[0]).startswith("restored 1 file(s)")
+    assert (ws / "a.py").read_text() == "A2 the agent's edit\n"
+
+
+def test_restore_with_nothing_to_undo_says_so(ws):
+    checkpoint.snapshot(str(ws), "before edit")
+    before = len(checkpoint.snapshots(str(ws), limit=50))
+    msg = checkpoint.restore(str(ws))
+    assert msg.startswith("nothing to undo")
+    # And it did not add a checkpoint for a restore that changed nothing.
+    assert len(checkpoint.snapshots(str(ws), limit=50)) == before
+
+
+def test_a_second_undo_brings_the_edit_back(ws):
+    checkpoint.snapshot(str(ws), "before edit")
+    (ws / "a.py").write_text("A2\n")
+    checkpoint.restore(str(ws))
+    assert (ws / "a.py").read_text() == "A1\n"
+    checkpoint.restore(str(ws))
+    assert (ws / "a.py").read_text() == "A2\n"
 
 
 def test_restore_to_named_earlier_snapshot(ws):
@@ -179,7 +211,7 @@ def test_old_shadow_gets_new_excludes_and_stops_carrying_secrets(ws):
     with open(os.path.join(checkpoint.shadow_dir(str(ws)), "info", "exclude")) as fh:
         assert fh.read() == checkpoint._DEFAULT_EXCLUDES
     assert ".env" not in _tree(ws)
-    assert checkpoint.restore(str(ws)).startswith("restored")
+    assert checkpoint.restore(str(ws)).startswith("nothing to undo")
     assert (ws / ".env").read_text() == "TOKEN=x\n"
 
 
