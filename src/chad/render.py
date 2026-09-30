@@ -19,8 +19,16 @@ import sys
 
 from . import tools
 
-C_DIM = "\033[2m"; C_CYAN = "\033[36m"; C_GREEN = "\033[32m"; C_YEL = "\033[33m"
-C_RED = "\033[31m"; C_BOLD = "\033[1m"; C_RST = "\033[0m"
+# https://no-color.org: any non-empty NO_COLOR turns colour off. Decided once at import;
+# the constants are imported by name across the package.
+_COLOR = not os.environ.get("NO_COLOR")
+C_DIM = "\033[2m" if _COLOR else ""
+C_CYAN = "\033[36m" if _COLOR else ""
+C_GREEN = "\033[32m" if _COLOR else ""
+C_YEL = "\033[33m" if _COLOR else ""
+C_RED = "\033[31m" if _COLOR else ""
+C_BOLD = "\033[1m" if _COLOR else ""
+C_RST = "\033[0m" if _COLOR else ""
 
 # Optional syntax highlighting. Pygments is a pure-Python OPTIONAL
 # extra (`pip install 'chad[highlight]'`): when present, diff/preview code lines get
@@ -409,3 +417,25 @@ def _default_emit(kind: str, text: str):
         # feed, and any unknown kinds return None and are intentionally dropped from
         # stdout — they belong to the TUI's pinned region, not the plain REPL scrollback.
     sys.stdout.flush()
+
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """`text` without colour codes, for output that is going to a file or a pipe."""
+    return _ANSI_RE.sub("", text)
+
+
+def piped_emit(kind: str, text: str) -> None:
+    """The emitter for a headless run whose stdout is not a terminal: progress goes to
+    stderr, uncoloured, so stdout carries only the answer."""
+    if kind == "stream":
+        sys.stderr.write(text)
+    elif kind == "user":
+        sys.stderr.write(f"\n» {text}\n")
+    else:
+        frag = ansi_fragment(kind, text)
+        if frag is not None:
+            sys.stderr.write(strip_ansi(frag))
+    sys.stderr.flush()

@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from chad import cli, session
+from chad import cli, render, session
 
 
 class _FakeEngine:
@@ -43,7 +43,8 @@ class _FakeEngine:
 def rec(monkeypatch, tmp_path):
     """Run `cli.main` against recorders; record every engine, Agent and TUI launch.
 
-    `rec.main(argv, tty=...)` runs the entrypoint with stdin reporting a TTY or not.
+    `rec.main(argv, tty=...)` runs the entrypoint with stdin reporting a TTY or not;
+    `stdout_tty` does the same for stdout, a terminal unless a test says otherwise.
     `rec.notes` scripts the `budget_note` each successive turn banks, to drive the
     relaunch loop; left empty, every turn finishes clean. `rec.answers` are typed at the
     terminal prompts, in order. The TUI is always a recorder so a regression that falls
@@ -54,6 +55,7 @@ def rec(monkeypatch, tmp_path):
         def __init__(self, eng, **kw):
             self.eng, self.kw, self.turns = eng, kw, []
             self.budget_note = None
+            self.stop_kind = None
             self.saved = False
             rec.agents.append(self)
 
@@ -77,9 +79,10 @@ def rec(monkeypatch, tmp_path):
 
     backend = cli.Backend(engine=_engine, agent=_RecordingAgent, repl=_repl, tui=_run_tui)
 
-    def main(argv, *, tty):
+    def main(argv, *, tty, stdout_tty=True):
         host = cli.Host(platform_id=lambda: ("Darwin", "arm64"),
                         stdin_isatty=lambda: tty,
+                        stdout_isatty=lambda: stdout_tty,
                         ask=lambda prompt: rec.answers.pop(0))
         return cli.main(argv, host=host, load_backend=lambda: backend)
 
@@ -233,3 +236,51 @@ def test_interactive_budget_stop_does_not_relaunch(rec):
 
     assert len(rec.agents) == 1 and rec.agents[0].saved
     assert rec.engines[0].resets == 0
+
+
+# --- the exit status a script reads -------------------------------------------
+
+def test_headless_clean_finish_exits_zero(rec):
+    assert rec.main(["do X"], tty=False) == 0
+
+
+def test_headless_exhausted_relaunches_exit_not_done(rec, monkeypatch):
+    monkeypatch.setenv("CHAD_AUTO_CONTINUE", "1")
+    rec.notes = ["n1", "n2"]
+
+    assert rec.main(["do X"], tty=False) == 1
+    assert len(rec.agents) == 2
+
+
+def test_headless_recovered_relaunch_exits_zero(rec, monkeypatch):
+    monkeypatch.setenv("CHAD_AUTO_CONTINUE", "1")
+    rec.notes = ["n1"]
+
+    assert rec.main(["do X"], tty=False) == 0
+    assert len(rec.agents) == 2
+
+
+@pytest.mark.parametrize("result, stop_kind, budget_note, status", [
+    ("Done.", None, None, 0),
+    ("[interrupted]", None, None, 130),
+    ("[stopped: the same call three times]", "loop", None, 1),
+    ("[budget] note", "budget", "note", 1),
+])
+def test_exit_status_reads_how_the_turn_ended(result, stop_kind, budget_note, status):
+    assert cli._exit_status(result, stop_kind, budget_note) == status
+
+
+# --- stdout piped or redirected -----------------------------------------------
+
+def test_piped_stdout_carries_only_the_answer(rec, capsys):
+    rec.main(["do X"], tty=False, stdout_tty=False)
+
+    assert rec.agents[0].kw["emit"] is render.piped_emit
+    assert capsys.readouterr().out == "ok\n"
+
+
+def test_terminal_stdout_keeps_the_streaming_emitter(rec, capsys):
+    rec.main(["do X"], tty=False, stdout_tty=True)
+
+    assert rec.agents[0].kw["emit"] is None
+    assert "ok" not in capsys.readouterr().out
