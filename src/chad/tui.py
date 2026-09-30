@@ -1273,6 +1273,11 @@ class TUI:
                 return False
             msg = checkpoint.restore(ws, arg or "HEAD")
             self._emit("info", msg)
+            if msg.startswith("restored"):
+                # The conversation still says the edit happened. Until the model is
+                # told, its next edit will look for text that is no longer in the file.
+                self._emit("info", "  chad has not been told about this. Mention it in "
+                                   "your next message, or /reset to start clean.")
             return False
         if text == "/resume" or text.startswith("/resume "):
             self._handle_resume(text[len("/resume"):].strip())

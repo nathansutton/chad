@@ -738,6 +738,40 @@ def test_init_targets_the_existing_agents_md(tmp_path, monkeypatch):
     assert len(queued) == 1, queued
     assert "AGENTS.md" in queued[0] and "CLAUDE.md" not in queued[0], queued[0]
 
+def test_undo_reports_the_restore_and_that_the_model_was_not_told(tmp_path, monkeypatch):
+    from chad import checkpoint
+    # A subdirectory: the checkpoint store itself lives under tmp_path.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    (proj / "a.py").write_text("A1\n")
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    checkpoint.snapshot(os.getcwd(), "before edit")
+    (proj / "a.py").write_text("A2\n")
+    tui._on_accept(_Buff("/undo"))
+    out = "".join(tui._pending)
+    assert "restored 1 file(s)" in out, out
+    assert "has not been told about this" in out, out
+    assert (proj / "a.py").read_text() == "A1\n"
+
+
+def test_undo_with_nothing_changed_says_so_without_the_model_warning(tmp_path, monkeypatch):
+    from chad import checkpoint
+    # A subdirectory: the checkpoint store itself lives under tmp_path.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    (proj / "a.py").write_text("A1\n")
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    checkpoint.snapshot(os.getcwd(), "before edit")
+    tui._on_accept(_Buff("/undo"))
+    out = "".join(tui._pending)
+    assert "nothing to undo" in out, out
+    assert "has not been told" not in out, out
+
+
 def test_ctx_command_survives_an_unpriceable_prompt():
     # The fake engine has no tokenizer at all — the gauge must degrade to one line,
     # not raise out of the key handler and kill the UI.

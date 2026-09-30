@@ -254,7 +254,7 @@ the REPL column. A slash command that does not exist is reported, not sent to th
 | `/mcp login` | authenticate an MCP server (OAuth) | ✓ |
 | `/compact` | reclaim context now | ✓ |
 | `/ctx` | where the context window is going, in tokens | – |
-| `/undo` | revert files to the last edit checkpoint | – |
+| `/undo` | revert files to the last edit checkpoint, saving the state it replaces as a checkpoint first, so `/undo` again brings the change back; the model is not told about the revert | – |
 | `/restore` | list edit checkpoints; `/restore <hash>` reverts to one | – |
 | `/resume` | list recent sessions; `/resume <n>` forks one | – |
 | `/reset` | clear the conversation + KV cache | ✓ |
