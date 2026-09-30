@@ -1143,7 +1143,7 @@ def _main(argv, host, load_backend, interrupt):
     resume = None
     if args.resume:
         from . import session
-        items = session.list_sessions(os.getcwd(), limit=10)
+        items = session.list_sessions(os.getcwd(), limit=session.RETAIN)
         if not items:
             sys.stderr.write("no saved sessions for this directory; starting fresh\n")
         elif not host.stdin_isatty():
@@ -1157,12 +1157,17 @@ def _main(argv, host, load_backend, interrupt):
                 if data:
                     resume = data["messages"]
                     sys.stderr.write(f"resuming (forked): {session.describe(pick)}\n")
+                    for ln in session.recap(resume):
+                        sys.stderr.write(f"  » {ln}\n")
     elif args.cont:
         from . import session
-        data = session.load_session(os.getcwd())
+        items = session.list_sessions(os.getcwd(), limit=1)
+        data = session.load_session(os.getcwd(), items[0]["session_id"]) if items else None
         if data:
             resume = data["messages"]
-            sys.stderr.write(f"resuming session ({session.session_summary(os.getcwd())})\n")
+            sys.stderr.write(f"resuming (forked): {session.describe(items[0])}\n")
+            for ln in session.recap(resume):
+                sys.stderr.write(f"  » {ln}\n")
         else:
             sys.stderr.write("no saved session for this directory; starting fresh\n")
 
