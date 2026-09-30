@@ -49,7 +49,8 @@ def rec(monkeypatch, tmp_path):
     relaunch loop; left empty, every turn finishes clean. `rec.answers` are typed at the
     terminal prompts, in order. The TUI is always a recorder so a regression that falls
     through to it fails an assertion instead of taking the terminal."""
-    rec = SimpleNamespace(agents=[], engines=[], notes=[], answers=[], tui=None, repl=None)
+    rec = SimpleNamespace(agents=[], engines=[], notes=[], answers=[], tui=None, repl=None,
+                          on_turn=None)
 
     class _RecordingAgent:
         def __init__(self, eng, **kw):
@@ -62,7 +63,11 @@ def rec(monkeypatch, tmp_path):
         def run_turn(self, text):
             self.turns.append(text)
             self.budget_note = rec.notes.pop(0) if rec.notes else None
-            return "ok"
+            if rec.on_turn is not None:
+                rec.on_turn(self)
+            # The real Agent ends the turn this way once `should_stop` turns true.
+            should_stop = self.kw.get("should_stop")
+            return "[interrupted]" if should_stop is not None and should_stop() else "ok"
 
         def save(self):
             self.saved = True
@@ -79,12 +84,15 @@ def rec(monkeypatch, tmp_path):
 
     backend = cli.Backend(engine=_engine, agent=_RecordingAgent, repl=_repl, tui=_run_tui)
 
-    def main(argv, *, tty, stdout_tty=True):
+    def main(argv, *, tty, stdout_tty=True, interrupt=None):
         host = cli.Host(platform_id=lambda: ("Darwin", "arm64"),
                         stdin_isatty=lambda: tty,
                         stdout_isatty=lambda: stdout_tty,
                         ask=lambda prompt: rec.answers.pop(0))
-        return cli.main(argv, host=host, load_backend=lambda: backend)
+        # Always inject the ctrl-c flag: left None, `main` would install it as the
+        # test process's own SIGINT handler.
+        return cli.main(argv, host=host, load_backend=lambda: backend,
+                        interrupt=interrupt or cli.Interrupt())
 
     rec.main = main
 
@@ -117,6 +125,16 @@ def test_repl_starts_in_the_mode_asked_for(rec, argv, mode):
     assert rec.repl["mode"] == mode
 
 
+def test_repl_polls_and_clears_the_ctrl_c_flag(rec):
+    stop = cli.Interrupt()
+    rec.main(["--repl"], tty=True, interrupt=stop)
+
+    stop.on_sigint(2, None)
+    assert rec.repl["should_stop"]() is True
+    rec.repl["clear_stop"]()
+    assert stop.requested() is False
+
+
 # --- one-shot permission mode -------------------------------------------------
 
 @pytest.mark.parametrize("argv, tty, mode, promoted", [
@@ -137,6 +155,47 @@ def test_one_shot_permission_mode(rec, capsys, argv, tty, mode, promoted):
     assert agent.turns == ["do X"]
     assert agent.saved  # a follow-up `chad -c` can pick the thread up
     assert ("[headless: auto-approving" in capsys.readouterr().err) is promoted
+
+
+# --- ctrl-c in a one-shot run -------------------------------------------------
+
+def test_interrupted_turn_is_saved_not_relaunched(rec, monkeypatch):
+    stop = cli.Interrupt()
+    rec.on_turn = lambda agent: stop.on_sigint(2, None)
+    rec.notes = ["note"]  # a banked budget note would otherwise relaunch
+    monkeypatch.setenv("CHAD_AUTO_CONTINUE", "2")
+
+    code = rec.main(["do X"], tty=False, interrupt=stop)
+
+    (agent,) = rec.agents
+    assert agent.saved is True
+    assert agent.kw["should_stop"]() is True
+    assert code == cli.EXIT_INTERRUPTED
+
+
+def test_exception_inside_the_turn_still_saves(rec):
+    def boom(agent):
+        raise RuntimeError("mid-turn")
+    rec.on_turn = boom
+
+    with pytest.raises(RuntimeError):
+        rec.main(["do X"], tty=False)
+
+    assert rec.agents[0].saved is True
+
+
+def test_raw_keyboard_interrupt_exits_130_without_a_traceback(rec, capsys):
+    def second_press(agent):
+        raise KeyboardInterrupt
+    rec.on_turn = second_press
+
+    code = rec.main(["do X"], tty=False)
+
+    err = capsys.readouterr().err
+    assert code == 130
+    assert "interrupted" in err
+    assert "Traceback" not in err
+    assert rec.agents[0].saved is True
 
 
 def test_bad_argv_still_fails_in_argparse(rec):

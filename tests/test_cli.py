@@ -307,6 +307,40 @@ def test_ensure_model_disk_preflight_unreadable(monkeypatch, tmp_path):
           terminal.asked)
 
 
+@pytest.mark.parametrize("key", [KeyboardInterrupt, EOFError])
+def test_ensure_model_consent_ctrl_c_or_ctrl_d_aborts_cleanly(monkeypatch, capsys,
+                                                              tmp_path, key):
+    """Ctrl-c or ctrl-d at the first-run download prompt — the moment a new user is
+    likeliest to press it — is a one-line abort, not a traceback."""
+    monkeypatch.chdir(tmp_path)  # the repo id is not a local directory from here
+
+    def ask(prompt):
+        raise key
+
+    host = cli.Host(cached_file=lambda repo, filename: None,  # nothing cached
+                    free_disk_gb=lambda path: None,
+                    stdin_isatty=lambda: True, ask=ask)
+    with pytest.raises(SystemExit) as e:
+        cli._ensure_model(cli._HF_MODEL, host=host)
+    check("exits 130", e.value.code == 130, e.value.code)
+    err = capsys.readouterr().err
+    check("says nothing was fetched", "Nothing was downloaded" in err, err)
+    check("no traceback", "Traceback" not in err, err)
+
+
+def test_interrupt_first_press_asks_second_press_raises(capsys):
+    stop = cli.Interrupt()
+    check("starts clear", stop.requested() is False)
+    stop.on_sigint(2, None)
+    check("first press sets the flag", stop.requested() is True)
+    check("and says what a second press does",
+          "again to quit" in capsys.readouterr().err)
+    with pytest.raises(KeyboardInterrupt):
+        stop.on_sigint(2, None)
+    stop.clear()
+    check("clear resets it", stop.requested() is False)
+
+
 def test_cached_weights_complete(tmp_path):
     """The guard must read WEIGHTS, not metadata. An interrupted first download leaves
     config.json + tokenizer in the snapshot and no tensors; treating that as a cache hit

@@ -17,10 +17,12 @@ import json
 import os
 import platform
 import re
+import signal
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from types import FrameType
 from typing import TYPE_CHECKING, Callable, Optional, TypeVar
 
 from . import config, gguf_pack, guardrails, levers
@@ -636,7 +638,13 @@ def _ensure_model(model_id, *, host: Host = HOST):
          + (f"The first start also saves a converted copy (~{repack_gb:.0f} GB) in "
             "~/.cache/chad, so later starts skip the conversion.\n" if repack_gb else "")))
     if host.stdin_isatty():
-        ans = host.ask("Download now? [Y/n] ").strip().lower()
+        try:
+            ans = host.ask("Download now? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            sys.stderr.write(
+                "\nAborted. Nothing was downloaded. Set CHAD_MODEL to a local model "
+                "dir to skip the download.\n")
+            sys.exit(EXIT_INTERRUPTED)
         if ans and ans not in ("y", "yes"):
             sys.stderr.write(
                 "Aborted. Set CHAD_MODEL to a local model dir to skip the download.\n")
@@ -652,6 +660,12 @@ def _ensure_model(model_id, *, host: Host = HOST):
             gguf_pack.fetch_hub(model_id)  # the file and its sidecar; tqdm to stderr
         else:
             snapshot_download(model_id)  # tqdm progress to stderr
+    except KeyboardInterrupt:
+        sys.stderr.write(
+            f"\nchad: download of '{model_id}' interrupted\n"
+            "  fix:   run chad again — the download resumes from the files already "
+            "fetched.\n")
+        sys.exit(EXIT_INTERRUPTED)
     except Exception as e:  # noqa: BLE001 — offline / gated / typo'd repo / full disk → guidance, not a traceback
         no_space = isinstance(e, OSError) and e.errno == 28
         extra = ("  note:  the disk filled up mid-download — free space and re-run "
@@ -753,6 +767,33 @@ _SUBCOMMANDS = ("prove", "levers")
 EXIT_OK = 0
 EXIT_NOT_DONE = 1      # a guard stopped the turn, or every relaunch ran out of budget
 EXIT_INTERRUPTED = 130  # 128 + SIGINT, what a shell reports for ctrl-c
+
+
+class Interrupt:
+    """Ctrl-c for the front ends that have no event loop: the first press asks the
+    running turn to stop at its next check, the second gives up waiting and raises.
+
+    The agent already stops cleanly when `should_stop` turns true — it ends the step,
+    kills a running command's process group and returns. A bare KeyboardInterrupt lands
+    wherever Python happens to be and takes the unsaved conversation with it."""
+
+    def __init__(self) -> None:
+        self._requested = False
+
+    def requested(self) -> bool:
+        return self._requested
+
+    def clear(self) -> None:
+        self._requested = False
+
+    def on_sigint(self, signum: int, frame: Optional[FrameType]) -> None:
+        if self._requested:
+            raise KeyboardInterrupt
+        self._requested = True
+        sys.stderr.write("\n[interrupting — press ctrl-c again to quit now]\n")
+
+    def install(self) -> None:
+        signal.signal(signal.SIGINT, self.on_sigint)
 
 
 def _exit_status(result: str, stop_kind: Optional[str], budget_note: Optional[str]) -> int:
@@ -901,20 +942,26 @@ def _load_backend() -> Backend:
     return Backend(engine=Engine, agent=Agent, repl=repl, tui=_run_tui)
 
 
-def main(argv=None, *, host=HOST, load_backend=_load_backend):
+def main(argv=None, *, host=HOST, load_backend=_load_backend,
+         interrupt: Optional[Interrupt] = None):
     """Console entrypoint. Wraps `_main` only to turn a backend fault that escaped the
     agent's retry loop into guidance — it can surface from the one-shot, --repl, or TUI
     path alike, and all three would otherwise exit through a raw traceback.
 
     `host` is the machine and terminal startup reads; `load_backend` is called once
-    argparse and the subcommands are through, and returns what the run is built from."""
+    argparse and the subcommands are through, and returns what the run is built from.
+    `interrupt` is the ctrl-c flag the one-shot and --repl paths poll; None installs a
+    fresh one as the SIGINT handler, and a test passes its own to press it by hand."""
     try:
-        return _main(argv, host, load_backend)
+        return _main(argv, host, load_backend, interrupt)
     except BackendError as e:
         _fail_backend(e, _resolved_base_url)
+    except KeyboardInterrupt:
+        sys.stderr.write("\nchad: interrupted.\n")
+        return EXIT_INTERRUPTED
 
 
-def _main(argv, host, load_backend):
+def _main(argv, host, load_backend, interrupt):
     global _resolved_base_url
     argv = list(sys.argv[1:] if argv is None else argv)
     sub = argv[0] if argv and argv[0] in _SUBCOMMANDS else None
@@ -1022,6 +1069,9 @@ def _main(argv, host, load_backend):
             sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} [{why}] ...\n")
         try:
             load_s = eng.load()
+        except KeyboardInterrupt:
+            sys.stderr.write("\nchad: interrupted while loading the model.\n")
+            sys.exit(EXIT_INTERRUPTED)
         except Exception as e:  # noqa: BLE001 — convert any load failure into guidance
             _fail_model_load(model_id, e)
         ctx_limit = _compute_ctx_limit(eng)
@@ -1081,101 +1131,112 @@ def _main(argv, host, load_backend):
         # of how the model got there goes to stderr.
         piped = not host.stdout_isatty()
         emit = render.piped_emit if piped else None
+        stop = interrupt or Interrupt()
+        if interrupt is None:
+            stop.install()
         agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
                               mode=run_mode, thinking=thinking, resume=resume, persist=True,
                               think_budget=args.think_budget,
                               turn_budget_s=turn_budget_s, ctx_limit_fn=ctx_limit_fn,
-                              emit=emit)
+                              emit=emit, should_stop=stop.requested)
         # Wall time across ALL of this task's turns (initial + any auto-continue
         # relaunches), measured against the wall budget to decide the early-finish review.
         task_start = time.monotonic()
-        result = agent.run_turn(task)
-        # If the turn hard-stopped on a budget (governor token/wall budget, the
-        # step cap's final window landing nothing, or the no-empty-diff gate),
-        # optionally relaunch a FRESH turn (new context + reset KV cache) seeded with the
-        # deterministic progress note — shedding both the ramble and the huge prefill the
-        # stuck model dragged. Unattended runs default to 2 relaunches: headless is
-        # exactly where nobody can say 'continue', and a banked half-done task otherwise
-        # ships as an empty diff — the measured bail signature.
-        auto_continue = config.env_int("CHAD_AUTO_CONTINUE")
-        continues = auto_continue if auto_continue is not None \
-            else (2 if run_mode == "yolo" else 0)
-        used_continues = 0
-        while agent.budget_note:
-            # Base allowance first; past it, keep granting fresh attempts while most
-            # of the task wall is still unspent (bounded by AUTO_CONTINUE_TOTAL_CAP) —
-            # the fixed base is wall-blind: a long build task gave up after 3
-            # step-capped turns with 94.7% of a 12000s budget still unused.
-            if continues > 0:
-                continues -= 1
-            elif (auto_continue is None and turn_budget_s
-                    and guardrails.replenish_continue(
-                        turn_budget_s, time.monotonic() - task_start,
-                        used_continues)):
-                sys.stderr.write("[governor] wall budget mostly unspent — granting an "
-                                 "extra continue\n")
-            else:
-                break
-            used_continues += 1
-            note = agent.budget_note
-            # The wall budget is a TASK-level deadline (the harness SIGKILLs the whole chad
-            # process), not a per-turn one: a relaunch must inherit only the wall time that
-            # REMAINS, or the governor / wrap-up / hard-abort windows (measured from each
-            # turn's own start) never open before the process is killed — the relaunched
-            # turn rides to a mid-work SIGKILL with nothing landed. With no wall budget set
-            # (interactive/unmetered), there is no deadline: keep the old fresh-None budget.
-            if turn_budget_s:
-                relaunch_s = guardrails.relaunch_budget(
-                    turn_budget_s, time.monotonic() - task_start)
-                if relaunch_s is None:
-                    sys.stderr.write("[governor] previous turn ran out of budget; too "
-                                     "little wall left to relaunch — stopping\n")
+        try:
+            result = agent.run_turn(task)
+            # If the turn hard-stopped on a budget (governor token/wall budget, the
+            # step cap's final window landing nothing, or the no-empty-diff gate),
+            # optionally relaunch a FRESH turn (new context + reset KV cache) seeded with the
+            # deterministic progress note — shedding both the ramble and the huge prefill the
+            # stuck model dragged. Unattended runs default to 2 relaunches: headless is
+            # exactly where nobody can say 'continue', and a banked half-done task otherwise
+            # ships as an empty diff — the measured bail signature.
+            auto_continue = config.env_int("CHAD_AUTO_CONTINUE")
+            continues = auto_continue if auto_continue is not None \
+                else (2 if run_mode == "yolo" else 0)
+            used_continues = 0
+            while agent.budget_note and not stop.requested():
+                # Base allowance first; past it, keep granting fresh attempts while most
+                # of the task wall is still unspent (bounded by AUTO_CONTINUE_TOTAL_CAP) —
+                # the fixed base is wall-blind: a long build task gave up after 3
+                # step-capped turns with 94.7% of a 12000s budget still unused.
+                if continues > 0:
+                    continues -= 1
+                elif (auto_continue is None and turn_budget_s
+                        and guardrails.replenish_continue(
+                            turn_budget_s, time.monotonic() - task_start,
+                            used_continues)):
+                    sys.stderr.write("[governor] wall budget mostly unspent — granting an "
+                                     "extra continue\n")
+                else:
                     break
-            else:
-                relaunch_s = None
-            sys.stderr.write("[governor] previous turn ran out of budget/steps; continuing "
-                             "fresh with a progress note\n")
-            # A deterministic (temp-0) stall replays itself verbatim on retry — the
-            # measured 3/3 byte-identical failing reps. Give the relaunch a
-            # sampling distribution so it can take a different path.
-            eng.temp = max(eng.temp, 0.6)
-            eng.reset()
-            agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
-                                  mode=run_mode, thinking=thinking, persist=True,
-                                  think_budget=args.think_budget,
-                                  turn_budget_s=relaunch_s, ctx_limit_fn=ctx_limit_fn,
-                                  emit=emit)
-            result = agent.run_turn(f"{task}\n\n[{note}]")
-        # Early-finish self-review: if the task settled CLEANLY (no
-        # banked budget note) with more than 30% of the wall budget still unspent, relaunch
-        # ONE fresh-context turn to independently verify the deliverables — the fresh KV
-        # cache sheds the poisoned context that convinced the first attempt it was done,
-        # catching the confident-wrong `done`. Off unless armed (--review-pass /
-        # CHAD_REVIEW_PASS) and a wall budget is set, so interactive/unmetered runs and
-        # clean A/B baselines never trigger it.
-        review_armed = config.flag("CHAD_REVIEW_PASS")
-        elapsed = time.monotonic() - task_start
-        if review_armed and guardrails.review_pass_should_fire(
-                not agent.budget_note, turn_budget_s, elapsed):
-            # The review turn respects the SAME task deadline: give it only the wall time
-            # that remains, floored, so its own governor/wrap-up can't blow past the cap.
-            review_budget = max(30.0, turn_budget_s - elapsed)
-            sys.stderr.write(f"[review] task finished with {turn_budget_s - elapsed:.0f}s "
-                             "of budget left; running one fresh-context verification pass\n")
-            eng.reset()
-            agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
-                                  mode=run_mode, thinking=thinking, persist=True,
-                                  think_budget=args.think_budget,
-                                  turn_budget_s=review_budget, ctx_limit_fn=ctx_limit_fn,
-                                  emit=emit)
-            result = agent.run_turn(task + guardrails.REVIEW_PASS_PROMPT)
-        agent.save()  # persist so a follow-up `chad -c "..."` picks up the thread
+                used_continues += 1
+                note = agent.budget_note
+                # The wall budget is a TASK-level deadline (the harness SIGKILLs the whole chad
+                # process), not a per-turn one: a relaunch must inherit only the wall time that
+                # REMAINS, or the governor / wrap-up / hard-abort windows (measured from each
+                # turn's own start) never open before the process is killed — the relaunched
+                # turn rides to a mid-work SIGKILL with nothing landed. With no wall budget set
+                # (interactive/unmetered), there is no deadline: keep the old fresh-None budget.
+                if turn_budget_s:
+                    relaunch_s = guardrails.relaunch_budget(
+                        turn_budget_s, time.monotonic() - task_start)
+                    if relaunch_s is None:
+                        sys.stderr.write("[governor] previous turn ran out of budget; too "
+                                         "little wall left to relaunch — stopping\n")
+                        break
+                else:
+                    relaunch_s = None
+                sys.stderr.write("[governor] previous turn ran out of budget/steps; continuing "
+                                 "fresh with a progress note\n")
+                # A deterministic (temp-0) stall replays itself verbatim on retry — the
+                # measured 3/3 byte-identical failing reps. Give the relaunch a
+                # sampling distribution so it can take a different path.
+                eng.temp = max(eng.temp, 0.6)
+                eng.reset()
+                agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
+                                      mode=run_mode, thinking=thinking, persist=True,
+                                      think_budget=args.think_budget,
+                                      turn_budget_s=relaunch_s, ctx_limit_fn=ctx_limit_fn,
+                                      emit=emit, should_stop=stop.requested)
+                result = agent.run_turn(f"{task}\n\n[{note}]")
+            # Early-finish self-review: if the task settled CLEANLY (no
+            # banked budget note) with more than 30% of the wall budget still unspent, relaunch
+            # ONE fresh-context turn to independently verify the deliverables — the fresh KV
+            # cache sheds the poisoned context that convinced the first attempt it was done,
+            # catching the confident-wrong `done`. Off unless armed (--review-pass /
+            # CHAD_REVIEW_PASS) and a wall budget is set, so interactive/unmetered runs and
+            # clean A/B baselines never trigger it.
+            review_armed = config.flag("CHAD_REVIEW_PASS")
+            elapsed = time.monotonic() - task_start
+            if review_armed and not stop.requested() and guardrails.review_pass_should_fire(
+                    not agent.budget_note, turn_budget_s, elapsed):
+                # The review turn respects the SAME task deadline: give it only the wall time
+                # that remains, floored, so its own governor/wrap-up can't blow past the cap.
+                review_budget = max(30.0, turn_budget_s - elapsed)
+                sys.stderr.write(f"[review] task finished with {turn_budget_s - elapsed:.0f}s "
+                                 "of budget left; running one fresh-context verification pass\n")
+                eng.reset()
+                agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
+                                      mode=run_mode, thinking=thinking, persist=True,
+                                      think_budget=args.think_budget,
+                                      turn_budget_s=review_budget, ctx_limit_fn=ctx_limit_fn,
+                                      emit=emit, should_stop=stop.requested)
+                result = agent.run_turn(task + guardrails.REVIEW_PASS_PROMPT)
+        finally:
+            # An interrupt, or a crash mid-turn, must not lose the thread `chad -c` resumes;
+            # `agent` is whichever relaunch is current.
+            agent.save()
         if piped:
             sys.stdout.write(render.strip_ansi(result).rstrip("\n") + "\n")
         return _exit_status(result, agent.stop_kind, agent.budget_note)
     elif args.repl:
+        stop = interrupt or Interrupt()
+        if interrupt is None:
+            stop.install()
         backend.repl(eng, mode=start_mode, yolo=args.yolo, ctx_limit=ctx_limit,
-                     resume=resume, thinking=thinking, ctx_limit_fn=ctx_limit_fn)
+                     resume=resume, thinking=thinking, ctx_limit_fn=ctx_limit_fn,
+                     should_stop=stop.requested, clear_stop=stop.clear)
     else:
         from .engine import peek_context_window
         _maybe_home_dir_note()

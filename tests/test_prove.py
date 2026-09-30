@@ -177,14 +177,13 @@ def test_verify_treats_a_hung_or_unrunnable_check_as_a_failure(tmp_path, monkeyp
     assert prove._verify(task, run_check=unrunnable) is False
 
 
-def test_a_task_that_raises_becomes_a_failed_row(tmp_path, monkeypatch, capsys):
-    """One task blowing up must not cost the user the scorecard and results.json — the
-    two artifacts the command exists to produce."""
+class _LoadedEngine:
+    def load(self):
+        return 1.0
 
-    class _FakeEngine:
-        def load(self):
-            return 1.0
 
+def _cached_host(tmp_path):
+    """A host on an Apple Silicon Mac whose HF cache already holds the shipped model."""
     # A complete cache: the model check passes, no download. The shipped default is a hub
     # GGUF, so "complete" is the file plus its drafter/tokenizer sidecar; a packed repo's
     # single-file layout is here too so the check reads the same either way.
@@ -201,8 +200,15 @@ def test_a_task_that_raises_becomes_a_failed_row(tmp_path, monkeypatch, capsys):
         path = snapshot / filename
         return str(path) if path.exists() else None
 
-    host = cli.Host(platform_id=lambda: ("Darwin", "arm64"), ram_gb=lambda: 64.0,
+    return cli.Host(platform_id=lambda: ("Darwin", "arm64"), ram_gb=lambda: 64.0,
                     cached_file=cached_file)
+
+
+def test_a_task_that_raises_becomes_a_failed_row(tmp_path, monkeypatch, capsys):
+    """One task blowing up must not cost the user the scorecard and results.json — the
+    two artifacts the command exists to produce."""
+
+    host = _cached_host(tmp_path)
     invoking_dir = tmp_path / "invoking"
     invoking_dir.mkdir()
     monkeypatch.chdir(invoking_dir)
@@ -214,7 +220,7 @@ def test_a_task_that_raises_becomes_a_failed_row(tmp_path, monkeypatch, capsys):
 
     real_connect = socket.socket.connect
     rc = prove.run(cli._prove_parser().parse_args([]), host=host,
-                   make_engine=lambda model_id: _FakeEngine(), run_one=boom)
+                   make_engine=lambda model_id: _LoadedEngine(), run_one=boom)
 
     assert socket.socket.connect is real_connect  # the offline guard never outlives run()
     assert rc == 1
@@ -225,6 +231,37 @@ def test_a_task_that_raises_becomes_a_failed_row(tmp_path, monkeypatch, capsys):
     assert f"0/{len(prove.TASKS)} tasks passed" in card
     assert "task raised RuntimeError" in card
     assert "share it" not in card
+
+
+def test_an_interrupted_run_still_prints_the_rows_it_measured(tmp_path, monkeypatch,
+                                                                capsys):
+    """Ctrl-c partway through must not throw away the tasks already timed on this
+    machine: the scorecard prints them and the exit code says it was interrupted."""
+    host = _cached_host(tmp_path)
+    invoking_dir = tmp_path / "invoking"
+    invoking_dir.mkdir()
+    monkeypatch.chdir(invoking_dir)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")      # run() sets it; restore after
+    monkeypatch.delenv("CHAD_MODEL", raising=False)
+    first = prove.TASKS[0]["name"]
+
+    def pass_then_ctrl_c(engine, task, capture_ttft=False):
+        if task["name"] != first:
+            raise KeyboardInterrupt
+        return {"name": first, "passed": True, "wall": 1.0, "timed_out": False,
+                "tok_per_s": 10.0, "gen_tokens": 10, "ttft_s": 0.5}
+
+    real_connect = socket.socket.connect
+    rc = prove.run(cli._prove_parser().parse_args([]), host=host,
+                   make_engine=lambda model_id: _LoadedEngine(), run_one=pass_then_ctrl_c)
+
+    assert socket.socket.connect is real_connect  # the offline guard never outlives run()
+    assert rc == 130
+    card = capsys.readouterr().out
+    assert first in card
+    assert "1/1 tasks passed" in card
+    rows = json.loads((invoking_dir / "results.json").read_text())["results"]
+    assert [r["name"] for r in rows] == [first]
 
 
 # ---- preflight refusals ----------------------------------------------------------

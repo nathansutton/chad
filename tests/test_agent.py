@@ -339,3 +339,20 @@ def test_ctx_breakdown_adds_up():
     lines = format_ctx_breakdown(bd)
     check("formats one line per part", len(lines) >= 7, lines)
     check("names the compaction trigger", f"{bd['limit']:,}" in lines[0], lines[0])
+
+
+def test_repl_confirm_treats_ctrl_d_as_no():
+    """The plain REPL's approve prompt: no answer — ctrl-d, or ctrl-c — is a denial,
+    not a traceback that takes the session with it."""
+    from chad.agent import Agent
+    from test_agent_e2e import ScriptedEngine
+    asked = []
+
+    def no_answer(prompt):
+        asked.append(prompt)
+        raise EOFError
+
+    agent = Agent(ScriptedEngine(["done"]), mode="normal", thinking=False,
+                  is_tty=lambda: True, ask=no_answer)
+    check("no answer denies", agent._confirm("bash", {"command": "ls"}) is False)
+    check("the approve prompt was asked", len(asked) == 1, asked)

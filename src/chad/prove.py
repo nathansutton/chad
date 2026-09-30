@@ -384,6 +384,7 @@ def run(args, *, host: cli.Host = cli.HOST,
         return 2
 
     results = []
+    interrupted = False
     try:
         for i, task in enumerate(TASKS):
             sys.stderr.write(f"task {i + 1}/{len(TASKS)}: {task['name']} ...\n")
@@ -402,8 +403,15 @@ def run(args, *, host: cli.Host = cli.HOST,
             sys.stderr.write(f"  {'PASS' if r['passed'] else 'FAIL'} "
                              f"{r['wall']:.1f}s\n")
             results.append(r)
+    except KeyboardInterrupt:
+        # The rows already measured are this machine's numbers; print them.
+        interrupted = True
+        sys.stderr.write("\n[interrupted — reporting the tasks that finished]\n")
     finally:
         uninstall_guard()
+    if interrupted and not results:
+        sys.stderr.write("chad prove: interrupted before any task finished.\n")
+        return cli.EXIT_INTERRUPTED
 
     meta = {
         "model": os.path.basename(model_id.rstrip("/")),
@@ -415,4 +423,6 @@ def run(args, *, host: cli.Host = cli.HOST,
     with open(out_path, "w") as f:  # overwritten per run; scorecard is the artifact
         json.dump({"meta": meta, "results": results}, f, indent=2)
     sys.stderr.write(f"\n[raw rows: {out_path}]\n")
+    if interrupted:
+        return cli.EXIT_INTERRUPTED
     return 0 if all(r["passed"] for r in results) else 1
