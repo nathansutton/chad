@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """chad — a local, MLX-backed, Claude-Code-style coding agent.
 
-One model (Qwen3.8-27B, ternary, with its DFlash2 drafter), one entrypoint, run with uv:
+One model (Qwen3.8-27B, with its DFlash2 drafter), one entrypoint, run with uv:
 
     uv run chad                                # interactive full-screen TUI
     uv run chad "fix the bug in greet.py"      # one-shot, headless
@@ -173,15 +173,15 @@ def _whole_number(raw: str) -> int:
 def apply_sampler_env(eng):
     """Apply the sampler-knob environment overrides to `eng`, in place.
 
-    CHAD_TEMP: sampling temperature, all backends. The default stays 0.0 (greedy —
-    reproducible, and the MLX prompt-lookup fast path requires it), but greedy has a
-    failure mode measured in the field: a stall/garbled call replays itself byte-identically
+    CHAD_TEMP: sampling temperature, all backends. The mode preset sets it (1.0
+    thinking, 0.7 non-thinking); 0 is greedy, which is reproducible but has a failure
+    mode measured in the field: a stall/garbled call replays itself byte-identically
     on every retry and across "independent" bench reps. Benchmarks and unattended runs
     should set e.g. CHAD_TEMP=0.7 (what the field harnesses run) so retries can take a
     different path.
 
-    CHAD_MIN_P / CHAD_TOP_P / CHAD_TOP_K: quant-tail anti-confabulation knobs, off
-    (0.0 / 0) by default — trim the sub-noise-floor logit tail without touching temp.
+    CHAD_MIN_P / CHAD_TOP_P / CHAD_TOP_K: quant-tail anti-confabulation knobs, set by
+    the mode preset (min-p off) — trim the sub-noise-floor logit tail without touching temp.
 
     CHAD_PRESENCE_PENALTY: flat score penalty on already-generated tokens; the
     model card's anti-repetition knob for non-thinking mode (useful range 0-2).
@@ -672,7 +672,8 @@ def _ensure_model(model_id, *, host: Host = HOST):
         sys.stderr.write(
             "While you wait: chad works best run from inside a project, on a scoped\n"
             'ask — "fix the failing test in tests/test_x.py" lands; "improve my\n'
-            'codebase" flails. (More: README → Quickstart.)\n')
+            'codebase" flails. (More: '
+            'https://github.com/nathansutton/chad/blob/main/docs/troubleshooting.md)\n')
     else:
         sys.stderr.write("[headless: downloading automatically]\n")
     try:
@@ -846,7 +847,7 @@ def _agent_parser():
         description="Local coding agent for a 24 GB Apple Silicon Mac (MLX, one model, no API key).",
         epilog="subcommands (each takes --help): chad prove · chad levers. "
                "Long-session and unattended-run knobs live in CHAD_* env vars — "
-               "see docs/configuration.md.",
+               "see https://github.com/nathansutton/chad/blob/main/docs/configuration.md",
     )
     ap.add_argument("--version", action="version", version=_version_string())
     ap.add_argument("task", nargs="?",
@@ -891,8 +892,9 @@ def _agent_parser():
                     help="name of the env var holding the API key for a remote backend; the "
                          "key is read from that var, never passed on the command line.")
     ap.add_argument("--model", default=None,
-                    help="which model to load: 'auto' (the shipped default) or any "
-                         "Hugging Face repo id / local model dir. Other weights run "
+                    help="which model to load: 'auto' (the shipped default), a "
+                         "Hugging Face repo id, a local model dir, or a GGUF (a .gguf "
+                         "path or owner/repo/file.gguf). Other weights run "
                          "through the same engine; the tuning is fitted to the shipped "
                          "model, so expect to lose speed, not correctness. "
                          "Also CHAD_MODEL.")

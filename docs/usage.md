@@ -2,6 +2,22 @@
 
 How to install and upgrade chad, what the terminal UI does, and the command-line flags.
 
+## Before you start
+
+- An Apple Silicon Mac with 24 GB of RAM or more, on macOS 14 or later.
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/), which installs and
+  runs chad.
+- About 30 GB of free disk for the first run: a ~14 GB download, plus a ~13 GB converted
+  copy that makes later starts fast. chad checks before it downloads.
+- `git`, which `/undo` uses to snapshot your files. On a new Mac, `xcode-select
+  --install` provides it.
+
+Then, from inside a project:
+
+    chad "fix the failing test in tests/test_parser.py"
+
+A small local model rewards a scoped ask: name the file, and ask for one thing.
+
 ## Installing & upgrading
 
 The one-line quickstart is `uvx chad-code`. The other ways in:
@@ -11,11 +27,16 @@ uv tool install chad-code   # install for good, then it's just `chad`
 uvx --from git+https://github.com/nathansutton/chad chad   # bleeding-edge main, no clone
 ```
 
+Every example in these docs is written as `chad …`. That is the command after
+`uv tool install chad-code`. With `uvx`, write `uvx chad-code …`; in a clone,
+`uv run chad …`. Environment variables go in front either way:
+`CHAD_TEMP=0.7 uvx chad-code`.
+
 Or from a clone (the dev path):
 
 ```bash
 uv sync                      # install deps + the `chad` entrypoint (one time)
-uv run chad                  # full-screen TUI
+uv run chad                  # the terminal UI
 uv run chad "add a --json flag to main.py and update the tests"   # one-shot, headless
 uv run chad -c               # resume this directory's last conversation
 ```
@@ -45,14 +66,18 @@ weights**, runs in seconds, and is what CI runs. For throughput on your own mach
 
 ## Interactive UX
 
-`uv run chad` launches a full-screen terminal UI (built on prompt_toolkit):
+`chad` opens a terminal UI (built on prompt_toolkit). It pins
+an input box and a status row at the bottom and prints into your terminal's normal
+scrollback, so scrolling and copying work as usual:
 
 - shift-tab cycles permission modes: `normal` (confirm each bash/write/edit) →
   `auto-accept edits` (edits land silently, **terminal commands still ask**) → `yolo`
   (nothing asks) → `plan mode` (read-only: investigate and propose a numbered plan) → back.
   A finished plan lands in `./plans/`; ctrl-g (or `/accept`) clears the context and starts
   implementing it ([details](configuration.md#plan-mode)).
-- Type-ahead message queue. Keep typing while the agent works; messages run in order.
+- Steering. Text you type while a turn runs is given to that turn after its current step,
+  so you can redirect it without stopping it. A `!command` typed mid-turn waits and runs
+  after.
 - Approving takes a deliberate key. `y` and `n` answer a pending approval only when the
   input box is empty; **v** prints the whole command or diff first, and **esc** denies at
   any time. Text you were typing can still be sent with Enter.
@@ -71,7 +96,18 @@ weights**, runs in seconds, and is what CI runs. For throughput on your own mach
   `say`. A word table teaches it your identifiers. Needs the `speech` extra
   ([details](configuration.md#voice-mode-speech)).
 
-`uv run chad --help` is the source of truth:
+| Key | What it does |
+|---|---|
+| Enter | send |
+| alt-enter, ctrl-j | new line in the message |
+| shift-tab | cycle the permission mode |
+| esc, ctrl-c | interrupt the running turn |
+| ctrl-c, with no turn running | clear the input; on an empty prompt, press twice to quit |
+| ctrl-g | accept a pending plan |
+| ctrl-t | start and stop dictation (with `/speech` on) |
+| ctrl-d | quit (a running turn is stopped and saved first) |
+
+`chad --help` is the source of truth:
 
 | Flag | What it does |
 |---|---|
@@ -82,7 +118,7 @@ weights**, runs in seconds, and is what CI runs. For throughput on your own mach
 | `--no-think` | skip the model's `<think>` blocks, faster on well-scoped work |
 | `--think-budget N` | soft-cap each step's `<think>` at N tokens, force-close it and carry on (off by default) |
 | `--backend llama` | run the same harness against a remote llama.cpp server, with `--base-url`, `--tokenizer` and `--api-key-env` ([details](configuration.md#alternate-backend-remote)) |
-| `--model` | `auto` (the shipped default), or any HF repo id / local model dir |
+| `--model` | `auto` (the shipped default), a HF repo id, a local model dir, or a GGUF (a `.gguf` path or `owner/repo/file.gguf`) |
 | `--repl` | plain line REPL instead of the TUI |
 
 Two subcommands, each with its own `--help`: `chad prove` (the offline smoke test) and

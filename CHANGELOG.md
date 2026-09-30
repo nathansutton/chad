@@ -4,6 +4,12 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**The docs describe the chad that ships.** They said chad decodes greedily (it samples at
+temperature 1.0), that the turn governor is for one-shot runs only (it applies to every
+session), and that conversations are saved only on resume (every one is). Examples are
+written as `chad …` and run however chad was installed, the first-run disk requirement
+(~30 GB) is stated, and the messages chad prints link to pages that exist.
+
 **`/mcp` shows what you are being asked to trust.** A gated project server was listed
 by name only. `/mcp` now shows the command it would run or the URL it would reach, and
 `/mcp trust` lists what it trusted, refuses a directory with no `.mcp.json`, and says so
