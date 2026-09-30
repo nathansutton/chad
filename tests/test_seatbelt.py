@@ -202,6 +202,30 @@ def test_probe_result_is_cached():
     assert len(calls) == 1
 
 
+# -- saying when yolo is unconfined -------------------------------------------
+
+def test_unconfined_reason_is_none_when_the_sandbox_enforces(monkeypatch):
+    monkeypatch.delenv("CHAD_NO_SEATBELT", raising=False)
+    assert _capable().unconfined_reason() is None
+
+
+def test_unconfined_reason_names_a_sandbox_that_cannot_apply(monkeypatch):
+    monkeypatch.delenv("CHAD_NO_SEATBELT", raising=False)
+    reason = seatbelt.Seatbelt(platform_ok=lambda: False).unconfined_reason()
+    assert reason is not None and "cannot be applied" in reason
+
+
+def test_unconfined_reason_names_the_opt_out_without_probing(monkeypatch):
+    monkeypatch.setenv("CHAD_NO_SEATBELT", "1")
+
+    def _must_not_run(argv):
+        raise AssertionError(f"probe ran with the sandbox switched off: {argv}")
+
+    sb = seatbelt.Seatbelt(platform_ok=lambda: True, run=_must_not_run)
+    reason = sb.unconfined_reason()
+    assert reason is not None and "CHAD_NO_SEATBELT" in reason
+
+
 # -- the spawned shell's environment (bash_env_guard) -------------------------
 
 def test_bash_env_strips_credential_shaped_names(monkeypatch):

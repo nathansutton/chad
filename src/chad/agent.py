@@ -1925,6 +1925,20 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
     notice = env_guard_notice()
     if notice:
         print(f"{C_DIM}{notice}{C_RST}")
+    from . import seatbelt
+    yolo_noticed = False
+
+    def after_mode_change() -> None:
+        # Once per session: whether the sandbox applies cannot change while chad runs.
+        nonlocal yolo_noticed
+        if agent.mode != "yolo" or yolo_noticed:
+            return
+        yolo_noticed = True
+        yolo_notice = seatbelt.yolo_notice()
+        if yolo_notice:
+            print(f"{C_RED}{yolo_notice}{C_RST}")
+
+    after_mode_change()
     while True:
         try:
             line = input(f"{C_YEL}» {C_RST}").strip()
@@ -1943,6 +1957,7 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             continue
         if line == "/mode":
             print(f"{C_DIM}mode: {MODE_LABEL[agent.cycle_mode()]}{C_RST}")
+            after_mode_change()
             continue
         if line == "/compact":
             b, a = agent.compact_now()

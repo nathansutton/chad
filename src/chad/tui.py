@@ -433,6 +433,7 @@ class TUI:
         self._cur_prompt_tokens = 0        # last rendered prompt size (context gauge)
         self._tick = 0                     # animation frame counter (spinner)
         self._dirty = False                # something the status line shows changed
+        self._yolo_noticed = False         # the unconfined-yolo notice was shown
         self._phase = "Thinking"           # current activity verb shown by the spinner
         # Live activity readouts for the bottom status line. Reset per
         # turn in _worker; updated by the agent's gen/prefill emits. Display-only.
@@ -821,6 +822,7 @@ class TUI:
         @kb.add("s-tab", filter=~confirming)
         def _(event):
             self.agent.cycle_mode()
+            self._after_mode_change()
             event.app.invalidate()
 
         # ctrl-g accepts a pending plan (clear context + start implementing) when the
@@ -1224,6 +1226,7 @@ class TUI:
             return False
         if text == "/mode":
             self.agent.cycle_mode()
+            self._after_mode_change()
             return False
         if text == "/speech":
             self._toggle_speech()
@@ -1509,6 +1512,22 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
             self._dirty = True  # the status line leaves its loading state
             self._wake.set()  # nudge the worker if a message was queued while loading
 
+    def _after_mode_change(self):
+        """On entering yolo, say so if its sandbox is not there. Once per session: the
+        answer cannot change while chad runs. Off the UI thread, because the first
+        probe runs a subprocess."""
+        if self.agent.mode != "yolo" or self._yolo_noticed:
+            return
+        self._yolo_noticed = True
+
+        def _check():
+            from . import seatbelt
+            notice = seatbelt.yolo_notice()
+            if notice:
+                self._emit("error", notice)
+                self._dirty = True
+        threading.Thread(target=_check, daemon=True, name="chad-seatbelt").start()
+
     def _emit_first_task_hint(self):
         """One muted line under the banner on a FRESH session (resume is None): a small
         local model needs a *scoped* ask, so a blinking cursor doesn't invite a
@@ -1537,6 +1556,7 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
         notice = env_guard_notice()
         if notice:
             self._emit("muted", notice)
+        self._after_mode_change()
         if self._finalize is not None:
             self._emit("info", f"loading {self.engine.model_id.split('/')[-1]}… "
                                "(type ahead — your first message runs when it's ready)")
