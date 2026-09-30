@@ -4,6 +4,12 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**`/accept` works after the plan is revised.** The handoff was remembered only when the
+model wrote the file; a revision is an edit, so the first steer ended in "no plan
+pending". Edits now count, `/accept <path>` accepts any plan file, and `/accept` with
+nothing pending lists the newest plans. In plan mode a write can no longer replace a
+plan file the session did not write.
+
 **The docs describe the chad that ships.** They said chad decodes greedily (it samples at
 temperature 1.0), that the turn governor is for one-shot runs only (it applies to every
 session), and that conversations are saved only on resume (every one is). Examples are

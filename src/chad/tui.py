@@ -272,6 +272,18 @@ def slash_matches(text: str):
     return [(c, d) for (c, d) in rows if c.startswith(text)]
 
 
+def _recent_plans(limit: int = 5) -> list[str]:
+    """The newest markdown files in ./plans, by modification time, as relative paths."""
+    try:
+        names = [n for n in os.listdir("plans")
+                 if n.endswith(".md") and n != "README.md"]
+    except OSError:
+        return []
+    paths = [os.path.join("plans", n) for n in names]
+    paths.sort(key=os.path.getmtime, reverse=True)
+    return paths[:limit]
+
+
 def at_path_token(text_before_cursor: str) -> Optional[str]:
     """The `@`-path fragment under the cursor (text AFTER the `@`), or None when the
     cursor isn't in an `@`-token. The token is the last whitespace-delimited chunk."""
@@ -1003,12 +1015,26 @@ class TUI:
         self.engine.reset()
         return True
 
-    def _accept_plan(self):
-        """Accept a pending plan: clear context and start a fresh implementation
-        session (inheriting the session's baseline perms) seeded to execute it."""
+    def _accept_plan(self, named: str = ""):
+        """Accept a plan: clear context and start a fresh implementation session
+        (inheriting the session's baseline perms) seeded to execute it. `named` picks
+        one by path — a plan written in an earlier session, or revised since the banner
+        was shown, is still a plan."""
         path = self._pending_plan
+        if named:
+            candidate = os.path.abspath(os.path.expanduser(named))
+            if not os.path.isfile(candidate):
+                self._emit("info", f"no such plan file: {named}")
+                return
+            path = candidate
         if not path:
             self._emit("info", "no plan pending.")
+            recent = _recent_plans()
+            if recent:
+                self._emit("info", "  plans in ./plans, newest first — accept one "
+                                   "with /accept <path>:")
+                for rel in recent:
+                    self._emit("info", f"    {rel}")
             return
         rel = os.path.relpath(path)
         if not self._fresh_agent(self._base_mode):
@@ -1264,8 +1290,8 @@ class TUI:
             if self._fresh_agent(self.agent.mode):
                 self._emit("info", "session reset.")
             return False
-        if text == "/accept":
-            self._accept_plan()
+        if text == "/accept" or text.startswith("/accept "):
+            self._accept_plan(text[len("/accept"):].strip())
             return False
         if text == "/mode":
             self.agent.cycle_mode()
