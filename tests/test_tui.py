@@ -838,3 +838,31 @@ def test_a_failed_load_refuses_engine_commands_instead_of_crashing():
 def test_a_failed_load_without_guidance_keeps_the_one_line_message():
     out = "".join(_failing_load_tui(describe=False)._pending)
     assert "[model load failed: MemoryError: out of memory]" in out
+
+
+def test_background_job_runs_off_the_calling_thread():
+    tui, _ = _worker_tui()
+    gate, seen = threading.Event(), {}
+
+    def job():
+        seen["thread"] = threading.current_thread().name
+        gate.wait(_JOIN)          # a slow login: the caller must not wait for this
+        tui._emit("info", "login finished")
+
+    tui._in_background("mcp-login", job)
+    # Control is back here while the job is still parked on the gate.
+    assert _spin_until(lambda: "thread" in seen)
+    assert seen["thread"] == "chad-mcp-login"
+    assert "login finished" not in "".join(tui._pending)
+    gate.set()
+    assert _spin_until(lambda: "login finished" in "".join(tui._pending))
+
+
+def test_background_job_failure_is_reported():
+    tui, _ = _worker_tui()
+
+    def job():
+        raise RuntimeError("no route to host")
+
+    tui._in_background("mcp", job)
+    assert _spin_until(lambda: "mcp failed: RuntimeError" in "".join(tui._pending))

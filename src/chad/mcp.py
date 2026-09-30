@@ -82,7 +82,7 @@ except Exception as _e:  # noqa: BLE001 — any import-time failure, not just Im
     _SDK_ERROR = f"{type(_e).__name__}: {_e}"
 
 from . import mcp_oauth
-from .diag import log, warn_footer
+from .diag import log, warning_lines
 
 # Namespacing: a model-visible MCP tool is `mcp__<server>__<tool>`. The separator is
 # the Claude-Code convention; it keeps server tools from colliding with chad builtins
@@ -631,7 +631,7 @@ class _Registry:
             out.append(f"{name} — ⊘ blocked ({reason})")
         for name, reason in self.needs_login:
             out.append(f"{name} [http/oauth] — ⊷ {reason}")
-        out += warn_footer(self.warnings)
+        out += warning_lines(self.warnings)
         return out
 
     def close(self):
@@ -694,6 +694,36 @@ def reset_session():
     if _registry is not None:
         _registry.close()
     _registry = None
+
+
+def configured(cwd: Optional[str] = None) -> bool:
+    """Whether any MCP config exists for this directory. Reads files, connects nothing."""
+    servers, warnings = _load_config(cwd or os.getcwd())
+    return bool(servers or warnings)
+
+
+def status_line(reg: "_Registry") -> Optional[str]:
+    """What happened when the servers were connected, in one line, or None when there
+    is nothing configured. The detail lives in /mcp; this is what makes a user look."""
+    ok = [c for c in reg.clients if not c.error]
+    failed = [c for c in reg.clients if c.error]
+    if not (reg.clients or reg.blocked or reg.needs_login or reg.warnings):
+        return None
+    parts = []
+    if ok:
+        tools = sum(len(c.tools) for c in ok)
+        parts.append(f"{len(ok)} connected ({tools} tool{'s' * (tools != 1)})")
+    if failed:
+        first = failed[0]
+        more = f", +{len(failed) - 1} more" if len(failed) > 1 else ""
+        parts.append(f"{len(failed)} failed ({first.name}: {first.error}{more})")
+    if reg.blocked:
+        parts.append(f"{len(reg.blocked)} waiting for /mcp trust")
+    if reg.needs_login:
+        parts.append(f"{len(reg.needs_login)} waiting for /mcp login")
+    if not parts:
+        parts.append("config has problems")
+    return "mcp: " + ", ".join(parts) + " — /mcp for details"
 
 
 def trust(cwd: str = None):

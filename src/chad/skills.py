@@ -25,7 +25,7 @@ pattern as `tools._TODOS` — and is cleared by `reset_session()` when a new Age
 import os
 
 from . import config
-from .diag import log, warn_footer
+from .diag import log, warning_lines
 from .ignore import IGNORE_DIRS
 
 # Bound the discovery walk so a pathological tree (a skills dir nested in a huge repo)
@@ -419,5 +419,5 @@ def summary_lines():
             desc = desc[:97] + "…"
         active = " *loaded*" if name in _loaded else ""
         out.append(f"{name}{active} — {desc}")
-    out += warn_footer(reg.warnings)
+    out += warning_lines(reg.warnings)
     return out

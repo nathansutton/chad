@@ -127,13 +127,15 @@ the `url`/`command` presence is authoritative. A stdio server's `command`/`args`
 launches it; an HTTP server's `url` is reached over the network and any `headers` (e.g. a
 static `Authorization: Bearer …` token) are sent on every request. `"disabled": true` skips
 a server, `"timeout"` (seconds) overrides the per-call limit, and `"connect_timeout"`
-(seconds) bounds the initial connect. At startup chad connects the **eligible** servers
+(seconds) bounds the initial connect. On the first turn of a session chad connects the **eligible** servers
 **in parallel and time-bounded** (one dead endpoint can't stall the others), runs the
 `initialize` handshake, lists each server's tools (paginated), and registers them.
 "Eligible" excludes servers that are gated: `"disabled": true` servers are skipped, OAuth
 servers are deferred until you log in (see below), and, most importantly, **project-scope
 `./.mcp.json` servers do not start until you `/mcp trust` the project** (next section).
 User-scope `~/.chad/mcp.json` servers are authored by you and auto-connect.
+The first turn prints one line saying how many servers connected, failed, or are waiting
+for `/mcp trust` or `/mcp login`.
 
 **Project trust.** Dropping a `./.mcp.json` into a repo does **nothing** until you run
 `/mcp trust` in that directory. This is deliberate: a project file is content you may have
