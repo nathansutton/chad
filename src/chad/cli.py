@@ -457,6 +457,10 @@ def _stdin_isatty() -> bool:
     return sys.stdin.isatty()
 
 
+def _stdout_isatty() -> bool:
+    return sys.stdout.isatty()
+
+
 @dataclass(frozen=True)
 class Host:
     """The machine chad runs on and the person at its terminal, as startup reads them.
@@ -472,6 +476,7 @@ class Host:
     free_disk_gb: Callable[[str], Optional[float]] = _free_disk_gb
     cached_file: Callable[[str, str], Optional[str]] = _hf_cached_file
     stdin_isatty: Callable[[], bool] = _stdin_isatty
+    stdout_isatty: Callable[[], bool] = _stdout_isatty
     ask: Callable[[str], str] = input
 
 
@@ -742,6 +747,22 @@ def _pick_session(items, *, ask: Callable[[str], str] = input):
 # `chad "prove the parser handles empty input"` a task and `chad prove` a subcommand,
 # which is the same rule the old literal-positional dispatch used.
 _SUBCOMMANDS = ("prove", "levers")
+
+# What a headless run tells the process that launched it. 0 only when the task ended on
+# its own; a script chaining `chad "fix X" && git commit` must not commit a give-up.
+EXIT_OK = 0
+EXIT_NOT_DONE = 1      # a guard stopped the turn, or every relaunch ran out of budget
+EXIT_INTERRUPTED = 130  # 128 + SIGINT, what a shell reports for ctrl-c
+
+
+def _exit_status(result: str, stop_kind: Optional[str], budget_note: Optional[str]) -> int:
+    """The exit status for a headless task, from how its last turn ended."""
+    if result == "[interrupted]":
+        return EXIT_INTERRUPTED
+    if stop_kind is not None or budget_note:
+        return EXIT_NOT_DONE
+    return EXIT_OK
+
 
 # Set by `_main` once the remote backend's URL is resolved, so the top-level BackendError
 # handler can name the host that stopped answering. Only the remote backend can raise
@@ -1055,14 +1076,20 @@ def _main(argv, host, load_backend):
         if run_mode == "normal" and not host.stdin_isatty():
             run_mode = "yolo"
             sys.stderr.write("[headless: auto-approving tools (use --plan for read-only)]\n")
+        from . import render
+        # Piped or redirected: the answer is what the caller wants on stdout; the trace
+        # of how the model got there goes to stderr.
+        piped = not host.stdout_isatty()
+        emit = render.piped_emit if piped else None
         agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
                               mode=run_mode, thinking=thinking, resume=resume, persist=True,
                               think_budget=args.think_budget,
-                              turn_budget_s=turn_budget_s, ctx_limit_fn=ctx_limit_fn)
+                              turn_budget_s=turn_budget_s, ctx_limit_fn=ctx_limit_fn,
+                              emit=emit)
         # Wall time across ALL of this task's turns (initial + any auto-continue
         # relaunches), measured against the wall budget to decide the early-finish review.
         task_start = time.monotonic()
-        agent.run_turn(task)
+        result = agent.run_turn(task)
         # If the turn hard-stopped on a budget (governor token/wall budget, the
         # step cap's final window landing nothing, or the no-empty-diff gate),
         # optionally relaunch a FRESH turn (new context + reset KV cache) seeded with the
@@ -1116,8 +1143,9 @@ def _main(argv, host, load_backend):
             agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
                                   mode=run_mode, thinking=thinking, persist=True,
                                   think_budget=args.think_budget,
-                                  turn_budget_s=relaunch_s, ctx_limit_fn=ctx_limit_fn)
-            agent.run_turn(f"{task}\n\n[{note}]")
+                                  turn_budget_s=relaunch_s, ctx_limit_fn=ctx_limit_fn,
+                                  emit=emit)
+            result = agent.run_turn(f"{task}\n\n[{note}]")
         # Early-finish self-review: if the task settled CLEANLY (no
         # banked budget note) with more than 30% of the wall budget still unspent, relaunch
         # ONE fresh-context turn to independently verify the deliverables — the fresh KV
@@ -1138,9 +1166,13 @@ def _main(argv, host, load_backend):
             agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
                                   mode=run_mode, thinking=thinking, persist=True,
                                   think_budget=args.think_budget,
-                                  turn_budget_s=review_budget, ctx_limit_fn=ctx_limit_fn)
-            agent.run_turn(task + guardrails.REVIEW_PASS_PROMPT)
+                                  turn_budget_s=review_budget, ctx_limit_fn=ctx_limit_fn,
+                                  emit=emit)
+            result = agent.run_turn(task + guardrails.REVIEW_PASS_PROMPT)
         agent.save()  # persist so a follow-up `chad -c "..."` picks up the thread
+        if piped:
+            sys.stdout.write(render.strip_ansi(result).rstrip("\n") + "\n")
+        return _exit_status(result, agent.stop_kind, agent.budget_note)
     elif args.repl:
         backend.repl(eng, mode=start_mode, yolo=args.yolo, ctx_limit=ctx_limit,
                      resume=resume, thinking=thinking, ctx_limit_fn=ctx_limit_fn)
@@ -1168,4 +1200,4 @@ def _main(argv, host, load_backend):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
