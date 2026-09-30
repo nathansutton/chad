@@ -1981,9 +1981,8 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             continue
         if line == "/mcp trust":
             from . import mcp
-            mcp.trust()
-            print(f"{C_DIM}trusted this project — its .mcp.json servers will connect "
-                  f"on the next turn{C_RST}")
+            for ln in mcp.trust():
+                print(f"{C_DIM}{ln}{C_RST}")
             continue
         if line.startswith("/mcp login"):
             from . import mcp

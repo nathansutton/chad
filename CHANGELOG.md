@@ -4,6 +4,12 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**`/mcp` shows what you are being asked to trust.** A gated project server was listed
+by name only. `/mcp` now shows the command it would run or the URL it would reach, and
+`/mcp trust` lists what it trusted, refuses a directory with no `.mcp.json`, and says so
+when the trust store cannot be saved. A stored login is tied to the URL it was made
+for: a project server that reuses the name of one of yours needs its own login.
+
 **A `!command` in the TUI shows its output.** It went through the renderer for the
 model's tool calls: six lines of a success, and only the exit status of a failure. It now
 shows up to 200 lines, keeping the head and the tail of anything longer, and a failing

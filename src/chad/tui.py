@@ -1347,9 +1347,8 @@ class TUI:
             return False
         if text == "/mcp trust":
             from . import mcp
-            mcp.trust()
-            self._emit("info", "trusted this project — its .mcp.json servers will "
-                               "connect on the next turn")
+            for ln in mcp.trust():
+                self._emit("info", ln)
             return False
         if text.startswith("/mcp login"):
             from . import mcp

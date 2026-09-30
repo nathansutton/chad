@@ -41,6 +41,7 @@ server subprocesses and HTTP sessions never leak.
 import atexit
 import json
 import os
+import shlex
 import threading
 import webbrowser
 from dataclasses import dataclass, field
@@ -191,11 +192,34 @@ def _load_config(cwd: str = None, home: str = None):
             if not isinstance(spec, dict):
                 warnings.append(f"{path}: server {name!r} is not an object")
                 continue
+            if name in merged and scopes[name] != scope:
+                # By design the project's entry wins and is gated. The user should still
+                # know their own server of that name is not the one in use here.
+                warnings.append(f"{name}: this project's .mcp.json replaces your own "
+                                f"server of the same name")
             if name not in merged:
                 order.append(name)
             merged[name] = _ServerSpec.decode(spec)
             scopes[name] = scope
     return [(n, merged[n], scopes[n]) for n in order], warnings
+
+
+def describe_spec(spec: _ServerSpec) -> str:
+    """What a server would run or connect to, for a person deciding whether to trust it.
+    Header and environment VALUES are never shown: they are where tokens live."""
+    if spec.url:
+        what = f"connects to {spec.url}"
+        if spec.headers:
+            what += " (sends headers: " + ", ".join(sorted(map(str, spec.headers))) + ")"
+    elif spec.command:
+        what = "runs " + shlex.join([spec.command, *map(str, spec.args)])
+        if spec.cwd:
+            what += f" in {spec.cwd}"
+    else:
+        return "has neither a command nor a url"
+    if spec.env:
+        what += " (sets: " + ", ".join(sorted(map(str, spec.env))) + ")"
+    return what
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +253,9 @@ def _is_trusted(cwd: str) -> bool:
     return _load_trust().get(os.path.abspath(cwd)) is True
 
 
-def _set_trusted(cwd: str):
-    """Mark a project path as trusted, persisting to ~/.chad/trusted_mcp.json (0600)."""
+def _set_trusted(cwd: str) -> bool:
+    """Mark a project path as trusted, persisting to ~/.chad/trusted_mcp.json (0600).
+    False when the store could not be written, so nothing was trusted."""
     path = _trust_store_path()
     data = _load_trust()
     data[os.path.abspath(cwd)] = True
@@ -243,6 +268,8 @@ def _set_trusted(cwd: str):
         os.chmod(path, 0o600)
     except OSError as e:
         log.warning("mcp: could not persist trust store %s — %s", path, e)
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +486,7 @@ class _Registry:
         self._param = {}                  # tool name -> JSON-Schema (for validate.py)
         self._mutating = set()            # tool names that need confirmation
         self.blocked = []                 # [(name, reason)] project servers gated as untrusted
+        self.blocked_specs: dict[str, _ServerSpec] = {}  # what each untrusted server would run
         self.needs_login = []             # [(name, reason)] oauth servers awaiting /mcp login
         self.warnings = []
         self.portal = None
@@ -496,6 +524,7 @@ class _Registry:
                 # the operator opts in out-of-band with `/mcp trust`.
                 reason = "project server not started — project not trusted (run /mcp trust)"
                 self.blocked.append((name, reason))
+                self.blocked_specs[name] = spec
                 self.warnings.append(f"{name}: {reason}")
                 log.info("mcp: %s gated — project %s not trusted", name, self.cwd)
                 continue
@@ -514,7 +543,8 @@ class _Registry:
                 if not spec.url:
                     self.warnings.append(f"{name}: oauth server needs a 'url'")
                     continue
-                if not mcp_oauth.has_tokens(name):
+                if not mcp_oauth.login_matches(name, spec.url,
+                                               require_binding=(scope == "project")):
                     reason = f"needs login — run /mcp login {name}"
                     self.needs_login.append((name, reason))
                     self.warnings.append(f"{name}: {reason}")
@@ -629,6 +659,9 @@ class _Registry:
                            + (f" — {desc}" if desc else ""))
         for name, reason in self.blocked:
             out.append(f"{name} — ⊘ blocked ({reason})")
+            spec = self.blocked_specs.get(name)
+            if spec is not None:
+                out.append(f"    if trusted, it {describe_spec(spec)}")
         for name, reason in self.needs_login:
             out.append(f"{name} [http/oauth] — ⊷ {reason}")
         out += warning_lines(self.warnings)
@@ -726,12 +759,24 @@ def status_line(reg: "_Registry") -> Optional[str]:
     return "mcp: " + ", ".join(parts) + " — /mcp for details"
 
 
-def trust(cwd: str = None):
-    """Mark the current project (cwd) as trusted so its `./.mcp.json` servers connect,
-    then reset the session so the next `service()` reconnects with them enabled. Wired
-    to the `/mcp trust` command in both front-ends."""
-    _set_trusted(cwd or os.getcwd())
+def trust(cwd: Optional[str] = None) -> list[str]:
+    """Trust the current project's `./.mcp.json` servers and reset the session so the
+    next turn connects them. Returns the lines to show: what was trusted, or why
+    nothing was. Trusting a directory with no config would arm it for a file that
+    arrives later, so that is refused. Wired to `/mcp trust` in both front-ends."""
+    cwd = cwd or os.getcwd()
+    if not os.path.isfile(os.path.join(cwd, ".mcp.json")):
+        return ["nothing to trust: this directory has no .mcp.json"]
+    servers, _warnings = _load_config(cwd)
+    mine = [(n, s) for n, s, scope in servers if scope == "project"]
+    if not _set_trusted(cwd):
+        return ["could not save the trust store (~/.chad/trusted_mcp.json) — "
+                "nothing was trusted"]
     reset_session()
+    lines = [f"trusted this project's {len(mine)} server(s); they connect on the "
+             f"next turn:"]
+    lines += [f"  {n} — {describe_spec(s)}" for n, s in mine]
+    return lines
 
 
 def login(name: str, emit=None, *, timeout: float = mcp_oauth._LOGIN_TIMEOUT,
@@ -788,6 +833,7 @@ def login(name: str, emit=None, *, timeout: float = mcp_oauth._LOGIN_TIMEOUT,
 
     if not mcp_oauth.has_tokens(name):
         return f"{name}: login did not produce a token."
+    mcp_oauth.bind(name, url)
     reset_session()
     return f"{name}: logged in — its tools are now available."
 
