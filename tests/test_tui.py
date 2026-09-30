@@ -790,3 +790,51 @@ def test_a_turn_after_reset_is_saved(tmp_path, monkeypatch):
     tui.agent.save()
     (item,) = session.list_sessions(str(tmp_path))
     assert item["title"].startswith("after the reset")
+
+
+# ---------------------------------------------------------------------------
+# A background model load that fails: the scrollback carries the guidance, the status
+# row stops reading "ready", and the commands that need an engine say why they refuse.
+# ---------------------------------------------------------------------------
+
+def _failing_load_tui(describe=True):
+    def finalize():
+        raise MemoryError("out of memory")
+    describe_load_error = (lambda e: ["chad: could not load model 'm'",
+                                      f"  cause: {type(e).__name__}: {e}",
+                                      "  fix:   close other apps"]) if describe else None
+    tui = TUI(_fake_engine(), ctx_limit=24000, finalize=finalize,
+              describe_load_error=describe_load_error)
+    tui.app.invalidate = lambda: None
+    tui._load_model()
+    return tui
+
+
+def test_a_failed_load_shows_the_cause_and_the_fix():
+    out = "".join(_failing_load_tui()._pending)
+    assert "cause: MemoryError" in out
+    assert "fix:   close other apps" in out
+
+
+def test_a_failed_load_still_releases_the_worker():
+    tui = _failing_load_tui()
+    assert tui._model_ready.is_set()
+    assert tui._load_error
+
+
+def test_a_failed_load_does_not_read_as_ready():
+    tui = _failing_load_tui()
+    status = "".join(text for _, text in tui._status_fragments())
+    assert "model did not load" in status
+    assert "ready" not in status
+
+
+def test_a_failed_load_refuses_engine_commands_instead_of_crashing():
+    tui = _failing_load_tui()
+    tui._on_accept(_Buff("/compact"))
+    assert "the model did not load" in "".join(tui._pending)
+
+
+def test_a_failed_load_without_guidance_keeps_the_one_line_message():
+    out = "".join(_failing_load_tui(describe=False)._pending)
+    assert "[model load failed: MemoryError: out of memory]" in out

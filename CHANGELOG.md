@@ -4,6 +4,13 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**Failures at startup say what to do.** A model that fails to load in the TUI now shows
+the cause and the fix and the status row stops saying "ready". A `--model` path that does
+not exist is reported as a missing path instead of a download problem, and a GGUF chad
+cannot read is a message, not a traceback. `--plan --yolo`, `-c --resume`, `--repl` with a
+task, and the remote flags without `--backend llama` are errors; each used to be resolved
+silently.
+
 **Ctrl-c outside the TUI was a traceback.** In `--repl` and one-shot runs the first
 ctrl-c now ends the turn at its next step and the conversation is saved; a second one
 quits. Interrupting the first-run download says that re-running resumes it, and an

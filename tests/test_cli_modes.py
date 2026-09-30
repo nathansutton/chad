@@ -355,3 +355,32 @@ def test_terminal_stdout_keeps_the_streaming_emitter(rec, capsys):
 
     assert rec.agents[0].kw["emit"] is None
     assert "ok" not in capsys.readouterr().out
+
+
+# --- flags that contradict each other -----------------------------------------
+
+@pytest.mark.parametrize("argv, flag", [
+    (["--plan", "--yolo"], "--plan"),
+    (["-c", "--resume"], "--resume"),
+    (["--repl", "do X"], "--repl"),
+    (["--base-url", "http://h:1"], "--base-url"),
+    (["--tokenizer", "owner/name"], "--tokenizer"),
+    (["--api-key-env", "KEY"], "--api-key-env"),
+])
+def test_conflicting_flags_are_a_usage_error(rec, capsys, argv, flag):
+    with pytest.raises(SystemExit) as exc:
+        rec.main(argv, tty=True)
+
+    assert exc.value.code == 2
+    assert rec.agents == [] and rec.engines == []
+    assert flag in capsys.readouterr().err
+
+
+def test_remote_flags_with_the_llama_backend_are_not_a_conflict(capsys):
+    # The benchmark kit's argv. Checked at the parser, not through `main`: past it the
+    # remote backend would fetch a real tokenizer.
+    ap = cli._agent_parser()
+    args = ap.parse_args(["--yolo", "--backend", "llama", "--base-url", "http://h:1",
+                          "--tokenizer", "owner/name", "do X"])
+    cli._reject_conflicts(ap, args)
+    assert "only applies with --backend llama" not in capsys.readouterr().err

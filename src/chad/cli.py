@@ -528,11 +528,31 @@ def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL
     source = "--model" if spec is not None else "CHAD_MODEL"
     spec = spec or config.env_str("CHAD_MODEL")
     if spec and spec.strip().lower() != "auto":
+        # A repo id is `owner/name`; it never starts like a path. Without this a typo'd
+        # path falls through to the hub and the user is told to check their connection.
+        if spec.strip().startswith((".", "/", "~")) \
+                and not os.path.exists(os.path.expanduser(spec.strip())):
+            sys.stderr.write(
+                f"chad: {source} names a path that does not exist\n"
+                f"  cause: {os.path.expanduser(spec.strip())}\n"
+                "  fix:   check the path. It can be a model directory or a .gguf file;\n"
+                "         a Hugging Face repo id is written owner/name, with no leading\n"
+                "         ./ or ~/.\n")
+            sys.exit(1)
         gguf = gguf_pack.resolve_file(spec)
         if gguf is not None:
             # A GGUF is one file; the engine reads a model directory. Build the
             # directory (config + tokenizer, no weights) once and load through it.
-            return materialize(gguf), f"GGUF file ({source} override)"
+            try:
+                return materialize(gguf), f"GGUF file ({source} override)"
+            except Exception as e:  # noqa: BLE001 — wrong model, no network, unwritable cache → guidance
+                sys.stderr.write(
+                    f"chad: could not prepare the GGUF file '{gguf}'\n"
+                    f"  cause: {type(e).__name__}: {e}\n"
+                    "  fix:   chad reads GGUF files of Qwen3.8-27B. The first use of a file\n"
+                    "         fetches its tokenizer (1.2 GB) and writes under ~/.cache/chad,\n"
+                    "         so it needs a network connection once and a writable cache.\n")
+                sys.exit(1)
         return spec, f"explicitly requested ({source} override)"
     ram = host.ram_gb()
     if ram is None or ram < _MIN_RAM_GB:
@@ -678,19 +698,28 @@ def _ensure_model(model_id, *, host: Host = HOST):
         sys.exit(1)
 
 
+def model_load_guidance(model_id: str, err: Exception) -> list[str]:
+    """Problem, cause and fix for a model that would not load, as lines. The TUI shows
+    the same lines the command line prints."""
+    lines = [f"chad: could not load model '{model_id}'",
+             f"  cause: {type(err).__name__}: {err}"]
+    if "MLX is unavailable" in str(err):
+        lines += ["  fix:   the MLX install is broken. Reinstall chad:",
+                  "         `uv tool install --force chad-code` (or, in a clone,",
+                  "         `uv sync --reinstall-package mlx-metal`)."]
+    elif os.path.isdir(model_id):
+        lines += ["  fix:   the local model dir looks incomplete or corrupt. Re-build it, or",
+                  "         unset CHAD_MODEL to fall back to the Hugging Face download."]
+    else:
+        lines += ["  fix:   a partial/corrupt download or not enough free RAM. Re-run (the HF",
+                  "         download resumes). chad needs ~13 GB resident for weights alone,",
+                  "         so close other memory-hungry apps before retrying."]
+    return lines
+
+
 def _fail_model_load(model_id, err):
     """Turn a raw model-load traceback into problem / cause / fix and exit."""
-    sys.stderr.write(f"\nchad: could not load model '{model_id}'\n")
-    sys.stderr.write(f"  cause: {type(err).__name__}: {err}\n")
-    if os.path.isdir(model_id):
-        sys.stderr.write(
-            "  fix:   the local model dir looks incomplete or corrupt. Re-build it, or\n"
-            "         unset CHAD_MODEL to fall back to the Hugging Face download.\n")
-    else:
-        sys.stderr.write(
-            "  fix:   a partial/corrupt download or not enough free RAM. Re-run (the HF\n"
-            "         download resumes). chad needs ~12 GB resident for weights alone,\n"
-            "         so close other memory-hungry apps before retrying.\n")
+    sys.stderr.write("\n" + "\n".join(model_load_guidance(model_id, err)) + "\n")
     sys.exit(1)
 
 
@@ -876,6 +905,23 @@ def _agent_parser():
     return ap
 
 
+def _reject_conflicts(ap: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Flags that cannot both be honoured. Picking one silently runs something the user
+    did not ask for — a read-only session that edits, or a REPL that never opens."""
+    task = args.task or args.prompt_flag
+    if args.plan and args.yolo:
+        ap.error("--plan is read-only and --yolo approves everything: choose one")
+    if args.cont and args.resume:
+        ap.error("-c resumes the most recent session and --resume asks which: choose one")
+    if args.repl and task:
+        ap.error("a task runs once and exits; --repl is interactive. Drop one of them")
+    if args.backend != "llama":
+        for flag, value in (("--base-url", args.base_url), ("--tokenizer", args.tokenizer),
+                            ("--api-key-env", args.api_key_env)):
+            if value:
+                ap.error(f"{flag} only applies with --backend llama")
+
+
 def _prove_parser():
     ap = argparse.ArgumentParser(
         prog="chad prove",
@@ -972,7 +1018,9 @@ def _main(argv, host, load_backend, interrupt):
         from . import prove
         sys.exit(prove.run(_prove_parser().parse_args(argv[1:]), host=host))
 
-    args = _agent_parser().parse_args(argv)
+    ap = _agent_parser()
+    args = ap.parse_args(argv)
+    _reject_conflicts(ap, args)
     if args.levers:  # deprecated spelling of `chad levers`
         sys.exit(_run_levers())
 
@@ -1257,7 +1305,8 @@ def _main(argv, host, load_backend, interrupt):
 
         backend.tui(eng, provisional, mode=start_mode, thinking=thinking, resume=resume,
                     ctx_window=provisional, native_ctx=window, finalize=finalize,
-                    ctx_limit_fn=ctx_limit_fn)
+                    ctx_limit_fn=ctx_limit_fn,
+                    describe_load_error=lambda e: model_load_guidance(model_id, e))
 
 
 if __name__ == "__main__":

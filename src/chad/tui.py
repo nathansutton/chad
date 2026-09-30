@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 log = logging.getLogger("chad.tui")
 
@@ -395,7 +395,9 @@ class TUI:
     def __init__(self, engine: BaseEngine, ctx_limit: int, mode: str = "normal",
                  thinking: bool = True, max_chars: int = 400_000, resume: list = None,
                  ctx_window: int = None, finalize=None, ctx_limit_fn=None,
-                 native_ctx: int = None, speech: Optional[_SpeechModule] = None,
+                 native_ctx: int = None,
+                 describe_load_error: Optional[Callable[[Exception], list[str]]] = None,
+                 speech: Optional[_SpeechModule] = None,
                  recorder: Optional[_Recorder] = None, speaker: Optional[_Speaker] = None):
         self.engine = engine
         self.ctx_limit = ctx_limit
@@ -416,6 +418,7 @@ class TUI:
         self._finalize = finalize
         self._model_ready = threading.Event()
         self._load_error = None
+        self._describe_load_error = describe_load_error
         if finalize is None:
             self._model_ready.set()
 
@@ -714,6 +717,8 @@ class TUI:
             left = [("class:spinner", f" {frame} {glyph} {self._phase}…  "),
                     ("class:idle", f"{prog}{elapsed}s · ↑{_kfmt(self._prefilled)} "
                                    f"↓{_kfmt(self._gen_tokens)} · {cap}ctrl-c ")]
+        elif self._load_error:
+            left = [("class:confirm", " model did not load — /exit and see the message above ")]
         else:
             left = [("class:idle", f" {_phase_glyph(self._phase)} ready ")]
         # Voice indicator ahead of everything: while the mic is open the user
@@ -1192,6 +1197,12 @@ class TUI:
                 text.startswith(("/reset", "/clear", "/compact", "/ctx", "/resume", "/accept"))):
             self._emit("info", "still loading the model — try that once it's ready.")
             return False
+        # A failed load leaves the engine unbuilt: the same commands would crash on it.
+        if self._load_error and text.startswith(
+                ("/reset", "/clear", "/compact", "/ctx", "/resume", "/accept")):
+            self._emit("info", "the model did not load, so there is nothing to act on "
+                               "— /exit and see the message above.")
+            return False
         if text in ("/reset", "/clear"):
             if self._fresh_agent(self.agent.mode):
                 self._emit("info", "session reset.")
@@ -1462,7 +1473,12 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
             self._emit("info", f"ready in {load_s:.0f}s · {detail}")
         except Exception as e:  # noqa: BLE001 — surface load failure; don't hang the worker
             self._load_error = f"{type(e).__name__}: {e}"
-            self._emit("error", f"[model load failed: {self._load_error}]")
+            lines = (self._describe_load_error(e) if self._describe_load_error
+                     else [f"[model load failed: {self._load_error}]"])
+            for ln in lines:
+                self._emit("error", ln)
+            self._emit("error", "  nothing can run in this session — /exit, then see the "
+                                "fix above")
         finally:
             self._model_ready.set()
             self._dirty = True  # the status line leaves its loading state
@@ -1509,7 +1525,8 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
 
 def run_tui(engine: BaseEngine, ctx_limit: int, mode: str = "normal", thinking: bool = True,
             resume: list = None, ctx_window: int = None, finalize=None, ctx_limit_fn=None,
-            native_ctx: int = None):
+            native_ctx: int = None,
+            describe_load_error: Optional[Callable[[Exception], list[str]]] = None):
     asyncio.run(TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume,
                     ctx_window=ctx_window, finalize=finalize, ctx_limit_fn=ctx_limit_fn,
-                    native_ctx=native_ctx).run())
+                    native_ctx=native_ctx, describe_load_error=describe_load_error).run())
