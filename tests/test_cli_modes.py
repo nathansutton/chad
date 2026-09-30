@@ -49,7 +49,7 @@ def rec(monkeypatch, tmp_path):
     relaunch loop; left empty, every turn finishes clean. `rec.answers` are typed at the
     terminal prompts, in order. The TUI is always a recorder so a regression that falls
     through to it fails an assertion instead of taking the terminal."""
-    rec = SimpleNamespace(agents=[], engines=[], notes=[], answers=[], tui=None)
+    rec = SimpleNamespace(agents=[], engines=[], notes=[], answers=[], tui=None, repl=None)
 
     class _RecordingAgent:
         def __init__(self, eng, **kw):
@@ -72,7 +72,7 @@ def rec(monkeypatch, tmp_path):
         return rec.engines[-1]
 
     def _repl(eng, **kw):
-        raise AssertionError("no test here takes the --repl path")
+        rec.repl = kw
 
     def _run_tui(eng, ctx_limit, **kw):
         rec.tui = kw
@@ -103,6 +103,18 @@ def rec(monkeypatch, tmp_path):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.chdir(tmp_path)  # the session store is keyed on cwd
     return rec
+
+
+# --- the plain REPL ---------------------------------------------------------
+
+@pytest.mark.parametrize("argv, mode", [
+    (["--repl"], "normal"),
+    (["--repl", "--plan"], "plan"),
+    (["--repl", "--yolo"], "yolo"),
+])
+def test_repl_starts_in_the_mode_asked_for(rec, argv, mode):
+    rec.main(argv, tty=True)
+    assert rec.repl["mode"] == mode
 
 
 # --- one-shot permission mode -------------------------------------------------

@@ -1302,6 +1302,15 @@ class TUI:
                                "(applies after the current step) · plan ready: type to "
                                "steer, ctrl-g to accept")
             return False
+        # Every builtin above matched exactly and returned. What is left that still
+        # looks like a command is a typo or a stray argument, unless it is a skill.
+        if _skills_mod().is_skill_command(text) is None:
+            from . import slash
+            msg = slash.unknown_message(
+                text, [c.split()[0] for c, _ in SLASH_COMMANDS])
+            if msg is not None:
+                self._emit("info", msg)
+                return False
         # `/<skill>` — the user picked an Agent Skill. Rewrite the line into the skill's
         # instructions and fall through to the normal message path: a skill is guidance
         # for one task, so it rides as a user turn that compaction can reclaim, not as

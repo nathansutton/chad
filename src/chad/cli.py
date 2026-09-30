@@ -1174,8 +1174,8 @@ def _main(argv, host, load_backend):
             sys.stdout.write(render.strip_ansi(result).rstrip("\n") + "\n")
         return _exit_status(result, agent.stop_kind, agent.budget_note)
     elif args.repl:
-        backend.repl(eng, yolo=args.yolo, ctx_limit=ctx_limit, resume=resume,
-                     thinking=thinking, ctx_limit_fn=ctx_limit_fn)
+        backend.repl(eng, mode=start_mode, yolo=args.yolo, ctx_limit=ctx_limit,
+                     resume=resume, thinking=thinking, ctx_limit_fn=ctx_limit_fn)
     else:
         from .engine import peek_context_window
         _maybe_home_dir_note()

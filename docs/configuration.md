@@ -239,29 +239,30 @@ the end. Accepting is the only handoff; a plan left un-accepted is just a file o
 
 Typed in the TUI (`/` opens a completion menu listing these alongside every installed
 skill). Most are local to the harness and cost nothing in context; `/init` and `/accept`
-are the two that start a real turn.
+are the two that start a real turn. The plain `--repl` front end runs the commands marked in
+the REPL column. A slash command that does not exist is reported, not sent to the model.
 
-| Command | What it does |
-| ------- | ------------ |
-| `/help` | commands & keybindings |
-| `/init` | analyze the project, write `CLAUDE.md` (a real turn — the model does the work) |
-| `/skills` | list installed Agent Skills (run one with `/<name>`) |
-| `/mcp` | MCP server status |
-| `/mcp trust` | trust this project's `.mcp.json` servers |
-| `/mcp login` | authenticate an MCP server (OAuth) |
-| `/compact` | reclaim context now |
-| `/ctx` | where the context window is going, in tokens |
-| `/undo` | revert files to the last edit checkpoint |
-| `/restore` | list edit checkpoints; `/restore <hash>` reverts to one |
-| `/resume` | list recent sessions; `/resume <n>` forks one |
-| `/reset` | clear the conversation + KV cache |
-| `/clear` | clear the conversation + KV cache |
-| `/model` | show model + context window |
-| `/mode` | cycle permission mode |
-| `/speech` | toggle voice mode — all-local STT (Parakeet-on-MLX) + TTS (`say`) |
-| `/accept` | accept a pending plan and implement it |
-| `/exit` | quit chad |
-| `/quit` | quit chad |
+| Command | What it does | REPL |
+| ------- | ------------ | ---- |
+| `/help` | commands & keybindings | ✓ |
+| `/init` | analyze the project, write `CLAUDE.md` (a real turn — the model does the work) | ✓ |
+| `/skills` | list installed Agent Skills (run one with `/<name>`) | ✓ |
+| `/mcp` | MCP server status | ✓ |
+| `/mcp trust` | trust this project's `.mcp.json` servers | ✓ |
+| `/mcp login` | authenticate an MCP server (OAuth) | ✓ |
+| `/compact` | reclaim context now | ✓ |
+| `/ctx` | where the context window is going, in tokens | – |
+| `/undo` | revert files to the last edit checkpoint | – |
+| `/restore` | list edit checkpoints; `/restore <hash>` reverts to one | – |
+| `/resume` | list recent sessions; `/resume <n>` forks one | – |
+| `/reset` | clear the conversation + KV cache | ✓ |
+| `/clear` | clear the conversation + KV cache | ✓ |
+| `/model` | show model + context window | ✓ |
+| `/mode` | cycle permission mode | ✓ |
+| `/speech` | toggle voice mode — all-local STT (Parakeet-on-MLX) + TTS (`say`) | – |
+| `/accept` | accept a pending plan and implement it | – |
+| `/exit` | quit chad | ✓ |
+| `/quit` | quit chad | ✓ |
 
 A builtin always wins a name clash with a skill, so `/<name>` reaches a skill only when no
 builtin owns that name.

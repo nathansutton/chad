@@ -4,6 +4,11 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**`--repl --plan` was not read-only.** The plain REPL never received the start mode, so
+`--plan` and `--repl` together ran in normal mode. It now starts in the mode asked for.
+A slash command that does not exist (`/hepl`, `/undo 2`, or `/undo` in the REPL, which
+only the TUI implements) is reported with a suggestion instead of being sent to the
+model as a task.
 **A one-shot run reports how it ended.** `chad "task"` exited 0 whether the task landed
 or every attempt ran out of budget. It now exits 1 when chad stopped the turn and 130 on
 an interrupt. With stdout piped or redirected, only the final answer is written to it
