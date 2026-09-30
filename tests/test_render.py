@@ -22,6 +22,7 @@ from chad.render import (  # noqa: E402
     ansi_fragment,
     banner,
     piped_emit,
+    render_passthrough,
     render_tool_result,
     strip_ansi,
 )
@@ -190,6 +191,60 @@ def test_render_real_error_uses_error_style():
     events = _emits("read", {}, "[no such file: /x/y.py]")
     check("error snapshot uses error kind",
           events == [("error", "  ⎿ no such file: /x/y.py")], repr(events))
+
+
+
+def _passthrough(result):
+    """Capture the (kind, text) events render_passthrough emits for one `!command`."""
+    shown = []
+    render_passthrough(lambda kind, text: shown.append((kind, text)), result)
+    return shown
+
+
+def test_passthrough_empty_output():
+    assert _passthrough("") == [("muted", "  ⎿ (no output)")]
+
+
+def test_passthrough_short_output_is_shown_whole():
+    shown = _passthrough("\n".join(f"line {i}" for i in range(1, 11)))
+    assert len(shown) == 10
+    assert all(kind == "muted" for kind, _ in shown)
+    assert not any("not shown" in text for _, text in shown)
+
+
+def test_passthrough_long_output_keeps_head_and_tail():
+    shown = _passthrough("\n".join(f"line {i}" for i in range(1, 501)))
+    texts = [text.strip().removeprefix("⎿ ") for _, text in shown]
+    assert len(shown) == 201
+    for kept in ("line 1", "line 100", "line 401", "line 500"):
+        assert kept in texts
+    assert "line 250" not in texts
+    assert any("300 lines not shown" in t for t in texts)
+
+
+def test_passthrough_failure_shows_its_output():
+    shown = _passthrough("[exit 1]\nFAILED test_x\nassert 1 == 2")
+    assert shown[0][0] == "error" and "exit 1" in shown[0][1]
+    assert shown[1:] == [("muted", "     FAILED test_x"), ("muted", "     assert 1 == 2")]
+
+
+def test_passthrough_timeout_shows_partial_output():
+    shown = _passthrough("[timed out after 120s]\npartial")
+    assert shown[0][0] == "error"
+    assert any("partial" in text for _, text in shown[1:])
+
+
+def test_passthrough_bracketed_output_is_not_an_error():
+    shown = _passthrough("[1, 2, 3]\nnext")
+    assert all(kind == "muted" for kind, _ in shown)
+    assert [text.strip().removeprefix("⎿ ") for _, text in shown] == ["[1, 2, 3]", "next"]
+
+
+def test_model_bash_result_is_still_six_lines():
+    # The model's own tool calls stay terse: the user is watching an agent work.
+    events = _emits("bash", {"command": "x"}, "\n".join(str(i) for i in range(20)))
+    assert len(events) == 7
+    assert events[-1] == ("muted", "     … +14 lines")
 
 
 if __name__ == "__main__":

@@ -63,7 +63,7 @@ from .render import (
     ansi_fragment,
     banner,
     confirm_preview,
-    render_tool_result,
+    render_passthrough,
 )
 
 if TYPE_CHECKING:
@@ -1478,7 +1478,7 @@ class TUI:
                         # environment: the guard is there to contain the model.
                         out = tool_bash(cmd, should_stop=self._interrupt.is_set,
                                         env_guard=False)
-                        render_tool_result(self._emit, "bash", {"command": cmd}, out)
+                        render_passthrough(self._emit, out)
                 else:
                     self.agent.run_turn(msg, stream=True)
                     self.agent.save()  # persist conversation for --continue

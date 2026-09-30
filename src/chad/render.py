@@ -333,6 +333,33 @@ def render_tool_result(emit, name: str, args: dict, result: str):
         _indent_block(emit, result)
 
 
+# A command the user typed is read, not glanced at: show it, up to a bound that keeps a
+# runaway command from burying the conversation.
+PASSTHROUGH_MAX_LINES = 200
+
+
+def render_passthrough(emit, result: str, max_lines: int = PASSTHROUGH_MAX_LINES):
+    """The output of a `!command`. Unlike a tool result there is no model to read the
+    rest, so nothing is summarised: a failure shows its output, not just its exit
+    status, and a long result keeps its head and its tail."""
+    text = str(result).rstrip("\n")
+    if not text:
+        emit("muted", "  ⎿ (no output)")
+        return
+    lines = text.split("\n")
+    failed = _is_err(lines[0])
+    if failed:
+        emit("error", "  ⎿ " + _firstline(lines[0]))
+        lines = lines[1:]
+    if len(lines) > max_lines:
+        head, tail = max_lines // 2, max_lines - max_lines // 2
+        lines = (lines[:head]
+                 + [f"… {len(lines) - max_lines} lines not shown …"]
+                 + lines[-tail:])
+    for i, ln in enumerate(lines):
+        emit("muted", ("  ⎿ " if i == 0 and not failed else "     ") + ln)
+
+
 def ansi_fragment(kind: str, text: str) -> str | None:
     """The transcript ANSI fragment shared by the REPL emitter and the TUI. Returns None
     for kinds a caller renders specially (stream, user) or drops (gauges/unknowns)."""
