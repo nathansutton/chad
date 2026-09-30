@@ -4,6 +4,10 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**Resuming shows what you are resuming.** `chad -c` names the session by its title and
+prints the last things you asked, as `/resume` and `--resume` now do. The pickers list
+all 20 kept sessions instead of 10, and chad says when saving removes the oldest one.
+
 **Yolo says when its sandbox is not there.** Inside another sandbox (CI, a container
 harness, another agent's shell) the yolo sandbox cannot be applied and commands run
 unconfined. That was only written to a log that is off by default. Entering yolo now

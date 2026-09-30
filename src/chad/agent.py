@@ -682,7 +682,14 @@ class Agent:
         if self.persist:
             session.save_session(os.getcwd(), self.messages,
                                  {"mode": self.mode, "thinking": self.thinking},
-                                 session_id=self.session_id)
+                                 session_id=self.session_id, on_prune=self._note_pruned)
+
+    def _note_pruned(self, removed: int) -> None:
+        # Resuming forks, so a directory that is resumed often reaches the limit faster
+        # than its owner expects. The oldest conversation is gone for good; say so.
+        self._emit("info", f"  [removed the {removed} oldest saved session"
+                           f"{'s' * (removed != 1)} for this directory — chad keeps "
+                           f"the newest {session.RETAIN}]")
 
     def compact_now(self):
         """Manual context reclaim (the /compact command). Runs only the SAFE, lossless-

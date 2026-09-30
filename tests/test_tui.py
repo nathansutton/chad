@@ -178,6 +178,20 @@ def test_first_task_hint_absent_on_resumed_session():
     assert t._pending == []
 
 
+def test_resumed_session_recaps_what_the_user_last_asked():
+    t = _bare_tui()
+    t._emit_recap([{"role": "user", "content": "fix the retry test"}])
+    joined = "".join(t._pending)
+    assert "you last asked:" in joined
+    assert "» fix the retry test" in joined
+
+
+def test_recap_of_an_empty_conversation_emits_nothing():
+    t = _bare_tui()
+    t._emit_recap([])
+    assert t._pending == []
+
+
 def test_todo_panel_rows_collapse_and_glyphs():
     assert _todo_panel_rows([]) == []
     short = [{"content": "a", "status": "completed"},

@@ -237,6 +237,17 @@ def test_continue_resumes_the_newest_session(rec):
     assert rec.agents[0].kw["resume"] == newest
 
 
+def test_continue_names_the_session_and_recaps_it(rec, capsys):
+    session.save_session(os.getcwd(), [{"role": "user", "content": "fix the retry test"}], {})
+
+    rec.main(["-c", "continue"], tty=True)
+
+    err = capsys.readouterr().err
+    assert "resuming (forked):" in err
+    assert '"fix the retry test"' in err
+    assert "  » fix the retry test" in err
+
+
 def test_continue_without_a_saved_session_starts_fresh(rec, capsys):
     rec.main(["-c", "do X"], tty=True)
 

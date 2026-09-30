@@ -938,9 +938,10 @@ project's thread and nothing else:
 ~/.chad/sessions/<cwdhash>/index.json          title / last-updated / turn count
 ```
 
-The newest **20** sessions per directory are kept; older ones are pruned on save. Both
-files are created mode `0600`: they hold full tool arguments and results (see [Session
-log & privacy](#session-log--privacy)).
+The newest **20** sessions per directory are kept; older ones are pruned on save. chad
+says so when it removes one. Resuming prints the session's title and the last things you
+asked, and the pickers list all 20. Both files are created mode `0600`: they hold full
+tool arguments and results (see [Session log & privacy](#session-log--privacy)).
 
 ```bash
 uv run chad -c            # resume this directory's most recent session

@@ -982,7 +982,7 @@ class TUI:
         messages, so the original session file is never overwritten."""
         from . import session
         if not arg:
-            items = session.list_sessions(os.getcwd(), limit=10)
+            items = session.list_sessions(os.getcwd(), limit=session.RETAIN)
             if not items:
                 self._emit("info", "no saved sessions for this directory.")
                 return
@@ -996,7 +996,7 @@ class TUI:
         except ValueError:
             self._emit("info", "usage: /resume  (to list)  ·  /resume <number>")
             return
-        items = self._resume_list or session.list_sessions(os.getcwd(), limit=10)
+        items = self._resume_list or session.list_sessions(os.getcwd(), limit=session.RETAIN)
         if not (1 <= n <= len(items)):
             self._emit("info", "out of range — run /resume to see the list.")
             return
@@ -1015,6 +1015,7 @@ class TUI:
         self.agent.messages += [m for m in data["messages"] if m.get("role") != "system"]
         self._resume_list = []
         self._emit("info", f"resumed (forked): {session.describe(pick)}")
+        self._emit_recap(data["messages"])
 
     # -- voice mode (/speech) ---------------------------------------------
 
@@ -1540,6 +1541,16 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
                    'tests/test_x.py" lands; "improve my codebase" flails. '
                    "shift-tab cycles plan mode.")
 
+    def _emit_recap(self, messages):
+        """What the user last asked in a resumed conversation, above the prompt."""
+        from . import session
+        lines = session.recap(messages)
+        if not lines:
+            return
+        self._emit("muted", "you last asked:")
+        for ln in lines:
+            self._emit("muted", "  » " + ln)
+
     async def run(self):
         worker = threading.Thread(target=self._worker, daemon=True)
         worker.start()
@@ -1552,6 +1563,8 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
         for ln in instructions_notice():
             self._emit("info", ln)
         self._emit_first_task_hint()
+        if self._resume is not None:
+            self._emit_recap(self._resume)
         from .tools import env_guard_notice
         notice = env_guard_notice()
         if notice:
