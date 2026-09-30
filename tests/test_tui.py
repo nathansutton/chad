@@ -937,3 +937,118 @@ def test_a_mode_other_than_yolo_says_nothing(monkeypatch):
     tui._after_mode_change()
     assert tui._pending == before
     assert tui._yolo_noticed is False
+
+
+# ---------------------------------------------------------------------------
+# Quitting and resetting keep the user's work: a deferred /reset keeps the queue,
+# text cleared with ctrl-c goes to the input history, ctrl-c on an empty prompt asks
+# for a second press, and a quit mid-turn stops the turn and lets the worker save.
+# ---------------------------------------------------------------------------
+
+def test_a_deferred_reset_keeps_the_queue():
+    tui, _ = _worker_tui()
+    tui._busy = True                      # a turn that will not yield
+    tui._queue.append("next task")
+    tui._steer_queue.append("steer it")
+    tui._reset_wait_s = 0.0               # give up on the turn at once
+    assert tui._fresh_agent("normal") is False
+    assert list(tui._queue) == ["next task"]
+    assert list(tui._steer_queue) == ["steer it"]
+    assert "queued messages are kept" in "".join(tui._pending)
+
+
+def _ctrl_c_binding(tui):
+    from prompt_toolkit.keys import Keys
+
+    for b in tui._bindings().bindings:
+        if tuple(b.keys) == (Keys.ControlC,) and b.filter():
+            return b
+    return None
+
+
+def test_ctrl_c_sends_cleared_text_to_history():
+    tui, _ = _worker_tui()
+    binding = _ctrl_c_binding(tui)
+    assert binding is not None
+    tui.input.text = "a long message I did not mean to lose"
+    binding.handler(None)
+    assert tui.input.text == ""
+    assert "a long message I did not mean to lose" in list(
+        tui.input.buffer.history.get_strings())
+
+
+def _record_shutdowns(tui):
+    calls = []
+    tui._shutdown_app = lambda event: calls.append(event)
+    return calls
+
+
+def test_one_ctrl_c_on_an_empty_prompt_does_not_quit():
+    tui, _ = _worker_tui()
+    calls = _record_shutdowns(tui)
+    _ctrl_c_binding(tui).handler(None)
+    assert calls == []
+    assert "press ctrl-c again to quit" in "".join(tui._pending)
+
+
+def test_two_ctrl_c_on_an_empty_prompt_quit():
+    tui, _ = _worker_tui()
+    calls = _record_shutdowns(tui)
+    binding = _ctrl_c_binding(tui)
+    binding.handler(None)
+    binding.handler(None)
+    assert len(calls) == 1
+
+
+def test_ctrl_c_quit_window_expires():
+    tui, _ = _worker_tui()
+    calls = _record_shutdowns(tui)
+    binding = _ctrl_c_binding(tui)
+    binding.handler(None)
+    tui._quit_armed_at = time.monotonic() - 10
+    binding.handler(None)
+    assert calls == []
+
+
+def _record_exits(tui):
+    exits = []
+    tui.app.exit = lambda: exits.append(1)
+    return exits
+
+
+def test_idle_quit_is_immediate():
+    tui, _ = _worker_tui()
+    exits = _record_exits(tui)
+    tui._request_quit()
+    assert exits == [1]
+    assert tui._shutdown is True
+
+
+def test_busy_quit_waits_for_the_save():
+    tui, fake = _worker_tui()
+    exits = _record_exits(tui)
+
+    def park_until_interrupted(_msg):
+        idle = threading.Event()
+        while not fake._should_stop():
+            idle.wait(0.005)
+
+    fake.on_call = park_until_interrupted
+    th = _start_worker(tui)
+    tui._on_accept(_Buff("work"))
+    assert _spin_until(lambda: tui._busy), "worker never started the turn"
+    tui._request_quit()
+    assert _spin_until(lambda: exits == [1]), "the quit never closed the app"
+    assert fake.saved == 1
+    assert tui._interrupt.is_set()
+    th.join(timeout=_JOIN)
+    assert not th.is_alive(), "worker did not shut down after the quit"
+
+
+def test_a_turn_that_will_not_stop_does_not_hang_the_quit():
+    tui, _ = _worker_tui()
+    exits = _record_exits(tui)
+    tui._busy = True
+    tui._quit_save_wait_s = 0.05
+    tui._request_quit()
+    assert _spin_until(lambda: exits == [1]), "a stuck turn hung the quit"

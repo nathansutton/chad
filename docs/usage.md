@@ -56,9 +56,11 @@ weights**, runs in seconds, and is what CI runs. For throughput on your own mach
 - Approving takes a deliberate key. `y` and `n` answer a pending approval only when the
   input box is empty; **v** prints the whole command or diff first, and **esc** denies at
   any time. Text you were typing can still be sent with Enter.
-- ctrl-c interrupts the running turn without killing the session. **↑prefilled /
-  ↓generated** token counts show an advancing **%** on an unavoidable full re-prefill, so it
-  is never silent.
+- ctrl-c interrupts the running turn without killing the session; on an empty prompt,
+  press it twice to quit. ctrl-d and `/exit` quit at once, and if a turn is running
+  they stop it and save the conversation first. **↑prefilled / ↓generated** token
+  counts show an advancing **%** on an unavoidable full re-prefill, so it is never
+  silent.
 - `@file` / `@dir` mentions and `!command` shell passthrough. Pull a file into
   context inline, or run a shell command without invoking the model.
 - Standing project instructions. A `CLAUDE.md` (or `AGENTS.md`) in the working directory is

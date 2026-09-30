@@ -375,7 +375,8 @@ def test_no_assistant_message_is_not_spoken():
 def test_shutdown_releases_mic_and_silences_speech():
     t, rec, spk = _tui()
     t._toggle_speech()
-    t._shutdown_app(type("E", (), {"app": type("A", (), {"exit": lambda self: None})()})())
+    t.app.exit = lambda: None
+    t._shutdown_app(None)
     assert rec.closed
     assert spk.stops >= 1
 
