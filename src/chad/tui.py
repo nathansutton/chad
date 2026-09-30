@@ -99,6 +99,11 @@ MODE_STYLE = {"normal": "status.normal", "auto": "status.auto", "yolo": "status.
 # whole point is that a one-line clipped preview means approving blind.
 _CONFIRM_MAX_LINES = 10
 _CONFIRM_MAX_CHARS = 600
+# Ctrl-c also interrupts a turn, so a second press meant to make sure the turn
+# stopped must not close chad. Two presses this close together are deliberate.
+_QUIT_WINDOW_S = 2.0
+# How long a quit waits for the running turn to stop and save before closing anyway.
+_QUIT_SAVE_WAIT_S = 5.0
 # How long a confirm must be on screen before y/n count. Long enough that the key
 # already on its way down when the panel appeared cannot answer it.
 _CONFIRM_GRACE_S = 0.4
@@ -427,6 +432,9 @@ class TUI:
         self._lock = threading.Lock()
         self._queue = deque()              # user messages awaiting the worker
         self._steer_queue = deque()        # mid-run steering awaiting the agent's drain
+        self._quit_armed_at = 0.0          # when ctrl-c on an empty prompt last asked to quit
+        self._quit_save_wait_s = _QUIT_SAVE_WAIT_S
+        self._reset_wait_s = 10.0          # how long /reset waits for a running turn to stop
         self._wake = threading.Event()     # signal the worker that work/queue changed
         self._shutdown = False
         self._busy = False
@@ -896,9 +904,14 @@ class TUI:
                 self._confirm_event.set()  # unblock a pending confirm as a denial
                 self._emit("info", "  [interrupting…]")
             elif self.input.text.strip():
-                self.input.buffer.reset()
+                self.input.buffer.reset(append_to_history=True)
             else:
-                self._shutdown_app(event)
+                now = time.monotonic()
+                if now - self._quit_armed_at <= _QUIT_WINDOW_S:
+                    self._shutdown_app(event)
+                else:
+                    self._quit_armed_at = now
+                    self._emit("info", "press ctrl-c again to quit (ctrl-d quits at once)")
 
         # Escape hard-interrupts a running turn (parity with ctrl-c and Claude Code)
         # so you can stop a trace and steer immediately instead of queueing behind it.
@@ -917,33 +930,63 @@ class TUI:
         return kb
 
     def _shutdown_app(self, event):
-        self._shutdown = True
+        self._request_quit()
+
+    def _request_quit(self):
+        """Quit. If a turn is running, stop it and wait for the worker to save the
+        conversation first: the worker is a daemon thread, so closing the app under it
+        ends the process with the turn unsaved."""
         if self._speaker:
             self._speaker.stop()
         if self._recorder:
             self._recorder.close()
+        if not self._busy:
+            self._close_app()
+            return
+        # `_shutdown` stays unset until the worker is done: its loop exits on it, and
+        # `_confirm` answers False on it, either of which would cut the save short.
+        self._interrupt.set()
+        self._confirm_event.set()  # a pending confirm counts as a denial
+        self._emit("info", "  [stopping the turn and saving…]")
+
+        def _wait():
+            idle = threading.Event()
+            deadline = time.monotonic() + self._quit_save_wait_s
+            while self._busy and time.monotonic() < deadline:
+                idle.wait(0.02)
+            loop = self.app.loop
+            if loop is not None:
+                loop.call_soon_threadsafe(self._close_app)
+            else:
+                self._close_app()
+        threading.Thread(target=_wait, daemon=True, name="chad-quit").start()
+
+    def _close_app(self):
+        self._shutdown = True
         self._wake.set()
         self._confirm_event.set()
-        event.app.exit()
+        self.app.exit()
 
     # -- session reset / plan handoff ------------------------------------
 
     def _fresh_agent(self, mode: str) -> bool:
         """Clear the conversation + KV cache and start a new Agent in `mode`.
         Returns False (without resetting) if a turn won't yield in time."""
-        self._queue.clear()
-        self._steer_queue.clear()
         if self._busy:
             # A turn is on the worker thread mutating engine._cache / _cached_ids.
             # Signal it to stop and wait for it to unwind before we reset the cache,
             # otherwise we race the live generate().
             self._interrupt.set()
-            deadline = time.time() + 10
+            deadline = time.time() + self._reset_wait_s
             while self._busy and time.time() < deadline:
                 time.sleep(0.02)
             if self._busy:
-                self._emit("info", "reset deferred: turn still running.")
+                self._emit("info", "reset deferred: turn still running. Your queued "
+                                   "messages are kept.")
                 return False
+        # Only now is the reset certain: a deferred one must not have eaten the queue.
+        self._queue.clear()
+        self._steer_queue.clear()
         self.agent = Agent(
             self.engine, ctx_limit=self.ctx_limit, mode=mode,
             thinking=self.thinking, emit=self._emit, confirm=self._confirm,
@@ -1201,9 +1244,7 @@ class TUI:
         if not text:
             return False
         if text in ("/exit", "/quit"):
-            self._shutdown = True
-            self._wake.set()
-            self.app.exit()
+            self._request_quit()
             return False
         # While the weights load in the background the engine isn't built yet, so the
         # commands that reset/compact/reslot the KV cache would crash. Typing a task is

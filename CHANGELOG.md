@@ -4,6 +4,12 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**Quitting mid-turn no longer loses the turn.** ctrl-d and `/exit` closed the app under
+the running turn, which was never saved. They now stop the turn, wait for it to save,
+and then close. ctrl-c on an empty prompt asks for a second press, text cleared with
+ctrl-c goes to the input history, and a `/reset` that has to be deferred keeps your
+queued messages.
+
 **Resuming shows what you are resuming.** `chad -c` names the session by its title and
 prints the last things you asked, as `/resume` and `--resume` now do. The pickers list
 all 20 kept sessions instead of 10, and chad says when saving removes the oldest one.
