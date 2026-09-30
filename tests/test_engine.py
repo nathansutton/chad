@@ -591,6 +591,88 @@ def test_hybrid_rewind_matches_fresh():
               f"\n--- WARM (rewound) ---\n{warm_text!r}\n--- FRESH ---\n{fresh_text!r}")
 
 
+def test_suffix_reuse_keeps_the_needle():
+    """Tier 2 (hybrid weights): a compaction-shaped edit moves the surviving rows
+    instead of re-reading them, and the model still reads what they hold.
+
+    Turn 1 answers a question whose answer sits in a note placed after ~3k tokens of
+    filler. Turn 2 is the same transcript with the filler replaced by one trimmed
+    line, the shape compaction produces. The note and the question must be moved,
+    not read, and the answer must survive in the moved rows. Relocated rows are
+    stale by construction (computed under the deleted filler, beside a recurrent
+    state that still summarises it), so there is no bit-equality assertion here: the
+    claim is that the answer survives, not that the tokens match a fresh read. Runs
+    on the shipped 8-bit quantized KV cache with the drafter at its default."""
+    if not _model_tests_enabled():
+        return skip("suffix_reuse", "CHAD_MODEL_TESTS not set (fast gate; skips model load)")
+    model_id = os.environ.get("CHAD_TEST_HYBRID_MODEL")
+    if not model_id:
+        return skip("suffix_reuse", "CHAD_TEST_HYBRID_MODEL unset")
+
+    try:
+        from chad.engine import Engine
+        eng = Engine(model_id=model_id, prompt_lookup=False, temp=0.0, kv_bits=8)
+        eng.load()
+    except Exception as e:  # noqa: BLE001 — missing model / MLX issue -> self-skip
+        return skip("suffix_reuse", f"could not load {model_id}: {type(e).__name__}: {e}")
+    if eng._trimmable or not eng._pld_hybrid:
+        return skip("suffix_reuse", "not a hybrid cache; suffix reuse won't engage")
+
+    filler = "\n".join(f"{i:04d}: the build log line {i} reports nothing unusual."
+                        for i in range(1, 260))
+    notes = "\n".join([f"note {i}: the weather was mild." for i in range(1, 40)]
+                      + ["The password is FOXGLOVE."]
+                      + [f"note {i}: the tea was cold." for i in range(40, 70)])
+    head = [{"role": "system", "content": "You are a terse assistant."},
+            {"role": "user", "content": "Read the notes, then answer the question "
+                                        "at the end."}]
+    body = [{"role": "assistant", "content": "Reading the build log."},
+            {"role": "user", "content": filler}]
+    trimmed = [{"role": "assistant", "content": "[…earlier output trimmed…]"}]
+    tail = [{"role": "user", "content": notes},
+            {"role": "user", "content": "What is the password? Answer with the "
+                                        "single word."}]
+
+    def render(messages):
+        return list(eng.tok.apply_chat_template(messages, add_generation_prompt=True,
+                                                enable_thinking=False))
+
+    before = render(head + body + tail)
+    after = render(head + trimmed + tail)
+    shared = next(i for i, (a, b) in enumerate(zip(before, after)) if a != b)
+
+    eng._reset_cache()
+    text1, _ = eng.generate(before, max_tokens=12)
+    check("fresh read finds the needle", "FOXGLOVE" in text1.upper(), repr(text1))
+
+    text2, stats = eng.generate(after, max_tokens=12)
+    check("the note and the question were moved", stats.relocated_tokens >= 700,
+          stats)
+    # The trimmed line is ~20 tokens with its template, the conditioning token one;
+    # a re-read of the note and question alone would be ~900.
+    check("only the edit was read, not the moved text", stats.prompt_tokens < 128,
+          (stats, len(after), shared))
+    check("the shared head stayed cached", stats.cached_tokens >= shared, stats)
+    check("the needle survived in the moved rows", "FOXGLOVE" in text2.upper(),
+          repr(text2))
+    check("the ledger is truthful after a relocation",
+          eng._cached_ids[: len(after)] == after
+          and len(eng._cached_ids) == len(after) + stats.generated_tokens,
+          (len(eng._cached_ids), len(after), stats.generated_tokens))
+
+    # Control: the off switch reads everything after the shared head.
+    os.environ["CHAD_NO_SCR"] = "1"
+    try:
+        eng._reset_cache()
+        eng.generate(before, max_tokens=12)
+        _, off = eng.generate(after, max_tokens=12)
+    finally:
+        os.environ.pop("CHAD_NO_SCR", None)
+    check("CHAD_NO_SCR: nothing moved", off.relocated_tokens == 0, off)
+    check("CHAD_NO_SCR: the whole post-head transcript is read",
+          off.prompt_tokens >= len(after) - shared, off)
+
+
 # === Tier 2b: cache-reuse correctness on the truncation/degenerate paths ==
 # These force the two rare cache-fast-path branches and assert
 # byte/text identity to the no-splice / fresh-cache baseline. The optimization must
@@ -943,6 +1025,132 @@ def test_bounded_rewind_orchestration():
     check("snapshot at divergence: trim only, no feed",
           eng.calls == [("restore", "SNAP"), ("trim", 3)], eng.calls)
     check("snapshot at divergence: common intact", common == 12, common)
+
+
+def test_suffix_reuse_orchestration():
+    """Tier 1 (no weights): `_sync_to`'s suffix-reuse tier — the orchestration, with
+    the row splice (tested model-free in test_suffix_reuse.py) recorded instead of run.
+
+      drop-oldest:  cache P(10) + D(20) + T(30), target P + T + [q]
+      replace:      cache P(10) + B(20) + C(30), target P + B'(5) + C + [q]
+
+    The last target token is never covered by a moved span (the decode loop needs one
+    to condition on), hence the trailing q. Expected: trim the attention KV back to
+    P, prefill only what the edit inserted, append the survivors re-rotated by the
+    distance they moved, and never reset the cache."""
+    from chad import suffix_reuse
+    from chad.engine import Engine
+
+    class _NoTrim:
+        def is_trimmable(self):
+            return False
+
+    P, D, T = list(range(100, 110)), list(range(200, 220)), list(range(300, 330))
+    saved = (suffix_reuse.take_rows, suffix_reuse.rerotate_rows,
+             suffix_reuse.append_rows, suffix_reuse.drop_spare_rows)
+    saved_env = {k: os.environ.get(k) for k in ("CHAD_SCR_MIN_SPAN", "CHAD_NO_SCR")}
+
+    def make(cached, feed_cap=None, hybrid=True):
+        eng = object.__new__(Engine)
+        eng._pld_hybrid = hybrid
+        eng._trimmable = False
+        eng._cache = [_NoTrim()]
+        eng._cached_ids = list(cached)
+        eng._rewind_snap = {"pos": 999, "recurrent": "SNAP"}
+        eng.calls = []
+        eng._attention_layers = lambda: [("C0", "R0")]
+        eng._rewind_to = lambda t, upto: None
+        eng._trim_kv = lambda n: eng.calls.append(("trim", n))
+        eng._prefill = lambda ids, *a, **k: (
+            eng.calls.append(("feed", list(ids))),
+            len(ids) if feed_cap is None else min(feed_cap, len(ids)))[1]
+        eng._reset_cache = lambda: eng.calls.append(("reset",))
+        eng._reload_warm_prefix = lambda t: (eng.calls.append(("warm",)), 0)[1]
+        suffix_reuse.take_rows = lambda c, lo, hi: (
+            eng.calls.append(("take", lo, hi)),
+            suffix_reuse.Rows(keys=(), values=(), size=hi - lo))[1]
+        suffix_reuse.rerotate_rows = lambda r, rope, d: (
+            eng.calls.append(("rotate", d)), r)[1]
+        suffix_reuse.append_rows = lambda c, r: eng.calls.append(("append", r.size))
+        suffix_reuse.drop_spare_rows = lambda c: eng.calls.append(("spare",))
+        return eng
+
+    try:
+        os.environ["CHAD_SCR_MIN_SPAN"] = "4"
+        os.environ.pop("CHAD_NO_SCR", None)
+
+        # Drop-oldest: one span, no gap.
+        eng = make(P + D + T)
+        target = P + T + [9]
+        common = eng._sync_to(target)
+        check("drop-oldest: lands at the end of the moved span", common == 40, common)
+        check("drop-oldest: take, rotate by -20, trim, append; nothing read",
+              eng.calls == [("take", 30, 60), ("rotate", -20), ("trim", 50), ("spare",),
+                            ("append", 30)], eng.calls)
+        check("drop-oldest: ledger is the target through the span",
+              eng._cached_ids == target[:40], eng._cached_ids)
+        check("drop-oldest: scr_last", eng._scr_last == (30, 0), eng._scr_last)
+        check("drop-oldest: the rewind snapshot is dropped", eng._rewind_snap is None)
+        stats = eng._sync_stats(target, common)
+        check("drop-oldest: stats read only the tail, the span is cached",
+              (stats.prompt_tokens, stats.cached_tokens, stats.relocated_tokens)
+              == (1, 40, 30), stats)
+
+        # Replace in the middle: the inserted text is read, then C moves by -15.
+        eng = make(P + D + T)
+        edit = [900, 901, 902, 903, 904]
+        target = P + edit + T + [9]
+        common = eng._sync_to(target)
+        check("replace: lands after C", common == 45, common)
+        check("replace: feed B' then append C re-rotated by -15",
+              eng.calls == [("take", 30, 60), ("rotate", -15), ("trim", 50), ("spare",),
+                            ("feed", edit), ("append", 30)], eng.calls)
+        check("replace: ledger", eng._cached_ids == target[:45], eng._cached_ids)
+        check("replace: scr_last", eng._scr_last == (30, 5), eng._scr_last)
+        stats = eng._sync_stats(target, common)
+        check("replace: the gap counts as prefilled",
+              (stats.prompt_tokens, stats.cached_tokens, stats.relocated_tokens)
+              == (6, 40, 30), stats)
+
+        # A gap prefill that stops short: land where it stopped, append nothing.
+        eng = make(P + D + T, feed_cap=2)
+        common = eng._sync_to(target)
+        check("short gap: lands after what was fed", common == 12, common)
+        check("short gap: ledger", eng._cached_ids == target[:12], eng._cached_ids)
+        check("short gap: nothing appended",
+              not any(c[0] == "append" for c in eng.calls), eng.calls)
+
+        # Nothing survives past the prefix: the rebuild, untouched.
+        eng = make(P + D + T)
+        eng._sync_to(P + [1, 2, 3])
+        check("no plan -> rebuild", ("reset",) in eng.calls and ("warm",) in eng.calls,
+              eng.calls)
+        check("no plan: no splice ran",
+              not any(c[0] in ("take", "trim", "append") for c in eng.calls), eng.calls)
+
+        # The off switch.
+        os.environ["CHAD_NO_SCR"] = "1"
+        eng = make(P + D + T)
+        eng._sync_to(P + T + [9])
+        check("CHAD_NO_SCR -> rebuild", ("reset",) in eng.calls, eng.calls)
+        check("CHAD_NO_SCR: no splice ran",
+              not any(c[0] in ("take", "append") for c in eng.calls), eng.calls)
+        os.environ.pop("CHAD_NO_SCR")
+
+        # Not the hybrid composition the splice is written for: never engages.
+        eng = make(P + D + T, hybrid=False)
+        eng._sync_to(P + T + [9])
+        check("not a hybrid -> rebuild", ("reset",) in eng.calls, eng.calls)
+        check("not a hybrid: no splice ran",
+              not any(c[0] in ("take", "append") for c in eng.calls), eng.calls)
+    finally:
+        (suffix_reuse.take_rows, suffix_reuse.rerotate_rows,
+         suffix_reuse.append_rows, suffix_reuse.drop_spare_rows) = saved
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_rewind_to_honors_short_prefill():
@@ -1443,6 +1651,7 @@ if __name__ == "__main__":
              test_prefill_oom_retry_rolls_back,
              test_snapshot_survives_empty_kvcache,
              test_bounded_rewind_orchestration,
+             test_suffix_reuse_orchestration,
              test_rewind_to_honors_short_prefill,
              test_ckpt_path_keys_on_rope_override,
              test_generate_exception_resets_ledger,
@@ -1456,6 +1665,7 @@ if __name__ == "__main__":
     tier2 = (test_pld_equals_greedy,
              test_pld_hybrid_equals_greedy,
              test_hybrid_rewind_matches_fresh,
+             test_suffix_reuse_keeps_the_needle,
              test_degenerate_reprefill_matches_fresh,
              test_truncation_recovery_matches_fresh)
     for fn in tier1 + tier2:

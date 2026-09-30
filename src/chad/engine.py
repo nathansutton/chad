@@ -67,7 +67,7 @@ except ImportError as _e:  # non-Apple host: remote backend only
 # GenStats moved to base_engine.py so a non-MLX backend can build one without
 # importing mlx.core. Re-exported here so existing `from .engine import GenStats` keeps
 # working (bench.py, tests) — the class is unchanged.
-from . import config
+from . import config, suffix_reuse
 from .base_engine import THINK_CLOSE, GenStats, KVCheckpointRef, TailWatch, think_ceiling_hit
 from .diag import log
 
@@ -578,6 +578,10 @@ class Engine:
     # native-trimming the attention KV, and re-feeding the few agreed-on tokens —
     # instead of the full-transcript re-prefill divergence used to cost.
     _rewind_snap: Optional[dict] = field(init=False, default=None)
+    # What the last `_sync_to` did by suffix reuse: (rows moved into place from the
+    # pre-edit cache, tokens prefilled into the gaps between them). Both are already
+    # inside the count `_sync_to` returns; the GenStats build sites split them out.
+    _scr_last: tuple[int, int] = field(init=False, default=(0, 0))
 
     def _read_config(self, repo):
         import json
@@ -1226,12 +1230,110 @@ class Engine:
                  "skipped a full re-prefill", upto, snap["pos"], len(refeed))
         return upto
 
+    def _attention_layers(self) -> Optional[list[tuple["suffix_reuse.AttnCache",
+                                                         "suffix_reuse.Rope"]]]:
+        """Each attention layer's cache paired with its RoPE module, in layer order.
+        None when the cache does not line up with the model's layers or a layer
+        rotates with a RoPE class `suffix_reuse.rerotate_keys` does not model — the
+        caller then leaves suffix reuse off rather than move keys it cannot re-rotate
+        exactly."""
+        import mlx.nn as nn
+
+        layers = self.model.layers
+        if len(layers) != len(self._cache):
+            return None
+        out = []
+        for layer, c in zip(layers, self._cache):
+            if layer.is_linear:
+                continue
+            if not suffix_reuse.is_attention_cache(c):
+                return None
+            rope = layer.self_attn.rope
+            if not (type(rope) is nn.RoPE or suffix_reuse.is_yarn(rope)):
+                return None
+            out.append((c, rope))
+        return out
+
+    def _relocate_to(self, target_ids: list, common: int) -> Optional[int]:
+        """Suffix reuse on the non-trimmable hybrid: land the cache on `target_ids`
+        after a mid-transcript edit by moving the rows of the text that survived it
+        instead of re-reading them. Each surviving span's attention rows are sliced
+        out, their keys re-rotated to the new positions, the attention KV trimmed back
+        to `common`, and then the target is rebuilt in order — gaps (text the edit
+        inserted) prefilled, spans appended. The recurrent layers are not touched: they
+        carry on from their current state, which still summarises the deleted text.
+
+        Returns the resident count it landed at (the end of the last moved span, or
+        less if a gap's prefill stopped short; `_cached_ids` records the same), None
+        when there is nothing worth moving (caller falls back to the rebuild). The
+        plan never covers the last target token, so the caller always has one to
+        condition on."""
+        if not self._pld_hybrid or config.flag("CHAD_NO_SCR") or common < 1:
+            return None
+        plan = suffix_reuse.plan(
+            self._cached_ids, list(target_ids[:-1]), common=common,
+            max_spans=config.env_int("CHAD_SCR_MAX_SPANS", 6),
+            min_span=config.env_int("CHAD_SCR_MIN_SPAN", 64))
+        if plan is None:
+            return None
+        layers = self._attention_layers()
+        if layers is None:
+            return None
+        moved = [[suffix_reuse.rerotate_rows(
+                      suffix_reuse.take_rows(c, s.src_lo, s.src_lo + s.size),
+                      rope, s.tgt_lo - s.src_lo)
+                  for c, rope in layers]
+                 for s in plan.spans]
+        # Evaluated here, once, so the moved rows reach the cache as plain arrays
+        # rather than as lazy slices of the pre-edit buffers carried into every
+        # later forward.
+        mx.eval([(r.keys, r.values) for rows in moved for r in rows])
+        self._trim_kv(len(self._cached_ids) - common)
+        for c, _ in layers:
+            # Cut each buffer back to its live rows: the next write then grows a fresh
+            # buffer instead of writing into the one the moved rows still share.
+            suffix_reuse.drop_spare_rows(c)
+        self._cached_ids = self._cached_ids[:common]
+        # Positions moved under the snapshot: it no longer describes this cache.
+        self._rewind_snap = None
+        pos, relocated, read = common, 0, 0
+        for span, rows in zip(plan.spans, moved):
+            gap = list(target_ids[pos:span.tgt_lo])
+            if gap:
+                fed = self._prefill(gap)
+                read += fed
+                self._cached_ids = list(target_ids[: pos + fed])
+                if fed < len(gap):
+                    self._scr_last = (relocated, read)
+                    log.warning("SCR gap prefill stopped short (%d/%d): %d tokens "
+                                "resident", fed, len(gap), pos + fed)
+                    return pos + fed
+            for (c, _), r in zip(layers, rows):
+                suffix_reuse.append_rows(c, r)
+            self._cached_ids.extend(target_ids[span.tgt_lo : span.tgt_lo + span.size])
+            relocated += span.size
+            pos = span.tgt_lo + span.size
+        self._scr_last = (relocated, read)
+        log.info("SCR moved %d tokens in %d spans, read %d between them; %d left to "
+                 "prefill after %d", relocated, len(plan.spans), read,
+                 len(target_ids) - plan.end, plan.end)
+        return plan.end
+
+    def _sync_stats(self, prompt_ids: list, common: int) -> GenStats:
+        """The GenStats a decode loop starts from after `_sync_to(prompt_ids)`
+        returned `common`. Tokens suffix reuse prefilled between moved spans count as
+        prefilled, not cached, so `prompt_tokens` stays the tokens actually read."""
+        relocated, read = self._scr_last
+        return GenStats(prompt_tokens=len(prompt_ids) - common + read,
+                        cached_tokens=common - read, relocated_tokens=relocated)
+
     def _sync_to(self, target_ids: list) -> int:
         """Trim the cache down to the longest common prefix with target_ids.
 
         Returns the number of leading tokens already resident in the cache
         (i.e. how many tokens we get to skip prefilling).
         """
+        self._scr_last = (0, 0)
         common = 0
         for a, b in zip(self._cached_ids, target_ids):
             if a != b:
@@ -1250,6 +1352,13 @@ class Engine:
                 # most one turn's tokens instead of the whole transcript. The ledger
                 # now ends where the rewind landed: short of `common` if its re-feed was.
                 common = len(self._cached_ids)
+            elif (landed := self._relocate_to(target_ids, common)) is not None:
+                # Suffix reuse: the divergence is a mid-transcript edit (compaction).
+                # Survivors keep their rows, re-rotated to their new positions; only
+                # the inserted text is read. The recurrent layers continue from the
+                # state they have — it still summarises the deleted text, which is
+                # the trade the mechanism makes.
+                common = landed
             else:
                 # Not trimmable (hybrid) -> can't partially rewind in RAM, so rebuild.
                 # But the dominant divergence in agentic loops is *compaction*, which
@@ -1616,10 +1725,7 @@ class Engine:
         try:
             common = self._sync_to(prompt_ids)
             suffix = prompt_ids[common:]
-            stats = GenStats(
-                prompt_tokens=len(suffix),
-                cached_tokens=common,
-            )
+            stats = self._sync_stats(prompt_ids, common)
             if not suffix:
                 # Nothing new to prefill (degenerate: the prompt is fully cached, e.g. an
                 # identical prompt regenerated — never in normal append-only turns). We
@@ -1820,7 +1926,7 @@ class Engine:
         try:
             common = self._sync_to(prompt_ids)
             suffix = prompt_ids[common:]
-            stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
+            stats = self._sync_stats(prompt_ids, common)
             if on_prefill:
                 on_prefill(stats.prompt_tokens, stats.cached_tokens)
 
@@ -2034,7 +2140,7 @@ class Engine:
         try:
             common = self._sync_to(prompt_ids)
             suffix = prompt_ids[common:]
-            stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
+            stats = self._sync_stats(prompt_ids, common)
             if on_prefill:
                 on_prefill(stats.prompt_tokens, stats.cached_tokens)
 
@@ -2448,7 +2554,7 @@ class Engine:
         try:
             common = self._sync_to(prompt_ids)
             suffix = prompt_ids[common:]
-            stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
+            stats = self._sync_stats(prompt_ids, common)
             if on_prefill:
                 on_prefill(stats.prompt_tokens, stats.cached_tokens)
 

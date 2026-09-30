@@ -54,9 +54,15 @@ layer can drop rows, and a recurrent state has no rows to drop.
 
 Everything in the loop is arranged so the transcript only grows at the end. Nothing above
 the conversation may change between steps, which rules out timestamps, fresh directory
-listings and per-session ids in the prompt. Compaction rewrites the middle and costs a
-full re-read, so it trims oldest first and takes enough in one pass that it does not come
-back the next step. Speculative decoding has to undo rejected drafts, and gets away with
+listings and per-session ids in the prompt. Compaction is the one step that rewrites the
+middle. It does not throw the cache away: the attention rows of whatever survived the edit
+are moved to their new positions, keys re-rotated, and only the text compaction inserted
+is read. The recurrent layers carry on from the state they have, which still summarises
+the deleted text; that approximation is the price of not re-reading. The mechanism is
+Suffix Cache Reuse from the Context Language Models paper (Shao et al., 2026),
+reimplemented for MLX (`suffix_reuse.py`; `CHAD_NO_SCR=1` turns it off). Compaction still
+trims oldest first and takes enough in one pass that it does not come back the next step:
+one large edit leaves one large survivor, the cheapest shape to move. Speculative decoding has to undo rejected drafts, and gets away with
 it because the recurrent layers reassign their state rather than mutate it, so a snapshot
 is a pointer and a rollback is free.
 
