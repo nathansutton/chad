@@ -16,7 +16,15 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from chad.render import _is_err, _tilde, ansi_fragment, banner, render_tool_result  # noqa: E402
+from chad.render import (  # noqa: E402
+    _is_err,
+    _tilde,
+    ansi_fragment,
+    banner,
+    piped_emit,
+    render_tool_result,
+    strip_ansi,
+)
 from chad.tui import TUI  # noqa: E402
 
 PASS = 0
@@ -131,6 +139,23 @@ def test_tilde_collapses_home():
     assert _tilde(home) == "~"
     assert _tilde(os.path.join(home, "assist")) == os.path.join("~", "assist")
     assert _tilde("/etc/hosts") == "/etc/hosts"  # non-home paths untouched
+
+
+def test_strip_ansi_drops_colour_codes():
+    assert strip_ansi("\033[2mx\033[0m") == "x"
+
+
+def test_piped_emit_keeps_stdout_for_the_answer(capsys):
+    piped_emit("info", "hello")
+    out = capsys.readouterr()
+    assert out.err == "hello\n" and out.out == ""
+
+    piped_emit("stream", "abc")
+    assert capsys.readouterr().err == "abc"
+
+    piped_emit("gen", "5")  # a live gauge: the TUI's, never scrollback
+    out = capsys.readouterr()
+    assert out.err == "" and out.out == ""
 
 
 def test_is_err_flags_real_diagnostics():

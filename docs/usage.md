@@ -86,6 +86,17 @@ weights**, runs in seconds, and is what CI runs. For throughput on your own mach
 Two subcommands, each with its own `--help`: `chad prove` (the offline smoke test) and
 `chad levers` (print the result-channel lever registry as JSON, for A/B ablation).
 
-A headless task (positional, or piped with no TTY) auto-approves mutating tools and runs
-greedy (temp 0). Every conversation is persisted under `~/.chad/sessions/`, and every resume
-forks a new branch rather than overwriting.
+A one-shot task (`chad "task"`) runs once and exits. With a terminal on stdin it asks
+before each command or edit, as the TUI does; with no terminal on stdin (CI, a pipe,
+`</dev/null`) it approves them itself and says so. Every conversation is persisted under
+`~/.chad/sessions/`, and every resume forks a new branch rather than overwriting.
+
+| Exit status | Meaning |
+|---|---|
+| `0` | the task ended on its own |
+| `1` | chad stopped it (a guard fired, or the budget ran out), or startup failed |
+| `130` | interrupted |
+
+When stdout is not a terminal, only the final answer is written to it; the model's
+reasoning and tool trace go to stderr, uncoloured. `NO_COLOR=1` turns colour off
+everywhere.

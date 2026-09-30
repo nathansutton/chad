@@ -4,6 +4,11 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**A one-shot run reports how it ended.** `chad "task"` exited 0 whether the task landed
+or every attempt ran out of budget. It now exits 1 when chad stopped the turn and 130 on
+an interrupt. With stdout piped or redirected, only the final answer is written to it
+and the trace goes to stderr without colour codes; `NO_COLOR` is honoured.
+
 **chad says which project instructions it read.** A `CLAUDE.md` or `AGENTS.md` longer than
 4,000 characters was cut without a word, an empty `CLAUDE.md` hid the `AGENTS.md` beside
 it, and `/init` wrote a `CLAUDE.md` that replaced an existing `AGENTS.md`. The session
