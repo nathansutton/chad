@@ -1067,3 +1067,50 @@ def test_a_turn_that_will_not_stop_does_not_hang_the_quit():
     tui._quit_save_wait_s = 0.05
     tui._request_quit()
     assert _spin_until(lambda: exits == [1]), "a stuck turn hung the quit"
+
+
+# ---------------------------------------------------------------------------
+# `/accept` with a path, and with nothing pending: a plan revised since the banner, or
+# written in an earlier session, is still a plan the user can hand over.
+# ---------------------------------------------------------------------------
+
+def _accept_tui(tmp_path, monkeypatch, *plans):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "plans").mkdir()
+    for name in plans:
+        (tmp_path / "plans" / name).write_text("# Plan\n")
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    tui.engine.reset = lambda: None
+    return tui
+
+
+def test_accept_with_nothing_pending_lists_the_plans(tmp_path, monkeypatch):
+    tui = _accept_tui(tmp_path, monkeypatch, "001-a.md", "002-b.md")
+    tui._on_accept(_Buff("/accept"))
+    shown = "".join(tui._pending)
+    assert "no plan pending" in shown
+    assert "plans/001-a.md" in shown and "plans/002-b.md" in shown
+    assert list(tui._queue) == []
+
+
+def test_accept_a_named_plan_implements_it(tmp_path, monkeypatch):
+    tui = _accept_tui(tmp_path, monkeypatch, "001-a.md", "002-b.md")
+    tui._on_accept(_Buff("/accept plans/001-a.md"))
+    (queued,) = tui._queue
+    assert "Implement the plan in plans/001-a.md" in queued
+
+
+def test_accept_a_missing_plan_is_reported(tmp_path, monkeypatch):
+    tui = _accept_tui(tmp_path, monkeypatch, "001-a.md")
+    tui._on_accept(_Buff("/accept plans/nope.md"))
+    assert "no such plan file" in "".join(tui._pending)
+    assert list(tui._queue) == []
+
+
+def test_accept_does_not_offer_the_plans_readme(tmp_path, monkeypatch):
+    tui = _accept_tui(tmp_path, monkeypatch, "README.md")
+    tui._on_accept(_Buff("/accept"))
+    shown = "".join(tui._pending)
+    assert "no plan pending." in shown
+    assert "README.md" not in shown and "newest first" not in shown

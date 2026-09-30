@@ -270,7 +270,14 @@ prints `plan ready → <path>` and waits. Type to steer (the plan turn continues
 back to the permission mode chad was started in (normal, if it was started in plan
 mode), and a fresh turn starts with an
 instruction to read that file and execute each step, running the verification commands at
-the end. Accepting is the only handoff; a plan left un-accepted is just a file on disk.
+the end. Steering keeps the handoff: a revision the model makes with `edit` brings the
+banner back for the same file. **`/accept <path>`** accepts any plan file, including one
+written in an earlier session, and `/accept` with nothing pending lists the newest files in
+`./plans/`. Accepting is the only handoff; a plan left un-accepted is just a file on disk.
+
+A plan write skips confirmation, so plan mode refuses a `write` to a file that already
+exists unless this session wrote it: a plan that reuses another's number is told to pick
+the next unused one, or to revise the existing file with `edit`, rather than replacing it.
 
 ## Slash commands
 
@@ -297,7 +304,7 @@ the REPL column. A slash command that does not exist is reported, not sent to th
 | `/model` | show model + context window | ✓ |
 | `/mode` | cycle permission mode | ✓ |
 | `/speech` | toggle voice mode — all-local STT (Parakeet-on-MLX) + TTS (`say`) | – |
-| `/accept` | accept a pending plan and implement it | – |
+| `/accept [path]` | accept the pending plan, or the named plan file, and implement it | – |
 | `/exit` | quit chad | ✓ |
 | `/quit` | quit chad | ✓ |
 

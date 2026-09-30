@@ -623,6 +623,8 @@ class Agent:
         # Absolute path of the plan file written during a plan-mode turn (consumed by
         # the TUI to offer the steer/accept handoff); reset each time it's read.
         self.last_plan_path = None
+        # The plan file this session wrote: the one existing plan a `write` may replace.
+        self._plan_written: str | None = None
         # rolling throughput accounting (read by evals / status line)
         self.gen_tokens = 0
         self.gen_time = 0.0
@@ -1673,12 +1675,23 @@ class Agent:
                 # (see guardrails.plan_mode_verdict).
                 verdict = guardrails.plan_mode_verdict(self.mode, name, args)
                 plan_write = verdict == "plan_write"
+                # A plan write skips the approval prompt, and `write` replaces a file
+                # without asking. Reusing a number would destroy an existing plan with
+                # nobody having been shown either one. Revising with `edit` is fine.
+                if (plan_write and name == "write"
+                        and os.path.exists(str(args.get("path", "") or ""))
+                        and os.path.abspath(str(args["path"])) != self._plan_written):
+                    verdict = "plan_exists"
                 _tool_s = 0.0  # stays 0 when the tool is blocked/denied (fn never ran)
                 if verdict == "blocked":
                     result = ("[plan mode: only writing the plan file under ./plans/ is "
                               "allowed. Do not edit project files or run commands. "
                               "Investigate with read-only bash, then write your "
                               "plan to ./plans/NNN-title.md.]")
+                elif verdict == "plan_exists":
+                    result = (f"[plan mode: {args['path']} already exists and is a "
+                              "different plan. Choose the next unused number, or "
+                              "revise this file with `edit`.]")
                 elif not plan_write and not self._confirm(name, args):
                     # A plan write is the expected action in plan mode, so it skips the
                     # confirm prompt; everything else still goes through _confirm. A
@@ -1700,8 +1713,11 @@ class Agent:
                     seatbelt.set_context(self.mode == "yolo", os.getcwd())
                     try:
                         result = fn(args, self._should_stop)
-                        if plan_write and result.startswith("[wrote"):
+                        # A revision arrives as an `edit`: the prompt tells the model
+                        # to change existing files that way. It is the same plan.
+                        if plan_write and result.startswith(("[wrote", "[edited")):
                             self.last_plan_path = os.path.abspath(args["path"])
+                            self._plan_written = self.last_plan_path
                     except Exception as e:  # noqa: BLE001 - surface tool errors to model
                         result = f"[tool error: {type(e).__name__}: {e}]"
                     finally:

@@ -1100,3 +1100,76 @@ def test_reasoning_effort_default_comes_from_the_engine(monkeypatch):
     assert all(kw.get("reasoning_effort") == "medium" for kw in run("medium"))
     monkeypatch.setenv("CHAD_REASONING_EFFORT", "low")
     assert all(kw.get("reasoning_effort") == "low" for kw in run("medium"))
+
+
+# --- plan mode: the handoff path and the overwrite guard -----------------------
+
+def _plan_agent(script):
+    return Agent(ScriptedEngine(script), mode="plan", thinking=False, max_steps=10)
+
+
+def test_plan_write_records_the_plan_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    agent = _plan_agent([
+        _tool_call("write", path="plans/001-x.md", content="# Plan\n"),
+        "Plan written.",
+    ])
+    agent.run_turn("plan it")
+    assert agent.last_plan_path == str(tmp_path / "plans" / "001-x.md")
+
+
+def test_plan_edit_records_the_plan_path(tmp_path, monkeypatch):
+    # A steer revises the plan with `edit`; the handoff must survive it.
+    monkeypatch.chdir(tmp_path)
+    plan = tmp_path / "plans" / "001-x.md"
+    plan.parent.mkdir()
+    plan.write_text("# Plan\nstep one\n")
+    agent = _plan_agent([
+        _tool_call("edit", path="plans/001-x.md", old="step one",
+                   new="step one\nstep two"),
+        "Plan revised.",
+    ])
+    agent.run_turn("add a step")
+    assert agent.last_plan_path == str(plan)
+    assert "step two" in plan.read_text()
+
+
+def test_plan_failed_edit_records_nothing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    plan = tmp_path / "plans" / "001-x.md"
+    plan.parent.mkdir()
+    plan.write_text("# Plan\nstep one\n")
+    agent = _plan_agent([
+        _tool_call("edit", path="plans/001-x.md", old="text that is not there",
+                   new="anything"),
+        "Could not revise.",
+    ])
+    agent.run_turn("add a step")
+    assert agent.last_plan_path is None
+
+
+def test_plan_write_does_not_replace_an_existing_plan(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    old = tmp_path / "plans" / "001-old.md"
+    old.parent.mkdir()
+    old.write_text("OLD\n")
+    agent = _plan_agent([
+        _tool_call("write", path="plans/001-old.md", content="NEW\n"),
+        "Stopped.",
+    ])
+    agent.run_turn("plan it")
+    assert old.read_text() == "OLD\n"
+    tool_turns = [m["content"] for m in agent.messages if m.get("role") == "tool"]
+    assert any("already exists and is a different plan" in c for c in tool_turns)
+    assert agent.last_plan_path is None
+
+
+def test_plan_write_may_replace_the_plan_this_session_wrote(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    agent = _plan_agent([
+        _tool_call("write", path="plans/002-new.md", content="first\n"),
+        _tool_call("write", path="plans/002-new.md", content="second\n"),
+        "Plan written.",
+    ])
+    agent.run_turn("plan it")
+    assert (tmp_path / "plans" / "002-new.md").read_text() == "second\n"
