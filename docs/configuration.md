@@ -714,8 +714,10 @@ CHAD_PROTECT_GIT=1          uv run chad  # also write-DENY .git inside the yolo 
   one value the guard reads is a `…_URL` carrying userinfo (`scheme://user:pass@host`),
   dropped because the name gives no hint that it holds a password. Set this for a
   session whose commands legitimately need a credential (e.g. `gh`, deploy scripts) — a
-  stripped variable is absent, never corrupted, so a command that needs one fails
-  clearly.
+  stripped variable is absent, never corrupted, so a command that needs one behaves as
+  if it had never been set: most fail with their own authentication error, and the AWS
+  CLI falls back to the default profile. chad prints the withheld names when an
+  interactive session starts. A command you type yourself with `!` is not filtered.
 - `CHAD_PROTECT_GIT`: an opt-in tier on top of the yolo sandbox: the workspace's
   `.git` (and a worktree's external gitdir) is write-DENIED, so an unreviewed command
   cannot destroy project history. The cost is real: every `.git`-writing git command
