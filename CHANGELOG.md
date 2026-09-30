@@ -4,6 +4,11 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**A `!command` in the TUI shows its output.** It went through the renderer for the
+model's tool calls: six lines of a success, and only the exit status of a failure. It now
+shows up to 200 lines, keeping the head and the tail of anything longer, and a failing
+command shows what it printed.
+
 **Quitting mid-turn no longer loses the turn.** ctrl-d and `/exit` closed the app under
 the running turn, which was never saved. They now stop the turn, wait for it to save,
 and then close. ctrl-c on an empty prompt asks for a second press, text cleared with

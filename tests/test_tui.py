@@ -621,6 +621,21 @@ def test_midturn_shell_passthrough_keeps_typeahead():
     assert list(tui._steer_queue) == []
 
 
+
+def test_shell_passthrough_shows_all_of_a_failure():
+    tui, fake = _worker_tui()
+    tui._model_ready.set()
+    th = _start_worker(tui)
+    try:
+        tui._on_accept(_Buff("!printf 'one\\ntwo\\nthree\\nfour\\nfive\\nsix\\nseven\\neight\\n'; exit 3"))
+        assert _spin_until(lambda: "eight" in "".join(tui._pending))
+        out = "".join(tui._pending)
+        assert "exit 3" in out
+        assert "one" in out and "eight" in out
+        assert fake.calls == []  # the model was not involved
+    finally:
+        _stop_worker(tui, th)
+
 def test_drain_steering_hands_over_fifo_and_empties():
     tui, _ = _worker_tui()
     tui._steer_queue.extend(["first", "second"])
