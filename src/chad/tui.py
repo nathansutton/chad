@@ -468,7 +468,8 @@ class TUI:
         # Plan-mode handoff state. After a plan-mode turn writes a plan file,
         # `_pending_plan` holds its path and the user can steer (type) or accept
         # (ctrl-g / `/accept`). The accepted implementation session inherits the
-        # session's baseline permission mode (auto when launched --yolo, else normal).
+        # session's baseline permission mode (the mode chad was launched in; normal when
+        # that was plan).
         self._pending_plan = None
         self._base_mode = self.agent.mode if self.agent.mode != "plan" else "normal"
         # Governor handoff: after a turn hard-stops on its budget, holds the
@@ -1376,7 +1377,9 @@ class TUI:
                                "· /<skill> runs an installed skill (/skills lists them) "
                                "· !cmd shell · @path "
                                "attach · type while busy to steer the running turn "
-                               "(applies after the current step) · plan ready: type to "
+                               "(applies after the current step) "
+                               "· alt-enter/ctrl-j: new line · ctrl-d: quit "
+                               "· ctrl-t: dictate (with /speech) · plan ready: type to "
                                "steer, ctrl-g to accept")
             return False
         # Every builtin above matched exactly and returned. What is left that still
