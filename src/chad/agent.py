@@ -1921,6 +1921,10 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
     print(f"{C_DIM}type a task, or /reset, /exit.{C_RST}")
     for ln in instructions_notice():
         print(f"{C_DIM}{ln}{C_RST}")
+    from .tools import env_guard_notice
+    notice = env_guard_notice()
+    if notice:
+        print(f"{C_DIM}{notice}{C_RST}")
     while True:
         try:
             line = input(f"{C_YEL}» {C_RST}").strip()
@@ -2007,6 +2011,6 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
                 from .tools import tool_bash
                 if clear_stop is not None:
                     clear_stop()
-                print(f"{C_DIM}{tool_bash(cmd, should_stop=should_stop)}{C_RST}")
+                print(f"{C_DIM}{tool_bash(cmd, should_stop=should_stop, env_guard=False)}{C_RST}")
             continue
         turn(line)

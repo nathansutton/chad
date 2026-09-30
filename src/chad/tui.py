@@ -1429,7 +1429,10 @@ class TUI:
                     cmd = msg[1:].strip()
                     if cmd:
                         self._emit("tool", f"Run  {cmd}")
-                        out = tool_bash(cmd, should_stop=self._interrupt.is_set)
+                        # Typed by the person at the terminal, in their own shell's
+                        # environment: the guard is there to contain the model.
+                        out = tool_bash(cmd, should_stop=self._interrupt.is_set,
+                                        env_guard=False)
                         render_tool_result(self._emit, "bash", {"command": cmd}, out)
                 else:
                     self.agent.run_turn(msg, stream=True)
@@ -1530,6 +1533,10 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
         for ln in instructions_notice():
             self._emit("info", ln)
         self._emit_first_task_hint()
+        from .tools import env_guard_notice
+        notice = env_guard_notice()
+        if notice:
+            self._emit("muted", notice)
         if self._finalize is not None:
             self._emit("info", f"loading {self.engine.model_id.split('/')[-1]}… "
                                "(type ahead — your first message runs when it's ready)")

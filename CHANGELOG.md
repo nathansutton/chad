@@ -4,6 +4,11 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**The environment guard says what it withholds.** An interactive session now lists the
+credential-shaped variables chad's commands will not see. They used to vanish without a
+word: `git push` failed on a missing ssh-agent and `aws` fell back to the default
+profile. A command you type yourself with `!` is no longer filtered.
+
 **`/undo` can be undone.** It restored over whatever was in the workspace, including
 your own edits since the last checkpoint, without saving it. It now snapshots that
 state first and names the checkpoint, says "nothing to undo" when nothing differs, and
