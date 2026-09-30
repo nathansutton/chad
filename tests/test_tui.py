@@ -900,3 +900,26 @@ def test_background_job_failure_is_reported():
 
     tui._in_background("mcp", job)
     assert _spin_until(lambda: "mcp failed: RuntimeError" in "".join(tui._pending))
+
+
+def test_entering_yolo_without_a_sandbox_says_so_once(monkeypatch):
+    monkeypatch.setenv("CHAD_NO_SEATBELT", "1")
+    tui, fake = _worker_tui()
+    fake.mode = "yolo"
+
+    tui._after_mode_change()
+    assert _spin_until(lambda: "UNCONFINED" in "".join(tui._pending))
+    tui._after_mode_change()
+    assert tui._yolo_noticed is True
+    assert "".join(tui._pending).count("UNCONFINED") == 1
+
+
+def test_a_mode_other_than_yolo_says_nothing(monkeypatch):
+    monkeypatch.setenv("CHAD_NO_SEATBELT", "1")
+    tui, fake = _worker_tui()
+    fake.mode = "normal"
+    before = list(tui._pending)
+
+    tui._after_mode_change()
+    assert tui._pending == before
+    assert tui._yolo_noticed is False

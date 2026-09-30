@@ -1174,6 +1174,11 @@ def _main(argv, host, load_backend, interrupt):
         if run_mode == "normal" and not host.stdin_isatty():
             run_mode = "yolo"
             sys.stderr.write("[headless: auto-approving tools (use --plan for read-only)]\n")
+        if run_mode == "yolo":
+            from . import seatbelt
+            notice = seatbelt.yolo_notice()
+            if notice:
+                sys.stderr.write(f"[{notice}]\n")
         from . import render
         # Piped or redirected: the answer is what the caller wants on stdout; the trace
         # of how the model got there goes to stderr.

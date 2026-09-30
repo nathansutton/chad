@@ -109,6 +109,8 @@ def rec(monkeypatch, tmp_path):
     for var in ("CHAD_AUTO_CONTINUE", "CHAD_TURN_BUDGET_S", "CHAD_REVIEW_PASS",
                 "CHAD_DISABLE"):
         monkeypatch.delenv(var, raising=False)
+    # Yolo runs the sandbox probe, a real sandbox-exec; opting out keeps it off the suite.
+    monkeypatch.setenv("CHAD_NO_SEATBELT", "1")
     monkeypatch.chdir(tmp_path)  # the session store is keyed on cwd
     return rec
 
@@ -155,6 +157,15 @@ def test_one_shot_permission_mode(rec, capsys, argv, tty, mode, promoted):
     assert agent.turns == ["do X"]
     assert agent.saved  # a follow-up `chad -c` can pick the thread up
     assert ("[headless: auto-approving" in capsys.readouterr().err) is promoted
+
+
+@pytest.mark.parametrize("argv, noticed", [
+    (["--yolo", "do X"], True),
+    (["do X"], False),
+])
+def test_one_shot_yolo_says_when_it_is_unconfined(rec, capsys, argv, noticed):
+    rec.main(argv, tty=True)
+    assert ("UNCONFINED" in capsys.readouterr().err) is noticed
 
 
 # --- ctrl-c in a one-shot run -------------------------------------------------

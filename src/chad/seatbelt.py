@@ -244,6 +244,17 @@ class Seatbelt:
         log.info("SEATBELT profile for %s -> %s", ws, path)
         return path
 
+    def unconfined_reason(self) -> Optional[str]:
+        """Why a yolo command would run with no sandbox, in words for the user, or None
+        when it will be confined. The log is off by default, so this is the only way a
+        user finds out."""
+        if config.flag("CHAD_NO_SEATBELT"):
+            return "the sandbox is switched off (CHAD_NO_SEATBELT)"
+        if not self.probe():
+            return ("the sandbox cannot be applied here (chad is running inside another "
+                    "sandbox, or this is not macOS)")
+        return None
+
     def wrap_argv(self, command: str) -> Optional[list[str]]:
         """The argv to spawn `command` sandboxed, or None to run it unconfined.
         None whenever the executing agent is not in yolo mode or the platform can't
@@ -282,3 +293,17 @@ def probe() -> bool:
 def wrap_argv(command: str) -> Optional[list[str]]:
     """The argv to spawn `command` sandboxed, or None (see Seatbelt.wrap_argv)."""
     return _SEATBELT.wrap_argv(command)
+
+
+def unconfined_reason() -> Optional[str]:
+    """Why yolo commands would run unconfined (see Seatbelt.unconfined_reason)."""
+    return _SEATBELT.unconfined_reason()
+
+
+def yolo_notice() -> str:
+    """The line to show when a session enters yolo without a working sandbox, or ''."""
+    why = unconfined_reason()
+    if why is None:
+        return ""
+    return (f"yolo: commands will run UNCONFINED — {why}. They can write anywhere "
+            f"your user can.")

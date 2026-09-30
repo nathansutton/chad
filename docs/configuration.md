@@ -706,7 +706,9 @@ CHAD_PROTECT_GIT=1          uv run chad  # also write-DENY .git inside the yolo 
 - `CHAD_NO_SEATBELT`: **disables** the macOS Seatbelt sandbox (`seatbelt.py`) that
   yolo-mode bash commands run under by default: file writes confined to the workspace,
   temp dirs, and caches; reads and network open. Only the spawned shell child is ever
-  sandboxed. Set this only when the sandbox itself breaks a legitimate workflow.
+  sandboxed. Set this only when the sandbox itself breaks a legitimate workflow. When
+  yolo cannot be sandboxed, because this is set or because chad is itself running inside
+  a sandbox, chad says so when the session enters yolo.
 - `CHAD_NO_ENV_GUARD`: bash children normally get a **filtered** copy of the
   environment: variable names shaped like credentials are dropped — `…_TOKEN`,
   `…_SECRET`, `…_PASSWORD`, `…_API_KEY`, `…_KEY`, `…_PAT`, `…_AUTH`, `…_DSN`,

@@ -4,6 +4,11 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**Yolo says when its sandbox is not there.** Inside another sandbox (CI, a container
+harness, another agent's shell) the yolo sandbox cannot be applied and commands run
+unconfined. That was only written to a log that is off by default. Entering yolo now
+prints it, as it does when `CHAD_NO_SEATBELT` is set.
+
 **The environment guard says what it withholds.** An interactive session now lists the
 credential-shaped variables chad's commands will not see. They used to vanish without a
 word: `git push` failed on a missing ssh-agent and `aws` fell back to the default
