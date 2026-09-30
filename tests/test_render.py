@@ -102,6 +102,7 @@ def _stub_tui(finalize):
     tui._model_ready = threading.Event()
     tui._wake = threading.Event()
     tui._load_error = None
+    tui._describe_load_error = None
     tui.ctx_limit = 8192  # provisional, set pre-load
     tui.agent = SimpleNamespace(ctx_limit=8192)
     tui.engine = SimpleNamespace(effective_ctx=262144)
