@@ -120,6 +120,34 @@ def test_no_token_literal_leaks_in_diag(tmp_path, monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
+# A stored login is bound to the URL it was made against
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("stored, asked, require_binding, expected", [
+    (None, "https://a.example", False, False),
+    (None, "https://a.example", True, False),
+    ("https://a.example", "https://a.example", True, True),
+    ("https://a.example", "https://b.example", False, False),
+    ("unbound", "https://a.example", False, True),
+    ("unbound", "https://a.example", True, False),
+])
+def test_login_matches(tmp_path, monkeypatch, stored, asked, require_binding, expected):
+    _isolate_home(tmp_path, monkeypatch)
+    if stored is not None:
+        mcp_oauth._write_section("srv", "tokens", {"access_token": "placeholder"})
+        if stored != "unbound":
+            mcp_oauth.bind("srv", stored)
+    assert mcp_oauth.login_matches("srv", asked, require_binding=require_binding) is expected
+
+
+def test_bound_url_round_trip(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    assert mcp_oauth.bound_url("srv") is None
+    mcp_oauth.bind("srv", "https://a.example")
+    assert mcp_oauth.bound_url("srv") == "https://a.example"
+
+
+# ---------------------------------------------------------------------------
 # Step 3: loopback callback server parses a fired redirect and stops
 # ---------------------------------------------------------------------------
 

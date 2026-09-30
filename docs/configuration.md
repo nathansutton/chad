@@ -142,9 +142,16 @@ for `/mcp trust` or `/mcp login`.
 just cloned, and a stdio server is an arbitrary local command; an untrusted repo must not
 be able to auto-launch a subprocess the moment you open chad in it. Until trusted, its
 servers show gated in `/mcp` (`project server not started — project not trusted (run /mcp
-trust)`) and contribute no tools. `/mcp trust` records the project's absolute path in
-`~/.chad/trusted_mcp.json` (mode `0600`); the path is the trust anchor, so moving the repo
-to a new directory re-prompts. User-scope servers are exempt (you wrote them).
+trust)`) and contribute no tools. Under each gated server `/mcp` shows what it would do if
+trusted: the command and arguments it would run, or the URL it would connect to. Header
+and `env` **names** are listed; their values never are. `/mcp trust` records the
+project's absolute path in `~/.chad/trusted_mcp.json` (mode `0600`) and lists the servers
+it trusted; the path is the trust anchor, so moving the repo to a new directory
+re-prompts. In a directory with no `.mcp.json` it does nothing, so a config added later
+(by a `git pull`, say) still waits for you. If the trust store cannot be written it says
+so and nothing is trusted. User-scope servers are exempt (you wrote them). A project
+server with the same name as one of yours replaces yours in that project, and a
+warning says so.
 
 > `CHAD_MCP_FULL_ENV`, a stdio MCP subprocess inherits only a **minimal env allowlist**
 > by default (`PATH`, `HOME`, `LANG`/locale, `TMPDIR`, `SHELL`, `USER`, …, enough to find
@@ -190,6 +197,10 @@ refreshes the token as needed). Notes:
 - Headless / no-browser sessions are **never blocked**: an OAuth server that can't complete
   an interactive login simply contributes no tools.
 - Token values are never logged. The token file is created `0600` from the first write.
+- A login is tied to the URL it was made for. A project server that reuses the name of one
+  of your servers but points at a different URL shows `needs login` and must be logged in
+  to itself. A login stored by an older chad still works for your own servers and is tied
+  to its URL the next time you run `/mcp login`.
 
 **How they behave in the harness:**
 
