@@ -4,6 +4,11 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**Ctrl-c outside the TUI was a traceback.** In `--repl` and one-shot runs the first
+ctrl-c now ends the turn at its next step and the conversation is saved; a second one
+quits. Interrupting the first-run download says that re-running resumes it, and an
+interrupted `chad prove` still prints the rows it measured.
+
 **`--repl --plan` was not read-only.** The plain REPL never received the start mode, so
 `--plan` and `--repl` together ran in normal mode. It now starts in the mode asked for.
 A slash command that does not exist (`/hepl`, `/undo 2`, or `/undo` in the REPL, which

@@ -487,7 +487,8 @@ class Agent:
                  think_budget: int = None, think_ceiling: int = None,
                  turn_budget_tokens: int = None,
                  turn_budget_s: float = None, session_id: str = None,
-                 ctx_limit_fn=None, is_tty: Callable[[], bool] | None = None):
+                 ctx_limit_fn=None, is_tty: Callable[[], bool] | None = None,
+                 ask: Callable[[str], str] = input):
         self.engine = engine
         # A fresh session clears stale skill activation state and reaps prior MCP
         # processes (matches engine._reset_cache on /reset). The todo list is module
@@ -603,6 +604,8 @@ class Agent:
         # Whether a human at a terminal can answer that prompt. Asked per confirm, not
         # once here: stdin can be swapped after the agent is built.
         self._is_tty = is_tty if is_tty is not None else (lambda: sys.stdin.isatty())
+        # The plain REPL's approve prompt reads the terminal through this.
+        self._ask = ask
         self._should_stop = should_stop or (lambda: False)
         # Mid-run steering (improve 01): callable() -> list[str] of user redirections
         # typed while the turn runs, drained between steps and injected into the live
@@ -934,7 +937,12 @@ class Agent:
         # The REPL has ordinary scrollback, so nothing needs clipping.
         preview = confirm_preview(name, args, full=True)
         warn = f"{C_RED}  ⚠ looks destructive — review carefully\n{C_RST}" if dangerous else ""
-        ans = input(f"{C_YEL}  allow {name}:\n{preview}\n{warn}  approve? [y/N] {C_RST}").strip().lower()
+        try:
+            ans = self._ask(f"{C_YEL}  allow {name}:\n{preview}\n{warn}  approve? [y/N] {C_RST}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            # No answer is not a yes.
+            print()
+            return False
         return ans in ("y", "yes")
 
     def _atif_sync(self) -> None:
@@ -1873,9 +1881,27 @@ _TUI_ONLY_COMMANDS = ("/undo", "/restore", "/resume", "/ctx", "/accept", "/speec
 
 
 def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = None,
-         thinking: bool = True, ctx_limit_fn=None, mode: str = None):
+         thinking: bool = True, ctx_limit_fn=None, mode: str = None,
+         should_stop: Callable[[], bool] | None = None,
+         clear_stop: Callable[[], None] | None = None):
+    # `should_stop` is the ctrl-c flag the caller's SIGINT handler sets; `clear_stop`
+    # resets it before each turn, so a press at the prompt does not cancel the next one.
     agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking, mode=mode,
-                  resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn)
+                  resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn,
+                  should_stop=should_stop)
+
+    def turn(text: str) -> None:
+        # A turn that stops early, or dies on a second ctrl-c, is still saved: the REPL
+        # outlives it and `chad -c` resumes it.
+        if clear_stop is not None:
+            clear_stop()
+        try:
+            agent.run_turn(text)
+        except KeyboardInterrupt:
+            print(f"\n{C_DIM}[interrupted]{C_RST}")
+        finally:
+            agent.save()
+
     print(banner(engine.model_id.split("/")[-1], ctx_limit, mode=agent.mode))
     print(f"{C_DIM}type a task, or /reset, /exit.{C_RST}")
     for ln in instructions_notice():
@@ -1891,7 +1917,8 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             break
         if line in ("/reset", "/clear"):
             agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking,
-                          mode=agent.mode, persist=True, ctx_limit_fn=ctx_limit_fn)
+                          mode=agent.mode, persist=True, ctx_limit_fn=ctx_limit_fn,
+                          should_stop=should_stop)
             engine.reset()
             print(f"{C_DIM}session reset.{C_RST}")
             continue
@@ -1938,8 +1965,7 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
                   f"/speech are TUI-only{C_RST}")
             continue
         if line == "/init":
-            agent.run_turn(init_prompt(init_target()))
-            agent.save()
+            turn(init_prompt(init_target()))
             print(f"{C_DIM}{INIT_RELOAD_NOTICE}{C_RST}")
             continue
         # `/<skill>` — checked after every builtin, so a builtin always wins the name.
@@ -1958,14 +1984,14 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             text = skills.load(name, task)
             print(f"{C_DIM}loaded skill {name} "
                   f"({skill_token_cost(engine, text):,} tokens){C_RST}")
-            agent.run_turn(text)
-            agent.save()
+            turn(text)
             continue
         if line.startswith("!"):  # shell passthrough — run directly, don't call the model
             cmd = line[1:].strip()
             if cmd:
                 from .tools import tool_bash
-                print(f"{C_DIM}{tool_bash(cmd)}{C_RST}")
+                if clear_stop is not None:
+                    clear_stop()
+                print(f"{C_DIM}{tool_bash(cmd, should_stop=should_stop)}{C_RST}")
             continue
-        agent.run_turn(line)
-        agent.save()
+        turn(line)
