@@ -730,3 +730,82 @@ def test_stdio_env_extra_non_dict_ignored():
     spec = mcp._ServerSpec.decode({"command": "srv", "env": "not-a-dict"})
     env = mcp._stdio_env({"PATH": "/usr/bin"}, spec.env)
     assert env == {"PATH": "/usr/bin"}
+
+
+# --- the one-line connect summary and the first-turn report --------------------
+
+class _StatusClient:
+    """The three fields status_line reads off a connection."""
+
+    def __init__(self, name: str, error: str | None = None, tools: int = 0):
+        self.name = name
+        self.error = error
+        self.tools = [f"t{i}" for i in range(tools)]
+
+
+def _empty_registry(tmp_path, monkeypatch):
+    """A real _Registry for a directory with no MCP config, ready to be filled in."""
+    _isolate_home(tmp_path, monkeypatch)
+    return mcp._Registry(str(tmp_path))
+
+
+def test_status_line_nothing_configured(tmp_path, monkeypatch):
+    assert mcp.status_line(_empty_registry(tmp_path, monkeypatch)) is None
+
+
+def test_status_line_counts_connected_tools(tmp_path, monkeypatch):
+    reg = _empty_registry(tmp_path, monkeypatch)
+    reg.clients = [_StatusClient("a", tools=3), _StatusClient("b", tools=2)]
+    assert "2 connected (5 tools)" in mcp.status_line(reg)
+
+
+def test_status_line_names_the_first_failure(tmp_path, monkeypatch):
+    reg = _empty_registry(tmp_path, monkeypatch)
+    reg.clients = [_StatusClient("github", error="connect timed out after 60s")]
+    assert "1 failed (github: connect timed out after 60s)" in mcp.status_line(reg)
+
+
+def test_status_line_blocked(tmp_path, monkeypatch):
+    reg = _empty_registry(tmp_path, monkeypatch)
+    reg.blocked = [("demo", "project not trusted")]
+    assert "1 waiting for /mcp trust" in mcp.status_line(reg)
+
+
+def test_status_line_only_warnings(tmp_path, monkeypatch):
+    reg = _empty_registry(tmp_path, monkeypatch)
+    reg.warnings = ["/x/.mcp.json: no 'mcpServers' object"]
+    assert "config has problems" in mcp.status_line(reg)
+
+
+def _recording_agent(script):
+    from chad.agent import Agent
+    from test_agent_e2e import ScriptedEngine
+    seen = []
+    agent = Agent(ScriptedEngine(script), mode="yolo", thinking=False,
+                  emit=lambda kind, text: seen.append((kind, text)))
+    return agent, seen
+
+
+def test_first_turn_reports_mcp_once(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    _write_project(tmp_path, tmp_path / "server.py")
+    monkeypatch.chdir(tmp_path)
+    agent, seen = _recording_agent(["first answer", "second answer"])
+    agent.run_turn("hello")
+    reports = [t for k, t in seen if k == "info" and "mcp:" in t]
+    assert len(reports) == 1 and "waiting for /mcp trust" in reports[0]
+    assert ("status", "Connecting MCP servers") in seen
+    seen.clear()
+    agent.run_turn("again")
+    assert not [t for _, t in seen if "mcp:" in t]
+    mcp.reset_session()
+
+
+def test_first_turn_silent_without_mcp_config(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    agent, seen = _recording_agent(["an answer"])
+    agent.run_turn("hello")
+    assert not [t for _, t in seen if "mcp:" in t]
+    assert ("status", "Connecting MCP servers") not in seen
+    mcp.reset_session()

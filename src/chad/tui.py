@@ -1159,6 +1159,18 @@ class TUI:
                 loop.call_soon_threadsafe(self.input.buffer.insert_text, text)
         threading.Thread(target=_job, daemon=True, name="chad-stt").start()
 
+    def _in_background(self, name: str, job: Callable[[], None]) -> None:
+        """Run `job` off the UI thread. Anything that waits on a network or a person
+        must: the event loop that would draw its progress is the one it would block."""
+        def _run():
+            try:
+                job()
+            except Exception as e:  # noqa: BLE001 — report, keep the session alive
+                self._emit("error", f"[{name} failed: {type(e).__name__}: {e}]")
+            finally:
+                self._dirty = True
+        threading.Thread(target=_run, daemon=True, name=f"chad-{name}").start()
+
     def _speak_reply(self):
         """Read the turn's final prose aloud (worker thread; `say` is a detached
         subprocess, so this never blocks the next queued turn)."""
@@ -1295,12 +1307,17 @@ class TUI:
             if not name:
                 self._emit("info", "usage: /mcp login <server>")
                 return False
-            self._emit("info", mcp.login(name, emit=lambda m: self._emit("info", m)))
+            self._emit("info", f"logging in to {name}… (esc or ctrl-c keeps working)")
+            self._in_background("mcp-login", lambda: self._emit(
+                "info", mcp.login(name, emit=lambda m: self._emit("info", m))))
             return False
         if text == "/mcp":
             from . import mcp
-            for ln in mcp.summary_lines():
-                self._emit("info", "  " + ln)
+
+            def _show():
+                for ln in mcp.summary_lines():
+                    self._emit("info", "  " + ln)
+            self._in_background("mcp", _show)
             return False
         if text == "/help":
             self._emit("info", "shift-tab: cycle mode (normal/auto-accept edits/yolo/plan) "

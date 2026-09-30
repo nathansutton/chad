@@ -83,14 +83,16 @@ def redact(s: str, *, bare_blobs: bool = True) -> str:
     return (_SECRET_RE if bare_blobs else _PREFIXED_SECRET_RE).sub(_mask, s)
 
 
-def warn_footer(warnings) -> list:
-    """One-line footer summarizing config/discovery warnings for the `/mcp` and
-    `/skills` summaries: `(N warning(s): a; b; c …)`, showing the first three. Returns
-    [] when there are none. Shared so the format lives in exactly one place."""
+def warning_lines(warnings: list[str]) -> list[str]:
+    """Every config/discovery warning, one per line, under a count. A duplicate or a
+    shadowed copy is expected when skills are mirrored between two directories; those
+    go last so they cannot bury a file that was skipped."""
     if not warnings:
         return []
-    return [f"({len(warnings)} warning(s): " + "; ".join(warnings[:3])
-            + (" …" if len(warnings) > 3 else "") + ")"]
+    noise = ("duplicate at", "shadows user skill")
+    ordered = ([w for w in warnings if not any(n in w for n in noise)]
+               + [w for w in warnings if any(n in w for n in noise)])
+    return [f"{len(ordered)} warning(s):"] + [f"  - {w}" for w in ordered]
 
 
 def args_preview(args, n=160):

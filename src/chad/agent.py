@@ -499,6 +499,7 @@ class Agent:
         skills.reset_session()
         from . import mcp
         mcp.reset_session()
+        self._mcp_reported = False
         ambient.reset()
         clear_todos()
         self.mode = mode or ("yolo" if yolo else "normal")
@@ -984,6 +985,20 @@ class Agent:
 
     def _run_turn(self, user_text: str, stream=True):
         self.interrupted = False
+        # The first render of a session connects the MCP servers, and a server that does
+        # not answer holds the turn for a minute. Name the wait, then say how it went —
+        # the warnings are otherwise only visible to someone who thinks to ask.
+        if not self._mcp_reported:
+            self._mcp_reported = True
+            from . import mcp
+            try:
+                if mcp.configured():
+                    self._emit("status", "Connecting MCP servers")
+                    line = mcp.status_line(mcp.service())
+                    if line:
+                        self._emit("info", "  " + line)
+            except Exception:  # noqa: BLE001 — a status line must never end a turn
+                pass
         # Live ctx-limit recheck: re-derive the compaction trigger
         # from current memory conditions. Hysteresis: apply only a >10% move, so the
         # limit doesn't jitter with ordinary turn-to-turn allocator noise.

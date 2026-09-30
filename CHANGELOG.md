@@ -4,6 +4,12 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**MCP and skill problems are shown when they happen.** The first turn of a session
+prints one line with how many MCP servers connected, failed or are waiting, and names
+the wait while it connects. `/mcp` and `/skills` list every warning, with skipped files
+ahead of duplicates; they used to show three. `/mcp login` and `/mcp` run off the UI
+thread, so the approval URL appears while the login is still waiting for it.
+
 **Failures at startup say what to do.** A model that fails to load in the TUI now shows
 the cause and the fix and the status row stops saying "ready". A `--model` path that does
 not exist is reported as a missing path instead of a download problem, and a GGUF chad
