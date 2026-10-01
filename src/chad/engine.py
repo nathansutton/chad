@@ -582,6 +582,9 @@ class Engine:
     # pre-edit cache, tokens prefilled into the gaps between them). Both are already
     # inside the count `_sync_to` returns; the GenStats build sites split them out.
     _scr_last: tuple[int, int] = field(init=False, default=(0, 0))
+    # Wall seconds the last `_sync_to` spent relocating (moving rows, reading gaps):
+    # prefill work done before a decode loop starts its own prefill clock.
+    _scr_s: float = field(init=False, default=0.0)
 
     def _read_config(self, repo):
         import json
@@ -1275,6 +1278,7 @@ class Engine:
         condition on."""
         if not self._pld_hybrid or config.flag("CHAD_NO_SCR") or common < 1:
             return None
+        t0 = time.time()
         live = len(self._cached_ids)
         snap = self._rewind_snap
         anchors = [live] + ([snap["pos"]] if snap and snap["pos"] < live else [])
@@ -1317,7 +1321,7 @@ class Engine:
                 read += fed
                 self._cached_ids = list(target_ids[: pos + fed])
                 if fed < len(gap):
-                    self._scr_last = (relocated, read)
+                    self._scr_last, self._scr_s = (relocated, read), time.time() - t0
                     log.warning("SCR gap prefill stopped short (%d/%d): %d tokens "
                                 "resident", fed, len(gap), pos + fed)
                     return pos + fed
@@ -1326,7 +1330,7 @@ class Engine:
             self._cached_ids.extend(target_ids[span.tgt_lo : span.tgt_lo + span.size])
             relocated += span.size
             pos = span.tgt_lo + span.size
-        self._scr_last = (relocated, read)
+        self._scr_last, self._scr_s = (relocated, read), time.time() - t0
         log.info("SCR moved %d tokens in %d spans, read %d between them; anchored at "
                  "%s (%d); %d left to prefill after %d", relocated, len(plan.spans),
                  read, "live" if plan.anchor == live else "turn start", plan.anchor,
@@ -1336,10 +1340,13 @@ class Engine:
     def _sync_stats(self, prompt_ids: list, common: int) -> GenStats:
         """The GenStats a decode loop starts from after `_sync_to(prompt_ids)`
         returned `common`. Tokens suffix reuse prefilled between moved spans count as
-        prefilled, not cached, so `prompt_tokens` stays the tokens actually read."""
+        prefilled, not cached, so `prompt_tokens` stays the tokens actually read, and
+        the time it spent is the start of `prefill_s`: each decode loop starts its
+        prefill clock that much earlier."""
         relocated, read = self._scr_last
         return GenStats(prompt_tokens=len(prompt_ids) - common + read,
-                        cached_tokens=common - read, relocated_tokens=relocated)
+                        cached_tokens=common - read, relocated_tokens=relocated,
+                        prefill_s=self._scr_s)
 
     def _sync_to(self, target_ids: list) -> int:
         """Trim the cache down to the longest common prefix with target_ids.
@@ -1347,7 +1354,7 @@ class Engine:
         Returns the number of leading tokens already resident in the cache
         (i.e. how many tokens we get to skip prefilling).
         """
-        self._scr_last = (0, 0)
+        self._scr_last, self._scr_s = (0, 0), 0.0
         common = 0
         for a, b in zip(self._cached_ids, target_ids):
             if a != b:
@@ -1794,7 +1801,7 @@ class Engine:
                          else make_sampler(temp=self.temp, min_p=self.min_p, top_p=self.top_p)),
                 prompt_cache=self._cache,
             )
-            t0 = time.time()
+            t0 = time.time() - stats.prefill_s   # includes what _sync_to already read
             # Interruptible prefill: feed everything but the last token ourselves so
             # should_stop is honored between chunks. stream_generate then only has to
             # prefill the final token before decoding.
@@ -1950,7 +1957,7 @@ class Engine:
             # On a hybrid cache we roll drafts back by snapshot/restore instead of trim.
             hybrid = self._pld_hybrid and not self._trimmable
 
-            t0 = time.time()
+            t0 = time.time() - stats.prefill_s   # includes what _sync_to already read
 
             def _prefill_head():
                 """Prefill suffix[:-1] (all but the conditioning token) through the shared
@@ -2168,7 +2175,7 @@ class Engine:
                     return embed.as_linear(h)
                 return lm.lm_head(h)
 
-            t0 = time.time()
+            t0 = time.time() - stats.prefill_s   # includes what _sync_to already read
 
             def _prefill_head():
                 fed = self._prefill(suffix[:-1], should_stop,
@@ -2583,7 +2590,7 @@ class Engine:
                 return lm.lm_head(h)
 
             hybrid = self._pld_hybrid and not self._trimmable
-            t0 = time.time()
+            t0 = time.time() - stats.prefill_s   # includes what _sync_to already read
 
             drafter = (drafter_cls or _DFlashDrafter)(self, embed, _logits)
             drafter.start_turn()

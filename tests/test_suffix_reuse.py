@@ -311,46 +311,49 @@ def test_relocation_on_a_real_hybrid_cache(tiny_hybrid, kv_bits):
         return [(c.offset, suffix_reuse.take_rows(c, 0, c.offset).keys[0].shape[-2])
                 for c, _ in layers]
 
-    P, D, T = _ids(10, 30), _ids(1000, 1100), _ids(2000, 2150)
+    # Every id inside the tiny model's 256-token vocabulary: an id past it reads
+    # unrelated memory through the embedding, and the test then compares garbage.
+    P, D, T, E = _ids(0, 10), _ids(10, 70), _ids(70, 190), _ids(190, 250)
+    q1, q2 = 250, 251
     eng._cached_ids = []
     assert eng._prefill(P + D + T) == len(P + D + T)
     eng._cached_ids = P + D + T
     recurrent = [c for layer, c in zip(tiny_hybrid.layers, eng._cache) if layer.is_linear]
     before = [list(c.cache) for c in recurrent]
-    old_rows = [suffix_reuse.take_rows(c, 120, 270) for c, _ in layers]
+    old_rows = [suffix_reuse.take_rows(c, len(P + D), len(P + D + T)) for c, _ in layers]
     mx.eval([(r.keys, r.values) for r in old_rows])
 
-    target = P + T + [7]
+    target = P + T + [q1]
     common = eng._sync_to(target)
-    assert common == len(P + T) and eng._scr_last == (150, 0)
+    assert common == len(P + T) and eng._scr_last == (len(T), 0)
     assert eng._cached_ids == target[:common]
     assert attn_rows() == [(common, common)] * len(layers)
     for c, arrs in zip(recurrent, before):
         assert all(a is b for a, b in zip(c.cache, arrs)), "recurrent state was touched"
-    # The moved rows are the old ones re-rotated by -100, values untouched.
+    # The moved rows are the old ones re-rotated back by len(D), values untouched.
     for (c, rope), old in zip(layers, old_rows):
-        moved = suffix_reuse.take_rows(c, 20, 170)
-        want = suffix_reuse.rerotate_rows(old, rope, -100)
+        moved = suffix_reuse.take_rows(c, len(P), len(P + T))
+        want = suffix_reuse.rerotate_rows(old, rope, -len(D))
         for a, b in zip(moved.keys + moved.values, want.keys + want.values):
+            assert not mx.isnan(a).any().item()
             assert mx.array_equal(a, b).item()
 
-    assert eng._prefill([7]) == 1
+    assert eng._prefill([q1]) == 1
     eng._cached_ids = target
     assert attn_rows()[0][0] == len(target)
 
     # Replace in the middle: the inserted text is read, the tail (and the token
-    # decoded after it) moves right by 100.
-    edit = _ids(5000, 5100)
-    target2 = P + edit + T + [7, 8]
+    # decoded after it) moves right by len(E).
+    target2 = P + E + T + [q1, q2]
     before = [list(c.cache) for c in recurrent]
     common = eng._sync_to(target2)
-    assert common == len(P + edit + T) + 1 and eng._scr_last == (151, 100)
+    assert common == len(P + E + T) + 1 and eng._scr_last == (len(T) + 1, len(E))
     # The gap was read for its attention rows; the recurrent layers kept the anchor's
     # state (here the live one) rather than reading the gap out of order.
     for c, arrs in zip(recurrent, before):
         assert all(a is b for a, b in zip(c.cache, arrs)), "gap leaked into the state"
     assert eng._cached_ids == target2[:common]
     assert [o for o, _ in attn_rows()] == [common] * len(layers)
-    assert eng._prefill([8]) == 1
-    mx.eval(eng.model(mx.array([[9]], dtype=mx.uint32), cache=eng._cache))
+    assert eng._prefill([q2]) == 1
+    mx.eval(eng.model(mx.array([[q2]], dtype=mx.uint32), cache=eng._cache))
     assert [o for o, _ in attn_rows()] == [common + 2] * len(layers)
