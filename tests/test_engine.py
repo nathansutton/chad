@@ -598,7 +598,10 @@ def test_suffix_reuse_keeps_the_needle():
     Turn 1 answers a question whose answer sits in a note placed after ~3k tokens of
     filler. Turn 2 is the same transcript with the filler replaced by one trimmed
     line, the shape compaction produces. The note and the question must be moved,
-    not read, and the answer must survive in the moved rows. Relocated rows are
+    not read, and the answer must survive in the moved rows. The live recurrent state
+    has read turn 1's answer, which turn 2 does not contain, so this also proves the
+    turn-start snapshot is the state the cache continues from (continuing from the
+    live one, the model ends its turn at once). Relocated rows are
     stale by construction (computed under the deleted filler, beside a recurrent
     state that still summarises it), so there is no bit-equality assertion here: the
     claim is that the answer survives, not that the tokens match a fresh read. Runs
@@ -655,10 +658,9 @@ def test_suffix_reuse_keeps_the_needle():
     check("the shared head stayed cached", stats.cached_tokens >= shared, stats)
     check("the needle survived in the moved rows", "FOXGLOVE" in text2.upper(),
           repr(text2))
-    check("the ledger is truthful after a relocation",
-          eng._cached_ids[: len(after)] == after
-          and len(eng._cached_ids) == len(after) + stats.generated_tokens,
-          (len(eng._cached_ids), len(after), stats.generated_tokens))
+    check("the ledger holds the target after a relocation",
+          eng._cached_ids[: len(after)] == after, len(eng._cached_ids))
+    scr_tail = eng._cached_ids[len(after):]
 
     # Control: the off switch reads everything after the shared head.
     os.environ["CHAD_NO_SCR"] = "1"
@@ -669,6 +671,11 @@ def test_suffix_reuse_keeps_the_needle():
     finally:
         os.environ.pop("CHAD_NO_SCR", None)
     check("CHAD_NO_SCR: nothing moved", off.relocated_tokens == 0, off)
+    # Whatever decode appends to the ledger, it appends the same way after a relocation.
+    off_tail = eng._cached_ids[len(after):]
+    check("the ledger grows past the target as it does after a full read",
+          len(scr_tail) - stats.generated_tokens == len(off_tail) - off.generated_tokens,
+          (scr_tail, stats.generated_tokens, off_tail, off.generated_tokens))
     check("CHAD_NO_SCR: the whole post-head transcript is read",
           off.prompt_tokens >= len(after) - shared, off)
 
@@ -1056,9 +1063,11 @@ def test_suffix_reuse_orchestration():
         eng._trimmable = False
         eng._cache = [_NoTrim()]
         eng._cached_ids = list(cached)
-        eng._rewind_snap = {"pos": 999, "recurrent": "SNAP"}
+        eng._rewind_snap = None
         eng.calls = []
         eng._attention_layers = lambda: [("C0", "R0")]
+        eng._snap_recurrent = lambda: "ANCHOR"
+        eng._restore_recurrent = lambda st: eng.calls.append(("restore", st))
         eng._rewind_to = lambda t, upto: None
         eng._trim_kv = lambda n: eng.calls.append(("trim", n))
         eng._prefill = lambda ids, *a, **k: (
@@ -1090,7 +1099,7 @@ def test_suffix_reuse_orchestration():
         check("drop-oldest: ledger is the target through the span",
               eng._cached_ids == target[:40], eng._cached_ids)
         check("drop-oldest: scr_last", eng._scr_last == (30, 0), eng._scr_last)
-        check("drop-oldest: the rewind snapshot is dropped", eng._rewind_snap is None)
+        check("drop-oldest: the rewind snapshot stays dropped", eng._rewind_snap is None)
         stats = eng._sync_stats(target, common)
         check("drop-oldest: stats read only the tail, the span is cached",
               (stats.prompt_tokens, stats.cached_tokens, stats.relocated_tokens)
@@ -1102,9 +1111,10 @@ def test_suffix_reuse_orchestration():
         target = P + edit + T + [9]
         common = eng._sync_to(target)
         check("replace: lands after C", common == 45, common)
-        check("replace: feed B' then append C re-rotated by -15",
+        check("replace: feed B', put the anchor's recurrent state back, append C",
               eng.calls == [("take", 30, 60), ("rotate", -15), ("trim", 50), ("spare",),
-                            ("feed", edit), ("append", 30)], eng.calls)
+                            ("feed", edit), ("restore", "ANCHOR"), ("append", 30)],
+              eng.calls)
         check("replace: ledger", eng._cached_ids == target[:45], eng._cached_ids)
         check("replace: scr_last", eng._scr_last == (30, 5), eng._scr_last)
         stats = eng._sync_stats(target, common)
@@ -1119,6 +1129,22 @@ def test_suffix_reuse_orchestration():
         check("short gap: ledger", eng._cached_ids == target[:12], eng._cached_ids)
         check("short gap: nothing appended",
               not any(c[0] == "append" for c in eng.calls), eng.calls)
+
+        # A re-asked question: the live state has read an answer the target lacks,
+        # so the turn-start snapshot (the last prompt token unread) is the anchor.
+        eng = make(P + D + T)
+        eng._rewind_snap = {"pos": 59, "recurrent": "SNAP"}
+        eng._cached_ids += [400, 401, 402]                   # the answer
+        target = P + edit + T
+        common = eng._sync_to(target)
+        check("snapshot anchor: lands where the snapshot stopped reading",
+              common == 15 + 29, common)
+        check("snapshot anchor: restore the snapshot, then the gap and the cut span",
+              eng.calls == [("take", 30, 59), ("rotate", -15), ("restore", "SNAP"),
+                            ("trim", 53), ("spare",), ("feed", edit),
+                            ("restore", "ANCHOR"), ("append", 29)], eng.calls)
+        check("snapshot anchor: ledger", eng._cached_ids == target[:44], eng._cached_ids)
+        check("snapshot anchor: the snapshot is consumed", eng._rewind_snap is None)
 
         # Nothing survives past the prefix: the rebuild, untouched.
         eng = make(P + D + T)

@@ -1260,18 +1260,26 @@ class Engine:
         instead of re-reading them. Each surviving span's attention rows are sliced
         out, their keys re-rotated to the new positions, the attention KV trimmed back
         to `common`, and then the target is rebuilt in order — gaps (text the edit
-        inserted) prefilled, spans appended. The recurrent layers are not touched: they
-        carry on from their current state, which still summarises the deleted text.
+        inserted) prefilled, spans appended.
+
+        The recurrent layers continue from an anchor (`suffix_reuse.plan`): the live
+        state, or the turn-boundary snapshot, whichever lines up with the end of a
+        survivor — the last moved span ends exactly where that state stopped reading.
+        Gap prefills compute the gap's attention rows and then put the anchor's
+        recurrent state back, so the recurrent layers never read text out of order.
 
         Returns the resident count it landed at (the end of the last moved span, or
         less if a gap's prefill stopped short; `_cached_ids` records the same), None
-        when there is nothing worth moving (caller falls back to the rebuild). The
-        plan never covers the last target token, so the caller always has one to
+        when no anchor falls inside a survivor (caller falls back to the rebuild).
+        The plan never covers the last target token, so the caller always has one to
         condition on."""
         if not self._pld_hybrid or config.flag("CHAD_NO_SCR") or common < 1:
             return None
+        live = len(self._cached_ids)
+        snap = self._rewind_snap
+        anchors = [live] + ([snap["pos"]] if snap and snap["pos"] < live else [])
         plan = suffix_reuse.plan(
-            self._cached_ids, list(target_ids[:-1]), common=common,
+            self._cached_ids, list(target_ids[:-1]), common=common, anchors=anchors,
             max_spans=config.env_int("CHAD_SCR_MAX_SPANS", 6),
             min_span=config.env_int("CHAD_SCR_MIN_SPAN", 64))
         if plan is None:
@@ -1288,7 +1296,11 @@ class Engine:
         # rather than as lazy slices of the pre-edit buffers carried into every
         # later forward.
         mx.eval([(r.keys, r.values) for rows in moved for r in rows])
-        self._trim_kv(len(self._cached_ids) - common)
+        if plan.anchor != live:
+            assert snap is not None and snap["pos"] == plan.anchor
+            self._restore_recurrent(snap["recurrent"])
+        anchor_state = self._snap_recurrent()
+        self._trim_kv(live - common)
         for c, _ in layers:
             # Cut each buffer back to its live rows: the next write then grows a fresh
             # buffer instead of writing into the one the moved rows still share.
@@ -1301,6 +1313,7 @@ class Engine:
             gap = list(target_ids[pos:span.tgt_lo])
             if gap:
                 fed = self._prefill(gap)
+                self._restore_recurrent(anchor_state)
                 read += fed
                 self._cached_ids = list(target_ids[: pos + fed])
                 if fed < len(gap):
@@ -1314,8 +1327,9 @@ class Engine:
             relocated += span.size
             pos = span.tgt_lo + span.size
         self._scr_last = (relocated, read)
-        log.info("SCR moved %d tokens in %d spans, read %d between them; %d left to "
-                 "prefill after %d", relocated, len(plan.spans), read,
+        log.info("SCR moved %d tokens in %d spans, read %d between them; anchored at "
+                 "%s (%d); %d left to prefill after %d", relocated, len(plan.spans),
+                 read, "live" if plan.anchor == live else "turn start", plan.anchor,
                  len(target_ids) - plan.end, plan.end)
         return plan.end
 

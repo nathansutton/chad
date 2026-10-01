@@ -875,9 +875,11 @@ CHAD_QMM_MMA_RECAL=1      chad  # re-probe the small-M matmul kernel on this mac
   compaction** (`suffix_reuse.py`). A compaction rewrites the middle of the transcript,
   and the hybrid cache cannot be rewound, so it used to cost a re-read of everything after
   the first change. Instead, the attention rows of text that survived the edit are moved
-  to their new positions (keys re-rotated) and only the inserted text is read; the
-  recurrent layers carry on from the state they have, which still summarises the deleted
-  text. The text the model sees is unchanged; the approximation is in the cache.
+  to their new positions (keys re-rotated) and only the inserted text is read. The
+  recurrent layers continue from whichever state they hold (live, or the start of the last
+  turn) has just read the text the edited transcript has at that point; it still
+  summarises the deleted text. The text the model sees is unchanged; the approximation is
+  in the cache.
   `CHAD_NO_SCR=1` restores the full re-read. At most `CHAD_SCR_MAX_SPANS` survivors are
   moved (default 6, the largest), each at least `CHAD_SCR_MIN_SPAN` tokens (default 64);
   everything else is read. The prefill trace (`CHAD_PREFILL_TRACE`) records the moved

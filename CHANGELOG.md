@@ -34,8 +34,9 @@ restored with it.
 compaction used to re-read every token after the first change — in one recorded
 session 73,000 tokens re-read to free 20,000, 43% of the wall clock. The engine now
 keeps the cached rows of everything that survived the edit, moves them to their new
-positions, and reads only the text compaction inserted. `CHAD_NO_SCR=1` restores the
-old behaviour. (Suffix Cache Reuse, Shao et al. 2026, reimplemented for MLX.)
+positions, and reads only the text compaction inserted. The recurrent layers continue
+from a state that has just read the same text the edited transcript has at that point.
+`CHAD_NO_SCR=1` restores the old behaviour. (Suffix Cache Reuse, Shao et al. 2026, reimplemented for MLX.)
 
 **`/accept` works after the plan is revised.** The handoff was remembered only when the
 model wrote the file; a revision is an edit, so the first steer ended in "no plan

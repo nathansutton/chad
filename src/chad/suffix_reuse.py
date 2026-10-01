@@ -10,9 +10,20 @@ surgery on one attention layer's cache.
 A *survivor* is a run of tokens present, in order, in both the cached ids and the
 new target ids, past their common prefix. Its attention rows are sliced out of the
 old cache, their keys re-rotated from the old positions to the new ones, and
-appended in place of a forward pass. The recurrent layers are left alone: they carry
-on from the state they have, which still summarises the deleted text — the
-approximation this mechanism trades for skipping the re-read.
+appended in place of a forward pass.
+
+The recurrent layers cannot be edited that way: their state is one summary of
+everything read so far. What can be chosen is *which* state the cache continues
+from. The engine holds a few (the live one, a snapshot at the last turn boundary),
+each the exact state after reading the old ids up to some position — an *anchor*.
+A plan ends at the latest anchor that falls inside a survivor, so the recurrent
+layers continue from a state that has just read the very text the target has at
+that point, and everything after it is read fresh through every layer. It still
+summarises the deleted text too — the approximation this mechanism trades for
+skipping the re-read. A plan that ends anywhere else leaves the recurrent layers
+past text the target never reaches (a previous answer, say), and the model acts on
+what they read: measured, it answers an already-answered question with an
+immediate end of turn.
 
 Keys are cached after RoPE, and rotations compose additively in position, so moving
 a key from position p to q is one more rotation by q - p over the rotary dims; the
@@ -25,7 +36,7 @@ from __future__ import annotations
 
 import difflib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module loads on Linux
     import mlx.core as mx
@@ -75,38 +86,54 @@ class Plan:
 
     `common` tokens are shared as a prefix and stay where they are. The target region
     `[common, end)` alternates between gaps (target tokens no span covers, which are
-    prefilled) and `spans` (rows moved from the old cache), in target order. Target
-    tokens past `end` are the ordinary suffix the caller prefills."""
+    prefilled) and `spans` (rows moved from the old cache), in target order. The last
+    span ends at `anchor` in the old ids: the recurrent state to continue from is the
+    one that had read exactly `anchor` of them. Target tokens past `end` are the
+    ordinary suffix the caller prefills."""
     common: int
     spans: tuple[Span, ...]
     end: int
+    anchor: int
 
 
 def plan(cached_ids: list[int], target_ids: list[int], *, common: int,
-         max_spans: int, min_span: int) -> Optional[Plan]:
-    """Find the survivors worth moving from `cached_ids` into `target_ids`.
+         anchors: Sequence[int], max_spans: int, min_span: int) -> Optional[Plan]:
+    """Find the survivors worth moving from `cached_ids` into `target_ids`, ending at
+    one of `anchors` (positions in `cached_ids` the caller holds a recurrent state
+    for; see the module docstring).
 
-    The common prefix is excluded: the prefix path already serves it in place. Only
-    the `max_spans` largest survivors are kept, because every moved span carries rows
-    computed under text that is no longer there and the largest few carry nearly all
-    of the reuse. A survivor shorter than `min_span` is read rather than moved: below
-    that, a forward over it is cheap and exact. None when nothing qualifies, so the
-    caller falls back to the rebuild."""
-    blocks = difflib.SequenceMatcher(
-        a=cached_ids, b=target_ids, autojunk=False).get_matching_blocks()
-    kept = [Span(b.a, b.b, b.size) for b in blocks
-            if b.a >= common and b.b >= common and b.size >= min_span]
-    if not kept or max_spans < 1:
+    The latest anchor that falls inside a survivor wins, and that survivor is cut
+    there: it is always moved, whatever its size, because it is what lines the
+    recurrent state up with the target. Survivors past it are read, not moved. Of the
+    ones before it only the `max_spans - 1` largest are moved, because every moved
+    span carries rows computed under text that is no longer there and the largest few
+    carry nearly all of the reuse; one shorter than `min_span` is read, since a
+    forward over it is cheap. The common prefix is excluded: the prefix path already
+    serves it in place. None when no anchor falls inside a survivor, so the caller
+    falls back to the rebuild."""
+    blocks = [Span(b.a, b.b, b.size) for b in difflib.SequenceMatcher(
+                  a=cached_ids, b=target_ids, autojunk=False).get_matching_blocks()
+              if b.a >= common and b.b >= common and b.size > 0]
+    if max_spans < 1:
         return None
-    kept = sorted(kept, key=lambda s: s.size, reverse=True)[:max_spans]
-    spans = tuple(sorted(kept, key=lambda s: s.tgt_lo))
-    # Matching blocks never overlap and are monotone in both sequences, so target
-    # order is also source order; the splice appends in that order and relies on it.
-    for prev, nxt in zip(spans, spans[1:]):
-        assert prev.src_lo + prev.size <= nxt.src_lo, (prev, nxt)
-        assert prev.tgt_lo + prev.size <= nxt.tgt_lo, (prev, nxt)
-    last = spans[-1]
-    return Plan(common=common, spans=spans, end=last.tgt_lo + last.size)
+    for anchor in sorted(set(anchors), reverse=True):
+        hit = next((b for b in blocks if b.src_lo < anchor <= b.src_lo + b.size), None)
+        if hit is None:
+            continue
+        last = Span(hit.src_lo, hit.tgt_lo, anchor - hit.src_lo)
+        # Matching blocks never overlap and are monotone in both sequences, so the
+        # blocks before `hit` in source order are the ones before it in target order.
+        before = [b for b in blocks
+                  if b.src_lo + b.size <= hit.src_lo and b.size >= min_span]
+        kept = sorted(before, key=lambda s: s.size, reverse=True)[:max_spans - 1]
+        spans = tuple(sorted(kept, key=lambda s: s.tgt_lo)) + (last,)
+        # The splice appends in target order and relies on it being source order too.
+        for prev, nxt in zip(spans, spans[1:]):
+            assert prev.src_lo + prev.size <= nxt.src_lo, (prev, nxt)
+            assert prev.tgt_lo + prev.size <= nxt.tgt_lo, (prev, nxt)
+        return Plan(common=common, spans=spans, end=last.tgt_lo + last.size,
+                    anchor=anchor)
+    return None
 
 
 def rerotate_keys(keys: mx.array, rope: Rope, delta: int) -> mx.array:

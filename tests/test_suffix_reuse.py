@@ -28,30 +28,34 @@ def _thirty_trims():
     return cached, target
 
 
+def _plan(cached, target, *, common, anchors=None, max_spans=6, min_span=64):
+    """Plan with the live state as the only anchor unless told otherwise."""
+    return suffix_reuse.plan(cached, target, common=common,
+                             anchors=[len(cached)] if anchors is None else anchors,
+                             max_spans=max_spans, min_span=min_span)
+
+
 def test_drop_oldest_is_one_span():
     prefix, dropped, tail = _ids(0, 3000), _ids(3000, 12000), _ids(12000, 60000)
-    p = suffix_reuse.plan(prefix + dropped + tail, prefix + tail, common=3000,
-                          max_spans=6, min_span=64)
+    p = _plan(prefix + dropped + tail, prefix + tail, common=3000)
     assert p is not None
     assert p.spans == (Span(src_lo=12000, tgt_lo=3000, size=48000),)
-    assert p.end == 51000
-    assert p.common == 3000
+    assert (p.end, p.common, p.anchor) == (51000, 3000, 60000)
 
 
-def test_many_trims_keep_the_k_largest_in_target_order():
+def test_many_trims_keep_the_anchor_span_and_the_largest_before_it():
     cached, target = _thirty_trims()
-    p = suffix_reuse.plan(cached, target, common=3000, max_spans=30, min_span=64)
+    p = _plan(cached, target, common=3000, max_spans=30)
     assert p is not None and len(p.spans) == 30
-    sizes = sorted((s.size for s in p.spans), reverse=True)
-
-    p6 = suffix_reuse.plan(cached, target, common=3000, max_spans=6, min_span=64)
+    p6 = _plan(cached, target, common=3000, max_spans=6)
     assert p6 is not None and len(p6.spans) == 6
-    assert sorted((s.size for s in p6.spans), reverse=True) == sizes[:6]
     assert [s.tgt_lo for s in p6.spans] == sorted(s.tgt_lo for s in p6.spans)
+    assert p6.spans[-1] == p.spans[-1]                     # the anchor span, always
+    assert p6.spans[-1].src_lo + p6.spans[-1].size == p6.anchor == len(cached)
     assert p6.end == p6.spans[-1].tgt_lo + p6.spans[-1].size
 
 
-def test_many_trims_unequal_sizes_pick_the_largest():
+def test_unequal_sizes_pick_the_largest_before_the_anchor():
     prefix = _ids(0, 100)
     cached, target = list(prefix), list(prefix)
     sizes = [100, 400, 150, 500, 90, 300, 200, 250]
@@ -60,32 +64,71 @@ def test_many_trims_unequal_sizes_pick_the_largest():
         cached += _ids(base, base + n + 50)
         target += [fresh + i] + _ids(base + 50, base + 50 + n)
         base += n + 50 + 1000
-    p = suffix_reuse.plan(cached, target, common=100, max_spans=3, min_span=64)
+    p = _plan(cached, target, common=100, max_spans=3)
     assert p is not None
-    assert sorted(s.size for s in p.spans) == [300, 400, 500]
-    assert [s.size for s in p.spans] == [400, 500, 300]          # target order
-    assert p.end == p.spans[-1].tgt_lo + 300                     # not the largest's end
+    # The anchor span (the last survivor, 250) plus the two largest before it.
+    assert [s.size for s in p.spans] == [400, 500, 250]        # target order
+    assert p.end == p.spans[-1].tgt_lo + 250
 
 
 def test_nothing_to_move_is_none():
     prefix = _ids(0, 3000)
-    assert suffix_reuse.plan(prefix + _ids(5000, 9000), prefix + _ids(20000, 21000),
-                             common=3000, max_spans=6, min_span=64) is None
+    assert _plan(prefix + _ids(5000, 9000), prefix + _ids(20000, 21000),
+                 common=3000) is None
 
 
-def test_spans_below_the_floor_are_dropped():
+def test_spans_below_the_floor_are_read():
+    prefix, small, gone, last = _ids(0, 100), _ids(1000, 1040), _ids(3000, 3100), \
+        _ids(2000, 2200)
+    cached = prefix + small + gone + last
+    target = prefix + [9] + small + last + [9]
+    p = _plan(cached, target, common=100, min_span=64)
+    assert p is not None and p.spans == (Span(src_lo=240, tgt_lo=141, size=200),)
+    p = _plan(cached, target, common=100, min_span=32)
+    assert p is not None and p.spans == (Span(src_lo=100, tgt_lo=101, size=40),
+                                         Span(src_lo=240, tgt_lo=141, size=200))
+
+
+def test_the_anchor_span_is_kept_below_the_floor():
+    """The span that lines the recurrent state up is moved whatever its size."""
     prefix = _ids(0, 100)
-    cached = prefix + _ids(1000, 1100) + _ids(2000, 2040)
-    target = prefix + _ids(2000, 2040) + [9]
-    assert suffix_reuse.plan(cached, target, common=100, max_spans=6,
-                             min_span=64) is None
-    p = suffix_reuse.plan(cached, target, common=100, max_spans=6, min_span=32)
-    assert p is not None and p.spans == (Span(src_lo=200, tgt_lo=100, size=40),)
+    cached = prefix + _ids(1000, 1100) + _ids(2000, 2010)
+    target = prefix + [9] + _ids(2000, 2010) + [9]
+    p = _plan(cached, target, common=100)
+    assert p is not None and p.spans == (Span(src_lo=200, tgt_lo=101, size=10),)
+
+
+def test_anchor_inside_a_survivor_cuts_it_and_later_text_is_read():
+    """A re-asked question after an answer: the live state has read the answer, which
+    the target does not have, so the turn-start snapshot is the anchor, and the
+    survivor is cut there."""
+    prefix, filler, notes, answer = (_ids(0, 100), _ids(1000, 1500), _ids(2000, 2300),
+                                     _ids(3000, 3005))
+    cached = prefix + filler + notes + answer
+    target = prefix + [9] + notes
+    turn_start = len(prefix + filler + notes) - 1        # the last prompt token is unread
+    assert _plan(cached, target[:-1], common=100) is None              # live only
+    p = _plan(cached, target[:-1], common=100,
+              anchors=[len(cached), turn_start])
+    assert p is not None and p.anchor == turn_start
+    assert p.spans == (Span(src_lo=600, tgt_lo=101, size=299),)
+    assert p.end == len(target) - 1
+
+
+def test_latest_anchor_wins():
+    prefix, a, b = _ids(0, 100), _ids(1000, 1200), _ids(2000, 2200)
+    cached = prefix + [7] + a + b
+    target = prefix + a + b + [9]
+    p = _plan(cached, target, common=100, anchors=[250, len(cached)])
+    assert p is not None and p.anchor == len(cached)
+    p = _plan(cached, target, common=100, anchors=[250])
+    assert p is not None and p.anchor == 250
+    assert p.spans == (Span(src_lo=101, tgt_lo=100, size=149),)
 
 
 def test_spans_never_overlap_and_are_monotone():
     cached, target = _thirty_trims()
-    p = suffix_reuse.plan(cached, target, common=3000, max_spans=64, min_span=64)
+    p = _plan(cached, target, common=3000, max_spans=64)
     assert p is not None
     for a, b in zip(p.spans, p.spans[1:]):
         assert a.src_lo + a.size <= b.src_lo
@@ -100,7 +143,7 @@ def test_planning_sixty_thousand_tokens_is_fast():
     tail = _ids(50_000_000, 50_000_000 + 60_000 - len(cached))
     cached, target = cached + tail, target + tail
     t0 = time.perf_counter()
-    p = suffix_reuse.plan(cached, target, common=3000, max_spans=6, min_span=64)
+    p = _plan(cached, target, common=3000)
     assert time.perf_counter() - t0 < 0.5
     assert p is not None
 
@@ -299,8 +342,13 @@ def test_relocation_on_a_real_hybrid_cache(tiny_hybrid, kv_bits):
     # decoded after it) moves right by 100.
     edit = _ids(5000, 5100)
     target2 = P + edit + T + [7, 8]
+    before = [list(c.cache) for c in recurrent]
     common = eng._sync_to(target2)
     assert common == len(P + edit + T) + 1 and eng._scr_last == (151, 100)
+    # The gap was read for its attention rows; the recurrent layers kept the anchor's
+    # state (here the live one) rather than reading the gap out of order.
+    for c, arrs in zip(recurrent, before):
+        assert all(a is b for a, b in zip(c.cache, arrs)), "gap leaked into the state"
     assert eng._cached_ids == target2[:common]
     assert [o for o, _ in attn_rows()] == [common] * len(layers)
     assert eng._prefill([8]) == 1

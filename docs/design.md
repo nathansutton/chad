@@ -57,8 +57,11 @@ the conversation may change between steps, which rules out timestamps, fresh dir
 listings and per-session ids in the prompt. Compaction is the one step that rewrites the
 middle. It does not throw the cache away: the attention rows of whatever survived the edit
 are moved to their new positions, keys re-rotated, and only the text compaction inserted
-is read. The recurrent layers carry on from the state they have, which still summarises
-the deleted text; that approximation is the price of not re-reading. The mechanism is
+is read. The recurrent layers cannot be edited that way, so the engine picks which state to
+continue from: the live one, or the snapshot from the start of the last turn, whichever has
+just read the text the edited transcript has at that point. Everything after it is read
+fresh, and text inserted mid-transcript is read for its attention rows only. That state
+still summarises the deleted text, the price of not re-reading. The mechanism is
 Suffix Cache Reuse from the Context Language Models paper (Shao et al., 2026),
 reimplemented for MLX (`suffix_reuse.py`; `CHAD_NO_SCR=1` turns it off). Compaction still
 trims oldest first and takes enough in one pass that it does not come back the next step:
