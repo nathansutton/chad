@@ -882,8 +882,10 @@ CHAD_QMM_MMA_RECAL=1      chad  # re-probe the small-M matmul kernel on this mac
   in the cache.
   `CHAD_NO_SCR=1` restores the full re-read. At most `CHAD_SCR_MAX_SPANS` survivors are
   moved (default 6, the largest), each at least `CHAD_SCR_MIN_SPAN` tokens (default 64);
-  everything else is read. The prefill trace (`CHAD_PREFILL_TRACE`) records the moved
-  count per step as `relocated_tokens`.
+  everything else is read. Survivors are found as runs of eight tokens, so a transcript
+  that is one short line repeated thousands of times is re-read in full rather than
+  matched slowly. The prefill trace (`CHAD_PREFILL_TRACE`) records the moved count per
+  step as `relocated_tokens`.
 - `CHAD_USE_PLD`: turns **wide prompt-lookup decoding** back on. It was the default
   before 2.0.0 and is now opt-in, because PLD drafts from *context recurrence* and can
   therefore only accelerate text that already appeared. On real agentic traces that is a

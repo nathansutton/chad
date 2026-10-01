@@ -257,7 +257,7 @@ def test_stop_condition_soft_close():
         eng._pld_hybrid = False
         eng.enable_pld_hybrid = False
         eng._cached_ids = []
-        eng._sync_to = lambda ids: 0            # nothing cached -> whole prompt is suffix
+        eng._sync_to = lambda ids, *a: 0        # nothing cached -> whole prompt is suffix
         eng._prefill = lambda ids, ss=None, chunk=256, on_progress=None: len(ids)
         eng.model = object()
         eng.tok = object()
@@ -1057,7 +1057,12 @@ def test_suffix_reuse_orchestration():
              suffix_reuse.append_rows, suffix_reuse.drop_spare_rows)
     saved_env = {k: os.environ.get(k) for k in ("CHAD_SCR_MIN_SPAN", "CHAD_NO_SCR")}
 
-    def make(cached, feed_cap=None, hybrid=True):
+    class _Attn:
+        """A stand-in attention cache: only its offset is read."""
+        def __init__(self, offset):
+            self.offset = offset
+
+    def make(cached, feed_cap=None, hybrid=True, offset=None, replace_on_feed=False):
         eng = object.__new__(Engine)
         eng._pld_hybrid = hybrid
         eng._trimmable = False
@@ -1065,14 +1070,28 @@ def test_suffix_reuse_orchestration():
         eng._cached_ids = list(cached)
         eng._rewind_snap = None
         eng.calls = []
-        eng._attention_layers = lambda: [("C0", "R0")]
+        eng.attn = _Attn(len(cached) if offset is None else offset)
+        eng.appended_to = []
+        eng.stop_seen = []
+        eng._attention_layers = lambda: [(eng.attn, "R0")]
         eng._snap_recurrent = lambda: "ANCHOR"
         eng._restore_recurrent = lambda st: eng.calls.append(("restore", st))
         eng._rewind_to = lambda t, upto: None
         eng._trim_kv = lambda n: eng.calls.append(("trim", n))
-        eng._prefill = lambda ids, *a, **k: (
-            eng.calls.append(("feed", list(ids))),
-            len(ids) if feed_cap is None else min(feed_cap, len(ids)))[1]
+
+        def prefill(ids, should_stop=None, on_progress=None, **k):
+            eng.calls.append(("feed", list(ids)))
+            eng.stop_seen.append(should_stop)
+            fed = len(ids) if feed_cap is None else min(feed_cap, len(ids))
+            if on_progress is not None:
+                on_progress(fed, len(ids))
+            if replace_on_feed:
+                # What a Metal OOM's replay does: the cache objects are rebuilt in
+                # place, so the ones captured before the read are stale.
+                eng.attn = _Attn(len(eng._cached_ids) + fed)
+            return fed
+
+        eng._prefill = prefill
         eng._reset_cache = lambda: eng.calls.append(("reset",))
         eng._reload_warm_prefix = lambda t: (eng.calls.append(("warm",)), 0)[1]
         suffix_reuse.take_rows = lambda c, lo, hi: (
@@ -1080,7 +1099,8 @@ def test_suffix_reuse_orchestration():
             suffix_reuse.Rows(keys=(), values=(), size=hi - lo))[1]
         suffix_reuse.rerotate_rows = lambda r, rope, d: (
             eng.calls.append(("rotate", d)), r)[1]
-        suffix_reuse.append_rows = lambda c, r: eng.calls.append(("append", r.size))
+        suffix_reuse.append_rows = lambda c, r: (
+            eng.calls.append(("append", r.size)), eng.appended_to.append(c))
         suffix_reuse.drop_spare_rows = lambda c: eng.calls.append(("spare",))
         return eng
 
@@ -1109,8 +1129,18 @@ def test_suffix_reuse_orchestration():
         eng = make(P + D + T)
         edit = [900, 901, 902, 903, 904]
         target = P + edit + T + [9]
-        common = eng._sync_to(target)
+        stop = lambda: False  # noqa: E731 - a sentinel the gap read must receive
+        progress = []
+        common = eng._sync_to(target, stop, lambda d, t: progress.append((d, t)))
         check("replace: lands after C", common == 45, common)
+        check("replace: the gap read runs under the caller's stop hook",
+              eng.stop_seen == [stop], eng.stop_seen)
+        # 6 tokens are read for this prompt: the 5-token gap, then the trailing q.
+        check("replace: progress counts the gap against the whole read",
+              progress == [(5, 6)], progress)
+        eng._progress_after_sync(lambda d, t: progress.append((d, t)))(1, 1)
+        check("replace: the loop's own prefill carries the percentage on",
+              progress == [(5, 6), (6, 6)], progress)
         check("replace: feed B', put the anchor's recurrent state back, append C",
               eng.calls == [("take", 30, 60), ("rotate", -15), ("trim", 50), ("spare",),
                             ("feed", edit), ("restore", "ANCHOR"), ("append", 30)],
@@ -1122,19 +1152,41 @@ def test_suffix_reuse_orchestration():
               (stats.prompt_tokens, stats.cached_tokens, stats.relocated_tokens)
               == (6, 40, 30), stats)
 
-        # A gap prefill that stops short: land where it stopped, append nothing.
+        # A gap prefill that stops short (the user interrupted): the relocation is
+        # abandoned for the rebuild, since the recurrent state has read the span
+        # the caller would feed again.
         eng = make(P + D + T, feed_cap=2)
         common = eng._sync_to(target)
-        check("short gap: lands after what was fed", common == 12, common)
-        check("short gap: ledger", eng._cached_ids == target[:12], eng._cached_ids)
-        check("short gap: nothing appended",
-              not any(c[0] == "append" for c in eng.calls), eng.calls)
+        check("short gap: lands on the rebuild", common == 0, common)
+        check("short gap: nothing appended, cache reset, warm prefix reloaded",
+              not any(c[0] == "append" for c in eng.calls)
+              and eng.calls[-2:] == [("reset",), ("warm",)], eng.calls)
+        check("short gap: nothing counts as relocated", eng._scr_last == (0, 0),
+              eng._scr_last)
+
+        # A Metal OOM inside the gap read rebuilds the cache objects in place: the
+        # span lands in the objects that hold the cache afterwards, not the stale ones.
+        eng = make(P + D + T, replace_on_feed=True)
+        stale = eng.attn
+        common = eng._sync_to(target)
+        check("replay: still lands after C", common == 45, common)
+        check("replay: the span went into the rebuilt cache",
+              eng.appended_to == [eng.attn] and eng.attn is not stale, eng.appended_to)
+
+        # The cache and the ledger disagree by a row: no splice, the rebuild instead.
+        eng = make(P + D + T, offset=len(P + D + T) + 1)
+        common = eng._sync_to(target)
+        check("ledger mismatch -> rebuild", ("reset",) in eng.calls and common == 0,
+              eng.calls)
+        check("ledger mismatch: nothing was taken or trimmed",
+              not any(c[0] in ("take", "trim", "append") for c in eng.calls), eng.calls)
 
         # A re-asked question: the live state has read an answer the target lacks,
         # so the turn-start snapshot (the last prompt token unread) is the anchor.
         eng = make(P + D + T)
         eng._rewind_snap = {"pos": 59, "recurrent": "SNAP"}
         eng._cached_ids += [400, 401, 402]                   # the answer
+        eng.attn.offset = len(eng._cached_ids)
         target = P + edit + T
         common = eng._sync_to(target)
         check("snapshot anchor: lands where the snapshot stopped reading",
@@ -1295,7 +1347,7 @@ def _plain_generate_engine(resets):
     eng.prompt_lookup = False
     eng.temp = 0.0
     eng._cached_ids = []
-    eng._sync_to = lambda ids: len(eng._cached_ids)
+    eng._sync_to = lambda ids, *a: len(eng._cached_ids)
     eng._prefill = lambda ids, *a, **k: len(ids)
 
     def _reset_cache():

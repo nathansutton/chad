@@ -148,6 +148,73 @@ def test_planning_sixty_thousand_tokens_is_fast():
     assert p is not None
 
 
+def _repetitive_transcript(vocab=400, turns=30):
+    """A 32k-token transcript over a small, skewed vocabulary — every id repeats
+    hundreds of times, the way newlines and indents do — compacted by stripping the
+    first 300 tokens of every turn but the last two."""
+    import random
+
+    rng = random.Random(5)
+    weights = [1.0 / (i + 1) for i in range(vocab)]
+
+    def text(n):
+        return rng.choices(range(vocab), weights, k=n)
+
+    prefix = text(3000)
+    cached, target = list(prefix), list(prefix)
+    for i in range(turns):
+        turn = text(1000)
+        cached += turn
+        target += turn if i >= turns - 2 else [vocab + i] + turn[300:]
+    return cached, target
+
+
+def test_a_repetitive_vocabulary_still_plans_quickly():
+    cached, target = _repetitive_transcript()
+    t0 = time.perf_counter()
+    p = _plan(cached, target, common=3000)
+    assert time.perf_counter() - t0 < 2.0
+    assert p is not None and len(p.spans) == 6
+    for s in p.spans:
+        assert cached[s.src_lo:s.src_lo + s.size] == target[s.tgt_lo:s.tgt_lo + s.size]
+
+
+def test_one_line_repeated_past_the_budget_is_not_planned():
+    """Text that is one run repeated thousands of times defeats run matching too;
+    rather than spend longer than the re-read, the planner declines."""
+    line = _ids(1, 9)
+    cached = _ids(0, 100) + line * 5000                  # 40k runs, 8 distinct
+    target = _ids(0, 100) + [9] + line * 2000 + [9]      # each run 2000 times: 80M pairs
+    t0 = time.perf_counter()
+    assert _plan(cached, target, common=100) is None
+    assert time.perf_counter() - t0 < 1.0
+
+
+def test_a_survivor_at_the_prefix_boundary_is_found():
+    """The last prefix token recurs just before the survivor in the target (a newline
+    ending both the prefix and the inserted text): a match over the whole lists would
+    start one token inside the prefix and be discarded with it. Only the text past
+    the prefix is matched, so the survivor, and the anchor in it, are found."""
+    prefix = _ids(0, 99) + [7]
+    notes = _ids(1000, 1300)
+    cached = prefix + notes
+    target = prefix + [500, 501, 7] + notes + [9]
+    p = _plan(cached, target, common=100)
+    assert p is not None
+    assert p.spans == (Span(src_lo=100, tgt_lo=103, size=300),)
+
+
+def test_survivors_shorter_than_a_run_are_invisible():
+    prefix = _ids(0, 100)
+    short = _ids(2000, 2000 + suffix_reuse.RUN - 1)
+    cached = prefix + _ids(1000, 1100) + short
+    target = prefix + [9] + short + [9]
+    assert _plan(cached, target, common=100) is None
+    exact = _ids(2000, 2000 + suffix_reuse.RUN)
+    p = _plan(prefix + _ids(1000, 1100) + exact, prefix + [9] + exact + [9], common=100)
+    assert p is not None and p.spans == (Span(src_lo=200, tgt_lo=101, size=suffix_reuse.RUN),)
+
+
 # -- re-rotation ------------------------------------------------------------------
 
 def _rope(scaling=None):
@@ -224,6 +291,8 @@ def _arrays(cache):
 def test_take_then_append_reproduces_the_rows(quantized):
     import mlx.core as mx
     cache = _filled(quantized)
+    cap = suffix_reuse._parts(cache)[0][0].shape[-2]   # step-rounded, past T
+    assert T < cap < 800
     keys, values = _arrays(cache)
     before_k = [a[..., 300:500, :] for a in keys]
     before_v = [a[..., 300:500, :] for a in values]
@@ -238,12 +307,21 @@ def test_take_then_append_reproduces_the_rows(quantized):
         assert mx.array_equal(a[..., 300:500, :], b).item()
     for a, b in zip(values, before_v):
         assert mx.array_equal(a[..., 300:500, :], b).item()
-    # mlx-lm's own write path accepts the spliced buffer (offset not step-aligned).
+    # The rows went into the spare capacity rather than a rebuilt buffer.
+    assert suffix_reuse._parts(cache)[0][0].shape[-2] == cap
+    # Past the capacity the buffer is rebuilt to end at the new offset, and mlx-lm's
+    # own write path accepts it (offset not step-aligned).
+    suffix_reuse.append_rows(cache, suffix_reuse.take_rows(cache, 0, 300))
+    assert cache.offset == 800
+    keys, values = _arrays(cache)
+    assert suffix_reuse._parts(cache)[0][0].shape[-2] == 800
+    for a in keys + values:
+        assert mx.array_equal(a[..., 500:800, :], a[..., 0:300, :]).item()
     k1 = _keys((1, 4, 1, 256), mx.float16)
     cache.update_and_fetch(k1, k1)
     mx.eval(cache.state)
-    assert cache.offset == 501
-    assert _arrays(cache)[0][0].shape[-2] == 501
+    assert cache.offset == 801
+    assert _arrays(cache)[0][0].shape[-2] == 801
 
 
 def test_quantized_rerotation_is_close_to_the_truth():

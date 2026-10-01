@@ -35,6 +35,7 @@ it already produced would scale that key twice.
 from __future__ import annotations
 
 import difflib
+from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
@@ -109,12 +110,13 @@ def plan(cached_ids: list[int], target_ids: list[int], *, common: int,
     span carries rows computed under text that is no longer there and the largest few
     carry nearly all of the reuse; one shorter than `min_span` is read, since a
     forward over it is cheap. The common prefix is excluded: the prefix path already
-    serves it in place. None when no anchor falls inside a survivor, so the caller
-    falls back to the rebuild."""
-    blocks = [Span(b.a, b.b, b.size) for b in difflib.SequenceMatcher(
-                  a=cached_ids, b=target_ids, autojunk=False).get_matching_blocks()
-              if b.a >= common and b.b >= common and b.size > 0]
+    serves it in place. None when no anchor falls inside a survivor, or when matching
+    would cost more than the re-read it saves, so the caller falls back to the
+    rebuild."""
     if max_spans < 1:
+        return None
+    blocks = _survivors(cached_ids[common:], target_ids[common:], common)
+    if blocks is None:
         return None
     for anchor in sorted(set(anchors), reverse=True):
         hit = next((b for b in blocks if b.src_lo < anchor <= b.src_lo + b.size), None)
@@ -134,6 +136,48 @@ def plan(cached_ids: list[int], target_ids: list[int], *, common: int,
         return Plan(common=common, spans=spans, end=last.tgt_lo + last.size,
                     anchor=anchor)
     return None
+
+
+# Survivors are matched as runs of this many consecutive ids, not single ids. A single
+# id repeats throughout a transcript (every newline, every indent), and the matcher's
+# cost grows with the number of equal pairs across the two sides — measured at about
+# 0.4 s per million pairs. A run this long is nearly unique in ordinary text, so the
+# same compaction plans in a fraction of the time. A survivor shorter than a run is
+# invisible; `min_span` is far above it, and the survivor that holds the anchor is the
+# tail of a tool result in practice.
+RUN = 8
+# Equal pairs beyond which no plan is made and the caller rebuilds: one line repeated
+# hundreds of times defeats the runs too, and the matcher would then take longer than
+# the re-read it saves.
+WORK_BUDGET = 40_000_000
+
+
+def _survivors(old: list[int], new: list[int], base: int) -> Optional[list[Span]]:
+    """The maximal runs of ids shared by `old` and `new`, in order, as spans whose
+    positions are offset by `base` (the common prefix the caller cut off). None when
+    matching would exceed `WORK_BUDGET`."""
+    runs_old = [tuple(old[i:i + RUN]) for i in range(len(old) - RUN + 1)]
+    runs_new = [tuple(new[i:i + RUN]) for i in range(len(new) - RUN + 1)]
+    if not runs_old or not runs_new:
+        return None
+    count_new = Counter(runs_new)
+    if sum(count_new[r] for r in runs_old) > WORK_BUDGET:
+        return None
+    out: list[Span] = []
+    for m in difflib.SequenceMatcher(a=runs_old, b=runs_new,
+                                     autojunk=False).get_matching_blocks():
+        if m.size == 0:
+            continue
+        # `size` equal runs are `size + RUN - 1` equal ids, so neighbouring blocks can
+        # share up to `RUN - 1` ids; the later block gives them up, on both sides.
+        src_lo, tgt_lo, size = m.a + base, m.b + base, m.size + RUN - 1
+        if out:
+            prev = out[-1]
+            cut = max(prev.src_lo + prev.size - src_lo, prev.tgt_lo + prev.size - tgt_lo, 0)
+            src_lo, tgt_lo, size = src_lo + cut, tgt_lo + cut, size - cut
+        if size > 0:
+            out.append(Span(src_lo, tgt_lo, size))
+    return out
 
 
 def rerotate_keys(keys: mx.array, rope: Rope, delta: int) -> mx.array:
@@ -202,18 +246,26 @@ def drop_spare_rows(cache: AttnCache) -> None:
 
 
 def append_rows(cache: AttnCache, rows: Rows) -> None:
-    """Append `rows` after the cache's live rows. The buffer ends exactly at the new
-    offset, a length mlx-lm's own growth path accepts: its next write past capacity
-    concatenates a fresh step onto the live rows."""
+    """Append `rows` after the cache's live rows. Into the buffer's spare capacity when
+    it has enough (a caller that reserved it keeps every append and the reads between
+    them writing in place), the way mlx-lm's own write lands. Otherwise the buffer is
+    rebuilt to end exactly at the new offset, a length mlx-lm's growth path accepts:
+    its next write past capacity concatenates a fresh step onto the live rows."""
 
     keys, values, quant = _parts(cache)
     assert quant == rows.quant, (quant, rows.quant)
     off = cache.offset
+    end = off + rows.size
+    if keys[0].shape[-2] >= end:
+        for x, r in zip(keys + values, rows.keys + rows.values):
+            x[..., off:end, :] = r
+        cache.offset = end
+        return
     new_keys = tuple(_cat(x[..., :off, :], r) for x, r in zip(keys, rows.keys))
     new_values = tuple(_cat(x[..., :off, :], r)
                        for x, r in zip(values, rows.values))
     _set_buffers(cache, new_keys, new_values)
-    cache.offset = off + rows.size
+    cache.offset = end
 
 
 def _set_buffers(cache: AttnCache, keys: tuple[mx.array, ...],
