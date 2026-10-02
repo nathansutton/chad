@@ -68,11 +68,20 @@ except ImportError as _e:  # non-Apple host: remote backend only
 # importing mlx.core. Re-exported here so existing `from .engine import GenStats` keeps
 # working (bench.py, tests) — the class is unchanged.
 from . import config
-from .base_engine import THINK_CLOSE, GenStats, TailWatch, think_ceiling_hit
+from .base_engine import THINK_CLOSE, GenStats, KVCheckpointRef, TailWatch, think_ceiling_hit
 from .diag import log
 
-# checkpoint filename prefix (on the basename)
+# checkpoint filename prefixes (on the basename): the stable system+tools prefix every
+# session shares, and a whole session's cache written when it ends (`save_kv`)
 _CKPT_WARM = "warm"
+_CKPT_SESS = "sess"
+
+
+def prefix_sha(ids: list) -> str:
+    """The identity of a token prefix: sha1 over the ids as uint32. A resume checkpoint
+    is named by this, never by a session id — a session names a conversation, a prefix
+    hash names model state any transcript beginning with those ids can reuse."""
+    return hashlib.sha1(np.asarray(ids, dtype=np.uint32).tobytes()).hexdigest()
 
 
 def _log_mlx_provenance() -> None:
@@ -957,7 +966,7 @@ class Engine:
     # the recurrent SSM state serializes fine (a fixed ~51MB floor; cheap for one
     # warm-start file), and on a same-model load the state is bit-for-bit reusable.
 
-    def _ckpt_path(self, ids: list) -> str:
+    def _ckpt_path(self, ids: list, tag: str = _CKPT_WARM) -> str:
         h = hashlib.sha1()
         h.update(self.model_id.encode("utf-8", "ignore"))
         h.update(b"\x00")
@@ -974,7 +983,7 @@ class Engine:
         h.update(np.asarray(ids, dtype=np.uint32).tobytes())
         # SAFETY: cache_dir is Optional on the dataclass but is always set when
         # checkpointing is enabled, which is the only path that reaches _ckpt_path.
-        return os.path.join(self.cache_dir, f"{_CKPT_WARM}-{h.hexdigest()}.safetensors")  # type: ignore[arg-type]
+        return os.path.join(self.cache_dir, f"{tag}-{h.hexdigest()}.safetensors")  # type: ignore[arg-type]
 
     def warm_prefix(self, prefix_ids: list, should_stop=None, head_ids=None):
         """Make a cold session start warm. Two checkpoints can serve it, longest first:
@@ -994,9 +1003,16 @@ class Engine:
         'miss' (n = tokens prefilled), 'skip'."""
         if not self.cache_dir or not prefix_ids:
             return ("skip", 0)
-        if self._cached_ids:               # cache already populated this session
-            return ("skip", 0)
         prefix_ids = list(prefix_ids)
+        if self._cached_ids:               # cache already populated this session
+            # A cache restored whole from a resume checkpoint (`restore_kv`) begins
+            # with this prefix too: adopt the warm files that exist for it, so a later
+            # compaction still rebuilds from the system prefix on disk rather than from
+            # nothing. Nothing is prefilled or written here — the non-trimmable cache
+            # cannot be cut back to the prefix to save it.
+            if self._cached_ids[: len(prefix_ids)] == prefix_ids:
+                self._adopt_warm_ids(prefix_ids, list(head_ids or []))
+            return ("skip", 0)
         path = self._ckpt_path(prefix_ids)
         if os.path.isfile(path) and self._load_ckpt(path, prefix_ids):
             self._warm_prefix_ids = list(prefix_ids)
@@ -1036,6 +1052,61 @@ class Engine:
         self._save_ckpt(path)
         return ("miss", len(prefix_ids))
 
+    def _adopt_warm_ids(self, full: list, head: list) -> None:
+        """Register the warm-prefix checkpoints already on disk for `full` and its
+        static `head`, without prefilling: the reload tiers of `_sync_to` consult these
+        ids, and a session that never ran `warm_prefix` against a cold cache would
+        otherwise have none to reload from."""
+        if os.path.isfile(self._ckpt_path(full)):
+            self._warm_prefix_ids = list(full)
+        if (head and len(head) < len(full) and full[: len(head)] == head
+                and os.path.isfile(self._ckpt_path(head))):
+            self._warm_head_ids = list(head)
+
+    # -- resume checkpoints: the whole session's cache, written when it ends ---------
+    # The warm prefix above saves a few thousand tokens per session. A resumed
+    # conversation re-reads everything after it: at the ~100 tok/s this model prefills,
+    # a 20k-token transcript is three minutes of silence before the first new token,
+    # against a fraction of a second to load its cache (mlx save/load are mmap-fast and
+    # the restored state is bit-identical to the live one, measured on the shipped
+    # weights). The file is ~35 KB per token on the 8-bit cache plus a fixed ~150 MB of
+    # recurrent state, so it is written once, when the session ends, not every turn,
+    # and shares the LRU budget of the warm files. Identity is the prefix hash: the same
+    # path for the same ids under the same model, cache mode and window, so a
+    # checkpoint another configuration wrote is never loaded.
+
+    def save_kv(self) -> Optional[KVCheckpointRef]:
+        """Persist the live cache as a resume checkpoint and return its ref, or None
+        when the cache is empty, there is no cache dir, the feature is off
+        (CHAD_NO_KV_RESUME), or the write failed. Best-effort like every checkpoint
+        write: a full disk costs the warm resume, never the save of the conversation."""
+        ids = list(self._cached_ids)
+        if not self.cache_dir or not ids or config.flag("CHAD_NO_KV_RESUME"):
+            return None
+        path = self._ckpt_path(ids, _CKPT_SESS)
+        if not self._save_ckpt(path):
+            return None
+        return KVCheckpointRef(path=path, tokens=len(ids), sha=prefix_sha(ids))
+
+    def restore_kv(self, ref: KVCheckpointRef, prefix_ids: list) -> bool:
+        """Install the checkpoint `ref` names as the live cache for the first
+        `ref.tokens` of `prefix_ids`. Refused, with nothing changed, unless the cache is
+        cold, the ids hash to `ref.sha` (the transcript still begins with what the file
+        holds), and the path is the one THIS engine would write for them — the path
+        encodes the model, the cache mode and the window, so a file from any other
+        configuration is rejected without being read."""
+        if not self.cache_dir or self._cached_ids or config.flag("CHAD_NO_KV_RESUME"):
+            return False
+        if ref.tokens <= 0 or len(prefix_ids) < ref.tokens:
+            return False
+        head = list(prefix_ids[: ref.tokens])
+        if prefix_sha(head) != ref.sha:
+            return False
+        path = self._ckpt_path(head, _CKPT_SESS)
+        if path != ref.path or not os.path.isfile(path):
+            return False
+        return self._load_ckpt(path, head)
+
     def _load_ckpt(self, path: str, ids: list) -> bool:
         """Install a KV checkpoint as the live cache for exactly `ids`. False on
         anything short of a clean load (unreadable, wrong layer count), leaving the
@@ -1051,17 +1122,18 @@ class Engine:
         self._set_cache_flags()
         return True
 
-    def _save_ckpt(self, path: str) -> None:
+    def _save_ckpt(self, path: str) -> bool:
         """Persist the live cache. Best-effort: a full or read-only disk skips the
-        checkpoint, never the turn."""
+        checkpoint, never the turn. True when the file was written."""
         if not self.cache_dir:
-            return
+            return False
         try:
             os.makedirs(self.cache_dir, exist_ok=True)
             cache_utils.save_prompt_cache(path, self._cache)
             self._enforce_kv_budget(path)
         except Exception:
-            pass
+            return False
+        return True
 
     def _n_model_layers(self) -> int:
         return len(self.model.layers)

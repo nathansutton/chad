@@ -25,6 +25,33 @@ from typing import Any, Callable, Iterable, Optional, Protocol, runtime_checkabl
 THINK_CLOSE = "\n</think>\n\n"
 
 
+@dataclass(frozen=True)
+class KVCheckpointRef:
+    """Where a session's live KV cache was written, and what it holds: the first `tokens`
+    ids of the transcript, identified by `sha` (their sha1) rather than by session id — a
+    session id names a conversation, a prefix hash names reusable model state. Saved in
+    the session file's `meta["kv"]`; a resume whose transcript still begins with those
+    ids restores the cache instead of re-reading them (`BaseEngine.restore_kv`)."""
+
+    path: str
+    tokens: int
+    sha: str
+
+    def to_dict(self) -> dict:
+        return {"path": self.path, "tokens": self.tokens, "sha": self.sha}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "KVCheckpointRef | None":
+        """The ref a saved session recorded, or None when the entry is missing or
+        malformed (a hand-edited file, an older format) — a resume then starts cold, as it
+        always did, rather than fail."""
+        path, tokens, sha = d.get("path"), d.get("tokens"), d.get("sha")
+        if (isinstance(path, str) and path and isinstance(tokens, int) and tokens > 0
+                and isinstance(sha, str) and sha):
+            return cls(path=path, tokens=tokens, sha=sha)
+        return None
+
+
 def think_ceiling_hit(text: str, n_tokens: int, ceiling: Optional[int],
                       think_closed: Optional[bool] = None) -> bool:
     """True when generation is still inside the auto-opened <think> block (no </think>
@@ -224,4 +251,18 @@ class BaseEngine(Protocol):
         of `prefix_ids` (a proper prefix of it), checkpointed once for every project so
         a fresh directory restores it and prefills only the tail. Returns
         (status, n_tokens) with status 'hit' | 'partial' | 'miss' | 'skip'."""
+        ...
+
+    def save_kv(self) -> Optional[KVCheckpointRef]:
+        """Write the live cache to disk as a resume checkpoint and say what it holds
+        (MLX), or None when there is nothing to save or nowhere to put it — a stateless
+        backend always answers None. Called when a session ends; the ref is saved with
+        the conversation so the next `chad -c` can `restore_kv` it."""
+        ...
+
+    def restore_kv(self, ref: KVCheckpointRef, prefix_ids: list) -> bool:
+        """Install the checkpoint `ref` names as the live cache, provided the cache is
+        cold, `prefix_ids` still begins with exactly the ids it holds, and this engine
+        configuration is the one that wrote it. False otherwise, with nothing changed —
+        the caller then starts cold. A stateless backend always answers False."""
         ...

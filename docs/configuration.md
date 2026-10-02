@@ -373,7 +373,7 @@ The rarely-touched tuning knobs live in environment variables so they stay off t
 ```bash
 CHAD_MAX_CONTEXT=131072 chad        # request a window (YaRN-extends a smaller --model past native)
 CHAD_KV_BITS=0          chad        # fp16 KV cache (8-bit fused is the default where covered)
-CHAD_KV_CACHE_MAX_GB=4  chad        # disk budget for the warm-prefix KV checkpoints (default 8; 0 = unlimited)
+CHAD_KV_CACHE_MAX_GB=4  chad        # disk budget for the KV checkpoints: warm prefixes + ended sessions (default 8; 0 = unlimited)
 CHAD_CTX_LIMIT=28000    chad        # force the compaction threshold (overrides the RAM-aware default)
 CHAD_CTX_SAFETY=0.95    chad        # the single headroom lever: fraction of the Metal budget
                                     # the auto-sizing may spend (default 0.975 — hold back 2.5%)
@@ -389,7 +389,9 @@ CHAD_NO_MEMORY_CLAMP=1  chad        # A/B knob: skip the Metal allocator clamps 
 **`CHAD_KV_CACHE_MAX_GB`** is the only one of these that spends *disk* rather than RAM.
 The warm-prefix checkpoints ([benchmarks](benchmarks.md#the-second-session-in-a-project-starts-warm))
 live in `~/.cache/chad/kv`, one file per distinct system prompt, so a machine with many
-projects accumulates them. chad LRU-evicts that directory down to this budget (default
+projects accumulates them; so do the whole-session checkpoints a quit writes for `chad -c`
+([Sessions](#sessions)), at roughly 35 KB per token of conversation plus 150 MB.
+chad LRU-evicts that directory down to this budget (default
 **8 GB**) after each write, always protecting the file it just wrote and the live warm
 prefix, so trimming the budget costs a cold first turn in the least-recently-used projects
 and nothing else. `0` disables eviction. Each checkpoint has a fixed ~51 MB floor from the
@@ -720,6 +722,7 @@ CHAD_NO_GOVERNOR=1          chad  # A/B knob: DISABLE the runaway-turn governor
 CHAD_NO_REPEAT_GUARD=1      chad  # A/B knob: DISABLE the degenerate-repetition stop
 CHAD_NO_SYNTAX_GATE=1       chad  # A/B knob: DISABLE the post-edit syntax gate
 CHAD_NO_PREFIX_CACHE=1      chad  # measurement knob: drop the persistent prefix KV cache
+CHAD_NO_KV_RESUME=1         chad  # a quit writes no KV checkpoint; a resume re-reads the transcript
 CHAD_NO_SKILLS=1            chad  # disable Agent Skill discovery (no /<skill>)
 CHAD_NO_FASTPATH=1          chad  # A/B knob: disable the fused-projection decode fast path
 CHAD_NO_DESTRUCTIVE_GUARD=1 chad  # DISABLE the catastrophic-bash screen (unsafe)
@@ -750,6 +753,10 @@ CHAD_PROTECT_GIT=1          chad  # also write-DENY .git inside the yolo sandbox
 - `CHAD_NO_PREFIX_CACHE`: a fairness/measurement knob that **drops** the persistent
   prefix KV cache (`engine.py`), forcing a full re-prefill every step. It exists to measure
   what the cache is worth and makes chad much slower. Never set it in normal use.
+- `CHAD_NO_KV_RESUME`: a session that ends no longer writes its cache to disk, and a
+  resume never restores one — `chad -c` re-reads the whole transcript, as it did before
+  ([Sessions](#sessions)). For a machine short of disk, or to measure what the restore
+  is worth.
 - `CHAD_NO_DESTRUCTIVE_GUARD`: **disables** the catastrophic-bash screen
   (`guardrails.py`) even in `--yolo` mode. With it set, an injected `rm -rf ~`,
   `mkfs`, `dd of=/dev/…`, fork bomb, or `curl … | sh` is **not** screened before running.
@@ -1009,6 +1016,18 @@ from is left exactly as it was, so branching off an old thread can't destroy it 
 can resume the same starting point twice. The practical consequence: a long session you
 resume repeatedly leaves several sessions behind, which is what `--resume`'s numbered
 list is for.
+
+**A resumed session does not re-read its conversation.** Quitting the TUI (`/exit`,
+ctrl-d, a second ctrl-c) or the REPL also writes the engine's cache to `~/.cache/chad/kv`
+and records where in the session file. `chad -c`, `--resume` and `/resume` restore that
+file instead of prefilling the transcript: well under a second, against about a second per
+hundred tokens of conversation on the shipped model, and the restored cache is identical
+to the one the session ended with. The resumed session keeps the system prompt it ran
+under (its workspace listing is the one the cache was built on); `/reset` starts a fresh
+one. A session that was not quit cleanly, one whose checkpoint has since been evicted
+from the disk budget, or one from another model, cache mode or window resumes cold, as
+before. The banner says which happened: `[resumed warm: N tokens of the conversation
+restored from disk]`. `CHAD_NO_KV_RESUME=1` turns the whole thing off.
 
 ### Session log & privacy
 

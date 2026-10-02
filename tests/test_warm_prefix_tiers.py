@@ -284,3 +284,116 @@ def test_static_head_renders_with_the_engine_effort_default(tmp_path, monkeypatc
     head, full = agent._static_head_ids(), agent._stable_prefix_ids()
     assert head and full[:len(head)] == head
     assert agent.engine.tok.decode(head).startswith("<effort>medium</effort>")
+
+
+# ------------------------------------------------------------- resume checkpoints
+# A whole session's cache, written when it ends (`save_kv`) and restored on the first
+# turn of a resume (`restore_kv`). Same stand-in engine: a layer's keys name the tokens
+# resident in it, so what a checkpoint holds and what a restore installs are both read
+# straight off the cache.
+
+TRANSCRIPT = HEAD + TAIL_A + [60, 61, 62, 63, 64, 65, 66, 67]   # prefix + a turn
+
+
+def _ended_session(tmp_path):
+    """An engine whose session prefilled TRANSCRIPT and then ended: returns (engine, ref)."""
+    eng = _engine(tmp_path)
+    eng._prefill(TRANSCRIPT)
+    eng._cached_ids = list(TRANSCRIPT)
+    ref = eng.save_kv()
+    assert ref is not None
+    return eng, ref
+
+
+def test_save_kv_writes_the_live_cache_under_its_prefix_hash(tmp_path):
+    _eng, ref = _ended_session(tmp_path)
+    assert os.path.basename(ref.path).startswith("sess-")   # never mistaken for a warm file
+    assert ref.tokens == len(TRANSCRIPT)
+    assert ref.sha == E.prefix_sha(TRANSCRIPT)
+    assert _ckpt_ids(ref.path) == TRANSCRIPT
+
+
+def test_save_kv_has_nothing_to_write_for_a_cold_cache(tmp_path):
+    eng = _engine(tmp_path)
+    assert eng.save_kv() is None
+    assert os.listdir(tmp_path) == []
+
+
+def test_restore_kv_installs_the_cache_without_prefilling(tmp_path):
+    _old, ref = _ended_session(tmp_path)
+    eng = _engine(tmp_path)
+    # The resumed transcript renders to the checkpointed ids plus the new user turn.
+    assert eng.restore_kv(ref, TRANSCRIPT + [90, 91, 92]) is True
+    assert eng.fed == []
+    assert eng._cached_ids == TRANSCRIPT
+    assert _ids(eng._cache[0]) == TRANSCRIPT
+
+
+def test_restore_kv_refuses_a_transcript_that_no_longer_begins_with_the_checkpoint(tmp_path):
+    _old, ref = _ended_session(tmp_path)
+    eng = _engine(tmp_path)
+    diverged = TRANSCRIPT[:-1] + [99] + [90, 91]
+    assert eng.restore_kv(ref, diverged) is False
+    assert eng._cached_ids == [] and eng.fed == []          # untouched: the caller goes cold
+    assert eng.restore_kv(ref, TRANSCRIPT[:-1]) is False    # shorter than the checkpoint
+
+
+def test_restore_kv_refuses_a_checkpoint_from_another_configuration(tmp_path):
+    # The path encodes model, cache mode and window. A ref whose path is not the one
+    # this engine would write for the same ids came from a different configuration
+    # and is rejected without being read, even though the file exists.
+    _old, ref = _ended_session(tmp_path)
+    eng = _engine(tmp_path)
+    eng.kv_bits = 8
+    assert os.path.isfile(ref.path)
+    assert eng.restore_kv(ref, TRANSCRIPT + [90]) is False
+    assert eng._cached_ids == []
+
+
+def test_restore_kv_refuses_a_missing_file_and_a_populated_cache(tmp_path):
+    _old, ref = _ended_session(tmp_path)
+    os.remove(ref.path)
+    eng = _engine(tmp_path)
+    assert eng.restore_kv(ref, TRANSCRIPT + [90]) is False
+    _old2, ref2 = _ended_session(tmp_path)
+    warm = _engine(tmp_path)
+    warm._prefill(HEAD)
+    warm._cached_ids = list(HEAD)
+    assert warm.restore_kv(ref2, TRANSCRIPT + [90]) is False
+    assert warm._cached_ids == HEAD
+
+
+def test_warm_prefix_on_a_restored_cache_adopts_the_warm_files(tmp_path):
+    # A restored session never ran warm_prefix on a cold cache, so without this a
+    # later compaction would rebuild from nothing. With the warm files on disk, the
+    # populated-cache call registers them and prefills nothing.
+    first = _engine(tmp_path)
+    first.warm_prefix(HEAD + TAIL_A, head_ids=HEAD)       # writes head + full
+    _old, ref = _ended_session(tmp_path)
+    eng = _engine(tmp_path)
+    assert eng.restore_kv(ref, TRANSCRIPT + [90]) is True
+    assert eng.warm_prefix(HEAD + TAIL_A, head_ids=HEAD) == ("skip", 0)
+    assert eng.fed == []
+    assert eng._warm_prefix_ids == HEAD + TAIL_A and eng._warm_head_ids == HEAD
+
+
+def test_warm_prefix_on_a_restored_cache_adopts_only_files_that_exist(tmp_path):
+    _old, ref = _ended_session(tmp_path)
+    eng = _engine(tmp_path)
+    assert eng.restore_kv(ref, TRANSCRIPT + [90]) is True
+    assert eng.warm_prefix(HEAD + TAIL_A, head_ids=HEAD) == ("skip", 0)
+    assert eng._warm_prefix_ids is None and eng._warm_head_ids is None
+    assert eng.warm_prefix(TAIL_B, head_ids=None) == ("skip", 0)   # not a prefix: no-op
+
+
+def test_kv_resume_opt_out(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHAD_NO_KV_RESUME", "1")
+    eng = _engine(tmp_path)
+    eng._prefill(TRANSCRIPT)
+    eng._cached_ids = list(TRANSCRIPT)
+    assert eng.save_kv() is None
+    monkeypatch.delenv("CHAD_NO_KV_RESUME")
+    ref = eng.save_kv()
+    monkeypatch.setenv("CHAD_NO_KV_RESUME", "1")
+    cold = _engine(tmp_path)
+    assert cold.restore_kv(ref, TRANSCRIPT + [90]) is False

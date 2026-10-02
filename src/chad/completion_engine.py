@@ -44,7 +44,14 @@ import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING, Callable, Generator, Optional
 
-from .base_engine import THINK_CLOSE, BackendError, GenStats, TailWatch, think_ceiling_hit
+from .base_engine import (
+    THINK_CLOSE,
+    BackendError,
+    GenStats,
+    KVCheckpointRef,
+    TailWatch,
+    think_ceiling_hit,
+)
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -194,6 +201,13 @@ class CompletionEngine:
         """No warm start: the KV checkpoint would live on the SERVER's disk, which we
         can't reach."""
         return ("skip", 0)
+
+    def save_kv(self) -> Optional[KVCheckpointRef]:
+        """No resume checkpoint, for the same reason: the cache is the server's."""
+        return None
+
+    def restore_kv(self, ref: KVCheckpointRef, prefix_ids: list) -> bool:
+        return False
 
     # -- HTTP (isolated so tests can stub it; no network in tests) ---------
 

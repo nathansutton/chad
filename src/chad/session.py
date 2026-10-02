@@ -30,6 +30,7 @@ import time
 from typing import Callable
 
 from . import config
+from .base_engine import KVCheckpointRef
 from .diag import redact
 
 SESS_DIR = os.path.expanduser("~/.chad/sessions")
@@ -300,6 +301,15 @@ def load_session(cwd: str, session_id: str = None):
             return None
         session_id = items[0]["session_id"]
     return _load_path(_session_path(cwd, session_id))
+
+
+def kv_ref(data: dict) -> KVCheckpointRef | None:
+    """The resume checkpoint a loaded session recorded (`meta["kv"]`, written by
+    `Agent.save(kv=True)` when the session ended), or None: an older file, a session
+    that was not quit cleanly, or a backend with no cache to save."""
+    meta = data.get("meta")
+    kv = meta.get("kv") if isinstance(meta, dict) else None
+    return KVCheckpointRef.from_dict(kv) if isinstance(kv, dict) else None
 
 
 def _ago(age_s: int) -> str:

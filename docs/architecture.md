@@ -20,10 +20,10 @@ it through a re-export).
 | Module | Responsibility | Guarding tests |
 |---|---|---|
 | `__init__.py` | Package docstring and `__version__` — the string `--version` prints and the ATIF trajectory records; must match `pyproject.toml`. | `test_cli.py` |
-| `agent.py` | The agentic loop and REPL: render the transcript through the chat template, stream the turn, parse tool calls, run them, feed results back, repeat. | `test_agent.py`, `test_agent_guards.py`, `test_agent_e2e.py`, `test_intent.py` |
+| `agent.py` | The agentic loop and REPL: render the transcript through the chat template, stream the turn, parse tool calls, run them, feed results back, repeat. | `test_agent.py`, `test_agent_guards.py`, `test_agent_e2e.py`, `test_intent.py`, `test_kv_resume.py` |
 | `ambient.py` | Ambient state for the result channel: the levers that append harness knowledge to results the model already reads, rather than adding tools. | `test_ambient.py`, `conftest.py` |
 | `atif.py` | ATIF v1.7 trajectory emitter, rebuilt from `agent.messages` after each step, with each step's cost in `metrics.extra` and the step still being generated as a trailing `in_flight` step; a pure observer armed by `CHAD_TRAJECTORY_JSON`, or per trial by `atif.start`. | `test_atif.py` |
-| `base_engine.py` | The engine seam: `GenStats` plus the `BaseEngine` Protocol that `Agent` already drives, so a second backend plugs in without touching the agent loop. | `test_completion_engine.py`, `test_agent_e2e.py`, `test_cli.py` |
+| `base_engine.py` | The engine seam: `GenStats`, the `KVCheckpointRef` a saved session records, and the `BaseEngine` Protocol that `Agent` already drives, so a second backend plugs in without touching the agent loop. | `test_completion_engine.py`, `test_agent_e2e.py`, `test_cli.py`, `test_kv_resume.py` |
 | `bench.py` | The throughput benchmark behind `docs/benchmarks.md` (`chad-bench`): cold prefill, decode and warm-step tok/s on the real engine and public model. | `test_bench.py` |
 | `checkpoint.py` | Shadow-git snapshots of the workspace before each file-mutating tool, in their own GIT_DIR, so `/undo` and `/restore` can revert an auto-approved edit. | `test_checkpoint.py` |
 | `cli.py` | Argument parsing and entrypoint (`chad.cli:main`), plus the `prove` and `levers` subcommands. | `test_cli.py`, `test_cli_modes.py` |
@@ -31,7 +31,7 @@ it through a re-export).
 | `completion_engine.py` | The one remote backend (`--backend llama`): llama.cpp's native `/completion` endpoint driven with token-id prompts and real cache telemetry. | `test_completion_engine.py` |
 | `config.py` | Single source of truth for `CHAD_*` configuration — typed accessors whose lenient parse warns and degrades a bad value to the default instead of raising. | `test_config.py`, `test_seatbelt.py` |
 | `diag.py` | The opt-in diagnostic session log (`CHAD_SESSION_LOG`): throughput numbers, tool args and result previews, secret-redacted and size-rotated, never model-facing. | `test_log_redaction.py` |
-| `engine.py` | The MLX inference engine and its persistent prefix KV cache, extended across turns by diffing token ids so only the newly appended tokens prefill. | `test_engine.py`, `test_engine_dflash.py`, `test_engine_kvquant.py`, `test_engine_pld_hybrid.py`, `test_engine_pld_wide.py` |
+| `engine.py` | The MLX inference engine and its persistent prefix KV cache, extended across turns by diffing token ids so only the newly appended tokens prefill; checkpointed to disk for the stable prefix every session and for the whole session when it ends. | `test_engine.py`, `test_engine_dflash.py`, `test_engine_kvquant.py`, `test_engine_pld_hybrid.py`, `test_engine_pld_wide.py`, `test_warm_prefix_tiers.py` |
 | `gguf_pack.py` | Loader for Unsloth's GGUF checkpoints of the qwen3_5 hybrid: derives the model directory from the GGUF header, undoes llama.cpp's converter layouts, and keeps every projection in its original blocks. | `test_gguf_pack.py`, `test_cli.py` |
 | `guardrails.py` | The pure decision predicates `run_turn` calls: loop guard, verify-before-done and empty-done gating, tool-result bookkeeping, no-tool-call nudge selection. | `test_agent_guards.py`, `test_gate.py`, `test_agent_e2e.py` |
 | `ignore.py` | Single source of truth for directories no tree-walk enters (`IGNORE_DIRS`, plus `REPOMAP_EXTRA` for the repo-analysis path). | `test_ignore.py` (through the `tools`/`repomap`/`skills` re-exports) |
@@ -48,7 +48,7 @@ it through a re-export).
 | `render.py` | Terminal rendering: raw tokens and tool results into a compact activity view, behind the `_emit(kind, text)` callback the REPL and the TUI each supply. | `test_render.py`, `test_confirm_preview.py`, `test_feel_pack.py` |
 | `repomap.py` | Tree-sitter tag extraction for the ambient levers: language detection, mtime-cached per-file definitions, and cross-file definition lookup. | `test_repomap.py`, `test_repomap_polyglot.py`, `test_ambient.py` |
 | `seatbelt.py` | macOS Seatbelt confinement for yolo-mode bash: the spawned shell (never the chad process, which needs Metal) is denied writes outside the workspace. | `test_seatbelt.py` |
-| `session.py` | Conversation persistence per project directory, so `--continue`, `--resume` and the TUI `/resume` picker survive across runs. | `test_session.py`, `test_cli_modes.py`, `conftest.py` |
+| `session.py` | Conversation persistence per project directory, so `--continue`, `--resume` and the TUI `/resume` picker survive across runs, with the ref to the session's KV checkpoint when it ended cleanly. | `test_session.py`, `test_cli_modes.py`, `test_kv_resume.py`, `conftest.py` |
 | `skills.py` | Agent Skills: discover `SKILL.md` dirs, parse frontmatter leniently, offer each as a slash command, and load only the one the user asks for as a user turn. | `test_skills.py`, `test_validate.py`, `test_ignore.py` |
 | `slash.py` | The check both front ends run before a line reaches the model: a command-shaped first word that no builtin or skill owns is reported with a suggestion, not sent as a task. | `test_slash.py`, `test_tui.py` |
 | `speech.py` | All-local speech I/O for the TUI — Parakeet-on-MLX dictation and macOS `say` replies — with the heavy audio/MLX imports deferred to first use. | `test_speech.py`, `test_speech_tui.py` |
@@ -68,8 +68,14 @@ it through a re-export).
 
 A session file is a JSON object with five keys: `cwd` (absolute), `session_id`
 (`YYYYMMDD-HHMMSS-<4 hex>`, minted at `Agent` construction), `updated` (epoch seconds),
-`meta`, and `messages`. Only the message list is persisted — never the KV cache — so a
-resume re-prefills the restored transcript. Each save overwrites only its own session file
+`meta`, and `messages`. The KV cache is not in the file. A session that ends cleanly (a
+TUI or REPL quit) writes it to `~/.cache/chad/kv/sess-<hash>.safetensors` beside the
+warm-prefix files and records `meta.kv = {path, tokens, sha}` (`base_engine.KVCheckpointRef`):
+the first `tokens` ids of the transcript and their sha1. A resume whose transcript still
+begins with those ids restores the file (`Engine.restore_kv`) and prefills only what is
+new; any other resume, or a session that was not quit cleanly, re-prefills the restored
+transcript as before. The hash in the filename also covers the model, the cache mode and
+the window, so a checkpoint from another configuration is never loaded. Each save overwrites only its own session file
 and refreshes that session's `index.json` entry, so the `/resume` picker lists a directory
 without opening every session, and resuming (which mints a fresh id and seeds the old
 messages) is implicitly a fork. Known-prefix secrets are masked in tool results and
