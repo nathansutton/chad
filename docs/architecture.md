@@ -21,7 +21,7 @@ it through a re-export).
 |---|---|---|
 | `__init__.py` | Package docstring and `__version__` — the string `--version` prints and the ATIF trajectory records; must match `pyproject.toml`. | `test_cli.py` |
 | `agent.py` | The agentic loop and REPL: render the transcript through the chat template, stream the turn, parse tool calls, run them, feed results back, repeat. | `test_agent.py`, `test_agent_guards.py`, `test_agent_e2e.py`, `test_intent.py`, `test_kv_resume.py` |
-| `ambient.py` | Ambient state for the result channel: the levers that append harness knowledge to results the model already reads, rather than adding tools. | `test_ambient.py`, `conftest.py` |
+| `ambient.py` | Ambient state for the result channel: the levers that append harness knowledge to results the model already reads, rather than adding tools; its facts are saved with the session and restored on resume. | `test_ambient.py`, `test_ambient_resume.py`, `conftest.py` |
 | `atif.py` | ATIF v1.7 trajectory emitter, rebuilt from `agent.messages` after each step, with each step's cost in `metrics.extra` and the step still being generated as a trailing `in_flight` step; a pure observer armed by `CHAD_TRAJECTORY_JSON`, or per trial by `atif.start`. | `test_atif.py` |
 | `base_engine.py` | The engine seam: `GenStats`, the `KVCheckpointRef` a saved session records, and the `BaseEngine` Protocol that `Agent` already drives, so a second backend plugs in without touching the agent loop. | `test_completion_engine.py`, `test_agent_e2e.py`, `test_cli.py`, `test_kv_resume.py` |
 | `bench.py` | The throughput benchmark behind `docs/benchmarks.md` (`chad-bench`): cold prefill, decode and warm-step tok/s on the real engine and public model. | `test_bench.py` |
@@ -75,7 +75,10 @@ the first `tokens` ids of the transcript and their sha1. A resume whose transcri
 begins with those ids restores the file (`Engine.restore_kv`) and prefills only what is
 new; any other resume, or a session that was not quit cleanly, re-prefills the restored
 transcript as before. The hash in the filename also covers the model, the cache mode and
-the window, so a checkpoint from another configuration is never loaded. Each save overwrites only its own session file
+the window, so a checkpoint from another configuration is never loaded. `meta.ambient`
+is `ambient.snapshot()`: the files the session edited and wrote, its last verifying run
+and pre-edit test baselines, and the files it was shown a skeleton of, restored into the
+resumed Agent so the result channel behaves as it would have uninterrupted. Each save overwrites only its own session file
 and refreshes that session's `index.json` entry, so the `/resume` picker lists a directory
 without opening every session, and resuming (which mints a fresh id and seeds the old
 messages) is implicitly a fork. Known-prefix secrets are masked in tool results and

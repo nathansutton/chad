@@ -1029,6 +1029,11 @@ from the disk budget, or one from another model, cache mode or window resumes co
 before. The banner says which happened: `[resumed warm: N tokens of the conversation
 restored from disk]`. `CHAD_NO_KV_RESUME=1` turns the whole thing off.
 
+The facts the [result channel](#harness-levers) gathers — files edited, the test
+command's outcome before the first edit, files already shown a symbol map — are saved with
+the conversation and come back with it, so a resumed session answers "was this failing
+before I started?" the way the uninterrupted one would have.
+
 ### Session log & privacy
 
 Diagnostics log: when enabled, each session appends throughput numbers and a readable

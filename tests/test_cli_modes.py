@@ -247,10 +247,13 @@ def test_continue_hands_the_agent_the_saved_kv_checkpoint(rec):
     rec.main(["-c", "go on"], tty=True)
     ref = rec.agents[0].kw["resume_kv"]
     assert (ref.path, ref.tokens, ref.sha) == (kv["path"], kv["tokens"], kv["sha"])
+    # The whole `meta` rides along too: the harness's own facts about the conversation.
+    assert rec.agents[0].kw["resume_meta"] == {"kv": kv}
 
     session.save_session(os.getcwd(), msgs, {}, session_id="20260101-000100-bbbb")
     rec.main(["-c", "go on"], tty=True)
     assert rec.agents[1].kw["resume_kv"] is None
+    assert rec.agents[1].kw["resume_meta"] == {}
 
 
 def test_continue_names_the_session_and_recaps_it(rec, capsys):

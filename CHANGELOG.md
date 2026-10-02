@@ -23,6 +23,13 @@ prefix's disk budget (`CHAD_KV_CACHE_MAX_GB`); a session that was not quit clean
 one from another model or window, resumes cold as before. `CHAD_NO_KV_RESUME=1` turns it
 off.
 
+**A resumed session remembers what the harness knew.** The facts chad gathers for the
+result channel — which files the session edited, the outcome of the test command before
+its first edit, which files it had already shown a symbol map for — were reset on every
+resume, so a resumed session could not say whether a failure predated it and decorated
+files the transcript already explained. They are now saved with the conversation and
+restored with it.
+
 **`/accept` works after the plan is revised.** The handoff was remembered only when the
 model wrote the file; a revision is an edit, so the first steer ended in "no plan
 pending". Edits now count, `/accept <path>` accepts any plan file, and `/accept` with

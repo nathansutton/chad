@@ -416,7 +416,8 @@ class TUI:
                  describe_load_error: Optional[Callable[[Exception], list[str]]] = None,
                  speech: Optional[_SpeechModule] = None,
                  recorder: Optional[_Recorder] = None, speaker: Optional[_Speaker] = None,
-                 resume_kv: Optional[KVCheckpointRef] = None):
+                 resume_kv: Optional[KVCheckpointRef] = None,
+                 resume_meta: Optional[dict] = None):
         self.engine = engine
         self.ctx_limit = ctx_limit
         self._ctx_limit_fn = ctx_limit_fn  # live per-turn recheck
@@ -476,6 +477,7 @@ class TUI:
             emit=self._emit, confirm=self._confirm, should_stop=self._interrupt.is_set,
             drain_steering=self._drain_steering,
             resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn, resume_kv=resume_kv,
+            resume_meta=resume_meta,
         )
 
         # Plan-mode handoff state. After a plan-mode turn writes a plan file,
@@ -997,7 +999,8 @@ class TUI:
     # -- session reset / plan handoff ------------------------------------
 
     def _fresh_agent(self, mode: str, resume: list = None,
-                     resume_kv: Optional[KVCheckpointRef] = None) -> bool:
+                     resume_kv: Optional[KVCheckpointRef] = None,
+                     resume_meta: Optional[dict] = None) -> bool:
         """Clear the conversation + KV cache and start a new Agent in `mode`, seeded
         with `resume` (a saved transcript) when given.
         Returns False (without resetting) if a turn won't yield in time."""
@@ -1021,7 +1024,7 @@ class TUI:
             thinking=self.thinking, emit=self._emit, confirm=self._confirm,
             should_stop=self._interrupt.is_set, drain_steering=self._drain_steering,
             persist=True, ctx_limit_fn=self._ctx_limit_fn,
-            resume=resume, resume_kv=resume_kv,
+            resume=resume, resume_kv=resume_kv, resume_meta=resume_meta,
         )
         self._pending_plan = None
         self._pending_budget_note = None
@@ -1096,7 +1099,8 @@ class TUI:
             self._emit("info", "busy — /resume once the current turn finishes.")
             return
         if not self._fresh_agent(self._base_mode, resume=data["messages"],
-                                 resume_kv=session.kv_ref(data)):
+                                 resume_kv=session.kv_ref(data),
+                                 resume_meta=data.get("meta")):
             return
         # The fresh Agent (which already minted a new session_id) was seeded with the
         # restored transcript; its next save() writes a NEW file, leaving the picked one
@@ -1677,8 +1681,8 @@ def run_tui(engine: BaseEngine, ctx_limit: int, mode: str = "normal", thinking: 
             resume: list = None, ctx_window: int = None, finalize=None, ctx_limit_fn=None,
             native_ctx: int = None,
             describe_load_error: Optional[Callable[[Exception], list[str]]] = None,
-            resume_kv: Optional[KVCheckpointRef] = None):
+            resume_kv: Optional[KVCheckpointRef] = None, resume_meta: Optional[dict] = None):
     asyncio.run(TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume,
                     ctx_window=ctx_window, finalize=finalize, ctx_limit_fn=ctx_limit_fn,
                     native_ctx=native_ctx, describe_load_error=describe_load_error,
-                    resume_kv=resume_kv).run())
+                    resume_kv=resume_kv, resume_meta=resume_meta).run())
