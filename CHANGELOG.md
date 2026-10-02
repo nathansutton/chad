@@ -4,6 +4,13 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+- **Serial decode 11.8 → 12.6 tok/s on the shipped GGUF (+6.7%), drafted 48.1 → 49.6
+  (+3.0%), bit-identical.** The IQ4_XS, Q4_K and Q5_K decoders in `mlx_gguf.py` read
+  their quant bytes as aligned 32-bit words instead of one byte load per value: the same
+  values in the same order, so every output is bit-identical to before, and the GEMV on
+  the format that carries 38% of the file goes from ~154 to ~180 GB/s on an M4 Pro.
+  Receipts and the per-format bandwidth map in `benchmarks/gguf_decoders/`.
+
 **Ctrl-c outside the TUI was a traceback.** In `--repl` and one-shot runs the first
 ctrl-c now ends the turn at its next step and the conversation is saved; a second one
 quits. Interrupting the first-run download says that re-running resumes it, and an
