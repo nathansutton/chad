@@ -67,7 +67,7 @@ except ImportError as _e:  # non-Apple host: remote backend only
 # GenStats moved to base_engine.py so a non-MLX backend can build one without
 # importing mlx.core. Re-exported here so existing `from .engine import GenStats` keeps
 # working (bench.py, tests) — the class is unchanged.
-from . import config
+from . import config, suffix_reuse
 from .base_engine import THINK_CLOSE, GenStats, KVCheckpointRef, TailWatch, think_ceiling_hit
 from .diag import log
 
@@ -578,6 +578,13 @@ class Engine:
     # native-trimming the attention KV, and re-feeding the few agreed-on tokens —
     # instead of the full-transcript re-prefill divergence used to cost.
     _rewind_snap: Optional[dict] = field(init=False, default=None)
+    # What the last `_sync_to` did by suffix reuse: (rows moved into place from the
+    # pre-edit cache, tokens prefilled into the gaps between them). Both are already
+    # inside the count `_sync_to` returns; the GenStats build sites split them out.
+    _scr_last: tuple[int, int] = field(init=False, default=(0, 0))
+    # Wall seconds the last `_sync_to` spent relocating (moving rows, reading gaps):
+    # prefill work done before a decode loop starts its own prefill clock.
+    _scr_s: float = field(init=False, default=0.0)
 
     def _read_config(self, repo):
         import json
@@ -1226,12 +1233,184 @@ class Engine:
                  "skipped a full re-prefill", upto, snap["pos"], len(refeed))
         return upto
 
-    def _sync_to(self, target_ids: list) -> int:
+    def _attention_layers(self) -> Optional[list[tuple["suffix_reuse.AttnCache",
+                                                         "suffix_reuse.Rope"]]]:
+        """Each attention layer's cache paired with its RoPE module, in layer order.
+        None when the cache does not line up with the model's layers, a layer is not
+        shaped like the qwen3_5 decoder layer this is written against, or a layer
+        rotates with a RoPE class `suffix_reuse.rerotate_keys` does not model — the
+        caller then leaves suffix reuse off rather than move keys it cannot re-rotate
+        exactly."""
+        import mlx.nn as nn
+
+        out = []
+        try:
+            layers = self.model.layers
+            if len(layers) != len(self._cache):
+                return None
+            for layer, c in zip(layers, self._cache):
+                if layer.is_linear:
+                    continue
+                if not suffix_reuse.is_attention_cache(c):
+                    return None
+                rope = layer.self_attn.rope
+                if not (type(rope) is nn.RoPE or suffix_reuse.is_yarn(rope)):
+                    return None
+                out.append((c, rope))
+        except AttributeError:
+            # Another hybrid's layers (no `is_linear`, no `self_attn.rope`): the cache
+            # composition alone let it this far, and the rebuild tier still serves it.
+            return None
+        return out
+
+    def _relocate_to(self, target_ids: list, common: int, should_stop=None,
+                     on_progress=None) -> Optional[int]:
+        """Suffix reuse on the non-trimmable hybrid: land the cache on `target_ids`
+        after a mid-transcript edit by moving the rows of the text that survived it
+        instead of re-reading them. Each surviving span's attention rows are sliced
+        out, their keys re-rotated to the new positions, the attention KV trimmed back
+        to `common`, and then the target is rebuilt in order — gaps (text the edit
+        inserted) prefilled, spans appended.
+
+        The recurrent layers continue from an anchor (`suffix_reuse.plan`): the live
+        state, or the turn-boundary snapshot, whichever lines up with the end of a
+        survivor — the last moved span ends exactly where that state stopped reading.
+        Gap prefills compute the gap's attention rows and then put the anchor's
+        recurrent state back, so the recurrent layers never read text out of order.
+
+        The gap reads run under `should_stop` and report `on_progress(done, total)`
+        like the decode loop's own prefill, with `total` every token this prompt will
+        read, so one percentage runs through both. A gap read that stops short
+        abandons the relocation: the only recurrent state to hand on has read the
+        spans the caller would then feed again, so the cache is dropped and the
+        rebuild tier's reload runs instead.
+
+        Returns the resident count it landed at (the end of the last moved span;
+        `_cached_ids` records the same), None when no anchor falls inside a survivor
+        or the cache and the ledger disagree (caller falls back to the rebuild). The
+        plan never covers the last target token, so the caller always has one to
+        condition on."""
+        if not self._pld_hybrid or config.flag("CHAD_NO_SCR") or common < 1:
+            return None
+        t0 = time.time()
+        live = len(self._cached_ids)
+        snap = self._rewind_snap
+        anchors = [live] + ([snap["pos"]] if snap and snap["pos"] < live else [])
+        plan = suffix_reuse.plan(
+            self._cached_ids, list(target_ids[:-1]), common=common, anchors=anchors,
+            max_spans=config.env_int("CHAD_SCR_MAX_SPANS", 6),
+            min_span=config.env_int("CHAD_SCR_MIN_SPAN", 64))
+        if plan is None:
+            return None
+        layers = self._attention_layers()
+        if layers is None:
+            return None
+        offsets = [c.offset for c, _ in layers]
+        if any(o != live for o in offsets):
+            # A loop that raised between a forward and its bookkeeping can leave the
+            # cache a row off the ledger. The rebuild describes that cache; a splice
+            # built on the ledger's positions would not.
+            log.warning("SCR skipped: attention offsets %s, ledger %d", offsets, live)
+            return None
+        moved = [[suffix_reuse.rerotate_rows(
+                      suffix_reuse.take_rows(c, s.src_lo, s.src_lo + s.size),
+                      rope, s.tgt_lo - s.src_lo)
+                  for c, rope in layers]
+                 for s in plan.spans]
+        # Evaluated here, once, so the moved rows reach the cache as plain arrays
+        # rather than as lazy slices of the pre-edit buffers carried into every
+        # later forward.
+        mx.eval([(r.keys, r.values) for rows in moved for r in rows])
+        # From the first recurrent restore until the last span lands, the attention
+        # offsets can equal the ledger while the recurrent layers sit at the anchor,
+        # a mismatch no offset check can see. Anything raised in between (an OOM
+        # growing the buffers, a ctrl-c) drops the cache rather than leave it to be
+        # kept and read on top of.
+        try:
+            if plan.anchor != live:
+                assert snap is not None and snap["pos"] == plan.anchor
+                self._restore_recurrent(snap["recurrent"])
+            anchor_state = self._snap_recurrent()
+            self._trim_kv(live - common)
+            for c, _ in layers:
+                # Cut each buffer back to its live rows: the next write then grows a fresh
+                # buffer instead of writing into the one the moved rows still share.
+                suffix_reuse.drop_spare_rows(c)
+            self._cached_ids = self._cached_ids[:common]
+            # Positions moved under the snapshot: it no longer describes this cache.
+            self._rewind_snap = None
+            # One reservation for everything the plan lands: the gap reads and the appends
+            # then write in place instead of each growing every buffer again.
+            self._reserve_kv(plan.end)
+            total = len(target_ids) - common - sum(s.size for s in plan.spans)
+            pos, relocated, read = common, 0, 0
+            for span, rows in zip(plan.spans, moved):
+                gap = list(target_ids[pos:span.tgt_lo])
+                if gap:
+                    progress = (None if on_progress is None else
+                                lambda done, _n, base=read: on_progress(base + done, total))
+                    fed = self._prefill(gap, should_stop, on_progress=progress)
+                    self._restore_recurrent(anchor_state)
+                    read += fed
+                    self._cached_ids = list(target_ids[: pos + fed])
+                    if fed < len(gap):
+                        log.info("SCR abandoned: gap read stopped at %d/%d, rebuilding",
+                                 fed, len(gap))
+                        self._scr_last, self._scr_s = (0, 0), time.time() - t0
+                        self._reset_cache()
+                        return self._reload_warm_prefix(target_ids)
+                    # A Metal OOM inside the read rebuilt the cache objects in place
+                    # (`_replay_after_oom`): the rows go into whichever objects hold the
+                    # cache now.
+                    layers = self._attention_layers()
+                    if layers is None:
+                        log.warning("SCR abandoned: cache changed shape under a gap read")
+                        self._scr_last, self._scr_s = (0, 0), time.time() - t0
+                        self._reset_cache()
+                        return self._reload_warm_prefix(target_ids)
+                for (c, _), r in zip(layers, rows):
+                    suffix_reuse.append_rows(c, r)
+                self._cached_ids.extend(target_ids[span.tgt_lo : span.tgt_lo + span.size])
+                relocated += span.size
+                pos = span.tgt_lo + span.size
+        except BaseException:
+            self._reset_cache()
+            raise
+        self._scr_last, self._scr_s = (relocated, read), time.time() - t0
+        log.info("SCR moved %d tokens in %d spans, read %d between them; anchored at "
+                 "%s (%d); %d left to prefill after %d", relocated, len(plan.spans),
+                 read, "live" if plan.anchor == live else "turn start", plan.anchor,
+                 len(target_ids) - plan.end, plan.end)
+        return plan.end
+
+    def _sync_stats(self, prompt_ids: list, common: int) -> GenStats:
+        """The GenStats a decode loop starts from after `_sync_to(prompt_ids)`
+        returned `common`. Tokens suffix reuse prefilled between moved spans count as
+        prefilled, not cached, so `prompt_tokens` stays the tokens actually read, and
+        the time it spent is the start of `prefill_s`: each decode loop starts its
+        prefill clock that much earlier."""
+        relocated, read = self._scr_last
+        return GenStats(prompt_tokens=len(prompt_ids) - common + read,
+                        cached_tokens=common - read, relocated_tokens=relocated,
+                        prefill_s=self._scr_s)
+
+    def _progress_after_sync(self, on_progress):
+        """`on_progress` for a decode loop's own prefill, carrying on the percentage
+        the gap reads of `_sync_to` began: both count toward the prompt's total."""
+        read = self._scr_last[1]
+        if on_progress is None or read == 0:
+            return on_progress
+        return lambda done, total: on_progress(read + done, read + total)
+
+    def _sync_to(self, target_ids: list, should_stop=None, on_progress=None) -> int:
         """Trim the cache down to the longest common prefix with target_ids.
 
         Returns the number of leading tokens already resident in the cache
-        (i.e. how many tokens we get to skip prefilling).
+        (i.e. how many tokens we get to skip prefilling). `should_stop` and
+        `on_progress` reach the reads suffix reuse may do on the way
+        (`_relocate_to`); the other tiers read nothing.
         """
+        self._scr_last, self._scr_s = (0, 0), 0.0
         common = 0
         for a, b in zip(self._cached_ids, target_ids):
             if a != b:
@@ -1250,6 +1429,14 @@ class Engine:
                 # most one turn's tokens instead of the whole transcript. The ledger
                 # now ends where the rewind landed: short of `common` if its re-feed was.
                 common = len(self._cached_ids)
+            elif (landed := self._relocate_to(target_ids, common, should_stop,
+                                              on_progress)) is not None:
+                # Suffix reuse: the divergence is a mid-transcript edit (compaction).
+                # Survivors keep their rows, re-rotated to their new positions; only
+                # the inserted text is read. The recurrent layers continue from the
+                # state they have — it still summarises the deleted text, which is
+                # the trade the mechanism makes.
+                common = landed
             else:
                 # Not trimmable (hybrid) -> can't partially rewind in RAM, so rebuild.
                 # But the dominant divergence in agentic loops is *compaction*, which
@@ -1614,12 +1801,9 @@ class Engine:
         # resident, rather than let the next turn prefill on top of tokens
         # `_cached_ids` doesn't know about.
         try:
-            common = self._sync_to(prompt_ids)
+            common = self._sync_to(prompt_ids, should_stop, on_prefill_progress)
             suffix = prompt_ids[common:]
-            stats = GenStats(
-                prompt_tokens=len(suffix),
-                cached_tokens=common,
-            )
+            stats = self._sync_stats(prompt_ids, common)
             if not suffix:
                 # Nothing new to prefill (degenerate: the prompt is fully cached, e.g. an
                 # identical prompt regenerated — never in normal append-only turns). We
@@ -1674,14 +1858,15 @@ class Engine:
                          else make_sampler(temp=self.temp, min_p=self.min_p, top_p=self.top_p)),
                 prompt_cache=self._cache,
             )
-            t0 = time.time()
+            t0 = time.time() - stats.prefill_s   # includes what _sync_to already read
             # Interruptible prefill: feed everything but the last token ourselves so
             # should_stop is honored between chunks. stream_generate then only has to
             # prefill the final token before decoding.
             gen_prompt = suffix
             resident = common
             if len(suffix) > 1:
-                fed = self._prefill(suffix[:-1], should_stop, on_progress=on_prefill_progress)
+                fed = self._prefill(suffix[:-1], should_stop,
+                                    on_progress=self._progress_after_sync(on_prefill_progress))
                 if fed < len(suffix) - 1:  # interrupted mid-prefill
                     self._cached_ids = prompt_ids[: common + fed]
                     stats.prefill_s = time.time() - t0
@@ -1818,9 +2003,9 @@ class Engine:
         # raises, _settle_after_error decides whether the cache still matches it.
         fed_ids = None
         try:
-            common = self._sync_to(prompt_ids)
+            common = self._sync_to(prompt_ids, should_stop, on_prefill_progress)
             suffix = prompt_ids[common:]
-            stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
+            stats = self._sync_stats(prompt_ids, common)
             if on_prefill:
                 on_prefill(stats.prompt_tokens, stats.cached_tokens)
 
@@ -1830,7 +2015,7 @@ class Engine:
             # On a hybrid cache we roll drafts back by snapshot/restore instead of trim.
             hybrid = self._pld_hybrid and not self._trimmable
 
-            t0 = time.time()
+            t0 = time.time() - stats.prefill_s   # includes what _sync_to already read
 
             def _prefill_head():
                 """Prefill suffix[:-1] (all but the conditioning token) through the shared
@@ -1839,7 +2024,7 @@ class Engine:
                 helper for both branches below — previously this loop was inlined twice and
                 the hybrid copy silently dropped the should_stop check (un-abortable)."""
                 fed = self._prefill(suffix[:-1], should_stop, chunk=prefill_step,
-                                    on_progress=on_prefill_progress)
+                                    on_progress=self._progress_after_sync(on_prefill_progress))
                 if fed < len(suffix) - 1:  # interrupted mid-prefill
                     self._cached_ids = list(prompt_ids[: common + fed])
                     stats.prefill_s = time.time() - t0
@@ -2032,9 +2217,9 @@ class Engine:
         # raises, _settle_after_error decides whether the cache still matches it.
         fed_ids = None
         try:
-            common = self._sync_to(prompt_ids)
+            common = self._sync_to(prompt_ids, should_stop, on_prefill_progress)
             suffix = prompt_ids[common:]
-            stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
+            stats = self._sync_stats(prompt_ids, common)
             if on_prefill:
                 on_prefill(stats.prompt_tokens, stats.cached_tokens)
 
@@ -2048,11 +2233,11 @@ class Engine:
                     return embed.as_linear(h)
                 return lm.lm_head(h)
 
-            t0 = time.time()
+            t0 = time.time() - stats.prefill_s   # includes what _sync_to already read
 
             def _prefill_head():
                 fed = self._prefill(suffix[:-1], should_stop,
-                                    on_progress=on_prefill_progress)
+                                    on_progress=self._progress_after_sync(on_prefill_progress))
                 if fed < len(suffix) - 1:  # interrupted mid-prefill
                     self._cached_ids = list(prompt_ids[: common + fed])
                     stats.prefill_s = time.time() - t0
@@ -2446,9 +2631,9 @@ class Engine:
         # raises, _settle_after_error decides whether the cache still matches it.
         fed_ids = None
         try:
-            common = self._sync_to(prompt_ids)
+            common = self._sync_to(prompt_ids, should_stop, on_prefill_progress)
             suffix = prompt_ids[common:]
-            stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
+            stats = self._sync_stats(prompt_ids, common)
             if on_prefill:
                 on_prefill(stats.prompt_tokens, stats.cached_tokens)
 
@@ -2463,7 +2648,7 @@ class Engine:
                 return lm.lm_head(h)
 
             hybrid = self._pld_hybrid and not self._trimmable
-            t0 = time.time()
+            t0 = time.time() - stats.prefill_s   # includes what _sync_to already read
 
             drafter = (drafter_cls or _DFlashDrafter)(self, embed, _logits)
             drafter.start_turn()
@@ -2471,7 +2656,7 @@ class Engine:
             def _prefill_head():
                 with drafter.tapped():
                     fed = self._prefill(suffix[:-1], should_stop,
-                                        on_progress=on_prefill_progress,
+                                        on_progress=self._progress_after_sync(on_prefill_progress),
                                         on_chunk=drafter.on_prefill_chunk)
                 if fed < len(suffix) - 1:  # interrupted mid-prefill
                     self._cached_ids = list(prompt_ids[: common + fed])

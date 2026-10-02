@@ -1496,6 +1496,9 @@ class Agent:
                     "seq": self._prefill_trace_seq, "step": step,
                     "prompt_tokens": stats.prompt_tokens,
                     "cached_tokens": stats.cached_tokens,
+                    # Of cached_tokens, rows moved into place after a compaction
+                    # rather than re-read (0 whenever nothing was relocated).
+                    "relocated_tokens": stats.relocated_tokens,
                     "prefill_s": round(stats.prefill_s, 4),
                     "gen_tokens": stats.generated_tokens,
                     "gen_s": round(stats.gen_s, 4),

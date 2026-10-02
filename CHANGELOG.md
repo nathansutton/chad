@@ -30,6 +30,14 @@ resume, so a resumed session could not say whether a failure predated it and dec
 files the transcript already explained. They are now saved with the conversation and
 restored with it.
 
+**Compaction no longer throws the cache away.** On the shipped hybrid model a
+compaction used to re-read every token after the first change — in one recorded
+session 73,000 tokens re-read to free 20,000, 43% of the wall clock. The engine now
+keeps the cached rows of everything that survived the edit, moves them to their new
+positions, and reads only the text compaction inserted. The recurrent layers continue
+from a state that has just read the same text the edited transcript has at that point.
+`CHAD_NO_SCR=1` restores the old behaviour. (Suffix Cache Reuse, Shao et al. 2026, reimplemented for MLX.)
+
 **`/accept` works after the plan is revised.** The handoff was remembered only when the
 model wrote the file; a revision is an edit, so the first steer ended in "no plan
 pending". Edits now count, `/accept <path>` accepts any plan file, and `/accept` with

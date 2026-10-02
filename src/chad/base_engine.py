@@ -135,6 +135,9 @@ class GenStats:
                                     # figure, when a server reports one, lands in
                                     # prompt_total_tokens.
     cached_tokens: int = 0          # tokens served from the prefix cache
+    relocated_tokens: int = 0       # of cached_tokens, rows moved into place from the
+                                    # pre-edit cache after a mid-transcript edit, served
+                                    # without a forward (suffix reuse, MLX hybrid only)
     prompt_total_tokens: int = 0    # FULL prompt size (cached + prefilled) when a server
                                     # reports one, kept raw for forensics. 0 = not reported
                                     # (MLX/llama paths derive totals from prompt_tokens +

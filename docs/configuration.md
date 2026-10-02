@@ -835,6 +835,9 @@ CHAD_NO_DFLASH=1          chad  # disable block speculation (decode serially)
 CHAD_DFLASH_DRAFT=7       chad  # verified-width cap per round (1..7; default the full block)
 CHAD_DFLASH_ADAPTIVE=0    chad  # verify the full block every round instead of the per-round schedule
 CHAD_DFLASH_PATH=/dir     chad  # explicit drafter checkpoint or built sidecar dir
+CHAD_NO_SCR=1             chad  # compaction re-reads everything after the first change
+CHAD_SCR_MAX_SPANS=6      chad  # most surviving spans a compaction moves instead of reads
+CHAD_SCR_MIN_SPAN=64      chad  # shortest survivor worth moving (shorter ones are read)
 CHAD_USE_PLD=1            chad  # OPT-IN: wide prompt-lookup decoding
 CHAD_NO_QSDPA_WIDE=1      chad  # disable the S>1 tier of the fused attention kernel
 CHAD_NO_QSDPA_WIDE_SGM=1  chad  # disable just its split-head variant
@@ -868,6 +871,21 @@ CHAD_QMM_MMA_RECAL=1      chad  # re-probe the small-M matmul kernel on this mac
   HF-layout checkpoint dir (quantized on first use into `~/.cache/chad/dflash/`) or an
   already-built sidecar dir. `python -m chad.mlx_dflash <dir> --out <model_dir>/dflash`
   builds a sidecar by hand; that is how the shipped repo's bundle was made.
+- `CHAD_NO_SCR` / `CHAD_SCR_MAX_SPANS` / `CHAD_SCR_MIN_SPAN`: **suffix reuse after
+  compaction** (`suffix_reuse.py`). A compaction rewrites the middle of the transcript,
+  and the hybrid cache cannot be rewound, so it used to cost a re-read of everything after
+  the first change. Instead, the attention rows of text that survived the edit are moved
+  to their new positions (keys re-rotated) and only the inserted text is read. The
+  recurrent layers continue from whichever state they hold (live, or the start of the last
+  turn) has just read the text the edited transcript has at that point; it still
+  summarises the deleted text. The text the model sees is unchanged; the approximation is
+  in the cache.
+  `CHAD_NO_SCR=1` restores the full re-read. At most `CHAD_SCR_MAX_SPANS` survivors are
+  moved (default 6, the largest), each at least `CHAD_SCR_MIN_SPAN` tokens (default 64);
+  everything else is read. Survivors are found as runs of eight tokens, so a transcript
+  that is one short line repeated thousands of times is re-read in full rather than
+  matched slowly. The prefill trace (`CHAD_PREFILL_TRACE`) records the moved count per
+  step as `relocated_tokens`.
 - `CHAD_USE_PLD`: turns **wide prompt-lookup decoding** back on. It was the default
   before 2.0.0 and is now opt-in, because PLD drafts from *context recurrence* and can
   therefore only accelerate text that already appeared. On real agentic traces that is a
