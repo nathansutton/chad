@@ -94,7 +94,8 @@ def _kill_group(p):
 # PATH, TOKENIZERS_PARALLELISM, PYTHONPATH and a HOMEBREW_KEYRING_PATH pass through.
 # CHAD_NO_ENV_GUARD opts out for a session whose commands legitimately need a
 # credential (a deploy, a gh push) — a stripped variable is absent, never corrupted,
-# so the command fails with a clear "not set" rather than a confusing auth error.
+# so nothing is half-present; the command fails, or falls back to a default, as if
+# the variable had never been set.
 _ENV_SECRET_RE = re.compile(
     r"(?i)((TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|API_?KEY|"
     r"ACCESS_KEY(_ID)?|SECRET_KEY|PRIVATE_KEY)$"
@@ -125,8 +126,33 @@ def _bash_env() -> dict | None:
             if not _ENV_SECRET_RE.search(k) and not _is_credential_url(k, v)}
 
 
+def withheld_env_names() -> list[str]:
+    """The variables the guard removes from a command's environment, by name, sorted.
+    Empty under CHAD_NO_ENV_GUARD. Names only: a value never leaves this module."""
+    if config.flag("CHAD_NO_ENV_GUARD"):
+        return []
+    return sorted(k for k, v in os.environ.items()
+                  if _ENV_SECRET_RE.search(k) or _is_credential_url(k, v))
+
+
+def env_guard_notice(limit: int = 4) -> str:
+    """One line for the start of an interactive session, or '' when nothing is withheld.
+    A command that loses a credential fails like a command with a wrong credential —
+    or, for AWS_PROFILE, succeeds against a different account — so the user has to be
+    told up front; the failure itself will not tell them."""
+    names = withheld_env_names()
+    if not names:
+        return ""
+    shown = ", ".join(names[:limit])
+    more = f", +{len(names) - limit} more" if len(names) > limit else ""
+    return (f"env guard: {len(names)} credential-shaped variable(s) are withheld from "
+            f"chad's commands ({shown}{more}). Your own !commands get them; "
+            f"CHAD_NO_ENV_GUARD=1 passes them to chad too.")
+
+
 def tool_bash(command: str, timeout: int = 120, should_stop=None,
-              wrap: Callable[[str], Optional[list[str]]] = seatbelt.wrap_argv) -> str:
+              wrap: Callable[[str], Optional[list[str]]] = seatbelt.wrap_argv,
+              *, env_guard: bool = True) -> str:
     # `wrap` confines the command: the sandboxed argv to spawn, or None for a plain shell.
     argv = wrap(command)
     try:
@@ -138,7 +164,7 @@ def tool_bash(command: str, timeout: int = 120, should_stop=None,
                              shell=argv is None,
                              executable=config.shell_path() if argv is None else None,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
-                             start_new_session=True, env=_bash_env())
+                             start_new_session=True, env=_bash_env() if env_guard else None)
     except OSError as e:
         return f"[failed to launch: {e}]"
     # Drain output on a helper thread (so large output can't deadlock the pipe)

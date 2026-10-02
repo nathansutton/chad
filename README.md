@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/nathansutton/chad/actions/workflows/tests.yml/badge.svg)](https://github.com/nathansutton/chad/actions/workflows/tests.yml)
 
-<img src="docs/claude-vs-chad.jpg" width="50%" alt="Two staircase newel posts side by side: Claude is a hand-carved wooden horse head, chad is a scuffed plastic toy horse tied on with twine">
+<img src="https://raw.githubusercontent.com/nathansutton/chad/main/docs/claude-vs-chad.jpg" width="50%" alt="Two staircase newel posts side by side: Claude is a hand-carved wooden horse head, chad is a scuffed plastic toy horse tied on with twine">
 
 > Claude can do anything, for anyone, anywhere. chad does one thing. 🗿
 > *Coding under supervision.*
@@ -12,13 +12,13 @@ chad is a coding agent that runs entirely on an Apple Silicon Mac via
 (Not affiliated with Anthropic.)
 
 ```bash
-uvx chad-code          # runs anywhere; the command is still `chad`
+uvx chad-code          # runs anywhere; `uv tool install chad-code` makes it `chad`
 uvx chad-code prove    # offline smoke test: 4 tiny fix-it tasks, verified, timed 🗿
 ```
 
-The first run asks, then downloads the model once (~14 GB). The PyPI package is `chad-code`.
+The first run asks, then downloads the model once (~14 GB; it needs ~30 GB free the first time). The PyPI package is `chad-code`.
 
-![chad fixing a failing test end to end: reason, read, edit, run pytest, confirm green, all on a local model](docs/demo.gif)
+![chad fixing a failing test end to end: reason, read, edit, run pytest, confirm green, all on a local model](https://raw.githubusercontent.com/nathansutton/chad/main/docs/demo.gif)
 
 > Real session, unedited.
 
@@ -39,18 +39,18 @@ You do not have an Apple Silicon with 24 GB RAM.  You want to pick your local mo
 
 ## Documentation
 
-- [Installing & using chad](docs/usage.md) covers install, extras and upgrades, the
+- [Installing & using chad](https://github.com/nathansutton/chad/blob/main/docs/usage.md) covers install, extras and upgrades, the
   terminal UI, and the command-line flags.
-- [Throughput & performance](docs/benchmarks.md) has every number above, the stock-engine
+- [Throughput & performance](https://github.com/nathansutton/chad/blob/main/docs/benchmarks.md) has every number above, the stock-engine
   comparison, the model, and how to reproduce them with `chad-bench`.
-- [Design](docs/design.md) is the argument: why the agent owns the engine, why there are
+- [Design](https://github.com/nathansutton/chad/blob/main/docs/design.md) is the argument: why the agent owns the engine, why there are
   five tools, and what 1.x got wrong.
-- [Architecture](docs/architecture.md) is the module map, the session file format and the
+- [Architecture](https://github.com/nathansutton/chad/blob/main/docs/architecture.md) is the module map, the session file format and the
   tool-call wire format.
-- [Configuration reference](docs/configuration.md) documents project instructions, Agent
+- [Configuration reference](https://github.com/nathansutton/chad/blob/main/docs/configuration.md) documents project instructions, Agent
   Skills, MCP servers, plan mode, the slash commands, the context window, every environment
   variable, and the safety opt-outs.
-- [Troubleshooting](docs/troubleshooting.md) maps symptoms to knobs for when a session
+- [Troubleshooting](https://github.com/nathansutton/chad/blob/main/docs/troubleshooting.md) maps symptoms to knobs for when a session
   rambles, loops, or slows.
-- [Contributing](CONTRIBUTING.md) says what lands easily and what needs a conversation
+- [Contributing](https://github.com/nathansutton/chad/blob/main/CONTRIBUTING.md) says what lands easily and what needs a conversation
   first.

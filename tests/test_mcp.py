@@ -22,7 +22,7 @@ import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-from chad import mcp, render, tools, validate
+from chad import mcp, mcp_oauth, render, tools, validate
 
 # A minimal but real MCP stdio server: newline-delimited JSON-RPC 2.0. It exposes one
 # read-only tool (`echo`, annotated readOnlyHint) and one mutating tool (`write_note`),
@@ -337,6 +337,33 @@ def test_project_overrides_user(tmp_path):
     assert scope["useronly"] == "user"              # user-only keeps user scope
 
 
+def test_project_replacing_user_server_warns(tmp_path):
+    home = tmp_path / "home"; (home / ".chad").mkdir(parents=True)
+    (home / ".chad" / "mcp.json").write_text(json.dumps(
+        {"mcpServers": {"demo": {"command": "user-cmd"}}}))
+    (tmp_path / ".mcp.json").write_text(json.dumps(
+        {"mcpServers": {"demo": {"command": "project-cmd"}}}))
+    _, warnings = mcp._load_config(str(tmp_path), str(home))
+    assert any("demo" in w and "replaces your own server" in w for w in warnings)
+
+
+@pytest.mark.parametrize("raw, shown, hidden", [
+    ({"command": "npx", "args": ["-y", "some-server"]}, ["runs npx -y some-server"], []),
+    ({"command": "sh", "args": ["-c", "a b"]}, ["runs sh -c 'a b'"], []),
+    ({"url": "https://h.example/mcp", "headers": {"Authorization": "placeholder-value"}},
+     ["connects to https://h.example/mcp", "Authorization"], ["placeholder-value"]),
+    ({"command": "x", "env": {"API_KEY": "placeholder-value"}},
+     ["sets: API_KEY"], ["placeholder-value"]),
+    ({}, ["neither a command nor a url"], []),
+])
+def test_describe_spec(raw, shown, hidden):
+    text = mcp.describe_spec(mcp._ServerSpec.decode(raw))
+    for part in shown:
+        assert part in text
+    for part in hidden:
+        assert part not in text
+
+
 def test_malformed_config_is_skipped(tmp_path, monkeypatch):
     _isolate_home(tmp_path, monkeypatch)
     (tmp_path / ".mcp.json").write_text("{ this is not json ")
@@ -447,6 +474,62 @@ def test_trust_enables_project_server(tmp_path, monkeypatch):
     names = [s["function"]["name"] for s in mcp.schemas()]
     assert "mcp__demo__echo" in names                 # now the server's tools appear
     assert not mcp.service().blocked
+    mcp.reset_session()
+
+
+def test_untrusted_summary_shows_what_would_run(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    server_py = tmp_path / "server.py"
+    _write_project(tmp_path, server_py)
+    monkeypatch.chdir(tmp_path)
+    mcp.reset_session()
+    lines = mcp.summary_lines()
+    assert any(f"if trusted, it runs {sys.executable}" in ln and str(server_py) in ln
+               for ln in lines)
+    mcp.reset_session()
+
+
+def test_trust_refuses_directory_without_config(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    lines = mcp.trust(str(tmp_path))
+    assert lines == ["nothing to trust: this directory has no .mcp.json"]
+    assert mcp._is_trusted(str(tmp_path)) is False
+
+
+def test_trust_lists_what_it_trusted(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    server_py = tmp_path / "server.py"
+    _write_project(tmp_path, server_py)
+    lines = mcp.trust(str(tmp_path))
+    assert "1 server(s)" in lines[0]
+    assert any(ln.startswith("  demo — runs ") and str(server_py) in ln for ln in lines)
+    assert mcp._is_trusted(str(tmp_path)) is True
+    mcp.reset_session()
+
+
+def test_trust_reports_a_store_it_cannot_save(tmp_path, monkeypatch):
+    home = _isolate_home(tmp_path, monkeypatch)
+    _write_project(tmp_path, tmp_path / "server.py")
+    (home / ".chad" / "trusted_mcp.json").mkdir(parents=True)   # a dir: the write fails
+    lines = mcp.trust(str(tmp_path))
+    assert any("nothing was trusted" in ln for ln in lines)
+    assert mcp._is_trusted(str(tmp_path)) is False
+    mcp.reset_session()
+
+
+def test_project_server_not_handed_a_login_for_another_url(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("CHAD_MCP_OAUTH", "1")
+    (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {"demo": {
+        "type": "http", "url": "http://127.0.0.1:9/b", "auth": "oauth"}}}))
+    mcp_oauth._write_section("demo", "tokens", {"access_token": "placeholder"})
+    mcp_oauth.bind("demo", "http://127.0.0.1:9/a")
+    monkeypatch.chdir(tmp_path)
+    mcp._set_trusted(str(tmp_path))
+    mcp.reset_session()
+    reg = mcp.service()
+    assert [n for n, _ in reg.needs_login] == ["demo"]
+    assert not reg.clients
     mcp.reset_session()
 
 
@@ -730,3 +813,82 @@ def test_stdio_env_extra_non_dict_ignored():
     spec = mcp._ServerSpec.decode({"command": "srv", "env": "not-a-dict"})
     env = mcp._stdio_env({"PATH": "/usr/bin"}, spec.env)
     assert env == {"PATH": "/usr/bin"}
+
+
+# --- the one-line connect summary and the first-turn report --------------------
+
+class _StatusClient:
+    """The three fields status_line reads off a connection."""
+
+    def __init__(self, name: str, error: str | None = None, tools: int = 0):
+        self.name = name
+        self.error = error
+        self.tools = [f"t{i}" for i in range(tools)]
+
+
+def _empty_registry(tmp_path, monkeypatch):
+    """A real _Registry for a directory with no MCP config, ready to be filled in."""
+    _isolate_home(tmp_path, monkeypatch)
+    return mcp._Registry(str(tmp_path))
+
+
+def test_status_line_nothing_configured(tmp_path, monkeypatch):
+    assert mcp.status_line(_empty_registry(tmp_path, monkeypatch)) is None
+
+
+def test_status_line_counts_connected_tools(tmp_path, monkeypatch):
+    reg = _empty_registry(tmp_path, monkeypatch)
+    reg.clients = [_StatusClient("a", tools=3), _StatusClient("b", tools=2)]
+    assert "2 connected (5 tools)" in mcp.status_line(reg)
+
+
+def test_status_line_names_the_first_failure(tmp_path, monkeypatch):
+    reg = _empty_registry(tmp_path, monkeypatch)
+    reg.clients = [_StatusClient("github", error="connect timed out after 60s")]
+    assert "1 failed (github: connect timed out after 60s)" in mcp.status_line(reg)
+
+
+def test_status_line_blocked(tmp_path, monkeypatch):
+    reg = _empty_registry(tmp_path, monkeypatch)
+    reg.blocked = [("demo", "project not trusted")]
+    assert "1 waiting for /mcp trust" in mcp.status_line(reg)
+
+
+def test_status_line_only_warnings(tmp_path, monkeypatch):
+    reg = _empty_registry(tmp_path, monkeypatch)
+    reg.warnings = ["/x/.mcp.json: no 'mcpServers' object"]
+    assert "config has problems" in mcp.status_line(reg)
+
+
+def _recording_agent(script):
+    from chad.agent import Agent
+    from test_agent_e2e import ScriptedEngine
+    seen = []
+    agent = Agent(ScriptedEngine(script), mode="yolo", thinking=False,
+                  emit=lambda kind, text: seen.append((kind, text)))
+    return agent, seen
+
+
+def test_first_turn_reports_mcp_once(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    _write_project(tmp_path, tmp_path / "server.py")
+    monkeypatch.chdir(tmp_path)
+    agent, seen = _recording_agent(["first answer", "second answer"])
+    agent.run_turn("hello")
+    reports = [t for k, t in seen if k == "info" and "mcp:" in t]
+    assert len(reports) == 1 and "waiting for /mcp trust" in reports[0]
+    assert ("status", "Connecting MCP servers") in seen
+    seen.clear()
+    agent.run_turn("again")
+    assert not [t for _, t in seen if "mcp:" in t]
+    mcp.reset_session()
+
+
+def test_first_turn_silent_without_mcp_config(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    agent, seen = _recording_agent(["an answer"])
+    agent.run_turn("hello")
+    assert not [t for _, t in seen if "mcp:" in t]
+    assert ("status", "Connecting MCP servers") not in seen
+    mcp.reset_session()

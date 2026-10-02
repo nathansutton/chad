@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 log = logging.getLogger("chad.tui")
 
@@ -63,7 +63,7 @@ from .render import (
     ansi_fragment,
     banner,
     confirm_preview,
-    render_tool_result,
+    render_passthrough,
 )
 
 if TYPE_CHECKING:
@@ -99,6 +99,11 @@ MODE_STYLE = {"normal": "status.normal", "auto": "status.auto", "yolo": "status.
 # whole point is that a one-line clipped preview means approving blind.
 _CONFIRM_MAX_LINES = 10
 _CONFIRM_MAX_CHARS = 600
+# Ctrl-c also interrupts a turn, so a second press meant to make sure the turn
+# stopped must not close chad. Two presses this close together are deliberate.
+_QUIT_WINDOW_S = 2.0
+# How long a quit waits for the running turn to stop and save before closing anyway.
+_QUIT_SAVE_WAIT_S = 5.0
 # How long a confirm must be on screen before y/n count. Long enough that the key
 # already on its way down when the panel appeared cannot answer it.
 _CONFIRM_GRACE_S = 0.4
@@ -267,6 +272,18 @@ def slash_matches(text: str):
     return [(c, d) for (c, d) in rows if c.startswith(text)]
 
 
+def _recent_plans(limit: int = 5) -> list[str]:
+    """The newest markdown files in ./plans, by modification time, as relative paths."""
+    try:
+        names = [n for n in os.listdir("plans")
+                 if n.endswith(".md") and n != "README.md"]
+    except OSError:
+        return []
+    paths = [os.path.join("plans", n) for n in names]
+    paths.sort(key=os.path.getmtime, reverse=True)
+    return paths[:limit]
+
+
 def at_path_token(text_before_cursor: str) -> Optional[str]:
     """The `@`-path fragment under the cursor (text AFTER the `@`), or None when the
     cursor isn't in an `@`-token. The token is the last whitespace-delimited chunk."""
@@ -395,7 +412,9 @@ class TUI:
     def __init__(self, engine: BaseEngine, ctx_limit: int, mode: str = "normal",
                  thinking: bool = True, max_chars: int = 400_000, resume: list = None,
                  ctx_window: int = None, finalize=None, ctx_limit_fn=None,
-                 native_ctx: int = None, speech: Optional[_SpeechModule] = None,
+                 native_ctx: int = None,
+                 describe_load_error: Optional[Callable[[Exception], list[str]]] = None,
+                 speech: Optional[_SpeechModule] = None,
                  recorder: Optional[_Recorder] = None, speaker: Optional[_Speaker] = None):
         self.engine = engine
         self.ctx_limit = ctx_limit
@@ -416,6 +435,7 @@ class TUI:
         self._finalize = finalize
         self._model_ready = threading.Event()
         self._load_error = None
+        self._describe_load_error = describe_load_error
         if finalize is None:
             self._model_ready.set()
 
@@ -424,12 +444,16 @@ class TUI:
         self._lock = threading.Lock()
         self._queue = deque()              # user messages awaiting the worker
         self._steer_queue = deque()        # mid-run steering awaiting the agent's drain
+        self._quit_armed_at = 0.0          # when ctrl-c on an empty prompt last asked to quit
+        self._quit_save_wait_s = _QUIT_SAVE_WAIT_S
+        self._reset_wait_s = 10.0          # how long /reset waits for a running turn to stop
         self._wake = threading.Event()     # signal the worker that work/queue changed
         self._shutdown = False
         self._busy = False
         self._cur_prompt_tokens = 0        # last rendered prompt size (context gauge)
         self._tick = 0                     # animation frame counter (spinner)
         self._dirty = False                # something the status line shows changed
+        self._yolo_noticed = False         # the unconfined-yolo notice was shown
         self._phase = "Thinking"           # current activity verb shown by the spinner
         # Live activity readouts for the bottom status line. Reset per
         # turn in _worker; updated by the agent's gen/prefill emits. Display-only.
@@ -456,7 +480,8 @@ class TUI:
         # Plan-mode handoff state. After a plan-mode turn writes a plan file,
         # `_pending_plan` holds its path and the user can steer (type) or accept
         # (ctrl-g / `/accept`). The accepted implementation session inherits the
-        # session's baseline permission mode (auto when launched --yolo, else normal).
+        # session's baseline permission mode (the mode chad was launched in; normal when
+        # that was plan).
         self._pending_plan = None
         self._base_mode = self.agent.mode if self.agent.mode != "plan" else "normal"
         # Governor handoff: after a turn hard-stops on its budget, holds the
@@ -714,6 +739,8 @@ class TUI:
             left = [("class:spinner", f" {frame} {glyph} {self._phase}…  "),
                     ("class:idle", f"{prog}{elapsed}s · ↑{_kfmt(self._prefilled)} "
                                    f"↓{_kfmt(self._gen_tokens)} · {cap}ctrl-c ")]
+        elif self._load_error:
+            left = [("class:confirm", " model did not load — /exit and see the message above ")]
         else:
             left = [("class:idle", f" {_phase_glyph(self._phase)} ready ")]
         # Voice indicator ahead of everything: while the mic is open the user
@@ -816,6 +843,7 @@ class TUI:
         @kb.add("s-tab", filter=~confirming)
         def _(event):
             self.agent.cycle_mode()
+            self._after_mode_change()
             event.app.invalidate()
 
         # ctrl-g accepts a pending plan (clear context + start implementing) when the
@@ -889,9 +917,14 @@ class TUI:
                 self._confirm_event.set()  # unblock a pending confirm as a denial
                 self._emit("info", "  [interrupting…]")
             elif self.input.text.strip():
-                self.input.buffer.reset()
+                self.input.buffer.reset(append_to_history=True)
             else:
-                self._shutdown_app(event)
+                now = time.monotonic()
+                if now - self._quit_armed_at <= _QUIT_WINDOW_S:
+                    self._shutdown_app(event)
+                else:
+                    self._quit_armed_at = now
+                    self._emit("info", "press ctrl-c again to quit (ctrl-d quits at once)")
 
         # Escape hard-interrupts a running turn (parity with ctrl-c and Claude Code)
         # so you can stop a trace and steer immediately instead of queueing behind it.
@@ -910,33 +943,63 @@ class TUI:
         return kb
 
     def _shutdown_app(self, event):
-        self._shutdown = True
+        self._request_quit()
+
+    def _request_quit(self):
+        """Quit. If a turn is running, stop it and wait for the worker to save the
+        conversation first: the worker is a daemon thread, so closing the app under it
+        ends the process with the turn unsaved."""
         if self._speaker:
             self._speaker.stop()
         if self._recorder:
             self._recorder.close()
+        if not self._busy:
+            self._close_app()
+            return
+        # `_shutdown` stays unset until the worker is done: its loop exits on it, and
+        # `_confirm` answers False on it, either of which would cut the save short.
+        self._interrupt.set()
+        self._confirm_event.set()  # a pending confirm counts as a denial
+        self._emit("info", "  [stopping the turn and saving…]")
+
+        def _wait():
+            idle = threading.Event()
+            deadline = time.monotonic() + self._quit_save_wait_s
+            while self._busy and time.monotonic() < deadline:
+                idle.wait(0.02)
+            loop = self.app.loop
+            if loop is not None:
+                loop.call_soon_threadsafe(self._close_app)
+            else:
+                self._close_app()
+        threading.Thread(target=_wait, daemon=True, name="chad-quit").start()
+
+    def _close_app(self):
+        self._shutdown = True
         self._wake.set()
         self._confirm_event.set()
-        event.app.exit()
+        self.app.exit()
 
     # -- session reset / plan handoff ------------------------------------
 
     def _fresh_agent(self, mode: str) -> bool:
         """Clear the conversation + KV cache and start a new Agent in `mode`.
         Returns False (without resetting) if a turn won't yield in time."""
-        self._queue.clear()
-        self._steer_queue.clear()
         if self._busy:
             # A turn is on the worker thread mutating engine._cache / _cached_ids.
             # Signal it to stop and wait for it to unwind before we reset the cache,
             # otherwise we race the live generate().
             self._interrupt.set()
-            deadline = time.time() + 10
+            deadline = time.time() + self._reset_wait_s
             while self._busy and time.time() < deadline:
                 time.sleep(0.02)
             if self._busy:
-                self._emit("info", "reset deferred: turn still running.")
+                self._emit("info", "reset deferred: turn still running. Your queued "
+                                   "messages are kept.")
                 return False
+        # Only now is the reset certain: a deferred one must not have eaten the queue.
+        self._queue.clear()
+        self._steer_queue.clear()
         self.agent = Agent(
             self.engine, ctx_limit=self.ctx_limit, mode=mode,
             thinking=self.thinking, emit=self._emit, confirm=self._confirm,
@@ -952,12 +1015,26 @@ class TUI:
         self.engine.reset()
         return True
 
-    def _accept_plan(self):
-        """Accept a pending plan: clear context and start a fresh implementation
-        session (inheriting the session's baseline perms) seeded to execute it."""
+    def _accept_plan(self, named: str = ""):
+        """Accept a plan: clear context and start a fresh implementation session
+        (inheriting the session's baseline perms) seeded to execute it. `named` picks
+        one by path — a plan written in an earlier session, or revised since the banner
+        was shown, is still a plan."""
         path = self._pending_plan
+        if named:
+            candidate = os.path.abspath(os.path.expanduser(named))
+            if not os.path.isfile(candidate):
+                self._emit("info", f"no such plan file: {named}")
+                return
+            path = candidate
         if not path:
             self._emit("info", "no plan pending.")
+            recent = _recent_plans()
+            if recent:
+                self._emit("info", "  plans in ./plans, newest first — accept one "
+                                   "with /accept <path>:")
+                for rel in recent:
+                    self._emit("info", f"    {rel}")
             return
         rel = os.path.relpath(path)
         if not self._fresh_agent(self._base_mode):
@@ -975,7 +1052,7 @@ class TUI:
         messages, so the original session file is never overwritten."""
         from . import session
         if not arg:
-            items = session.list_sessions(os.getcwd(), limit=10)
+            items = session.list_sessions(os.getcwd(), limit=session.RETAIN)
             if not items:
                 self._emit("info", "no saved sessions for this directory.")
                 return
@@ -989,7 +1066,7 @@ class TUI:
         except ValueError:
             self._emit("info", "usage: /resume  (to list)  ·  /resume <number>")
             return
-        items = self._resume_list or session.list_sessions(os.getcwd(), limit=10)
+        items = self._resume_list or session.list_sessions(os.getcwd(), limit=session.RETAIN)
         if not (1 <= n <= len(items)):
             self._emit("info", "out of range — run /resume to see the list.")
             return
@@ -1008,6 +1085,7 @@ class TUI:
         self.agent.messages += [m for m in data["messages"] if m.get("role") != "system"]
         self._resume_list = []
         self._emit("info", f"resumed (forked): {session.describe(pick)}")
+        self._emit_recap(data["messages"])
 
     # -- voice mode (/speech) ---------------------------------------------
 
@@ -1154,6 +1232,18 @@ class TUI:
                 loop.call_soon_threadsafe(self.input.buffer.insert_text, text)
         threading.Thread(target=_job, daemon=True, name="chad-stt").start()
 
+    def _in_background(self, name: str, job: Callable[[], None]) -> None:
+        """Run `job` off the UI thread. Anything that waits on a network or a person
+        must: the event loop that would draw its progress is the one it would block."""
+        def _run():
+            try:
+                job()
+            except Exception as e:  # noqa: BLE001 — report, keep the session alive
+                self._emit("error", f"[{name} failed: {type(e).__name__}: {e}]")
+            finally:
+                self._dirty = True
+        threading.Thread(target=_run, daemon=True, name=f"chad-{name}").start()
+
     def _speak_reply(self):
         """Read the turn's final prose aloud (worker thread; `say` is a detached
         subprocess, so this never blocks the next queued turn)."""
@@ -1181,9 +1271,7 @@ class TUI:
         if not text:
             return False
         if text in ("/exit", "/quit"):
-            self._shutdown = True
-            self._wake.set()
-            self.app.exit()
+            self._request_quit()
             return False
         # While the weights load in the background the engine isn't built yet, so the
         # commands that reset/compact/reslot the KV cache would crash. Typing a task is
@@ -1192,15 +1280,22 @@ class TUI:
                 text.startswith(("/reset", "/clear", "/compact", "/ctx", "/resume", "/accept"))):
             self._emit("info", "still loading the model — try that once it's ready.")
             return False
+        # A failed load leaves the engine unbuilt: the same commands would crash on it.
+        if self._load_error and text.startswith(
+                ("/reset", "/clear", "/compact", "/ctx", "/resume", "/accept")):
+            self._emit("info", "the model did not load, so there is nothing to act on "
+                               "— /exit and see the message above.")
+            return False
         if text in ("/reset", "/clear"):
             if self._fresh_agent(self.agent.mode):
                 self._emit("info", "session reset.")
             return False
-        if text == "/accept":
-            self._accept_plan()
+        if text == "/accept" or text.startswith("/accept "):
+            self._accept_plan(text[len("/accept"):].strip())
             return False
         if text == "/mode":
             self.agent.cycle_mode()
+            self._after_mode_change()
             return False
         if text == "/speech":
             self._toggle_speech()
@@ -1250,6 +1345,11 @@ class TUI:
                 return False
             msg = checkpoint.restore(ws, arg or "HEAD")
             self._emit("info", msg)
+            if msg.startswith("restored"):
+                # The conversation still says the edit happened. Until the model is
+                # told, its next edit will look for text that is no longer in the file.
+                self._emit("info", "  chad has not been told about this. Mention it in "
+                                   "your next message, or /reset to start clean.")
             return False
         if text == "/resume" or text.startswith("/resume "):
             self._handle_resume(text[len("/resume"):].strip())
@@ -1274,9 +1374,8 @@ class TUI:
             return False
         if text == "/mcp trust":
             from . import mcp
-            mcp.trust()
-            self._emit("info", "trusted this project — its .mcp.json servers will "
-                               "connect on the next turn")
+            for ln in mcp.trust():
+                self._emit("info", ln)
             return False
         if text.startswith("/mcp login"):
             from . import mcp
@@ -1284,12 +1383,17 @@ class TUI:
             if not name:
                 self._emit("info", "usage: /mcp login <server>")
                 return False
-            self._emit("info", mcp.login(name, emit=lambda m: self._emit("info", m)))
+            self._emit("info", f"logging in to {name}… (esc or ctrl-c keeps working)")
+            self._in_background("mcp-login", lambda: self._emit(
+                "info", mcp.login(name, emit=lambda m: self._emit("info", m))))
             return False
         if text == "/mcp":
             from . import mcp
-            for ln in mcp.summary_lines():
-                self._emit("info", "  " + ln)
+
+            def _show():
+                for ln in mcp.summary_lines():
+                    self._emit("info", "  " + ln)
+            self._in_background("mcp", _show)
             return False
         if text == "/help":
             self._emit("info", "shift-tab: cycle mode (normal/auto-accept edits/yolo/plan) "
@@ -1299,7 +1403,9 @@ class TUI:
                                "· /<skill> runs an installed skill (/skills lists them) "
                                "· !cmd shell · @path "
                                "attach · type while busy to steer the running turn "
-                               "(applies after the current step) · plan ready: type to "
+                               "(applies after the current step) "
+                               "· alt-enter/ctrl-j: new line · ctrl-d: quit "
+                               "· ctrl-t: dictate (with /speech) · plan ready: type to "
                                "steer, ctrl-g to accept")
             return False
         # Every builtin above matched exactly and returned. What is left that still
@@ -1396,8 +1502,11 @@ class TUI:
                     cmd = msg[1:].strip()
                     if cmd:
                         self._emit("tool", f"Run  {cmd}")
-                        out = tool_bash(cmd, should_stop=self._interrupt.is_set)
-                        render_tool_result(self._emit, "bash", {"command": cmd}, out)
+                        # Typed by the person at the terminal, in their own shell's
+                        # environment: the guard is there to contain the model.
+                        out = tool_bash(cmd, should_stop=self._interrupt.is_set,
+                                        env_guard=False)
+                        render_passthrough(self._emit, out)
                 else:
                     self.agent.run_turn(msg, stream=True)
                     self.agent.save()  # persist conversation for --continue
@@ -1462,11 +1571,32 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
             self._emit("info", f"ready in {load_s:.0f}s · {detail}")
         except Exception as e:  # noqa: BLE001 — surface load failure; don't hang the worker
             self._load_error = f"{type(e).__name__}: {e}"
-            self._emit("error", f"[model load failed: {self._load_error}]")
+            lines = (self._describe_load_error(e) if self._describe_load_error
+                     else [f"[model load failed: {self._load_error}]"])
+            for ln in lines:
+                self._emit("error", ln)
+            self._emit("error", "  nothing can run in this session — /exit, then see the "
+                                "fix above")
         finally:
             self._model_ready.set()
             self._dirty = True  # the status line leaves its loading state
             self._wake.set()  # nudge the worker if a message was queued while loading
+
+    def _after_mode_change(self):
+        """On entering yolo, say so if its sandbox is not there. Once per session: the
+        answer cannot change while chad runs. Off the UI thread, because the first
+        probe runs a subprocess."""
+        if self.agent.mode != "yolo" or self._yolo_noticed:
+            return
+        self._yolo_noticed = True
+
+        def _check():
+            from . import seatbelt
+            notice = seatbelt.yolo_notice()
+            if notice:
+                self._emit("error", notice)
+                self._dirty = True
+        threading.Thread(target=_check, daemon=True, name="chad-seatbelt").start()
 
     def _emit_first_task_hint(self):
         """One muted line under the banner on a FRESH session (resume is None): a small
@@ -1480,6 +1610,16 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
                    'tests/test_x.py" lands; "improve my codebase" flails. '
                    "shift-tab cycles plan mode.")
 
+    def _emit_recap(self, messages):
+        """What the user last asked in a resumed conversation, above the prompt."""
+        from . import session
+        lines = session.recap(messages)
+        if not lines:
+            return
+        self._emit("muted", "you last asked:")
+        for ln in lines:
+            self._emit("muted", "  » " + ln)
+
     async def run(self):
         worker = threading.Thread(target=self._worker, daemon=True)
         worker.start()
@@ -1492,6 +1632,13 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
         for ln in instructions_notice():
             self._emit("info", ln)
         self._emit_first_task_hint()
+        if self._resume is not None:
+            self._emit_recap(self._resume)
+        from .tools import env_guard_notice
+        notice = env_guard_notice()
+        if notice:
+            self._emit("muted", notice)
+        self._after_mode_change()
         if self._finalize is not None:
             self._emit("info", f"loading {self.engine.model_id.split('/')[-1]}… "
                                "(type ahead — your first message runs when it's ready)")
@@ -1509,7 +1656,8 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
 
 def run_tui(engine: BaseEngine, ctx_limit: int, mode: str = "normal", thinking: bool = True,
             resume: list = None, ctx_window: int = None, finalize=None, ctx_limit_fn=None,
-            native_ctx: int = None):
+            native_ctx: int = None,
+            describe_load_error: Optional[Callable[[Exception], list[str]]] = None):
     asyncio.run(TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume,
                     ctx_window=ctx_window, finalize=finalize, ctx_limit_fn=ctx_limit_fn,
-                    native_ctx=native_ctx).run())
+                    native_ctx=native_ctx, describe_load_error=describe_load_error).run())

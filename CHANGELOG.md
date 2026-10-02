@@ -10,6 +10,66 @@ Notable, user-visible changes.
   values in the same order, so every output is bit-identical to before, and the GEMV on
   the format that carries 38% of the file goes from ~154 to ~180 GB/s on an M4 Pro.
   Receipts and the per-format bandwidth map in `benchmarks/gguf_decoders/`.
+**`/accept` works after the plan is revised.** The handoff was remembered only when the
+model wrote the file; a revision is an edit, so the first steer ended in "no plan
+pending". Edits now count, `/accept <path>` accepts any plan file, and `/accept` with
+nothing pending lists the newest plans. In plan mode a write can no longer replace a
+plan file the session did not write.
+
+**The docs describe the chad that ships.** They said chad decodes greedily (it samples at
+temperature 1.0), that the turn governor is for one-shot runs only (it applies to every
+session), and that conversations are saved only on resume (every one is). Examples are
+written as `chad …` and run however chad was installed, the first-run disk requirement
+(~30 GB) is stated, and the messages chad prints link to pages that exist.
+
+**`/mcp` shows what you are being asked to trust.** A gated project server was listed
+by name only. `/mcp` now shows the command it would run or the URL it would reach, and
+`/mcp trust` lists what it trusted, refuses a directory with no `.mcp.json`, and says so
+when the trust store cannot be saved. A stored login is tied to the URL it was made
+for: a project server that reuses the name of one of yours needs its own login.
+
+**A `!command` in the TUI shows its output.** It went through the renderer for the
+model's tool calls: six lines of a success, and only the exit status of a failure. It now
+shows up to 200 lines, keeping the head and the tail of anything longer, and a failing
+command shows what it printed.
+
+**Quitting mid-turn no longer loses the turn.** ctrl-d and `/exit` closed the app under
+the running turn, which was never saved. They now stop the turn, wait for it to save,
+and then close. ctrl-c on an empty prompt asks for a second press, text cleared with
+ctrl-c goes to the input history, and a `/reset` that has to be deferred keeps your
+queued messages.
+
+**Resuming shows what you are resuming.** `chad -c` names the session by its title and
+prints the last things you asked, as `/resume` and `--resume` now do. The pickers list
+all 20 kept sessions instead of 10, and chad says when saving removes the oldest one.
+
+**Yolo says when its sandbox is not there.** Inside another sandbox (CI, a container
+harness, another agent's shell) the yolo sandbox cannot be applied and commands run
+unconfined. That was only written to a log that is off by default. Entering yolo now
+prints it, as it does when `CHAD_NO_SEATBELT` is set.
+
+**The environment guard says what it withholds.** An interactive session now lists the
+credential-shaped variables chad's commands will not see. They used to vanish without a
+word: `git push` failed on a missing ssh-agent and `aws` fell back to the default
+profile. A command you type yourself with `!` is no longer filtered.
+
+**`/undo` can be undone.** It restored over whatever was in the workspace, including
+your own edits since the last checkpoint, without saving it. It now snapshots that
+state first and names the checkpoint, says "nothing to undo" when nothing differs, and
+reminds you that the model has not been told about the revert.
+
+**MCP and skill problems are shown when they happen.** The first turn of a session
+prints one line with how many MCP servers connected, failed or are waiting, and names
+the wait while it connects. `/mcp` and `/skills` list every warning, with skipped files
+ahead of duplicates; they used to show three. `/mcp login` and `/mcp` run off the UI
+thread, so the approval URL appears while the login is still waiting for it.
+
+**Failures at startup say what to do.** A model that fails to load in the TUI now shows
+the cause and the fix and the status row stops saying "ready". A `--model` path that does
+not exist is reported as a missing path instead of a download problem, and a GGUF chad
+cannot read is a message, not a traceback. `--plan --yolo`, `-c --resume`, `--repl` with a
+task, and the remote flags without `--backend llama` are errors; each used to be resolved
+silently.
 
 **Ctrl-c outside the TUI was a traceback.** In `--repl` and one-shot runs the first
 ctrl-c now ends the turn at its next step and the conversation is saved; a second one

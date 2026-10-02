@@ -109,6 +109,8 @@ def rec(monkeypatch, tmp_path):
     for var in ("CHAD_AUTO_CONTINUE", "CHAD_TURN_BUDGET_S", "CHAD_REVIEW_PASS",
                 "CHAD_DISABLE"):
         monkeypatch.delenv(var, raising=False)
+    # Yolo runs the sandbox probe, a real sandbox-exec; opting out keeps it off the suite.
+    monkeypatch.setenv("CHAD_NO_SEATBELT", "1")
     monkeypatch.chdir(tmp_path)  # the session store is keyed on cwd
     return rec
 
@@ -155,6 +157,15 @@ def test_one_shot_permission_mode(rec, capsys, argv, tty, mode, promoted):
     assert agent.turns == ["do X"]
     assert agent.saved  # a follow-up `chad -c` can pick the thread up
     assert ("[headless: auto-approving" in capsys.readouterr().err) is promoted
+
+
+@pytest.mark.parametrize("argv, noticed", [
+    (["--yolo", "do X"], True),
+    (["do X"], False),
+])
+def test_one_shot_yolo_says_when_it_is_unconfined(rec, capsys, argv, noticed):
+    rec.main(argv, tty=True)
+    assert ("UNCONFINED" in capsys.readouterr().err) is noticed
 
 
 # --- ctrl-c in a one-shot run -------------------------------------------------
@@ -224,6 +235,17 @@ def test_continue_resumes_the_newest_session(rec):
     rec.main(["-c", "do X"], tty=True)
 
     assert rec.agents[0].kw["resume"] == newest
+
+
+def test_continue_names_the_session_and_recaps_it(rec, capsys):
+    session.save_session(os.getcwd(), [{"role": "user", "content": "fix the retry test"}], {})
+
+    rec.main(["-c", "continue"], tty=True)
+
+    err = capsys.readouterr().err
+    assert "resuming (forked):" in err
+    assert '"fix the retry test"' in err
+    assert "  » fix the retry test" in err
 
 
 def test_continue_without_a_saved_session_starts_fresh(rec, capsys):
@@ -355,3 +377,32 @@ def test_terminal_stdout_keeps_the_streaming_emitter(rec, capsys):
 
     assert rec.agents[0].kw["emit"] is None
     assert "ok" not in capsys.readouterr().out
+
+
+# --- flags that contradict each other -----------------------------------------
+
+@pytest.mark.parametrize("argv, flag", [
+    (["--plan", "--yolo"], "--plan"),
+    (["-c", "--resume"], "--resume"),
+    (["--repl", "do X"], "--repl"),
+    (["--base-url", "http://h:1"], "--base-url"),
+    (["--tokenizer", "owner/name"], "--tokenizer"),
+    (["--api-key-env", "KEY"], "--api-key-env"),
+])
+def test_conflicting_flags_are_a_usage_error(rec, capsys, argv, flag):
+    with pytest.raises(SystemExit) as exc:
+        rec.main(argv, tty=True)
+
+    assert exc.value.code == 2
+    assert rec.agents == [] and rec.engines == []
+    assert flag in capsys.readouterr().err
+
+
+def test_remote_flags_with_the_llama_backend_are_not_a_conflict(capsys):
+    # The benchmark kit's argv. Checked at the parser, not through `main`: past it the
+    # remote backend would fetch a real tokenizer.
+    ap = cli._agent_parser()
+    args = ap.parse_args(["--yolo", "--backend", "llama", "--base-url", "http://h:1",
+                          "--tokenizer", "owner/name", "do X"])
+    cli._reject_conflicts(ap, args)
+    assert "only applies with --backend llama" not in capsys.readouterr().err

@@ -118,10 +118,12 @@ def is_oauth(spec: dict) -> bool:
 # ---------------------------------------------------------------------------
 #
 # The file maps a server key -> {"tokens": <OAuthToken>, "client_info":
-# <OAuthClientInformationFull>}. Both are pydantic models persisted via model_dump and
-# rehydrated via model_validate. The file is created 0600 from the first write so a
-# token is never briefly world-readable, mirroring the MCP trust store. Token VALUES
-# are never logged — only the server key and field name ever appear in diagnostics.
+# <OAuthClientInformationFull>, "bound": {"url": <str>}}. The first two are pydantic
+# models persisted via model_dump and rehydrated via model_validate; `bound` records the
+# URL the login was made against, since a server name alone does not pin an endpoint.
+# The file is created 0600 from the first write so a token is never briefly
+# world-readable, mirroring the MCP trust store. Token VALUES are never logged — only
+# the server key and field name ever appear in diagnostics.
 
 _io_lock = threading.Lock()
 
@@ -180,6 +182,31 @@ def has_tokens(server_key: str) -> bool:
     access token for this server? (Presence only — never inspects/logs the value.)"""
     tokens = _read_section(server_key, "tokens")
     return bool(tokens and tokens.get("access_token"))
+
+
+def bind(server_key: str, url: str) -> None:
+    """Record which URL this server's login was made against."""
+    _write_section(server_key, "bound", {"url": url})
+
+
+def bound_url(server_key: str) -> "str | None":
+    """The URL this server's login was made against, or None for a login stored before
+    logins were bound."""
+    bound = _read_section(server_key, "bound")
+    url = bound.get("url") if bound else None
+    return url if isinstance(url, str) and url else None
+
+
+def login_matches(server_key: str, url: str, *, require_binding: bool) -> bool:
+    """Whether the stored login may be used for a server at `url`. A login is for one
+    endpoint; a server of the same name that points somewhere else has not been logged
+    in to. `require_binding` refuses an unbound (older) login outright."""
+    if not has_tokens(server_key):
+        return False
+    bound = bound_url(server_key)
+    if bound is None:
+        return not require_binding
+    return bound == url
 
 
 class FileTokenStorage:

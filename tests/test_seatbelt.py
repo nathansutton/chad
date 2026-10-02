@@ -202,6 +202,30 @@ def test_probe_result_is_cached():
     assert len(calls) == 1
 
 
+# -- saying when yolo is unconfined -------------------------------------------
+
+def test_unconfined_reason_is_none_when_the_sandbox_enforces(monkeypatch):
+    monkeypatch.delenv("CHAD_NO_SEATBELT", raising=False)
+    assert _capable().unconfined_reason() is None
+
+
+def test_unconfined_reason_names_a_sandbox_that_cannot_apply(monkeypatch):
+    monkeypatch.delenv("CHAD_NO_SEATBELT", raising=False)
+    reason = seatbelt.Seatbelt(platform_ok=lambda: False).unconfined_reason()
+    assert reason is not None and "cannot be applied" in reason
+
+
+def test_unconfined_reason_names_the_opt_out_without_probing(monkeypatch):
+    monkeypatch.setenv("CHAD_NO_SEATBELT", "1")
+
+    def _must_not_run(argv):
+        raise AssertionError(f"probe ran with the sandbox switched off: {argv}")
+
+    sb = seatbelt.Seatbelt(platform_ok=lambda: True, run=_must_not_run)
+    reason = sb.unconfined_reason()
+    assert reason is not None and "CHAD_NO_SEATBELT" in reason
+
+
 # -- the spawned shell's environment (bash_env_guard) -------------------------
 
 def test_bash_env_strips_credential_shaped_names(monkeypatch):
@@ -270,6 +294,88 @@ def test_bash_env_guard_end_to_end(monkeypatch):
     out = tools.tool_bash("printenv SOME_API_KEY; printenv HARMLESS_SETTING")
     assert "sekrit-value" not in out
     assert "visible-value" in out
+
+
+
+# -- naming what the guard withholds, and whose commands it filters -----------
+
+def _clear_withheld(monkeypatch):
+    """Drop whatever the developer's own shell exports, so counts are exact."""
+    monkeypatch.delenv("CHAD_NO_ENV_GUARD", raising=False)
+    for name in tools.withheld_env_names():
+        monkeypatch.delenv(name)
+
+
+def test_withheld_env_names_lists_credential_names(monkeypatch):
+    _clear_withheld(monkeypatch)
+    monkeypatch.setenv("GITHUB_TOKEN", "k")
+    monkeypatch.setenv("AWS_PROFILE", "prod")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    names = tools.withheld_env_names()
+    assert names == ["AWS_PROFILE", "GITHUB_TOKEN", "SSH_AUTH_SOCK"]
+    assert "PATH" not in names
+
+
+def test_withheld_env_names_includes_a_credential_url(monkeypatch):
+    _clear_withheld(monkeypatch)
+    monkeypatch.setenv("REDIS_URL", "redis://u:p@h/0")
+    assert tools.withheld_env_names() == ["REDIS_URL"]
+
+
+def test_withheld_env_names_empty_when_guard_off(monkeypatch):
+    _clear_withheld(monkeypatch)
+    monkeypatch.setenv("GITHUB_TOKEN", "k")
+    monkeypatch.setenv("CHAD_NO_ENV_GUARD", "1")
+    assert tools.withheld_env_names() == []
+    assert tools.env_guard_notice() == ""
+
+
+def test_env_guard_notice_names_but_never_values(monkeypatch):
+    _clear_withheld(monkeypatch)
+    values = {"GITHUB_TOKEN": "ghp-value-must-not-show",
+              "AWS_PROFILE": "prod-account-must-not-show",
+              "REDIS_URL": "redis://u:hunter2@h/0"}
+    for k, v in values.items():
+        monkeypatch.setenv(k, v)
+    notice = tools.env_guard_notice()
+    for k, v in values.items():
+        assert k in notice
+        assert v not in notice
+    assert "hunter2" not in notice
+
+
+def test_env_guard_notice_caps_the_list(monkeypatch):
+    _clear_withheld(monkeypatch)
+    for i in range(6):
+        monkeypatch.setenv(f"SERVICE{i}_TOKEN", "k")
+    notice = tools.env_guard_notice(limit=4)
+    assert "6 credential-shaped" in notice
+    assert "+2 more" in notice
+
+
+def test_the_agents_commands_stay_guarded(monkeypatch):
+    monkeypatch.delenv("CHAD_NO_ENV_GUARD", raising=False)
+    monkeypatch.setenv("DEPLOY_TOKEN", "value-that-must-not-appear")
+    out = tools.tool_bash('printf "%s" "${DEPLOY_TOKEN:-unset}"', wrap=lambda c: None)
+    assert out == "unset"
+
+
+def test_the_users_own_command_is_not_filtered(monkeypatch):
+    monkeypatch.delenv("CHAD_NO_ENV_GUARD", raising=False)
+    monkeypatch.setenv("DEPLOY_TOKEN", "present")
+    out = tools.tool_bash('printf "%s" "${DEPLOY_TOKEN:-unset}"', wrap=lambda c: None,
+                          env_guard=False)
+    assert out == "present"
+
+
+def test_the_dispatched_bash_tool_keeps_the_guard(monkeypatch):
+    """The agent's path through the dispatch table must never inherit the
+    passthrough's exemption."""
+    seatbelt.set_context(False, None)
+    monkeypatch.delenv("CHAD_NO_ENV_GUARD", raising=False)
+    monkeypatch.setenv("DEPLOY_TOKEN", "value-that-must-not-appear")
+    out = tools.DISPATCH["bash"]({"command": 'printf "%s" "${DEPLOY_TOKEN:-unset}"'}, None)
+    assert out == "unset"
 
 
 # -- the tool_bash seam -------------------------------------------------------

@@ -12,6 +12,7 @@ import textwrap
 import pytest
 
 from chad import compaction, skills, tools
+from chad.diag import warning_lines
 
 
 def _write_skill(root, name, description="Use this when the user mentions widgets.",
@@ -324,3 +325,25 @@ def test_compaction_does_not_truncate_skill_content():
     assert big in survivor["content"]  # skill instructions kept verbatim
     assert compaction._COLLAPSED not in survivor["content"]
 
+
+
+# --- warning list shown by /skills and /mcp -----------------------------------
+
+def test_warning_lines_empty():
+    assert warning_lines([]) == []
+
+
+def test_warning_lines_shows_every_warning():
+    warnings = [f"w{i}: skipped (bad)" for i in range(5)]
+    lines = warning_lines(warnings)
+    assert len(lines) == 6
+    assert lines[0] == "5 warning(s):"
+    assert all(any(w in ln for ln in lines) for w in warnings)
+
+
+def test_warning_lines_puts_skipped_before_duplicates():
+    lines = warning_lines(["a: duplicate at /x shadowed by /y",
+                           "b: skipped (unparseable YAML)"])
+    skipped = next(i for i, ln in enumerate(lines) if "skipped" in ln)
+    dup = next(i for i, ln in enumerate(lines) if "duplicate at" in ln)
+    assert skipped < dup

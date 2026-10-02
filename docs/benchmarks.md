@@ -36,7 +36,7 @@ that appends ~16 tokens):
 | **Qwen3.8-27B `UD-Q3_K_XL` GGUF** (shipped, default) | 104 tok/s | 46.1 tok/s | 0.51 s (16 tok) |
 | same, serial (`CHAD_NO_DFLASH=1`) | 105 tok/s | 11.6 tok/s | 0.51 s (16 tok) |
 
-> Measured on this machine with the command above, chad 2.2.0 at `ca0598a`. Run it on
+> Measured on this machine with the command above, chad, the GGUF loader released as 2.3.0 at `ca0598a`. Run it on
 > yours; these are hardware numbers, not scores.
 
 Prefill is the honest cost of a dense checkpoint: every one of the 27B parameters is read
@@ -80,7 +80,7 @@ comparison that matters is drafted against drafted:
 | same GGUF, same M4 Pro, same prompt | serial | **DFlash2** | speedup |
 |---|---|---|---|
 | llama.cpp `llama-server` b11184 (2026-09-25) | 11.4 tok/s | 11.1 tok/s (96.5% accepted) | 0.97× |
-| chad 2.2.0 | 11.7 tok/s | **48.2 tok/s** | 4.1× |
+| chad, the GGUF loader released as 2.3.0 | 11.7 tok/s | **48.2 tok/s** | 4.1× |
 
 Serial decode is the same on both, since the same bytes stream through the same bandwidth.
 The drafter works on both: llama.cpp accepts 96.5% of what it drafts. The difference is

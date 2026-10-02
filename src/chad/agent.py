@@ -499,6 +499,7 @@ class Agent:
         skills.reset_session()
         from . import mcp
         mcp.reset_session()
+        self._mcp_reported = False
         ambient.reset()
         clear_todos()
         self.mode = mode or ("yolo" if yolo else "normal")
@@ -622,6 +623,8 @@ class Agent:
         # Absolute path of the plan file written during a plan-mode turn (consumed by
         # the TUI to offer the steer/accept handoff); reset each time it's read.
         self.last_plan_path = None
+        # The plan file this session wrote: the one existing plan a `write` may replace.
+        self._plan_written: str | None = None
         # rolling throughput accounting (read by evals / status line)
         self.gen_tokens = 0
         self.gen_time = 0.0
@@ -681,7 +684,14 @@ class Agent:
         if self.persist:
             session.save_session(os.getcwd(), self.messages,
                                  {"mode": self.mode, "thinking": self.thinking},
-                                 session_id=self.session_id)
+                                 session_id=self.session_id, on_prune=self._note_pruned)
+
+    def _note_pruned(self, removed: int) -> None:
+        # Resuming forks, so a directory that is resumed often reaches the limit faster
+        # than its owner expects. The oldest conversation is gone for good; say so.
+        self._emit("info", f"  [removed the {removed} oldest saved session"
+                           f"{'s' * (removed != 1)} for this directory — chad keeps "
+                           f"the newest {session.RETAIN}]")
 
     def compact_now(self):
         """Manual context reclaim (the /compact command). Runs only the SAFE, lossless-
@@ -984,6 +994,20 @@ class Agent:
 
     def _run_turn(self, user_text: str, stream=True):
         self.interrupted = False
+        # The first render of a session connects the MCP servers, and a server that does
+        # not answer holds the turn for a minute. Name the wait, then say how it went —
+        # the warnings are otherwise only visible to someone who thinks to ask.
+        if not self._mcp_reported:
+            self._mcp_reported = True
+            from . import mcp
+            try:
+                if mcp.configured():
+                    self._emit("status", "Connecting MCP servers")
+                    line = mcp.status_line(mcp.service())
+                    if line:
+                        self._emit("info", "  " + line)
+            except Exception:  # noqa: BLE001 — a status line must never end a turn
+                pass
         # Live ctx-limit recheck: re-derive the compaction trigger
         # from current memory conditions. Hysteresis: apply only a >10% move, so the
         # limit doesn't jitter with ordinary turn-to-turn allocator noise.
@@ -1651,12 +1675,23 @@ class Agent:
                 # (see guardrails.plan_mode_verdict).
                 verdict = guardrails.plan_mode_verdict(self.mode, name, args)
                 plan_write = verdict == "plan_write"
+                # A plan write skips the approval prompt, and `write` replaces a file
+                # without asking. Reusing a number would destroy an existing plan with
+                # nobody having been shown either one. Revising with `edit` is fine.
+                if (plan_write and name == "write"
+                        and os.path.exists(str(args.get("path", "") or ""))
+                        and os.path.abspath(str(args["path"])) != self._plan_written):
+                    verdict = "plan_exists"
                 _tool_s = 0.0  # stays 0 when the tool is blocked/denied (fn never ran)
                 if verdict == "blocked":
                     result = ("[plan mode: only writing the plan file under ./plans/ is "
                               "allowed. Do not edit project files or run commands. "
                               "Investigate with read-only bash, then write your "
                               "plan to ./plans/NNN-title.md.]")
+                elif verdict == "plan_exists":
+                    result = (f"[plan mode: {args['path']} already exists and is a "
+                              "different plan. Choose the next unused number, or "
+                              "revise this file with `edit`.]")
                 elif not plan_write and not self._confirm(name, args):
                     # A plan write is the expected action in plan mode, so it skips the
                     # confirm prompt; everything else still goes through _confirm. A
@@ -1678,8 +1713,11 @@ class Agent:
                     seatbelt.set_context(self.mode == "yolo", os.getcwd())
                     try:
                         result = fn(args, self._should_stop)
-                        if plan_write and result.startswith("[wrote"):
+                        # A revision arrives as an `edit`: the prompt tells the model
+                        # to change existing files that way. It is the same plan.
+                        if plan_write and result.startswith(("[wrote", "[edited")):
                             self.last_plan_path = os.path.abspath(args["path"])
+                            self._plan_written = self.last_plan_path
                     except Exception as e:  # noqa: BLE001 - surface tool errors to model
                         result = f"[tool error: {type(e).__name__}: {e}]"
                     finally:
@@ -1906,6 +1944,24 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
     print(f"{C_DIM}type a task, or /reset, /exit.{C_RST}")
     for ln in instructions_notice():
         print(f"{C_DIM}{ln}{C_RST}")
+    from .tools import env_guard_notice
+    notice = env_guard_notice()
+    if notice:
+        print(f"{C_DIM}{notice}{C_RST}")
+    from . import seatbelt
+    yolo_noticed = False
+
+    def after_mode_change() -> None:
+        # Once per session: whether the sandbox applies cannot change while chad runs.
+        nonlocal yolo_noticed
+        if agent.mode != "yolo" or yolo_noticed:
+            return
+        yolo_noticed = True
+        yolo_notice = seatbelt.yolo_notice()
+        if yolo_notice:
+            print(f"{C_RED}{yolo_notice}{C_RST}")
+
+    after_mode_change()
     while True:
         try:
             line = input(f"{C_YEL}» {C_RST}").strip()
@@ -1924,6 +1980,7 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             continue
         if line == "/mode":
             print(f"{C_DIM}mode: {MODE_LABEL[agent.cycle_mode()]}{C_RST}")
+            after_mode_change()
             continue
         if line == "/compact":
             b, a = agent.compact_now()
@@ -1940,9 +1997,8 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
             continue
         if line == "/mcp trust":
             from . import mcp
-            mcp.trust()
-            print(f"{C_DIM}trusted this project — its .mcp.json servers will connect "
-                  f"on the next turn{C_RST}")
+            for ln in mcp.trust():
+                print(f"{C_DIM}{ln}{C_RST}")
             continue
         if line.startswith("/mcp login"):
             from . import mcp
@@ -1992,6 +2048,6 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
                 from .tools import tool_bash
                 if clear_stop is not None:
                     clear_stop()
-                print(f"{C_DIM}{tool_bash(cmd, should_stop=should_stop)}{C_RST}")
+                print(f"{C_DIM}{tool_bash(cmd, should_stop=should_stop, env_guard=False)}{C_RST}")
             continue
         turn(line)

@@ -27,6 +27,7 @@ import json
 import os
 import secrets
 import time
+from typing import Callable
 
 from . import config
 from .diag import redact
@@ -228,11 +229,12 @@ def list_sessions(cwd: str, limit: int = None) -> list:
     return items[:limit] if limit else items
 
 
-def _prune(cwd: str, keep: int = RETAIN) -> None:
-    """Retention: keep the newest `keep` sessions, remove older files + index rows."""
+def _prune(cwd: str, keep: int = RETAIN) -> int:
+    """Retention: keep the newest `keep` sessions, remove older files + index rows.
+    Returns how many sessions were removed."""
     sessions = _load_index(cwd)["sessions"]
     if len(sessions) <= keep:
-        return
+        return 0
     ordered = sorted(sessions.items(), key=lambda kv: kv[1].get("updated", 0), reverse=True)
     for sid, _meta in ordered[keep:]:
         try:
@@ -241,6 +243,7 @@ def _prune(cwd: str, keep: int = RETAIN) -> None:
             pass
         sessions.pop(sid, None)
     _write_index(cwd, sessions)
+    return len(ordered) - keep
 
 
 def _redacted(messages: list) -> list:
@@ -262,9 +265,11 @@ def _redacted(messages: list) -> list:
 
 
 def save_session(cwd: str, messages: list, meta: dict = None,
-                 session_id: str = None) -> str:
+                 session_id: str = None, *,
+                 on_prune: Callable[[int], None] | None = None) -> str:
     """Atomically persist the conversation for `cwd` to its own session file. Mints a
-    `session_id` if none is given. Updates the index and prunes old sessions (best-effort).
+    `session_id` if none is given. Updates the index and prunes old sessions (best-effort),
+    calling `on_prune` with the count when any were removed.
     Returns the session file path, or '' on failure."""
     try:
         os.makedirs(_dir(cwd), exist_ok=True)
@@ -277,7 +282,9 @@ def save_session(cwd: str, messages: list, meta: dict = None,
         if not ok:
             return ""
         _update_index(cwd, session_id, messages, updated)
-        _prune(cwd)
+        removed = _prune(cwd)
+        if removed and on_prune is not None:
+            on_prune(removed)
         return path
     except OSError:
         return ""
@@ -310,6 +317,27 @@ def describe(item: dict) -> str:
     turns = item.get("turns", 0)
     title = item.get("title") or "(no title)"
     return f'{when} · {turns} turn{"s" * (turns != 1)} · "{title}"'
+
+
+def recap(messages: list, last: int = 3, width: int = 100) -> list[str]:
+    """The last few things the user asked in a conversation, oldest first, one line
+    each — what a resumed session shows so the user is not typing into a conversation
+    they cannot see. A harness prefix in square brackets is not something the user
+    typed, so it is skipped."""
+    asked = []
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        text = str(m.get("content") or "").strip()
+        while text.startswith("["):
+            end = text.find("]")
+            if end < 0:
+                break
+            text = text[end + 1:].strip()
+        line = text.splitlines()[0].strip() if text else ""
+        if line:
+            asked.append(line if len(line) <= width else line[:width - 1] + "…")
+    return asked[-last:]
 
 
 def session_summary(cwd: str) -> str:

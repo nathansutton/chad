@@ -210,8 +210,9 @@ def snapshots(workspace: str, limit: int = 10) -> list:
 
 
 def restore(workspace: str, ref: str = "HEAD") -> str:
-    """Check snapshotted files back out at `ref`. Returns a human-readable
-    one-liner (also used verbatim by the TUI)."""
+    """Check snapshotted files back out at `ref`. The state about to be overwritten
+    is snapshotted first, so a restore can itself be reverted. Returns a
+    human-readable one-liner (also used verbatim by the TUI)."""
     try:
         ok = _git(workspace, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
         if ok.returncode != 0:
@@ -219,13 +220,25 @@ def restore(workspace: str, ref: str = "HEAD") -> str:
             return (f"no checkpoint named {ref!r}" if have else
                     "no checkpoints exist for this workspace yet — snapshots are "
                     "taken before file edits")
-        changed = _git(workspace, "diff", "--name-only", ref)
+        # Resolve the target BEFORE snapshotting: the snapshot below moves HEAD, and
+        # `/undo` means "the checkpoint that was newest when I asked".
+        target = ok.stdout.strip()
+        short = _git(workspace, "rev-parse", "--short", target).stdout.strip() or ref
+        label = _git(workspace, "log", "-1", "--format=%s", target).stdout.strip()
+        changed = _git(workspace, "diff", "--name-only", target)
         n = len([ln for ln in changed.stdout.splitlines() if ln.strip()])
-        r = _git(workspace, "restore", "--worktree", f"--source={ref}", "--", ".")
+        if n == 0:
+            return (f"nothing to undo — the files already match checkpoint {short} "
+                    f"({label}).")
+        # What is about to be overwritten may be the agent's edit or the user's own
+        # work since the last snapshot. Either way it is only recoverable if saved now.
+        saved = snapshot(workspace, f"before restore to {short}")
+        r = _git(workspace, "restore", "--worktree", f"--source={target}", "--", ".")
         if r.returncode != 0:
             return f"restore failed: {r.stderr.strip() or 'unknown git error'}"
-        label = _git(workspace, "log", "-1", "--format=%s", ref).stdout.strip()
-        return (f"restored {n} file(s) to checkpoint {ref} ({label}). Files created "
-                f"since that snapshot were left in place.")
+        back = (f" What was there is saved as {saved}: /restore {saved} brings it back."
+                if saved else " (The previous state could not be saved first.)")
+        return (f"restored {n} file(s) to checkpoint {short} ({label}).{back} Files "
+                f"created since that snapshot were left in place.")
     except (OSError, subprocess.SubprocessError) as e:
         return f"restore failed: {e}"

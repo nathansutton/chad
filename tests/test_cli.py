@@ -107,18 +107,21 @@ def test_levers_prints_the_registry_even_when_chad_disable_is_wrong(monkeypatch,
 def test_pick_model_override(monkeypatch, tmp_path):
     # An explicit CHAD_MODEL wins outright, regardless of RAM or local dirs, and the
     # reason says the choice was requested rather than defaulted.
-    monkeypatch.setenv("CHAD_MODEL", "/some/local/model")
+    env_model, flag_model = tmp_path / "env-model", tmp_path / "flag-model"
+    env_model.mkdir()
+    flag_model.mkdir()
+    monkeypatch.setenv("CHAD_MODEL", str(env_model))
     # even with a surprising RAM reading and a local build present, the override must
     # short-circuit first
     local = tmp_path / "local-build"
     local.mkdir()
     model, why = cli._pick_model(host=_host(8.0), local_model=str(local))
-    check("override returns CHAD_MODEL value", model == "/some/local/model", model)
+    check("override returns CHAD_MODEL value", model == str(env_model), model)
     check("override reason says requested", "requested" in why.lower(), why)
     # `--model` (the `spec` argument) outranks CHAD_MODEL: the flag is the more specific
     # signal, and a shell that exports CHAD_MODEL globally must not pin every run.
-    model, _ = cli._pick_model("/flag/model", host=_host(8.0), local_model=str(local))
-    check("--model beats CHAD_MODEL", model == "/flag/model", model)
+    model, _ = cli._pick_model(str(flag_model), host=_host(8.0), local_model=str(local))
+    check("--model beats CHAD_MODEL", model == str(flag_model), model)
     # `--model auto` is the explicit spelling of "ignore the override, use the default".
     model, why = cli._pick_model("auto", host=_host(64.0),
                                  local_model=str(tmp_path / "no-local-build"))
@@ -425,22 +428,22 @@ def test_pick_model_flag_auto_ignores_env(monkeypatch, tmp_path):
     check("--model auto reason is a default", "default" in why, why)
 
 
-def test_pick_model_flag_repo_passthrough(monkeypatch):
+def test_pick_model_flag_repo_passthrough(monkeypatch, tmp_path):
     # A spec is a literal repo id / local dir, passed through unchanged (the CLI twin of
     # CHAD_MODEL). RAM is irrelevant.
     monkeypatch.delenv("CHAD_MODEL", raising=False)
-    model, why = cli._pick_model("/some/local/model", host=_host(8.0))
-    check("--model repo passthrough", model == "/some/local/model", model)
+    model, why = cli._pick_model(str(tmp_path), host=_host(8.0))
+    check("--model repo passthrough", model == str(tmp_path), model)
     check("passthrough reason names source + override",
           "--model" in why and "override" in why.lower(), why)
 
 
 def test_pick_model_flag_beats_env(monkeypatch, tmp_path):
     # Both set -> the CLI flag wins over CHAD_MODEL.
-    monkeypatch.setenv("CHAD_MODEL", "/env/repo")
-    model, why = cli._pick_model("/flag/repo", host=_host(64.0),
+    monkeypatch.setenv("CHAD_MODEL", "env/repo")
+    model, why = cli._pick_model("flag/repo", host=_host(64.0),
                                  local_model=str(tmp_path / "no-local-build"))
-    check("--model beats CHAD_MODEL", model == "/flag/repo", model)
+    check("--model beats CHAD_MODEL", model == "flag/repo", model)
     check("winner reason names --model", "--model" in why, why)
 
 
@@ -570,8 +573,8 @@ def test_prefill_transient_floor_tracks_the_cache_mode():
 
 def test_pick_model_routes_a_gguf_file(monkeypatch, tmp_path):
     """A `.gguf` path goes through gguf_pack.materialize, however it is spelled: with
-    a `~` and an upper-case suffix included. A path that is not a file falls through
-    as an ordinary explicit request rather than being materialized."""
+    a `~` and an upper-case suffix included. A path that is not there is reported as
+    missing rather than being materialized or sent to the hub."""
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / "m.GGUF").write_bytes(b"GGUF")
     local = tmp_path / "local"
@@ -583,9 +586,9 @@ def test_pick_model_routes_a_gguf_file(monkeypatch, tmp_path):
           model == "built:" + str(tmp_path / "m.GGUF"), model)
     check("reason names the source", why == "GGUF file (--model override)", why)
     missing = str(tmp_path / "missing.gguf")
-    model, why = cli._pick_model(missing, host=_host(8.0), local_model=str(local),
-                                 materialize=built)
-    check("a missing .gguf is an ordinary explicit request", model == missing, model)
+    with pytest.raises(SystemExit):
+        cli._pick_model(missing, host=_host(8.0), local_model=str(local),
+                        materialize=built)
 
 
 def test_host_avail_bytes():
@@ -781,6 +784,82 @@ def test_backend_failure_reports_problem_cause_fix(capsys):
     check("names the unreachable url", "http://10.0.0.5:8081" in out, out)
     check("offers a fix", "fix:" in out, out)
     check("no traceback", "Traceback" not in out, out)
+
+
+
+# --- a model that will not load: problem / cause / fix as lines -----------------
+
+def _has_cause_and_fix(lines):
+    return (any(ln.startswith("  cause:") for ln in lines)
+            and any(ln.startswith("  fix:") for ln in lines))
+
+
+def test_guidance_for_a_broken_mlx_install_is_a_reinstall():
+    """The engine's own advice is a clone-only command; the RAM/download advice would
+    contradict it, so a broken MLX gets the reinstall alone."""
+    lines = cli.model_load_guidance(
+        "owner/name", RuntimeError("MLX is unavailable, so the engine cannot start"))
+    text = "\n".join(lines)
+    assert "uv tool install --force chad-code" in text
+    assert "partial/corrupt download" not in text
+    assert _has_cause_and_fix(lines)
+
+
+def test_guidance_for_a_local_dir_says_it_looks_incomplete(tmp_path):
+    lines = cli.model_load_guidance(str(tmp_path), OSError("x"))
+    assert "local model dir looks incomplete" in "\n".join(lines)
+    assert _has_cause_and_fix(lines)
+
+
+def test_guidance_for_a_repo_id_names_the_shipped_resident_size():
+    lines = cli.model_load_guidance("owner/name", MemoryError())
+    text = "\n".join(lines)
+    assert "~13 GB" in text and "~12 GB" not in text
+    assert _has_cause_and_fix(lines)
+
+
+def test_guidance_always_carries_a_cause_and_a_fix(tmp_path):
+    for model_id, err in (("owner/name", RuntimeError("MLX is unavailable")),
+                          (str(tmp_path), OSError("x")),
+                          ("owner/name", MemoryError())):
+        assert _has_cause_and_fix(cli.model_load_guidance(model_id, err)), model_id
+
+
+# --- --model naming a path that is not there, or a GGUF chad cannot prepare ------
+
+@pytest.mark.parametrize("spec", ["./no/such/dir", "~/no-such-file.gguf"])
+def test_pick_model_reports_a_missing_path_not_a_download_problem(
+        monkeypatch, tmp_path, capsys, spec):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        cli._pick_model(spec, host=_host(32))
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "does not exist" in err
+    assert "hf auth login" not in err
+
+
+def test_pick_model_passes_a_repo_id_through_untouched():
+    model, why = cli._pick_model("owner/name", host=_host(32))
+    assert model == "owner/name"
+    assert why == "explicitly requested (--model override)"
+
+
+def test_pick_model_reports_a_gguf_it_cannot_prepare(tmp_path, capsys):
+    gguf = tmp_path / "other.gguf"
+    gguf.write_bytes(b"GGUF")
+
+    def refuse(path):
+        raise ValueError("GGUF architecture 'llama'; this loader implements 'qwen35'")
+
+    with pytest.raises(SystemExit) as exc:
+        cli._pick_model(str(gguf), host=_host(32), materialize=refuse)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "could not prepare the GGUF file" in err
+    assert "GGUF architecture 'llama'" in err
+    assert "Traceback" not in err
 
 
 # --- DFlash2 drafter consent/download (rides _ensure_model) ---------------------

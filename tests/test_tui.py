@@ -178,6 +178,20 @@ def test_first_task_hint_absent_on_resumed_session():
     assert t._pending == []
 
 
+def test_resumed_session_recaps_what_the_user_last_asked():
+    t = _bare_tui()
+    t._emit_recap([{"role": "user", "content": "fix the retry test"}])
+    joined = "".join(t._pending)
+    assert "you last asked:" in joined
+    assert "» fix the retry test" in joined
+
+
+def test_recap_of_an_empty_conversation_emits_nothing():
+    t = _bare_tui()
+    t._emit_recap([])
+    assert t._pending == []
+
+
 def test_todo_panel_rows_collapse_and_glyphs():
     assert _todo_panel_rows([]) == []
     short = [{"content": "a", "status": "completed"},
@@ -607,6 +621,21 @@ def test_midturn_shell_passthrough_keeps_typeahead():
     assert list(tui._steer_queue) == []
 
 
+
+def test_shell_passthrough_shows_all_of_a_failure():
+    tui, fake = _worker_tui()
+    tui._model_ready.set()
+    th = _start_worker(tui)
+    try:
+        tui._on_accept(_Buff("!printf 'one\\ntwo\\nthree\\nfour\\nfive\\nsix\\nseven\\neight\\n'; exit 3"))
+        assert _spin_until(lambda: "eight" in "".join(tui._pending))
+        out = "".join(tui._pending)
+        assert "exit 3" in out
+        assert "one" in out and "eight" in out
+        assert fake.calls == []  # the model was not involved
+    finally:
+        _stop_worker(tui, th)
+
 def test_drain_steering_hands_over_fifo_and_empties():
     tui, _ = _worker_tui()
     tui._steer_queue.extend(["first", "second"])
@@ -738,6 +767,40 @@ def test_init_targets_the_existing_agents_md(tmp_path, monkeypatch):
     assert len(queued) == 1, queued
     assert "AGENTS.md" in queued[0] and "CLAUDE.md" not in queued[0], queued[0]
 
+def test_undo_reports_the_restore_and_that_the_model_was_not_told(tmp_path, monkeypatch):
+    from chad import checkpoint
+    # A subdirectory: the checkpoint store itself lives under tmp_path.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    (proj / "a.py").write_text("A1\n")
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    checkpoint.snapshot(os.getcwd(), "before edit")
+    (proj / "a.py").write_text("A2\n")
+    tui._on_accept(_Buff("/undo"))
+    out = "".join(tui._pending)
+    assert "restored 1 file(s)" in out, out
+    assert "has not been told about this" in out, out
+    assert (proj / "a.py").read_text() == "A1\n"
+
+
+def test_undo_with_nothing_changed_says_so_without_the_model_warning(tmp_path, monkeypatch):
+    from chad import checkpoint
+    # A subdirectory: the checkpoint store itself lives under tmp_path.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    (proj / "a.py").write_text("A1\n")
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    checkpoint.snapshot(os.getcwd(), "before edit")
+    tui._on_accept(_Buff("/undo"))
+    out = "".join(tui._pending)
+    assert "nothing to undo" in out, out
+    assert "has not been told" not in out, out
+
+
 def test_ctx_command_survives_an_unpriceable_prompt():
     # The fake engine has no tokenizer at all — the gauge must degrade to one line,
     # not raise out of the key handler and kill the UI.
@@ -790,3 +853,264 @@ def test_a_turn_after_reset_is_saved(tmp_path, monkeypatch):
     tui.agent.save()
     (item,) = session.list_sessions(str(tmp_path))
     assert item["title"].startswith("after the reset")
+
+
+# ---------------------------------------------------------------------------
+# A background model load that fails: the scrollback carries the guidance, the status
+# row stops reading "ready", and the commands that need an engine say why they refuse.
+# ---------------------------------------------------------------------------
+
+def _failing_load_tui(describe=True):
+    def finalize():
+        raise MemoryError("out of memory")
+    describe_load_error = (lambda e: ["chad: could not load model 'm'",
+                                      f"  cause: {type(e).__name__}: {e}",
+                                      "  fix:   close other apps"]) if describe else None
+    tui = TUI(_fake_engine(), ctx_limit=24000, finalize=finalize,
+              describe_load_error=describe_load_error)
+    tui.app.invalidate = lambda: None
+    tui._load_model()
+    return tui
+
+
+def test_a_failed_load_shows_the_cause_and_the_fix():
+    out = "".join(_failing_load_tui()._pending)
+    assert "cause: MemoryError" in out
+    assert "fix:   close other apps" in out
+
+
+def test_a_failed_load_still_releases_the_worker():
+    tui = _failing_load_tui()
+    assert tui._model_ready.is_set()
+    assert tui._load_error
+
+
+def test_a_failed_load_does_not_read_as_ready():
+    tui = _failing_load_tui()
+    status = "".join(text for _, text in tui._status_fragments())
+    assert "model did not load" in status
+    assert "ready" not in status
+
+
+def test_a_failed_load_refuses_engine_commands_instead_of_crashing():
+    tui = _failing_load_tui()
+    tui._on_accept(_Buff("/compact"))
+    assert "the model did not load" in "".join(tui._pending)
+
+
+def test_a_failed_load_without_guidance_keeps_the_one_line_message():
+    out = "".join(_failing_load_tui(describe=False)._pending)
+    assert "[model load failed: MemoryError: out of memory]" in out
+
+
+def test_background_job_runs_off_the_calling_thread():
+    tui, _ = _worker_tui()
+    gate, seen = threading.Event(), {}
+
+    def job():
+        seen["thread"] = threading.current_thread().name
+        gate.wait(_JOIN)          # a slow login: the caller must not wait for this
+        tui._emit("info", "login finished")
+
+    tui._in_background("mcp-login", job)
+    # Control is back here while the job is still parked on the gate.
+    assert _spin_until(lambda: "thread" in seen)
+    assert seen["thread"] == "chad-mcp-login"
+    assert "login finished" not in "".join(tui._pending)
+    gate.set()
+    assert _spin_until(lambda: "login finished" in "".join(tui._pending))
+
+
+def test_background_job_failure_is_reported():
+    tui, _ = _worker_tui()
+
+    def job():
+        raise RuntimeError("no route to host")
+
+    tui._in_background("mcp", job)
+    assert _spin_until(lambda: "mcp failed: RuntimeError" in "".join(tui._pending))
+
+
+def test_entering_yolo_without_a_sandbox_says_so_once(monkeypatch):
+    monkeypatch.setenv("CHAD_NO_SEATBELT", "1")
+    tui, fake = _worker_tui()
+    fake.mode = "yolo"
+
+    tui._after_mode_change()
+    assert _spin_until(lambda: "UNCONFINED" in "".join(tui._pending))
+    tui._after_mode_change()
+    assert tui._yolo_noticed is True
+    assert "".join(tui._pending).count("UNCONFINED") == 1
+
+
+def test_a_mode_other_than_yolo_says_nothing(monkeypatch):
+    monkeypatch.setenv("CHAD_NO_SEATBELT", "1")
+    tui, fake = _worker_tui()
+    fake.mode = "normal"
+    before = list(tui._pending)
+
+    tui._after_mode_change()
+    assert tui._pending == before
+    assert tui._yolo_noticed is False
+
+
+# ---------------------------------------------------------------------------
+# Quitting and resetting keep the user's work: a deferred /reset keeps the queue,
+# text cleared with ctrl-c goes to the input history, ctrl-c on an empty prompt asks
+# for a second press, and a quit mid-turn stops the turn and lets the worker save.
+# ---------------------------------------------------------------------------
+
+def test_a_deferred_reset_keeps_the_queue():
+    tui, _ = _worker_tui()
+    tui._busy = True                      # a turn that will not yield
+    tui._queue.append("next task")
+    tui._steer_queue.append("steer it")
+    tui._reset_wait_s = 0.0               # give up on the turn at once
+    assert tui._fresh_agent("normal") is False
+    assert list(tui._queue) == ["next task"]
+    assert list(tui._steer_queue) == ["steer it"]
+    assert "queued messages are kept" in "".join(tui._pending)
+
+
+def _ctrl_c_binding(tui):
+    from prompt_toolkit.keys import Keys
+
+    for b in tui._bindings().bindings:
+        if tuple(b.keys) == (Keys.ControlC,) and b.filter():
+            return b
+    return None
+
+
+def test_ctrl_c_sends_cleared_text_to_history():
+    tui, _ = _worker_tui()
+    binding = _ctrl_c_binding(tui)
+    assert binding is not None
+    tui.input.text = "a long message I did not mean to lose"
+    binding.handler(None)
+    assert tui.input.text == ""
+    assert "a long message I did not mean to lose" in list(
+        tui.input.buffer.history.get_strings())
+
+
+def _record_shutdowns(tui):
+    calls = []
+    tui._shutdown_app = lambda event: calls.append(event)
+    return calls
+
+
+def test_one_ctrl_c_on_an_empty_prompt_does_not_quit():
+    tui, _ = _worker_tui()
+    calls = _record_shutdowns(tui)
+    _ctrl_c_binding(tui).handler(None)
+    assert calls == []
+    assert "press ctrl-c again to quit" in "".join(tui._pending)
+
+
+def test_two_ctrl_c_on_an_empty_prompt_quit():
+    tui, _ = _worker_tui()
+    calls = _record_shutdowns(tui)
+    binding = _ctrl_c_binding(tui)
+    binding.handler(None)
+    binding.handler(None)
+    assert len(calls) == 1
+
+
+def test_ctrl_c_quit_window_expires():
+    tui, _ = _worker_tui()
+    calls = _record_shutdowns(tui)
+    binding = _ctrl_c_binding(tui)
+    binding.handler(None)
+    tui._quit_armed_at = time.monotonic() - 10
+    binding.handler(None)
+    assert calls == []
+
+
+def _record_exits(tui):
+    exits = []
+    tui.app.exit = lambda: exits.append(1)
+    return exits
+
+
+def test_idle_quit_is_immediate():
+    tui, _ = _worker_tui()
+    exits = _record_exits(tui)
+    tui._request_quit()
+    assert exits == [1]
+    assert tui._shutdown is True
+
+
+def test_busy_quit_waits_for_the_save():
+    tui, fake = _worker_tui()
+    exits = _record_exits(tui)
+
+    def park_until_interrupted(_msg):
+        idle = threading.Event()
+        while not fake._should_stop():
+            idle.wait(0.005)
+
+    fake.on_call = park_until_interrupted
+    th = _start_worker(tui)
+    tui._on_accept(_Buff("work"))
+    assert _spin_until(lambda: tui._busy), "worker never started the turn"
+    tui._request_quit()
+    assert _spin_until(lambda: exits == [1]), "the quit never closed the app"
+    assert fake.saved == 1
+    assert tui._interrupt.is_set()
+    th.join(timeout=_JOIN)
+    assert not th.is_alive(), "worker did not shut down after the quit"
+
+
+def test_a_turn_that_will_not_stop_does_not_hang_the_quit():
+    tui, _ = _worker_tui()
+    exits = _record_exits(tui)
+    tui._busy = True
+    tui._quit_save_wait_s = 0.05
+    tui._request_quit()
+    assert _spin_until(lambda: exits == [1]), "a stuck turn hung the quit"
+
+
+# ---------------------------------------------------------------------------
+# `/accept` with a path, and with nothing pending: a plan revised since the banner, or
+# written in an earlier session, is still a plan the user can hand over.
+# ---------------------------------------------------------------------------
+
+def _accept_tui(tmp_path, monkeypatch, *plans):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "plans").mkdir()
+    for name in plans:
+        (tmp_path / "plans" / name).write_text("# Plan\n")
+    tui, _ = _worker_tui()
+    tui._model_ready.set()
+    tui.engine.reset = lambda: None
+    return tui
+
+
+def test_accept_with_nothing_pending_lists_the_plans(tmp_path, monkeypatch):
+    tui = _accept_tui(tmp_path, monkeypatch, "001-a.md", "002-b.md")
+    tui._on_accept(_Buff("/accept"))
+    shown = "".join(tui._pending)
+    assert "no plan pending" in shown
+    assert "plans/001-a.md" in shown and "plans/002-b.md" in shown
+    assert list(tui._queue) == []
+
+
+def test_accept_a_named_plan_implements_it(tmp_path, monkeypatch):
+    tui = _accept_tui(tmp_path, monkeypatch, "001-a.md", "002-b.md")
+    tui._on_accept(_Buff("/accept plans/001-a.md"))
+    (queued,) = tui._queue
+    assert "Implement the plan in plans/001-a.md" in queued
+
+
+def test_accept_a_missing_plan_is_reported(tmp_path, monkeypatch):
+    tui = _accept_tui(tmp_path, monkeypatch, "001-a.md")
+    tui._on_accept(_Buff("/accept plans/nope.md"))
+    assert "no such plan file" in "".join(tui._pending)
+    assert list(tui._queue) == []
+
+
+def test_accept_does_not_offer_the_plans_readme(tmp_path, monkeypatch):
+    tui = _accept_tui(tmp_path, monkeypatch, "README.md")
+    tui._on_accept(_Buff("/accept"))
+    shown = "".join(tui._pending)
+    assert "no plan pending." in shown
+    assert "README.md" not in shown and "newest first" not in shown

@@ -233,9 +233,75 @@ def test_persisted_copy_masks_known_prefix_secrets(tmp_path):
           session.load_session(a)["messages"] == masked)
 
 
+def test_prune_reports_what_it_removed(tmp_path):
+    a = _proj(tmp_path, "proj_prune_notice")
+    removed = []
+    for i in range(session.RETAIN):
+        session.save_session(a, [{"role": "user", "content": f"t{i}"}], {},
+                             session_id=f"20260101-0000{i:02d}-{i:04x}",
+                             on_prune=removed.append)
+    check("no notice while under the limit", removed == [], removed)
+    session.save_session(a, [{"role": "user", "content": "one more"}], {},
+                         session_id="20260101-000100-ffff", on_prune=removed.append)
+    check("one notice for the one pruned", removed == [1], removed)
+
+
+def test_prune_without_a_listener_still_prunes(tmp_path):
+    a = _proj(tmp_path, "proj_prune_quiet")
+    path = ""
+    for i in range(session.RETAIN + 1):
+        path = session.save_session(a, [{"role": "user", "content": f"t{i}"}], {},
+                                    session_id=f"20260101-0000{i:02d}-{i:04x}")
+    check("returns the path", path == session._session_path(a, "20260101-000020-0014"), path)
+    check("pruned to RETAIN", len(session.list_sessions(a)) == session.RETAIN)
+
+
+def test_prune_returns_zero_under_the_limit(tmp_path):
+    a = _proj(tmp_path, "proj_prune_zero")
+    session.save_session(a, [{"role": "user", "content": "only"}], {})
+    check("nothing removed", session._prune(a) == 0)
+
+
+def test_recap_keeps_the_last_three_user_lines_oldest_first():
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(5):
+        msgs += [{"role": "user", "content": f"ask {i}"},
+                 {"role": "assistant", "content": f"answer {i}"},
+                 {"role": "tool", "content": f"result {i}"}]
+    check("last three", session.recap(msgs) == ["ask 2", "ask 3", "ask 4"], session.recap(msgs))
+
+
+def test_recap_skips_a_harness_prefix():
+    msgs = [{"role": "user",
+             "content": "[PLAN MODE. Research first …]\n\nadd a retry to fetch()"}]
+    check("prefix skipped", session.recap(msgs) == ["add a retry to fetch()"],
+          session.recap(msgs))
+
+
+def test_recap_clips_a_long_line():
+    got = session.recap([{"role": "user", "content": "x" * 300}])
+    check("clipped to width", len(got[0]) == 100 and got[0].endswith("…"), got)
+
+
+def test_recap_keeps_only_the_first_line():
+    got = session.recap([{"role": "user", "content": "first line\nsecond line"}])
+    check("first line only", got == ["first line"], got)
+
+
+def test_recap_of_nothing_the_user_asked_is_empty():
+    check("empty", session.recap([]) == [])
+    check("system only", session.recap([{"role": "system", "content": "sys"}]) == [])
+
+
+def test_recap_tolerates_missing_content():
+    check("None content", session.recap([{"role": "user", "content": None}]) == [])
+
+
 if __name__ == "__main__":
     for test in (test_session, test_session_perms_0600, test_mint_list_and_fork,
-                 test_prune_keeps_newest, test_adopt_legacy,
+                 test_prune_keeps_newest, test_prune_reports_what_it_removed,
+                 test_prune_without_a_listener_still_prunes,
+                 test_prune_returns_zero_under_the_limit, test_adopt_legacy,
                  test_adopt_legacy_keeps_the_source_when_the_copy_fails,
                  test_adopt_legacy_sets_an_unparseable_file_aside,
                  test_index_0600_and_corrupt_tolerated,

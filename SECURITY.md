@@ -1,7 +1,7 @@
 # Security Policy
 
-**Supported version:** the latest `main`. chad is pre-1.0 and single-user; fixes land on
-`main`, not on backported releases.
+**Supported version:** the latest release of `chad-code` on PyPI. chad is single-user;
+a fix ships as a new release, not as a backport.
 
 **Reporting a vulnerability:** report privately via GitHub Security Advisories — the
 **"Report a vulnerability"** button on the repo's **Security** tab — not a public issue.
