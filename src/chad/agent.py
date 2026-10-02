@@ -489,7 +489,8 @@ class Agent:
                  turn_budget_s: float = None, session_id: str = None,
                  ctx_limit_fn=None, is_tty: Callable[[], bool] | None = None,
                  ask: Callable[[str], str] = input,
-                 resume_kv: KVCheckpointRef | None = None):
+                 resume_kv: KVCheckpointRef | None = None,
+                 resume_meta: dict | None = None):
         self.engine = engine
         # A fresh session clears stale skill activation state and reaps prior MCP
         # processes (matches engine._reset_cache on /reset). The todo list is module
@@ -502,6 +503,16 @@ class Agent:
         mcp.reset_session()
         self._mcp_reported = False
         ambient.reset()
+        # A resumed conversation gets the facts the harness had gathered about it back
+        # (`resume_meta["ambient"]`, written by `save`): which files it edited, the test
+        # baseline it took before the first edit, which files it was already shown the
+        # skeleton of. Without them a resumed session recalls no baseline and re-decorates
+        # files the transcript already explains — behaviour the uninterrupted session
+        # never had.
+        if resume and resume_meta is not None:
+            saved_ambient = resume_meta.get("ambient")
+            if isinstance(saved_ambient, dict):
+                ambient.restore(saved_ambient)
         clear_todos()
         self.mode = mode or ("yolo" if yolo else "normal")
         self.thinking = thinking  # a reasoning model; toggles <think> blocks
@@ -701,7 +712,8 @@ class Agent:
         transcript. Asked for only when the session ends — the file is the size of the
         whole cache — and only from the thread that owns the engine."""
         if self.persist:
-            meta = {"mode": self.mode, "thinking": self.thinking}
+            meta = {"mode": self.mode, "thinking": self.thinking,
+                    "ambient": ambient.snapshot()}
             if kv:
                 ref = self.engine.save_kv()
                 if ref is not None:
@@ -1980,12 +1992,12 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
          thinking: bool = True, ctx_limit_fn=None, mode: str = None,
          should_stop: Callable[[], bool] | None = None,
          clear_stop: Callable[[], None] | None = None,
-         resume_kv: KVCheckpointRef | None = None):
+         resume_kv: KVCheckpointRef | None = None, resume_meta: dict | None = None):
     # `should_stop` is the ctrl-c flag the caller's SIGINT handler sets; `clear_stop`
     # resets it before each turn, so a press at the prompt does not cancel the next one.
     agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking, mode=mode,
                   resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn,
-                  should_stop=should_stop, resume_kv=resume_kv)
+                  should_stop=should_stop, resume_kv=resume_kv, resume_meta=resume_meta)
 
     def turn(text: str) -> None:
         # A turn that stops early, or dies on a second ctrl-c, is still saved: the REPL

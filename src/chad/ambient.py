@@ -97,6 +97,57 @@ def reset() -> None:
     _manifest_cache = None
 
 
+def snapshot() -> dict:
+    """The session facts worth carrying across a resume, as JSON-ready data: what was
+    edited and written, the last verifying run and the pre-edit baselines, and which
+    files' skeleton lines the model has already been shown. Saved with the conversation
+    (`Agent.save`) so a resumed session answers "was this failing before I started?" and
+    does not re-decorate a file the transcript already explains. The definition-pointer
+    memo is left out on purpose: it caches where a symbol was (or that it was nowhere)
+    at lookup time, and a session that ended may have moved it."""
+    return {
+        "calls": _calls,
+        "edited": {rel: sorted(syms) for rel, syms in _edited.items()},
+        "wrote": list(_wrote),
+        "last_run": dict(_last_run) if _last_run else None,
+        "baselines": {key: dict(base) for key, base in _baselines.items()},
+        "skeleton_shown": sorted(_skeleton_shown),
+    }
+
+
+def restore(state: dict) -> None:
+    """Rebuild the facts `snapshot` recorded, on top of a fresh session. Each entry is
+    taken only in the shape `snapshot` writes it; anything else (an older file, a hand
+    edit) is skipped, so a damaged entry costs its fact and never the resume."""
+    global _calls, _last_run
+    calls = state.get("calls")
+    if isinstance(calls, int) and calls >= 0:
+        _calls = calls
+    edited = state.get("edited")
+    if isinstance(edited, dict):
+        for rel, syms in edited.items():
+            if isinstance(rel, str) and rel and isinstance(syms, list):
+                _edited[rel] = {s for s in syms if isinstance(s, str)}
+    wrote = state.get("wrote")
+    if isinstance(wrote, list):
+        _wrote.extend(rel for rel in wrote if isinstance(rel, str) and rel not in _wrote)
+    last_run = state.get("last_run")
+    if (isinstance(last_run, dict) and isinstance(last_run.get("call"), int)
+            and isinstance(last_run.get("exit"), int)):
+        _last_run = {"call": last_run["call"], "head": str(last_run.get("head") or "bash"),
+                     "exit": last_run["exit"], "key": str(last_run.get("key") or "")}
+    baselines = state.get("baselines")
+    if isinstance(baselines, dict):
+        for key, base in baselines.items():
+            if (isinstance(key, str) and key and isinstance(base, dict)
+                    and isinstance(base.get("call"), int) and isinstance(base.get("exit"), int)):
+                _baselines[key] = {"call": base["call"], "exit": base["exit"],
+                                   "summary": str(base.get("summary") or "")}
+    shown = state.get("skeleton_shown")
+    if isinstance(shown, list):
+        _skeleton_shown.update(p for p in shown if isinstance(p, str))
+
+
 # ---------------------------------------------------------------------------
 # bookkeeping (always on — see module docstring)
 # ---------------------------------------------------------------------------

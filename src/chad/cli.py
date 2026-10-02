@@ -1144,6 +1144,7 @@ def _main(argv, host, load_backend, interrupt):
     #   -c       : the most recent session (unchanged simple case).
     resume = None
     resume_kv = None   # the saved session's KV checkpoint, when it was quit cleanly
+    resume_meta = None  # its `meta`: the harness's own facts about the conversation
     if args.resume:
         from . import session
         items = session.list_sessions(os.getcwd(), limit=session.RETAIN)
@@ -1160,6 +1161,7 @@ def _main(argv, host, load_backend, interrupt):
                 if data:
                     resume = data["messages"]
                     resume_kv = session.kv_ref(data)
+                    resume_meta = data.get("meta")
                     sys.stderr.write(f"resuming (forked): {session.describe(pick)}\n")
                     for ln in session.recap(resume):
                         sys.stderr.write(f"  » {ln}\n")
@@ -1170,6 +1172,7 @@ def _main(argv, host, load_backend, interrupt):
         if data:
             resume = data["messages"]
             resume_kv = session.kv_ref(data)
+            resume_meta = data.get("meta")
             sys.stderr.write(f"resuming (forked): {session.describe(items[0])}\n")
             for ln in session.recap(resume):
                 sys.stderr.write(f"  » {ln}\n")
@@ -1199,7 +1202,8 @@ def _main(argv, host, load_backend, interrupt):
             stop.install()
         agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
                               mode=run_mode, thinking=thinking, resume=resume, persist=True,
-                              resume_kv=resume_kv, think_budget=args.think_budget,
+                              resume_kv=resume_kv, resume_meta=resume_meta,
+                              think_budget=args.think_budget,
                               turn_budget_s=turn_budget_s, ctx_limit_fn=ctx_limit_fn,
                               emit=emit, should_stop=stop.requested)
         # Wall time across ALL of this task's turns (initial + any auto-continue
@@ -1299,7 +1303,8 @@ def _main(argv, host, load_backend, interrupt):
             stop.install()
         backend.repl(eng, mode=start_mode, yolo=args.yolo, ctx_limit=ctx_limit,
                      resume=resume, thinking=thinking, ctx_limit_fn=ctx_limit_fn,
-                     should_stop=stop.requested, clear_stop=stop.clear, resume_kv=resume_kv)
+                     should_stop=stop.requested, clear_stop=stop.clear, resume_kv=resume_kv,
+                     resume_meta=resume_meta)
     else:
         from .engine import peek_context_window
         _maybe_home_dir_note()
@@ -1320,7 +1325,7 @@ def _main(argv, host, load_backend, interrupt):
 
         backend.tui(eng, provisional, mode=start_mode, thinking=thinking, resume=resume,
                     ctx_window=provisional, native_ctx=window, finalize=finalize,
-                    ctx_limit_fn=ctx_limit_fn, resume_kv=resume_kv,
+                    ctx_limit_fn=ctx_limit_fn, resume_kv=resume_kv, resume_meta=resume_meta,
                     describe_load_error=lambda e: model_load_guidance(model_id, e))
 
 
