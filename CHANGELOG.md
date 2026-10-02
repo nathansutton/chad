@@ -4,6 +4,12 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+- **Serial decode 11.8 → 12.6 tok/s on the shipped GGUF (+6.7%), drafted 48.1 → 49.6
+  (+3.0%), bit-identical.** The IQ4_XS, Q4_K and Q5_K decoders in `mlx_gguf.py` read
+  their quant bytes as aligned 32-bit words instead of one byte load per value: the same
+  values in the same order, so every output is bit-identical to before, and the GEMV on
+  the format that carries 38% of the file goes from ~154 to ~180 GB/s on an M4 Pro.
+  Receipts and the per-format bandwidth map in `benchmarks/gguf_decoders/`.
 **`/accept` works after the plan is revised.** The handoff was remembered only when the
 model wrote the file; a revision is an edit, so the first steer ended in "no plan
 pending". Edits now count, `/accept <path>` accepts any plan file, and `/accept` with
