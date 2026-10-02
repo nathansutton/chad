@@ -435,3 +435,23 @@ def test_relocation_on_a_real_hybrid_cache(tiny_hybrid, kv_bits):
     assert eng._prefill([q2]) == 1
     mx.eval(eng.model(mx.array([[q2]], dtype=mx.uint32), cache=eng._cache))
     assert [o for o, _ in attn_rows()] == [common + 2] * len(layers)
+
+
+def test_a_relocation_that_raises_drops_the_cache(tiny_hybrid):
+    """An error after the attention trim (here the one reservation, as a Metal OOM
+    would raise it) leaves offsets that can match the ledger over recurrent state
+    that does not: the cache is dropped, so no error handler can keep it."""
+    eng = _tiny_engine(tiny_hybrid, None)
+    P, D, T = _ids(0, 10), _ids(10, 70), _ids(70, 190)
+    assert eng._prefill(P + D + T) == len(P + D + T)
+    eng._cached_ids = P + D + T
+
+    def out_of_memory(n):
+        raise RuntimeError("[metal] out of memory")
+    eng._reserve_kv = out_of_memory
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        eng._sync_to(P + T + [250])
+    assert eng._cached_ids == [] and eng._rewind_snap is None
+    layers = eng._attention_layers()
+    assert layers and all(c.offset == 0 for c, _ in layers)

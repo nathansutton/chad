@@ -1321,52 +1321,61 @@ class Engine:
         # rather than as lazy slices of the pre-edit buffers carried into every
         # later forward.
         mx.eval([(r.keys, r.values) for rows in moved for r in rows])
-        if plan.anchor != live:
-            assert snap is not None and snap["pos"] == plan.anchor
-            self._restore_recurrent(snap["recurrent"])
-        anchor_state = self._snap_recurrent()
-        self._trim_kv(live - common)
-        for c, _ in layers:
-            # Cut each buffer back to its live rows: the next write then grows a fresh
-            # buffer instead of writing into the one the moved rows still share.
-            suffix_reuse.drop_spare_rows(c)
-        self._cached_ids = self._cached_ids[:common]
-        # Positions moved under the snapshot: it no longer describes this cache.
-        self._rewind_snap = None
-        # One reservation for everything the plan lands: the gap reads and the appends
-        # then write in place instead of each growing every buffer again.
-        self._reserve_kv(plan.end)
-        total = len(target_ids) - common - sum(s.size for s in plan.spans)
-        pos, relocated, read = common, 0, 0
-        for span, rows in zip(plan.spans, moved):
-            gap = list(target_ids[pos:span.tgt_lo])
-            if gap:
-                progress = (None if on_progress is None else
-                            lambda done, _n, base=read: on_progress(base + done, total))
-                fed = self._prefill(gap, should_stop, on_progress=progress)
-                self._restore_recurrent(anchor_state)
-                read += fed
-                self._cached_ids = list(target_ids[: pos + fed])
-                if fed < len(gap):
-                    log.info("SCR abandoned: gap read stopped at %d/%d, rebuilding",
-                             fed, len(gap))
-                    self._scr_last, self._scr_s = (0, 0), time.time() - t0
-                    self._reset_cache()
-                    return self._reload_warm_prefix(target_ids)
-                # A Metal OOM inside the read rebuilt the cache objects in place
-                # (`_replay_after_oom`): the rows go into whichever objects hold the
-                # cache now.
-                layers = self._attention_layers()
-                if layers is None:
-                    log.warning("SCR abandoned: cache changed shape under a gap read")
-                    self._scr_last, self._scr_s = (0, 0), time.time() - t0
-                    self._reset_cache()
-                    return self._reload_warm_prefix(target_ids)
-            for (c, _), r in zip(layers, rows):
-                suffix_reuse.append_rows(c, r)
-            self._cached_ids.extend(target_ids[span.tgt_lo : span.tgt_lo + span.size])
-            relocated += span.size
-            pos = span.tgt_lo + span.size
+        # From the first recurrent restore until the last span lands, the attention
+        # offsets can equal the ledger while the recurrent layers sit at the anchor,
+        # a mismatch no offset check can see. Anything raised in between (an OOM
+        # growing the buffers, a ctrl-c) drops the cache rather than leave it to be
+        # kept and read on top of.
+        try:
+            if plan.anchor != live:
+                assert snap is not None and snap["pos"] == plan.anchor
+                self._restore_recurrent(snap["recurrent"])
+            anchor_state = self._snap_recurrent()
+            self._trim_kv(live - common)
+            for c, _ in layers:
+                # Cut each buffer back to its live rows: the next write then grows a fresh
+                # buffer instead of writing into the one the moved rows still share.
+                suffix_reuse.drop_spare_rows(c)
+            self._cached_ids = self._cached_ids[:common]
+            # Positions moved under the snapshot: it no longer describes this cache.
+            self._rewind_snap = None
+            # One reservation for everything the plan lands: the gap reads and the appends
+            # then write in place instead of each growing every buffer again.
+            self._reserve_kv(plan.end)
+            total = len(target_ids) - common - sum(s.size for s in plan.spans)
+            pos, relocated, read = common, 0, 0
+            for span, rows in zip(plan.spans, moved):
+                gap = list(target_ids[pos:span.tgt_lo])
+                if gap:
+                    progress = (None if on_progress is None else
+                                lambda done, _n, base=read: on_progress(base + done, total))
+                    fed = self._prefill(gap, should_stop, on_progress=progress)
+                    self._restore_recurrent(anchor_state)
+                    read += fed
+                    self._cached_ids = list(target_ids[: pos + fed])
+                    if fed < len(gap):
+                        log.info("SCR abandoned: gap read stopped at %d/%d, rebuilding",
+                                 fed, len(gap))
+                        self._scr_last, self._scr_s = (0, 0), time.time() - t0
+                        self._reset_cache()
+                        return self._reload_warm_prefix(target_ids)
+                    # A Metal OOM inside the read rebuilt the cache objects in place
+                    # (`_replay_after_oom`): the rows go into whichever objects hold the
+                    # cache now.
+                    layers = self._attention_layers()
+                    if layers is None:
+                        log.warning("SCR abandoned: cache changed shape under a gap read")
+                        self._scr_last, self._scr_s = (0, 0), time.time() - t0
+                        self._reset_cache()
+                        return self._reload_warm_prefix(target_ids)
+                for (c, _), r in zip(layers, rows):
+                    suffix_reuse.append_rows(c, r)
+                self._cached_ids.extend(target_ids[span.tgt_lo : span.tgt_lo + span.size])
+                relocated += span.size
+                pos = span.tgt_lo + span.size
+        except BaseException:
+            self._reset_cache()
+            raise
         self._scr_last, self._scr_s = (relocated, read), time.time() - t0
         log.info("SCR moved %d tokens in %d spans, read %d between them; anchored at "
                  "%s (%d); %d left to prefill after %d", relocated, len(plan.spans),
