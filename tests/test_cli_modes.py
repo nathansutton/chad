@@ -69,7 +69,7 @@ def rec(monkeypatch, tmp_path):
             should_stop = self.kw.get("should_stop")
             return "[interrupted]" if should_stop is not None and should_stop() else "ok"
 
-        def save(self):
+        def save(self, kv=False):
             self.saved = True
 
     def _engine(**kw):
@@ -235,6 +235,22 @@ def test_continue_resumes_the_newest_session(rec):
     rec.main(["-c", "do X"], tty=True)
 
     assert rec.agents[0].kw["resume"] == newest
+
+
+def test_continue_hands_the_agent_the_saved_kv_checkpoint(rec):
+    # A session quit cleanly records where its cache went; `-c` passes that ref on so
+    # the first turn can restore it. A session without one (an older file, a crash)
+    # passes None and resumes cold, as before.
+    msgs = [{"role": "user", "content": "task"}, {"role": "assistant", "content": "ok"}]
+    kv = {"path": "/kv/sess-abc.safetensors", "tokens": 1234, "sha": "feed"}
+    session.save_session(os.getcwd(), msgs, {"kv": kv}, session_id="20260101-000000-aaaa")
+    rec.main(["-c", "go on"], tty=True)
+    ref = rec.agents[0].kw["resume_kv"]
+    assert (ref.path, ref.tokens, ref.sha) == (kv["path"], kv["tokens"], kv["sha"])
+
+    session.save_session(os.getcwd(), msgs, {}, session_id="20260101-000100-bbbb")
+    rec.main(["-c", "go on"], tty=True)
+    assert rec.agents[1].kw["resume_kv"] is None
 
 
 def test_continue_names_the_session_and_recaps_it(rec, capsys):

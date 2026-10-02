@@ -53,7 +53,7 @@ from prompt_toolkit.widgets import TextArea
 
 from . import config, guardrails
 from .agent import INIT_RELOAD_NOTICE, MODE_LABEL, Agent, init_prompt, init_target
-from .base_engine import BaseEngine
+from .base_engine import BaseEngine, KVCheckpointRef
 from .ignore import IGNORE_DIRS
 from .prompt import instructions_notice
 from .render import (
@@ -415,7 +415,8 @@ class TUI:
                  native_ctx: int = None,
                  describe_load_error: Optional[Callable[[Exception], list[str]]] = None,
                  speech: Optional[_SpeechModule] = None,
-                 recorder: Optional[_Recorder] = None, speaker: Optional[_Speaker] = None):
+                 recorder: Optional[_Recorder] = None, speaker: Optional[_Speaker] = None,
+                 resume_kv: Optional[KVCheckpointRef] = None):
         self.engine = engine
         self.ctx_limit = ctx_limit
         self._ctx_limit_fn = ctx_limit_fn  # live per-turn recheck
@@ -474,7 +475,7 @@ class TUI:
             engine, ctx_limit=ctx_limit, mode=mode, thinking=thinking,
             emit=self._emit, confirm=self._confirm, should_stop=self._interrupt.is_set,
             drain_steering=self._drain_steering,
-            resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn,
+            resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn, resume_kv=resume_kv,
         )
 
         # Plan-mode handoff state. After a plan-mode turn writes a plan file,
@@ -954,6 +955,7 @@ class TUI:
         if self._recorder:
             self._recorder.close()
         if not self._busy:
+            self._save_kv_on_quit()
             self._close_app()
             return
         # `_shutdown` stays unset until the worker is done: its loop exits on it, and
@@ -967,12 +969,24 @@ class TUI:
             deadline = time.monotonic() + self._quit_save_wait_s
             while self._busy and time.monotonic() < deadline:
                 idle.wait(0.02)
+            if not self._busy:
+                self._save_kv_on_quit()
             loop = self.app.loop
             if loop is not None:
                 loop.call_soon_threadsafe(self._close_app)
             else:
                 self._close_app()
         threading.Thread(target=_wait, daemon=True, name="chad-quit").start()
+
+    def _save_kv_on_quit(self):
+        """The one save that also writes the engine's cache to disk, so `chad -c` picks
+        the conversation up without re-reading it. Only once no turn is running: the
+        worker thread owns the engine during a turn, and a turn that would not stop in
+        time is left alone — the conversation itself was saved after its last turn."""
+        try:
+            self.agent.save(kv=True)
+        except Exception as e:  # noqa: BLE001 — a checkpoint must never block the quit
+            log.warning("resume checkpoint skipped: %s", e)
 
     def _close_app(self):
         self._shutdown = True
@@ -982,8 +996,10 @@ class TUI:
 
     # -- session reset / plan handoff ------------------------------------
 
-    def _fresh_agent(self, mode: str) -> bool:
-        """Clear the conversation + KV cache and start a new Agent in `mode`.
+    def _fresh_agent(self, mode: str, resume: list = None,
+                     resume_kv: Optional[KVCheckpointRef] = None) -> bool:
+        """Clear the conversation + KV cache and start a new Agent in `mode`, seeded
+        with `resume` (a saved transcript) when given.
         Returns False (without resetting) if a turn won't yield in time."""
         if self._busy:
             # A turn is on the worker thread mutating engine._cache / _cached_ids.
@@ -1005,6 +1021,7 @@ class TUI:
             thinking=self.thinking, emit=self._emit, confirm=self._confirm,
             should_stop=self._interrupt.is_set, drain_steering=self._drain_steering,
             persist=True, ctx_limit_fn=self._ctx_limit_fn,
+            resume=resume, resume_kv=resume_kv,
         )
         self._pending_plan = None
         self._pending_budget_note = None
@@ -1078,11 +1095,13 @@ class TUI:
         if self._busy:
             self._emit("info", "busy — /resume once the current turn finishes.")
             return
-        if not self._fresh_agent(self._base_mode):
+        if not self._fresh_agent(self._base_mode, resume=data["messages"],
+                                 resume_kv=session.kv_ref(data)):
             return
-        # Seed the fresh Agent (which already minted a new session_id) with the restored
-        # transcript; next save() writes a NEW file, leaving the picked one untouched.
-        self.agent.messages += [m for m in data["messages"] if m.get("role") != "system"]
+        # The fresh Agent (which already minted a new session_id) was seeded with the
+        # restored transcript; its next save() writes a NEW file, leaving the picked one
+        # untouched. The engine was reset, so a checkpoint the picked session left can be
+        # restored on the first turn like a `chad -c` would.
         self._resume_list = []
         self._emit("info", f"resumed (forked): {session.describe(pick)}")
         self._emit_recap(data["messages"])
@@ -1657,7 +1676,9 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
 def run_tui(engine: BaseEngine, ctx_limit: int, mode: str = "normal", thinking: bool = True,
             resume: list = None, ctx_window: int = None, finalize=None, ctx_limit_fn=None,
             native_ctx: int = None,
-            describe_load_error: Optional[Callable[[Exception], list[str]]] = None):
+            describe_load_error: Optional[Callable[[Exception], list[str]]] = None,
+            resume_kv: Optional[KVCheckpointRef] = None):
     asyncio.run(TUI(engine, ctx_limit, mode=mode, thinking=thinking, resume=resume,
                     ctx_window=ctx_window, finalize=finalize, ctx_limit_fn=ctx_limit_fn,
-                    native_ctx=native_ctx, describe_load_error=describe_load_error).run())
+                    native_ctx=native_ctx, describe_load_error=describe_load_error,
+                    resume_kv=resume_kv).run())

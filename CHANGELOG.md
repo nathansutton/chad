@@ -10,6 +10,19 @@ Notable, user-visible changes.
   values in the same order, so every output is bit-identical to before, and the GEMV on
   the format that carries 38% of the file goes from ~154 to ~180 GB/s on an M4 Pro.
   Receipts and the per-format bandwidth map in `benchmarks/gguf_decoders/`.
+
+**A resumed session does not re-read its conversation.** Only the messages used to
+survive a session, so `chad -c` prefilled the whole transcript again: at the ~100 tokens a
+second the shipped model reads, a 20k-token conversation was three minutes of silence
+before the first new token. Quitting the TUI or the REPL now also writes the engine's
+cache to `~/.cache/chad/kv` and records where in the session file; `chad -c`, `--resume`
+and `/resume` restore it in well under a second (measured bit-identical to the live cache
+at 4k, 12k and 24k tokens) and read only what is new. The resumed session keeps the
+system prompt it ran under, since the cache was built on it. The files share the warm
+prefix's disk budget (`CHAD_KV_CACHE_MAX_GB`); a session that was not quit cleanly, or
+one from another model or window, resumes cold as before. `CHAD_NO_KV_RESUME=1` turns it
+off.
+
 **`/accept` works after the plan is revised.** The handoff was remembered only when the
 model wrote the file; a revision is an edit, so the first steer ended in "no plan
 pending". Edits now count, `/accept <path>` accepts any plan file, and `/accept` with

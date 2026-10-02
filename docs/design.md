@@ -42,7 +42,8 @@ cost anything. Over the task the model was shown 70,320 prompt tokens and the en
 twelve minutes of prefill.
 
 The system prompt and tool schemas are also checkpointed to disk, so a new session in any
-directory starts warm.
+directory starts warm, and a session you quit checkpoints its whole cache, so `chad -c`
+picks the conversation up without reading it again.
 
 ## The cache only appends
 

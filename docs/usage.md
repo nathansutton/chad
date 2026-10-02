@@ -127,7 +127,9 @@ Two subcommands, each with its own `--help`: `chad prove` (the offline smoke tes
 A one-shot task (`chad "task"`) runs once and exits. With a terminal on stdin it asks
 before each command or edit, as the TUI does; with no terminal on stdin (CI, a pipe,
 `</dev/null`) it approves them itself and says so. Every conversation is persisted under
-`~/.chad/sessions/`, and every resume forks a new branch rather than overwriting.
+`~/.chad/sessions/`, and every resume forks a new branch rather than overwriting. A
+session you quit from the TUI or REPL also leaves its KV cache on disk, so resuming it
+does not re-read the conversation.
 
 | Exit status | Meaning |
 |---|---|

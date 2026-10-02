@@ -28,7 +28,7 @@ from . import (
     spill,
     syntaxgate,
 )
-from .base_engine import BaseEngine
+from .base_engine import BaseEngine, KVCheckpointRef
 from .diag import args_preview, log, redact, result_preview
 from .prompt import (
     build_system_prompt,
@@ -488,7 +488,8 @@ class Agent:
                  turn_budget_tokens: int = None,
                  turn_budget_s: float = None, session_id: str = None,
                  ctx_limit_fn=None, is_tty: Callable[[], bool] | None = None,
-                 ask: Callable[[str], str] = input):
+                 ask: Callable[[str], str] = input,
+                 resume_kv: KVCheckpointRef | None = None):
         self.engine = engine
         # A fresh session clears stale skill activation state and reaps prior MCP
         # processes (matches engine._reset_cache on /reset). The todo list is module
@@ -598,7 +599,20 @@ class Agent:
         # "repetition". None when the turn finished on its own.
         self.stop_kind: str | None = None
         self.messages = [{"role": "system", "content": build_system_prompt()}]
+        # The resumed session's KV checkpoint, restored on the first turn once the
+        # engine is loaded (`_restore_resumed_kv`). Its cache was built under the system
+        # prompt that session ran with, so that prompt is kept verbatim — a rebuilt one
+        # (today's workspace listing) would not be a prefix of the cache, and the
+        # conversation it continues saw the old one anyway. A ref whose file is already
+        # gone (evicted) is dropped here and the prompt is rebuilt as before.
+        self._resume_kv: KVCheckpointRef | None = None
         if resume:
+            saved_system = resume[0] if resume[0].get("role") == "system" else None
+            if (resume_kv is not None and saved_system is not None
+                    and os.path.isfile(resume_kv.path)
+                    and not config.flag("CHAD_NO_KV_RESUME")):
+                self.messages = [dict(saved_system)]
+                self._resume_kv = resume_kv
             self.messages += [m for m in resume if m.get("role") != "system"]
         self._emit = emit or _default_emit
         self._confirm_cb = confirm  # callable(name, args)->bool; None => input() prompt
@@ -679,11 +693,21 @@ class Agent:
             self.messages, self._render, self._emit, self.ctx_limit, prompt_ids,
             state=self._compact_state)
 
-    def save(self):
-        """Persist the conversation for the current dir (no-op unless `persist`)."""
+    def save(self, kv: bool = False):
+        """Persist the conversation for the current dir (no-op unless `persist`).
+
+        `kv` also writes the engine's live cache to disk and records where
+        (`meta["kv"]`), so `chad -c` can restore it instead of re-reading the
+        transcript. Asked for only when the session ends — the file is the size of the
+        whole cache — and only from the thread that owns the engine."""
         if self.persist:
-            session.save_session(os.getcwd(), self.messages,
-                                 {"mode": self.mode, "thinking": self.thinking},
+            meta = {"mode": self.mode, "thinking": self.thinking}
+            if kv:
+                ref = self.engine.save_kv()
+                if ref is not None:
+                    meta["kv"] = ref.to_dict()
+                    log.info("CACHE resume checkpoint: %d tokens -> %s", ref.tokens, ref.path)
+            session.save_session(os.getcwd(), self.messages, meta,
                                  session_id=self.session_id, on_prune=self._note_pruned)
 
     def _note_pruned(self, removed: int) -> None:
@@ -805,10 +829,13 @@ class Agent:
         # escalation renders one step with <think> off, then restores). None => self.thinking.
         if thinking is None:
             thinking = self.thinking
+        return self._render_ids(self.messages, thinking)
+
+    def _render_ids(self, messages: list, thinking: bool):
+        """The prompt ids `messages` render to, exactly as a turn would feed them."""
         # Lift inline reasoning into `reasoning_content` when the template needs it, so
         # the re-render is a prefix extension of the KV cache instead of diverging at the
         # first generated token. Off (and byte-identical to before) on the shipped model.
-        messages = self.messages
         if self._reasoning_split_supported():
             messages = [split_inline_reasoning(m) for m in messages]
         # Qwen3.8's template exposes a reasoning_effort knob (xhigh | medium | low,
@@ -865,6 +892,35 @@ class Agent:
                 break
             n += 1
         return list(a[:n])
+
+    def _restore_resumed_kv(self) -> None:
+        """First turn of a resumed session: install the saved cache if the transcript
+        still begins with what it holds. The checkpoint ends inside the last assistant
+        turn, before any new user text, so the prefix is checked against a render with
+        a placeholder user turn — the same shape every real turn renders. On a miss
+        nothing is cached yet, so the system prompt goes back to a fresh build for free
+        (the saved one was kept only to match the checkpoint)."""
+        ref, self._resume_kv = self._resume_kv, None
+        if ref is None:
+            return
+        t0 = time.time()
+        ids = self._render_ids(self.messages + [{"role": "user", "content": "a"}],
+                               self.thinking)
+        if self.engine.restore_kv(ref, ids):
+            warm_s = time.time() - t0
+            log.info("CACHE resume: %d tokens restored from %s (%.1fs)",
+                     ref.tokens, ref.path, warm_s)
+            self._emit("info", f"  [resumed warm: {ref.tokens:,} tokens of the "
+                               f"conversation restored from disk]")
+            if _PREFILL_TRACE:
+                _trace_prefill({"seq": 0, "step": -1, "kind": "kv_resume",
+                                "status": "hit", "prefix_tokens": ref.tokens,
+                                "total_prefix": ref.tokens, "prefilled_tokens": 0,
+                                "prefill_s": round(warm_s, 4)})
+            return
+        log.info("CACHE resume miss: %s does not match the transcript (%d tokens); "
+                 "cold resume with a fresh system prompt", ref.path, ref.tokens)
+        self.messages[0] = {"role": "system", "content": build_system_prompt()}
 
     def _static_head_ids(self) -> list:
         """The project-independent head of `_stable_prefix_ids`: everything the
@@ -1027,6 +1083,8 @@ class Agent:
         # prefilled). Cheap no-op on a warm cache.
         if self.engine.cache_dir and not self.engine._cached_ids:
             try:
+                if self._resume_kv is not None:
+                    self._restore_resumed_kv()
                 t_warm = time.time()
                 full = self._stable_prefix_ids()
                 status, n = self.engine.warm_prefix(full, should_stop=self._should_stop,
@@ -1921,12 +1979,13 @@ _TUI_ONLY_COMMANDS = ("/undo", "/restore", "/resume", "/ctx", "/accept", "/speec
 def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = None,
          thinking: bool = True, ctx_limit_fn=None, mode: str = None,
          should_stop: Callable[[], bool] | None = None,
-         clear_stop: Callable[[], None] | None = None):
+         clear_stop: Callable[[], None] | None = None,
+         resume_kv: KVCheckpointRef | None = None):
     # `should_stop` is the ctrl-c flag the caller's SIGINT handler sets; `clear_stop`
     # resets it before each turn, so a press at the prompt does not cancel the next one.
     agent = Agent(engine, yolo=yolo, ctx_limit=ctx_limit, thinking=thinking, mode=mode,
                   resume=resume, persist=True, ctx_limit_fn=ctx_limit_fn,
-                  should_stop=should_stop)
+                  should_stop=should_stop, resume_kv=resume_kv)
 
     def turn(text: str) -> None:
         # A turn that stops early, or dies on a second ctrl-c, is still saved: the REPL
@@ -2051,3 +2110,7 @@ def repl(engine: BaseEngine, yolo: bool, ctx_limit: int = 24000, resume: list = 
                 print(f"{C_DIM}{tool_bash(cmd, should_stop=should_stop, env_guard=False)}{C_RST}")
             continue
         turn(line)
+    # The session is over: this save also writes the cache to disk, so `chad -c` picks
+    # the conversation up without re-reading it (the per-turn saves above do not — the
+    # file is the size of the whole cache).
+    agent.save(kv=True)

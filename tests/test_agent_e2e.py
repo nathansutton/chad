@@ -92,6 +92,12 @@ class ScriptedEngine:
     def warm_prefix(self, prefix_ids, should_stop=None, head_ids=None):
         return "skip", 0
 
+    def save_kv(self):
+        return None
+
+    def restore_kv(self, ref, prefix_ids):
+        return False
+
 
 def _tool_call(name, **args):
     """One `<tool_call>` block in the JSON dialect `toolcall_parse` accepts (built with

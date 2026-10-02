@@ -246,6 +246,7 @@ class _FakeAgent:
         self._should_stop = should_stop
         self.calls = []
         self.saved = 0
+        self.saved_kv = 0   # saves that also wrote the KV checkpoint (the quit)
         self.mode = "normal"
         self.budget_note = None
         self.stop_kind = None
@@ -257,8 +258,9 @@ class _FakeAgent:
         if self.on_call is not None:
             self.on_call(msg)
 
-    def save(self):
+    def save(self, kv=False):
         self.saved += 1
+        self.saved_kv += int(kv)
 
 
 def _worker_tui():
@@ -1032,11 +1034,13 @@ def _record_exits(tui):
 
 
 def test_idle_quit_is_immediate():
-    tui, _ = _worker_tui()
+    tui, fake = _worker_tui()
     exits = _record_exits(tui)
     tui._request_quit()
     assert exits == [1]
     assert tui._shutdown is True
+    # The quit is the one save that also writes the cache for `chad -c` to restore.
+    assert (fake.saved, fake.saved_kv) == (1, 1)
 
 
 def test_busy_quit_waits_for_the_save():
@@ -1054,19 +1058,22 @@ def test_busy_quit_waits_for_the_save():
     assert _spin_until(lambda: tui._busy), "worker never started the turn"
     tui._request_quit()
     assert _spin_until(lambda: exits == [1]), "the quit never closed the app"
-    assert fake.saved == 1
+    # The worker's own save of the stopped turn, then the quit's KV save once it is idle.
+    assert (fake.saved, fake.saved_kv) == (2, 1)
     assert tui._interrupt.is_set()
     th.join(timeout=_JOIN)
     assert not th.is_alive(), "worker did not shut down after the quit"
 
 
 def test_a_turn_that_will_not_stop_does_not_hang_the_quit():
-    tui, _ = _worker_tui()
+    tui, fake = _worker_tui()
     exits = _record_exits(tui)
     tui._busy = True
     tui._quit_save_wait_s = 0.05
     tui._request_quit()
     assert _spin_until(lambda: exits == [1]), "a stuck turn hung the quit"
+    # The worker still owns the engine: no KV save from under it.
+    assert fake.saved_kv == 0
 
 
 # ---------------------------------------------------------------------------
