@@ -48,7 +48,7 @@ from string import Template
 
 import catalog
 import workspace
-from catalog import JsonValue, is_number, is_object
+from catalog import JsonValue, is_number, is_object, is_text
 
 from chad import seatbelt
 from harness import AtifDoc, Solved, Trial
@@ -106,6 +106,7 @@ class Endpoint:
     model: str                    # the id the server answers to
     context: int                  # its window, for configs that ask for one
     tokenizer: str                # the served model's tokenizer, as a local directory
+    file: str = ""                # the GGUF the server loaded, when its build says
 
 
 @dataclass(frozen=True)
@@ -117,20 +118,33 @@ class Pin:
     install: str
 
 
-def server_context(origin: str, timeout_s: float = 5.0) -> int:
-    """The window the server at `origin` enforces, from llama-server's `/props` — the
-    same number chad's llama backend sizes itself from. Doubles as the check that a
-    server is up before a block spends its first trial finding out."""
+def _props(origin: str, timeout_s: float) -> JsonValue:
     try:
         with urllib.request.urlopen(f"{origin}/props", timeout=timeout_s) as r:
             doc: JsonValue = json.loads(r.read().decode())
     except (OSError, ValueError) as e:
         raise HarnessError(f"no llama-server answers at {origin} ({e})") from e
+    return doc
+
+
+def server_context(origin: str, timeout_s: float = 5.0) -> int:
+    """The window the server at `origin` enforces, from llama-server's `/props` — the
+    same number chad's llama backend sizes itself from. Doubles as the check that a
+    server is up before a block spends its first trial finding out."""
+    doc = _props(origin, timeout_s)
     settings = doc.get("default_generation_settings") if is_object(doc) else None
     n_ctx = settings.get("n_ctx") if is_object(settings) else None
     if not is_number(n_ctx):
         raise HarnessError(f"{origin}/props reports no n_ctx: is it a llama-server?")
     return int(n_ctx)
+
+
+def served_file(origin: str, timeout_s: float = 5.0) -> str:
+    """The file the server at `origin` loaded (`/props` `model_path`), or "" from a build
+    that does not say: the block's own record that every arm ran the bytes chad ships."""
+    doc = _props(origin, timeout_s)
+    path = doc.get("model_path") if is_object(doc) else None
+    return path if is_text(path) else ""
 
 
 def profile(*writable: str) -> str:
@@ -309,7 +323,7 @@ class CliHarness:
                   "this one", flush=True)
         return {"harness_sha256": sha256,
                 "server": self.endpoint.origin, "model": self.endpoint.model,
-                "server_ctx": self.endpoint.context,
+                "served_file": self.endpoint.file, "server_ctx": self.endpoint.context,
                 "isolation": "throwaway home, allowlisted env, seatbelt"}
 
     def render(self, home: str) -> dict[str, str]:

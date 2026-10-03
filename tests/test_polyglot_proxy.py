@@ -366,24 +366,27 @@ def test_two_engines_are_never_resident():
     server.refuse("in-process block", pgrep(blocks=[os.getpid()]))  # itself does not count
 
 
-def test_the_server_binary_is_the_fork_these_weights_need(tmp_path):
-    fork = tmp_path / "fork" / "bin"
-    fork.mkdir(parents=True)
-    (fork / "llama-server").write_text("#!/bin/sh\n")
-    assert server.binary({}, str(fork.parent)) == (str(fork / "llama-server"), True)
-    assert server.binary({"POLYGLOT_LLAMA_SERVER": "/opt/x"}, "/nowhere") == ("/opt/x", True)
+def test_the_server_binary_is_any_stock_llama_cpp(tmp_path):
     stock = tmp_path / "stock"
     stock.mkdir()
     (stock / "llama-server").write_text("#!/bin/sh\n")
     (stock / "llama-server").chmod(0o755)
-    assert server.binary({"PATH": str(stock)}, "/nowhere") == \
-        (str(stock / "llama-server"), False)          # stock cannot read PQ2_0
-    with pytest.raises(server.EngineBusy, match="no llama-server at all"):
-        server.binary({"PATH": str(tmp_path / "empty")}, "/nowhere")
+    assert server.binary({"PATH": str(stock)}) == str(stock / "llama-server")
+    assert server.binary({"POLYGLOT_LLAMA_SERVER": "/opt/x", "PATH": str(stock)}) == "/opt/x"
+    with pytest.raises(server.EngineBusy, match="no llama-server on PATH"):
+        server.binary({"PATH": str(tmp_path / "empty")})
+
+
+def test_the_server_serves_the_file_chad_loads_in_process(tmp_path):
+    gguf = tmp_path / "m.gguf"
+    resolved = {"unsloth/Qwen3.8-27B-GGUF/m.gguf": str(gguf)}
+    assert server.default_gguf(lambda: "unsloth/Qwen3.8-27B-GGUF/m.gguf", resolved.get) == str(gguf)
+    with pytest.raises(server.EngineBusy, match="not a GGUF file on this disk"):
+        server.default_gguf(lambda: "some/repo", resolved.get)     # a pack chad never fetched
 
 
 def test_the_server_is_started_so_its_slots_can_be_erased(tmp_path, monkeypatch):
-    monkeypatch.setenv("POLYGLOT_LLAMA_SERVER", "/opt/llama-server")   # no fork on this box needed
+    monkeypatch.setenv("POLYGLOT_LLAMA_SERVER", "/opt/llama-server")   # none on this box needed
     argv = server.LlamaServer("m.gguf", str(tmp_path / "server.log")).argv()
     assert argv[argv.index("--slot-save-path") + 1] == str(tmp_path / "llama-slots")
     assert argv[argv.index("-c") + 1] == "32768" and "--jinja" in argv

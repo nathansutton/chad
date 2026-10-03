@@ -1,30 +1,20 @@
-"""The llama-server the CLI arms run against — chad's own weights, in llama.cpp — and the
-rule that keeps it from ever sharing the machine with the in-process engine.
+"""The llama-server the CLI arms run against — the file chad ships, in llama.cpp — and
+the rule that keeps it from ever sharing the machine with the in-process engine.
 
     python benchmarks/polyglot/server.py          # foreground; Ctrl-C stops it
 
-THE WEIGHTS ARE CHAD'S
-----------------------
-The arms run the GGUF build of the same model chad ships: Prism ML's Ternary Bonsai 2 of
-Qwen3.8-27B, `PQ2_0` (7.2 GB), the pack its card measures on Apple Silicon, against
-chad's MLX 2-bit pack of the same build. Anything else compares harnesses on weights no
-chad user runs — and the first harness night, which served `Qwen3.8-27B-UD-Q3_K_XL`,
-showed why that matters: chad in process on the ternary pack spiralled into a 20k-token
-think on 6 of 9 trials, while the same harness on the conventional quant never did.
-With one model everywhere, chad-mlx against chad-llama isolates the engine: if the
-ternary pack rambles in llama.cpp too it is the weights, and if it does not it is chad's
-own MLX path.
+THE WEIGHTS ARE CHAD'S, BYTE FOR BYTE
+-------------------------------------
+chad reads a GGUF natively, so the arms serve the file it loads in process: `default_gguf()`
+asks chad which file it would pick with no `--model` (`chad.cli._pick_model`, so a
+`CHAD_MODEL` override moves every arm together) and hands that path to llama-server. One
+file everywhere takes the weights out of the comparison: chad-mlx against chad-llama
+isolates the engine, and a foreign arm against chad-llama isolates the harness. Before
+chad read GGUF, the llama arms ran a different quant of the same model, and a harness
+gap carried a weights gap inside it.
 
-These files need Prism ML's llama.cpp fork — stock llama.cpp rejects `PQ2_0` as an
-unknown type. `binary()` looks for it in `_data/llama-prism/` (or `POLYGLOT_LLAMA_SERVER`)
-before falling back to whatever `llama-server` is on PATH, which will refuse to load
-these weights. Fetch it once, pinned:
-
-    cd benchmarks/polyglot/_data && mkdir -p llama-prism && cd llama-prism
-    curl -L -o release.tar.gz https://github.com/PrismML-Eng/llama.cpp/releases/download/\
-prism-b10709-9a9394a/llama-prism-b10709-9a9394a-bin-macos-arm64.tar.gz
-    tar -xzf release.tar.gz
-    hf download prism-ml/Ternary-Bonsai-2-27B-gguf Ternary-Bonsai-2-27B-PQ2_0.gguf
+Any stock llama-server reads the file (`binary()`: `POLYGLOT_LLAMA_SERVER`, else PATH);
+`version()` records which build in every block's meta.json.
 
 ONE ENGINE
 ----------
@@ -48,14 +38,7 @@ import time
 import urllib.request
 from collections.abc import Callable, Mapping
 
-GGUF_REPO = "prism-ml/Ternary-Bonsai-2-27B-gguf"
-GGUF_FILE = "Ternary-Bonsai-2-27B-PQ2_0.gguf"
-ALIAS = "ternary-bonsai-2-27b"
-# The fork whose kernels read those weights, pinned to the release these runs used.
-FORK_TAG = "prism-b10709-9a9394a"
-FORK_URL = (f"https://github.com/PrismML-Eng/llama.cpp/releases/download/{FORK_TAG}/"
-            f"llama-{FORK_TAG}-bin-macos-arm64.tar.gz")
-FORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_data", "llama-prism")
+ALIAS = "qwen3.8-27b-local"          # the model id every arm asks the server for
 DEFAULT_PORT = 8081
 DEFAULT_CTX = 32768
 HEALTH_TIMEOUT_S = 600
@@ -83,36 +66,41 @@ def refuse(starting: str, pgrep: Callable[..., list[int]] = _pgrep) -> None:
                          "engine at a time")
 
 
-def binary(environ: Mapping[str, str] = os.environ, fork_dir: str = FORK_DIR) -> tuple[str, bool]:
-    """The `llama-server` to run, and whether it is the fork these weights need: the
-    pinned fork under `_data/` (`POLYGLOT_LLAMA_SERVER` overrides), else whatever is on
-    PATH — which is stock llama.cpp, and rejects `PQ2_0` as an unknown type."""
+def binary(environ: Mapping[str, str] = os.environ) -> str:
+    """The `llama-server` to run: `POLYGLOT_LLAMA_SERVER` when set, else the one on PATH."""
     override = environ.get("POLYGLOT_LLAMA_SERVER")
     if override:
-        return override, True
-    for base, _dirs, files in sorted(os.walk(fork_dir)):
-        if "llama-server" in files:
-            return os.path.join(base, "llama-server"), True
+        return override
     found = shutil.which("llama-server", path=environ.get("PATH"))
     if not found:
-        raise EngineBusy(f"no llama-server at all: fetch the fork these weights need into "
-                         f"{fork_dir} (see this module's docstring, release {FORK_TAG})")
-    return found, False
+        raise EngineBusy("no llama-server on PATH (brew install llama.cpp), and "
+                         "POLYGLOT_LLAMA_SERVER names none")
+    return found
 
 
-def default_gguf() -> str:
-    """chad's own weights in GGUF form, from the Hugging Face cache; never downloaded here."""
-    from huggingface_hub import hf_hub_download
-    try:
-        return hf_hub_download(GGUF_REPO, GGUF_FILE, local_files_only=True)
-    except (OSError, ValueError) as e:
-        raise EngineBusy(f"{GGUF_REPO}/{GGUF_FILE} is not in the Hugging Face cache; fetch it "
-                         f"once with `hf download {GGUF_REPO} {GGUF_FILE}`") from e
+def shipped_spec() -> str:
+    """The model chad loads with no `--model`: its shipped default, or `CHAD_MODEL`."""
+    from chad.cli import _pick_model
+    return _pick_model()[0]
+
+
+def default_gguf(spec: Callable[[], str] = shipped_spec,
+                 resolve: Callable[[str], str | None] | None = None) -> str:
+    """The GGUF file chad in process loads, as a path for llama-server. Never downloaded
+    here: a file chad has not fetched is one it has not run."""
+    if resolve is None:
+        from chad.gguf_pack import resolve_file
+        resolve = resolve_file
+    name = spec()
+    path = resolve(name)
+    if path is None:
+        raise EngineBusy(f"{name} is not a GGUF file on this disk; the llama arms serve the "
+                         "file chad loads in process, so run `chad` once to fetch it")
+    return path
 
 
 def version() -> str:
-    out = subprocess.run([binary()[0], "--version"], capture_output=True, text=True,
-                         check=False)
+    out = subprocess.run([binary(), "--version"], capture_output=True, text=True, check=False)
     return next((ln.strip() for ln in (out.stdout + out.stderr).splitlines()
                  if ln.startswith("version")), "?")
 
@@ -130,17 +118,12 @@ class LlamaServer:
     def argv(self) -> list[str]:
         # --slot-save-path: llama-server refuses every slot action without one, and a
         # block's first act is erasing the slots so it starts on a cold prefix cache.
-        return [binary()[0], "-m", self.gguf, "--host", "127.0.0.1", "--port", str(self.port),
+        return [binary(), "-m", self.gguf, "--host", "127.0.0.1", "--port", str(self.port),
                 "-c", str(self.ctx), "-ngl", "999", "--jinja", "--metrics", "--alias", self.alias,
                 "--slot-save-path", self.slots]
 
     def __enter__(self) -> str:
         refuse("server")
-        if not binary()[1]:
-            raise EngineBusy(
-                f"{binary()[0]} is stock llama.cpp, which cannot read {os.path.basename(self.gguf)}"
-                f" — fetch Prism ML's fork ({FORK_TAG}) into {FORK_DIR}, or point "
-                "POLYGLOT_LLAMA_SERVER at it (see this module's docstring)")
         os.makedirs(self.slots, exist_ok=True)
         with open(self.log, "ab") as log:
             self._proc = subprocess.Popen(self.argv(), stdout=log, stderr=subprocess.STDOUT)
@@ -172,9 +155,10 @@ class LlamaServer:
 def main() -> int:
     log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_runs", "llama-server.log")
     try:
-        with LlamaServer(default_gguf(), log) as origin:
-            print(f"llama-server up at {origin} ({version()}); log {log}. Ctrl-C stops it.",
-                  flush=True)
+        gguf = default_gguf()
+        with LlamaServer(gguf, log) as origin:
+            print(f"llama-server up at {origin} ({version()}) serving {gguf}; log {log}. "
+                  "Ctrl-C stops it.", flush=True)
             while True:
                 time.sleep(3600)
     except KeyboardInterrupt:

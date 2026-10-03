@@ -103,14 +103,13 @@ matrix article did — per arm, the prompt tax of turn 1 and its wait, the token
 prefix cache could not serve on each later turn and their wait, cache reuse, side
 requests — and pairs each arm's pass rate with the reference arm by task.
 
-The llama arms run **the model chad ships**, not a conventional quant of it: Prism ML's
-Ternary Bonsai 2 of Qwen3.8-27B, as `Ternary-Bonsai-2-27B-PQ2_0.gguf` against chad's MLX
-2-bit pack of the same build. That keeps a harness comparison on the weights a chad user
-actually runs, and makes chad-in-process against chad-on-llama an engine comparison
-rather than a weights one. Those files need Prism ML's
-[llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) (stock llama.cpp rejects
-`PQ2_0`); `server.py` looks for it in `_data/llama-prism/`, or at
-`POLYGLOT_LLAMA_SERVER`, and refuses to start a stock binary on these weights.
+The llama arms serve **the file chad loads**, byte for byte: chad reads its GGUF
+natively, and `server.py` asks chad which file that is (so `CHAD_MODEL` moves every arm
+together) and hands the path to whatever stock `llama-server` is on PATH, or at
+`POLYGLOT_LLAMA_SERVER`. With one file everywhere, chad in process against chad on
+llama-server is an engine comparison, and a foreign harness against chad on llama-server
+is a harness comparison; each block's `meta.json` records the file the server reported
+loading and the llama.cpp build.
 
 One engine at a time, enforced: an in-process block refuses while a llama-server is up,
 and a block refuses while another block runs.

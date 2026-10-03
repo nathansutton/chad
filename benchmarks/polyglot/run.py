@@ -57,7 +57,13 @@ import workspace  # noqa: E402
 from catalog import JsonValue, Task, is_object  # noqa: E402
 from harness import AtifDoc, Harness, Solved, Trial  # noqa: E402
 from harness.chad_inprocess import ChadInProcess  # noqa: E402
-from harness.cli import CliHarness, Endpoint, HarnessError, server_context  # noqa: E402
+from harness.cli import (  # noqa: E402
+    CliHarness,
+    Endpoint,
+    HarnessError,
+    served_file,
+    server_context,
+)
 from harness.proxied import Proxied  # noqa: E402
 from proxy import Proxy, shipped_sampler, shipped_template  # noqa: E402
 
@@ -215,14 +221,20 @@ class Block:
 
 
 def tokenizer_dir() -> str:
-    """The shipped model's directory, for an arm that renders token ids itself (chad on
-    llama-server). Resolved here, where HOME is the real one: inside a trial a repo id
+    """Where chad in process reads its tokenizer and chat template, for an arm that
+    renders token ids itself (chad on llama-server): for a GGUF, the pack directory
+    `gguf_pack.materialize` builds around the file, so both chad arms render from the
+    same template. Resolved here, where HOME is the real one: inside a trial a repo id
     would resolve against the throwaway home's empty cache. Empty when it is nowhere
     local, which only an arm that needs it refuses."""
+    from chad import gguf_pack
     from chad.cli import _pick_model
     model = _pick_model()[0]
     if os.path.isdir(model):
         return model
+    gguf = gguf_pack.resolve_file(model)
+    if gguf is not None:
+        return gguf_pack.materialize(gguf)
     from huggingface_hub import snapshot_download
     try:
         return snapshot_download(model, local_files_only=True)
@@ -258,7 +270,8 @@ def build_harness(args: argparse.Namespace, stack: contextlib.ExitStack) -> Harn
     relay.start()
     stack.callback(relay.stop)
     tokenizer = tokenizer_dir()
-    endpoint = Endpoint(relay.origin, args.served_model, server_context(relay.origin), tokenizer)
+    endpoint = Endpoint(relay.origin, args.served_model, server_context(relay.origin), tokenizer,
+                        served_file(relay.origin))
     return Proxied(CliHarness(spec, endpoint, harnesses.load_lock().get(spec.name)), relay,
                    token_counter(tokenizer))
 
