@@ -1,90 +1,52 @@
 # Contributing to chad
 
-chad is a local, single-user, Apple-Silicon coding agent. It's a small project with a
-sharp design constraint (prefill is the bill, the KV cache stays warm), so here's the
-honest map of what lands easily and what needs a conversation first.
-
-Working here with an agent? Start at [`AGENTS.md`](AGENTS.md); the per-module map is in
-[`docs/architecture.md#architecture-map`](docs/architecture.md#architecture-map).
+chad is a local, single-user, Apple-Silicon coding agent with one sharp constraint: prefill
+is the bill, and the KV cache stays warm. This is the map of what lands easily and what
+needs a conversation first. Working here with an agent? Start at [`AGENTS.md`](AGENTS.md),
+which also holds the high-risk zones, the dependency-pin rule and the code conventions.
 
 ## What lands easily
 
-Docs fixes, tests, bug fixes that come with a failing-test repro, portability and
-tooling improvements. The gate is fast and needs **no model weights**:
+Docs fixes, tests, bug fixes with a failing-test repro, portability and tooling. The gate
+is fast and loads no model weights:
 
 ```bash
-make gate
+make gate    # lint, typecheck, anti-slop, test — the same four targets CI runs
 ```
 
-That runs four targets in order, and CI (`.github/workflows/tests.yml`) runs the same ones:
+A green `make test` alone still fails CI if ruff, mypy or anti-slop is unhappy, so run the
+whole gate before opening a PR. Run `make typecheck` on macOS: on Linux the mlx symbols
+type as `Any` and the check passes vacuously over the engine modules it should guard.
 
-- `make lint` runs `ruff check` over `src`, `tests` and `benchmarks`.
-- `make typecheck` runs `mypy` over `src/chad`.
-- `make slop` runs the vendored [anti-slop](https://github.com/TinyFrontier/anti-slop-py)
-  linter (`tools/anti_slop`, stdlib-only, needs Python 3.12 — `uv` fetches one) over the
-  same three trees. It rejects the escape hatches ruff and mypy permit by construction:
-  `Any`/`object` contracts, `dict[str, Any]`, string-name `getattr`, `mock.patch`, and any
-  `cast` or `# type: ignore[code]` without a `# SAFETY: <invariant>` comment. Findings
-  that predate the linter are recorded in `.anti-slop-baseline.json` and resurface when
-  their line is edited; `make slop-review` shows only what your branch added, with the
-  recipe for each.
-- `make test` runs `pytest -q`, which loads no model and finishes in seconds.
-
-A green `make test` alone still fails the build if `ruff`, `mypy` or anti-slop is unhappy,
-so run the whole gate before opening a PR.
-
-### Running the model-backed tests
-
-A few tests in `tests/test_engine.py` load a real model and compare its output byte for
-byte. They skip unless you set `CHAD_MODEL_TESTS=1`, and the first run downloads a 0.5B
-proxy model from Hugging Face:
+A few engine tests load a real model and compare output byte for byte. They skip unless
+`CHAD_MODEL_TESTS=1` is set; the first run downloads a 0.5B proxy model:
 
 ```bash
 CHAD_MODEL_TESTS=1 uv run pytest -q tests/test_engine.py
 ```
 
-The hybrid-cache tests also need `CHAD_TEST_HYBRID_MODEL` set to a local qwen3_5 model
-directory, and skip without it. Their strict byte-equality checks need unquantized (bf16)
-weights.
+The hybrid-cache tests also need `CHAD_TEST_HYBRID_MODEL` pointing at a local bf16
+qwen3_5 model directory, and skip without it.
 
 ## What needs a conversation first
 
 Anything that changes **model-visible behavior**: prompts, tool schemas, guardrails, the
-engine, compaction. Unit tests can't say whether a change like that helps, so it should
-arrive with a measurement, and [`benchmarks/polyglot`](benchmarks/polyglot/README.md) is
-one you can run on your own Mac. Pin a pool of tasks a baseline passes only sometimes,
-run the pool on `main` and on your branch, and paste the `stats.py compare` output (an
-exact sign test, paired by task) into the PR; the kit's README has the commands. Please
-**open an issue and describe the change before building it**: a paired run costs a night,
-and it is worth agreeing on what it should show first. That is how a RAM-bound local
-model gets kept honest.
+engine, compaction. Unit tests cannot say whether such a change helps, so it arrives with a
+measurement from [`benchmarks/polyglot`](benchmarks/polyglot/README.md), which runs on
+your own Mac: pin a pool of tasks a baseline passes only sometimes, run the pool on `main`
+and on your branch, and paste the `stats.py compare` output into the PR. **Open an issue
+describing the change before building it.** A paired run costs a night, and it is worth
+agreeing on what it should show first.
 
 ## Dev setup
 
 ```bash
-uv sync                # install deps + the `chad` console script (one time)
-uv run chad            # launch the full-screen TUI
-uv run chad "do X"     # one-shot headless task, then exit
-uv run chad -c         # resume this directory's saved conversation
-uv run pytest -q       # fast unit gate
+uv sync                # deps + the `chad` console script (one time)
+uv run chad            # the TUI
+uv run chad "do X"     # one-shot headless task
+uv run chad -c         # resume this directory's last conversation
+uv run pytest -q       # the fast unit gate
 ```
 
-Python is 3.11+; dependency and venv management is [uv](https://docs.astral.sh/uv/).
-
-## High-risk zones
-
-Two areas corrupt more than the line you touched, so lean on the existing tests:
-
-- **`engine.py` and `compaction.py`.** The shipped model's hybrid SSM/attention cache is
-  **non-trimmable**: any change to the prefix forces a full re-prefill, and a bug here
-  corrupts every later turn. Run `test_engine.py` / `test_compaction.py`.
-- **The `run_turn` loop in `agent.py`.** The heart of the agent, guarded by
-  `test_agent_guards.py`, with tool/edit behavior in `test_tools.py` / `test_edit.py`.
-
-## Style
-
-ruff and mypy are the law. Match the surrounding comment density and naming, and write code
-that reads like the code already there.
-
-`build/` and `*.egg-info` are regenerable artifacts; delete them before a repo-wide grep or
-a local wheel build.
+Python 3.11+, managed by [uv](https://docs.astral.sh/uv/). `build/` and `*.egg-info` are
+regenerable; delete them before a repo-wide grep or a local wheel build.

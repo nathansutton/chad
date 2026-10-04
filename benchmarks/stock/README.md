@@ -1,10 +1,9 @@
-# `benchmarks/stock/` — same model, same Mac, stock engine
+# `benchmarks/stock/`: same model, same Mac, stock engine
 
 The rows behind the comparison table in
 [Throughput & performance](../../docs/benchmarks.md#same-model-same-mac-stock-engine):
-stock llama.cpp on Unsloth's `Qwen3.8-27B-UD-Q3_K_XL` GGUF, against chad
-serial and chad default on its MLX checkpoint of the same recipe — one laptop, one engine
-resident at a time, each measured with its own benchmark.
+stock llama.cpp against chad on Unsloth's `Qwen3.8-27B-UD-Q3_K_XL` GGUF, one laptop, one
+engine resident at a time, each measured with its own benchmark.
 
 ```bash
 brew install llama.cpp
@@ -14,13 +13,12 @@ uv run python benchmarks/stock/stock.py chad          # chad-bench, CHAD_NO_DFLA
 uv run python benchmarks/stock/stock.py table         # render _runs/*.json as markdown
 ```
 
-`llama-dflash` needs a llama.cpp with DFlash2 (build 10658 or later). To run one without
-replacing a pinned brew install, unpack a release tarball and point `STOCK_LLAMA_BIN` at
-it; the drafter (`incoai/Qwen3.8-27B-DFlash2-GGUF`, Q4_K_M) downloads on first use.
+Run the arms one at a time: each loads ~13 GB and a 24 GB box cannot hold two.
+`llama-dflash` needs a llama.cpp with DFlash2 (build 10658 or later); to run one without
+replacing a brew install, unpack a release tarball and point `STOCK_LLAMA_BIN` at it. The
+drafter (`incoai/Qwen3.8-27B-DFlash2-GGUF`, Q4_K_M) downloads on first use.
 
-Ollama is not a separate arm — it runs llama.cpp's engine underneath, and was measured
-without speculative decoding. `_runs/ollama.json` is one hand-run measurement on the same GGUF
-(0.32.15, `FROM`-only Modelfile, `num_ctx` 2048, temperature 0, `/api/generate` counters):
-96 / 10.9 tok/s, the llama.cpp decode number. No script arm: the import needs ~45 GB of
-scratch disk and shows nothing the llama.cpp row does not. Run the arms one at a time — each loads ~13 GB and a 24 GB box cannot hold two. The
-measured rows live in `_runs/` as the record; `stock.py`'s docstring has the method.
+Ollama runs llama.cpp underneath, so it is not a separate arm. `_runs/ollama.json` is one
+hand-run measurement on the same GGUF (0.32.15, `FROM`-only Modelfile, `num_ctx` 2048,
+temperature 0): 96 / 10.9 tok/s, the llama.cpp number. The measured rows live in `_runs/`;
+`stock.py`'s docstring has the method.
