@@ -1,70 +1,39 @@
 # Releasing chad
 
-Maintainer checklist. The pipeline is tag-driven: pushing a version tag runs
-`.github/workflows/publish.yml`, which builds and — after the manual `pypi`
-environment approval — publishes `chad-code` to PyPI.
+Maintainer checklist. Pushing a version tag runs `.github/workflows/publish.yml`, which
+builds and, after the manual `pypi` environment approval, publishes `chad-code` to PyPI.
 
-## Checklist
-
-1. **Gate green, locally and in CI** (it loads no model weights). It runs lint,
-   typecheck, anti-slop and tests, the same targets CI runs:
-   ```bash
-   make gate
-   ```
-2. **Behavior changes eval'd.** Anything model-visible since the last release
-   (prompts, tool schemas, guardrails, engine, compaction) has a paired polyglot
-   comparison against the last release (`benchmarks/polyglot/stats.py compare`; see
-   CONTRIBUTING.md — the unit gate alone is not enough).
-3. **CHANGELOG.md**: move `[Unreleased]` under the new version heading with the
-   date. If the model itself was bumped, say so explicitly — a *model* bump is
-   what tells users a re-download is coming and old snapshots can be freed.
-4. **Regenerate the demo GIF** on this Mac (CI can't — it needs the model):
-   ```bash
-   vhs docs/demo.tape
-   ```
-   Watch it once, all the way through. Two things must survive the cut: the
-   banner (logo, version, model, context, cwd) and the fix landing with its diff
-   on screen. The tape (`docs/demo.tape`) is the source of truth and ships with
-   the repo so the demo can't silently rot.
-
-   Budget ~5 minutes and two model loads per take: the tape primes the on-disk
-   warm-prefix checkpoint off camera before recording, because its fixture lives
-   in a fresh `mktemp` dir that would otherwise miss the checkpoint and record a
-   ~75 s system-prefix prefill no returning user ever pays.
-
-   Three things about recording it, all learned the hard way:
-   - **The turn is timed, not matched.** `Wait+Screen` stops seeing the screen
-     once chad's TUI starts a turn, so the tape sleeps through it. Overshooting
-     costs a few dull frames of a finished transcript; undershooting types
-     `/exit` into a running turn. If the model or the prompt changed, re-measure
-     the offsets before recording — the tape header says how.
-   - **Don't "simplify" the priming run away.** It is what makes the recorded
-     turn the warm one. Delete it and the GIF silently becomes a demo of chad's
-     worst case.
-   - **Expect to re-roll.** Sampling is not deterministic: a take where the model
-     fumbles (invents a path, re-reads, wanders) is a bad demo, not a bad tape.
-     Watch the frames, and if it wandered, just run it again.
-5. **Version bump** in BOTH `pyproject.toml` and `src/chad/__init__.py`
-   (`__version__` drives `--version`; the pyproject version drives the wheel and
-   the ATIF trajectory's agent.version). They must match.
-6. **Tag and push**:
+1. **Gate green**, locally and in CI: `make gate`.
+2. **Model-visible changes eval'd.** Anything since the last release that touches prompts,
+   tool schemas, guardrails, the engine or compaction has a paired polyglot comparison
+   against the last release (`benchmarks/polyglot/stats.py compare`; see CONTRIBUTING.md).
+3. **CHANGELOG.md**: move `[Unreleased]` under the new version with its date. Say
+   explicitly whether the model changed: a model bump is what tells users a re-download
+   is coming and old snapshots can be freed.
+4. **Hardware tables.** If the model or the engine changed, re-run `chad-bench` and
+   `benchmarks/stock/` on the release build and refresh `docs/benchmarks.md` in the same
+   commit as the version bump. The docs carry measurements a reader can reproduce on their
+   own Mac and nothing else: no pass rates, no leaderboards, no numbers against other
+   agents or hosted models.
+5. **Version bump** in both `pyproject.toml` and `src/chad/__init__.py`; they must match.
+   Do it on a `release/X.Y.Z` branch and open the release PR from there.
+6. **Demo GIF**, regenerated on this Mac (CI has no model): `vhs docs/demo.tape`. Watch it
+   through once. The banner (version, model, context, cwd) and the fix landing with its
+   diff must both survive the cut. Three things about the tape:
+   - The turn is timed, not matched: `Wait+Screen` cannot see the TUI mid-turn, so the
+     tape sleeps through it. If the model or the prompt changed, re-measure the offsets
+     (the tape header says how).
+   - Keep the priming run. It warms the prefix checkpoint off camera; without it the GIF
+     records a ~75 s cold prefill no returning user pays.
+   - Expect to re-roll. Sampling is not deterministic, and a take where the model wanders
+     is a bad demo, not a bad tape.
+7. **Tag main after the PR merges**, then approve the `pypi` gate when the workflow
+   pauses on it (the environment name must match the trusted-publisher config on PyPI; see
+   the comment at the top of `publish.yml`):
    ```bash
    git tag v<X.Y.Z> && git push origin v<X.Y.Z>
    ```
-   Approve the `pypi` gate when the publish workflow pauses on it (the name must
-   also match the trusted-publisher configuration on PyPI; see the comment at the
-   top of `publish.yml`).
-7. **Cold-install check** (or wait for the weekly canary,
-   `.github/workflows/canary.yml`):
+8. **Cold-install check**, or wait for the weekly canary (`.github/workflows/canary.yml`):
    ```bash
    uvx --refresh chad-code -- --version
    ```
-   `uvx` caches resolves — `--refresh` is what a real upgrade looks like.
-8. **No scores, no comparisons.** chad's docs carry hardware measurements a reader can
-   reproduce on their own Mac (`chad-bench`, `benchmarks/stock/`) and nothing else: no
-   task pass-rates, no leaderboard placings, no numbers against other agents or hosted
-   models. The premise is a 24 GB laptop with the model in-process, and anything measured
-   elsewhere — a server feeding the weights into a container, say — describes a different
-   system. If a release changes the model or
-   the engine, re-run the two kits on the release build and refresh the tables in the
-   same commit as the version bump.

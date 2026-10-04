@@ -49,25 +49,24 @@ picks the conversation up without reading it again.
 
 Qwen3.8-27B is a hybrid. 48 of its 64 layers are recurrent, and a recurrent layer's state
 is a fixed-size summary of everything so far. That is why 128k tokens of cache cost 4.6 GB
-rather than ~17. It is also why the cache cannot be rewound: an attention
-layer can drop rows, and a recurrent state has no rows to drop.
+rather than ~17. It is also why the cache cannot be rewound: an attention layer can drop
+rows, and a recurrent state has no rows to drop.
 
 Everything in the loop is arranged so the transcript only grows at the end. Nothing above
 the conversation may change between steps, which rules out timestamps, fresh directory
 listings and per-session ids in the prompt. Compaction is the one step that rewrites the
-middle. It does not throw the cache away: the attention rows of whatever survived the edit
-are moved to their new positions, keys re-rotated, and only the text compaction inserted
-is read. The recurrent layers cannot be edited that way, so the engine picks which state to
-continue from: the live one, or the snapshot from the start of the last turn, whichever has
-just read the text the edited transcript has at that point. Everything after it is read
-fresh, and text inserted mid-transcript is read for its attention rows only. That state
-still summarises the deleted text, the price of not re-reading. The mechanism is
-Suffix Cache Reuse from the Context Language Models paper (Shao et al., 2026),
-reimplemented for MLX (`suffix_reuse.py`; `CHAD_NO_SCR=1` turns it off). Compaction still
-trims oldest first and takes enough in one pass that it does not come back the next step:
-one large edit leaves one large survivor, the cheapest shape to move. Speculative decoding has to undo rejected drafts, and gets away with
-it because the recurrent layers reassign their state rather than mutate it, so a snapshot
-is a pointer and a rollback is free.
+middle, and it does not throw the cache away: the attention rows of whatever survived the
+edit are moved to their new positions, keys re-rotated, and only the text compaction
+inserted is read. The recurrent layers cannot be edited that way, so the engine continues
+from whichever state it holds, the live one or the snapshot from the start of the last
+turn, has just read the text the edited transcript has at that point. That state still
+summarises the deleted text, the price of not re-reading. The mechanism is Suffix Cache
+Reuse from the Context Language Models paper (Shao et al., 2026), reimplemented for MLX
+(`suffix_reuse.py`; `CHAD_NO_SCR=1` turns it off). Compaction trims oldest first and takes
+enough in one pass that it does not come back the next step: one large edit leaves one
+large survivor, the cheapest shape to move. Speculative decoding has to undo rejected
+drafts, and gets away with it because the recurrent layers reassign their state rather
+than mutate it, so a snapshot is a pointer and a rollback is free.
 
 ## One model
 
@@ -87,13 +86,13 @@ as fast as a 3-bit quant, and room for ~150k of context on 24 GB. The tasks we t
 could not tell the two apart, so we took the window. Harder tasks could. On 36 paired
 polyglot tasks the ternary passed 24 and Unsloth's 3-bit GGUF of the same model passed 34,
 ten tasks up and none down. All twelve ternary failures ran out the 20-minute wall clock,
-and it generated 3.3× the tokens getting there. The window was not what ran out: the median trial peaked under 20k
-on either.
+and it generated 3.3× the tokens getting there. The window was not what ran out: the
+median trial peaked under 20k on either.
 
 The obvious fix failed next. Converting Unsloth's file into MLX's own format, the same
-bits per weight in the same places, passed 6 of 9 trials where the file passes 9. The bit map was
-never the good part; the quantizer was. Unsloth fits i-quants and K-quants against an
-importance matrix, three quarters of the file's bytes are i-quants, and an i-quant is a
+bits per weight in the same places, passed 6 of 9 trials where the file passes 9. The bit
+map was never the good part; the quantizer was. Unsloth fits i-quants and K-quants against
+an importance matrix, three quarters of the file's bytes are i-quants, and an i-quant is a
 codebook that MLX's `scale * q + bias` format cannot express. Re-quantizing throws away
 exactly what made the file worth having.
 
@@ -106,7 +105,9 @@ to keep both the quant and the loop.
 
 The cost is 6 GB of weights: ~74k of context on 24 GB instead of the ternary's ~238k.
 `UD-IQ3_XXS` is one `--model` away at 10.9 GB and ~138k, passing 8 of the same 9. Every
-run cited here is published; see [`RUNS.md`](../benchmarks/polyglot/RUNS.md).
+run cited here is in the public
+[dataset of eval runs](https://huggingface.co/datasets/nathansutton/chad-polyglot-runs),
+indexed in [`RUNS.md`](../benchmarks/polyglot/RUNS.md).
 
 ## Five tools
 

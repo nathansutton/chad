@@ -1,7 +1,7 @@
 # Configuration & reference
 
-*Steering chad (project instructions, Agent Skills, MCP servers, plan mode) and the full
-flag/env-var reference. For the basics, see the [README](../README.md).*
+Steering chad (project instructions, Agent Skills, MCP servers, plan mode) and the full
+flag and environment-variable reference. For the basics, see the [README](../README.md).
 
 ## Contents
 
@@ -28,104 +28,66 @@ flag/env-var reference. For the basics, see the [README](../README.md).*
 
 ## Project instructions (CLAUDE.md / AGENTS.md)
 
-Standing instructions for a project — conventions, the commands you want used, things not
-to touch — go in a markdown file at the root of that project. chad looks for exactly two
-names in the **working directory**, in this order:
+Standing instructions for a project (conventions, the commands you want used, things not
+to touch) go in a markdown file at the root of that project. chad reads `CLAUDE.md`, or
+`AGENTS.md` if there is no `CLAUDE.md` with content, from the **working directory only**:
+not parent directories, not `~`. The two are never merged, and chad says at startup which
+file it read and when a second one is ignored.
 
-| Order | File        |
-| ----- | ----------- |
-| 1     | `CLAUDE.md` |
-| 2     | `AGENTS.md` |
+The first **4,000 characters** are used, so put what matters at the top; chad says when it
+cut the file. It is read when a session starts, so an edit applies after `/reset` or in
+the next session. The text is appended to the system prompt below the cache boundary with
+the other per-project context, so it is prefilled once and restored from that project's
+warm-start checkpoint, never re-sent per turn.
 
-**The first one with content wins, and that is the only one read.** An empty or
-whitespace-only file is skipped, so an empty `CLAUDE.md` does not hide the `AGENTS.md`
-beside it. Otherwise `CLAUDE.md` shadows `AGENTS.md`; they are never merged, and a repo
-that carries both is only using the first — chad says so at startup. Only the working
-directory is searched — not parent directories, not `~` — so the file you get is the one
-belonging to the project you launched chad in.
-
-The first **4,000 characters** are used and the rest is dropped, so put what matters at
-the top. At startup chad prints which file it read, and when the file is longer than the
-cap, how much of it the model sees. The file is read when a session starts: an edit made
-during a session applies after `/reset` or in the next session. The text is appended to the system prompt under a
-`# Project instructions (<filename>)` heading, below the cache boundary with the other
-per-project context (working directory, workspace listing). That placement is the whole
-cost story: the static half of the prompt stays byte-identical across projects and keeps
-its global checkpoint, while your instructions are part of the few-hundred-token project
-tail that is prefilled once and then restored from that project's own warm-start
-checkpoint — not re-sent on every turn.
-
-**`/init` writes one for you.** It orients itself with `bash`, reads whichever of
-`README` / `pyproject.toml` / `package.json` / `go.mod` / `Cargo.toml` / `Makefile` exist,
-and writes a concise instructions file — an overview, the main components, the *actual*
-build/run/test commands copied out of the config it read, and any conventions worth
-noting. It writes the instructions file the project already has, so a project that uses
-`AGENTS.md` gets its `AGENTS.md` improved rather than a new `CLAUDE.md` that would shadow
-it; only when there is neither does it write `CLAUDE.md`. An existing file is read and
-improved rather than clobbered. The file is an ordinary write, so it goes through the
-usual confirmation in `normal` mode, and like any edit it applies after `/reset`.
+**`/init` writes one for you.** It reads whichever of `README`, `pyproject.toml`,
+`package.json`, `go.mod`, `Cargo.toml` and `Makefile` exist and writes a concise file: an
+overview, the main components, the real build/run/test commands, and any conventions
+worth noting. It improves the file the project already has rather than shadowing it with
+a new one, and the write goes through the usual confirmation in `normal` mode.
 
 ## Agent Skills (agentskills.io)
 
 chad implements the open [Agent Skills](https://agentskills.io) format, so a skill
-authored for Claude Code (or any compatible client) works here unchanged. A *skill* is a
-folder with a `SKILL.md`: YAML frontmatter (`name` + `description`, plus optional
-`license`/`compatibility`/`metadata`/`allowed-tools`) followed by markdown instructions,
-optionally bundling `scripts/`, `references/`, and `assets/`.
+written for Claude Code works here unchanged: a folder with a `SKILL.md` (YAML frontmatter
+with `name` and `description`, then markdown instructions), optionally bundling
+`scripts/`, `references/` and `assets/`.
 
-**Where chad looks** (project skills override user skills on a name clash):
+| Scope | Paths |
+|---|---|
+| Project | `./.agents/skills/`, `./.claude/skills/` |
+| User | `~/.agents/skills/`, `~/.claude/skills/` |
 
-| Scope   | Paths |
-| ------- | ----- |
-| Project | `./.agents/skills/`, `./.claude/skills/` (relative to the working dir) |
-| User    | `~/.agents/skills/`, `~/.claude/skills/` |
+Project skills override user skills on a name clash; a builtin always wins over both.
 
-**You choose the skill, not the model.** Every installed skill is a slash command:
+**You choose the skill, not the model.** Every installed skill is a slash command. Type `/`
+and the completion menu lists them beside chad's builtins; `/skills` prints the same list
+with discovery warnings. None of that reaches the model. `/ship` submits that one skill's
+instructions as your turn, wrapped in `<skill>` with its directory and bundled files
+listed, and anything after the command is the task: `/investigate the flaky test`. Bundled
+files are read on demand from `bash`.
 
-1. Dispatch: type `/` and the completion menu lists every skill by name and
-   description, alongside chad's builtins. `/skills` prints the same list with any
-   discovery warnings. None of this reaches the model, so it costs nothing in context.
-2. Load: `/ship` submits that one skill's instructions as your turn, wrapped in
-   `<skill>` with its directory and bundled files listed. Anything you type after the
-   command is the task: `/investigate the flaky truncation test`.
-3. Resources: referenced `scripts/`/`references/`/`assets/` files are read on demand
-   against the skill's directory, from `bash` (`sed -n '1,120p' <file>`).
+This diverges from the spec's tier-1 disclosure, where a catalog of every skill rides in
+the system prompt for the model to pick from. That catalog measured 4,751 tokens for 62
+installed skills, 60% of chad's system prompt, paid on every turn so a small model could
+guess at a choice you can make from a menu. The cost you do pay is the skill body, which
+can be most of the window: chad prints the token count when you load one
+(`loaded skill ship (41,238 tokens)`).
 
-This is a deliberate divergence from the spec's tier-1 disclosure, where a catalog of
-every skill's description rides in the system prompt for the model to select from. That
-catalog measured **4,751 tokens against 62 installed skills, 60% of chad's entire system
-prompt**, paid on every turn of every session, so a small model could guess at a choice
-you can make instantly from a menu. Dropping it took the system prompt from 7,975 tokens
-to 2,824. On a 24 GB box whose usable window is ~74k, that is 7% of the window back.
-
-The cost you *do* still pay is the skill body itself, and it can be large, a big
-Claude Code skill runs past 40k tokens, most of the window. chad prints the exact token
-count when you load one (`loaded skill ship (41,238 tokens)`) so the bill arrives when
-you incur it, rather than as an unexplained compaction three turns later.
-
-Parsing is lenient (a name that doesn't match its directory, an over-long field, or an
-unquoted `colon: value` in YAML loads anyway, with a warning); only a missing description
-or unparseable YAML is skipped. A loaded skill's turn is exempt from context compaction,
-you asked for that guidance by name, and nothing would reload it, and re-running the same
-command notes that it is already loaded instead of sending a second copy. Implementation:
-`src/chad/skills.py` (discovery/parse/dispatch/load), with the menu in `tui.py` and the
-compaction guard in `compaction.py`.
+Parsing is lenient: only a missing description or unparseable YAML skips a skill, and
+anything else loads with a warning. A loaded skill's turn is exempt from compaction, and
+re-running the command says it is already loaded instead of sending a second copy.
 
 ## MCP servers (modelcontextprotocol.io)
 
-Agent Skills add *instructions*; **MCP** adds *tools*. chad can connect to external
-[Model Context Protocol](https://modelcontextprotocol.io) servers (a GitHub server, a
-Postgres server, a company's internal API server, or hosted connectors like Linear and
-Slack) and expose their tools to the model alongside its builtins. chad uses the official
-`mcp` SDK for transport, so it speaks both **stdio** (local subprocess servers) and
-**Streamable HTTP** (hosted/remote servers).
+Agent Skills add instructions; **MCP** adds tools. chad connects to
+[Model Context Protocol](https://modelcontextprotocol.io) servers over the official `mcp`
+SDK, so it speaks both **stdio** (local subprocesses) and **Streamable HTTP** (hosted).
 
-**Configure** servers in either file (project overrides user on a name clash):
-
-| Scope   | Path | Convention |
-| ------- | ---- | ---------- |
-| Project | `./.mcp.json` | the Claude-Code project convention |
-| User    | `~/.chad/mcp.json` | applies to every project |
+| Scope | Path |
+|---|---|
+| Project | `./.mcp.json` (the Claude Code convention) |
+| User | `~/.chad/mcp.json` |
 
 ```json
 {
@@ -144,932 +106,525 @@ Slack) and expose their tools to the model alongside its builtins. chad uses the
 }
 ```
 
-**Transport is chosen by which key is present:** `url` → Streamable HTTP; otherwise
-`command` → stdio. The optional `type` (`"http"` / `"stdio"`) is accepted for clarity but
-the `url`/`command` presence is authoritative. A stdio server's `command`/`args`/`env`/`cwd`
-launches it; an HTTP server's `url` is reached over the network and any `headers` (e.g. a
-static `Authorization: Bearer …` token) are sent on every request. `"disabled": true` skips
-a server, `"timeout"` (seconds) overrides the per-call limit, and `"connect_timeout"`
-(seconds) bounds the initial connect. On the first turn of a session chad connects the **eligible** servers
-**in parallel and time-bounded** (one dead endpoint can't stall the others), runs the
-`initialize` handshake, lists each server's tools (paginated), and registers them.
-"Eligible" excludes servers that are gated: `"disabled": true` servers are skipped, OAuth
-servers are deferred until you log in (see below), and, most importantly, **project-scope
-`./.mcp.json` servers do not start until you `/mcp trust` the project** (next section).
-User-scope `~/.chad/mcp.json` servers are authored by you and auto-connect.
-The first turn prints one line saying how many servers connected, failed, or are waiting
-for `/mcp trust` or `/mcp login`.
+A `url` means Streamable HTTP, otherwise `command` means stdio; `type` is accepted but
+the key present is authoritative. `headers` are sent on every request, `"disabled": true`
+skips a server, `"timeout"` (seconds) overrides the per-call limit and `"connect_timeout"`
+bounds the connect. On the first turn chad connects the eligible servers in parallel and
+time-bounded, so one dead endpoint cannot stall the others, and prints one line saying
+how many connected, failed, or are waiting for `/mcp trust` or `/mcp login`.
 
-**Project trust.** Dropping a `./.mcp.json` into a repo does **nothing** until you run
-`/mcp trust` in that directory. This is deliberate: a project file is content you may have
-just cloned, and a stdio server is an arbitrary local command; an untrusted repo must not
-be able to auto-launch a subprocess the moment you open chad in it. Until trusted, its
-servers show gated in `/mcp` (`project server not started — project not trusted (run /mcp
-trust)`) and contribute no tools. Under each gated server `/mcp` shows what it would do if
-trusted: the command and arguments it would run, or the URL it would connect to. Header
-and `env` **names** are listed; their values never are. `/mcp trust` records the
-project's absolute path in `~/.chad/trusted_mcp.json` (mode `0600`) and lists the servers
-it trusted; the path is the trust anchor, so moving the repo to a new directory
-re-prompts. In a directory with no `.mcp.json` it does nothing, so a config added later
-(by a `git pull`, say) still waits for you. If the trust store cannot be written it says
-so and nothing is trusted. User-scope servers are exempt (you wrote them). A project
-server with the same name as one of yours replaces yours in that project, and a
-warning says so.
+**Project trust.** A `./.mcp.json` does nothing until you run `/mcp trust` in that
+directory. A project file may have just been cloned, and a stdio server is an arbitrary
+local command, so an untrusted repo must not launch a subprocess the moment you open chad
+in it. Until then `/mcp` shows each gated server with what it would do if trusted: the
+command and arguments, or the URL, with header and `env` names but never values.
+`/mcp trust` records the project's absolute path in `~/.chad/trusted_mcp.json` (mode
+`0600`) and lists what it trusted; moving the repo re-prompts, and a directory with no
+`.mcp.json` trusts nothing. User-scope servers are yours and auto-connect. A project
+server with the same name as one of yours replaces it in that project, with a warning.
 
-> `CHAD_MCP_FULL_ENV`, a stdio MCP subprocess inherits only a **minimal env allowlist**
-> by default (`PATH`, `HOME`, `LANG`/locale, `TMPDIR`, `SHELL`, `USER`, …, enough to find
-> its binary and start), **not** chad's full environment. A user-configured server runs an
-> arbitrary local command and has no business inheriting your API keys, cloud tokens, or
-> provider creds. A server that genuinely needs one var declares it in its config `env:`
-> block (merged in, and it wins). Setting `CHAD_MCP_FULL_ENV=1` restores the full
-> parent-environment inherit for the rare server that needs it, but it hands **every**
-> secret in chad's environment to **every** stdio server, so leave it unset unless you know
-> exactly which server needs what.
+**Environment.** A stdio server inherits a minimal env allowlist (`PATH`, `HOME`, locale,
+`TMPDIR`, `SHELL`, `USER`), not chad's environment: a local command has no business
+inheriting your API keys. A server that needs a variable declares it in its `env:` block.
+`CHAD_MCP_FULL_ENV=1` restores the full inherit, for every secret to every server, so
+leave it unset unless you know which server needs what.
 
-> **Auth:** static bearer/PAT tokens via `headers` work out of the box. Hosted connectors
-> that require **OAuth** (Linear, Slack, Atlassian, most SaaS) are supported behind an
-> opt-in flag; see below.
-
-**OAuth (hosted connectors).** Mark an HTTP server with `"auth": "oauth"` and set the
-`CHAD_MCP_OAUTH=1` environment variable to enable it:
+**OAuth (hosted connectors).** Static bearer tokens via `headers` work out of the box.
+Connectors that require OAuth (Linear, Slack, Atlassian) are behind `CHAD_MCP_OAUTH=1`
+and `"auth": "oauth"` on the server:
 
 ```json
-{
-  "mcpServers": {
-    "linear": { "type": "http", "url": "https://mcp.linear.app/mcp", "auth": "oauth" }
-  }
-}
+{ "mcpServers": { "linear": { "type": "http", "url": "https://mcp.linear.app/mcp", "auth": "oauth" } } }
 ```
 
-Because the first OAuth connect is **interactive** (it opens a browser and waits for you
-to approve), OAuth servers do **not** auto-connect; that would hang an agent turn or an
-eval. Instead they show as `needs login` in `/mcp`, and you authorize them explicitly:
+The first login is interactive, so OAuth servers never auto-connect; they show as
+`needs login` in `/mcp` until you run `/mcp login linear`. That opens the browser (or
+prints the URL), catches the redirect on a loopback server, and stores the tokens in
+`~/.chad/mcp_tokens.json` (mode `0600`); later runs reconnect without you. A login is
+tied to the URL it was made for, so a project server reusing one of your names but
+pointing elsewhere needs its own. With the flag unset, an `auth: oauth` server is skipped
+with a warning. A headless session is never blocked: a server that cannot log in
+contributes no tools.
 
-```
-/mcp login linear
-```
-
-This opens your browser (or prints the URL to paste, for a watched headless session),
-catches the redirect on a one-shot `127.0.0.1` loopback server, exchanges the code for
-tokens, and stores them in **`~/.chad/mcp_tokens.json` (mode 0600)**. After a successful
-login the server's tools come live and reconnect non-interactively on later runs (the SDK
-refreshes the token as needed). Notes:
-
-- With `CHAD_MCP_OAUTH` unset, an `auth: oauth` server is skipped with a warning and the
-  stdio/bearer/HTTP paths are unchanged; none of the OAuth code runs.
-- Headless / no-browser sessions are **never blocked**: an OAuth server that can't complete
-  an interactive login simply contributes no tools.
-- Token values are never logged. The token file is created `0600` from the first write.
-- A login is tied to the URL it was made for. A project server that reuses the name of one
-  of your servers but points at a different URL shows `needs login` and must be logged in
-  to itself. A login stored by an older chad still works for your own servers and is tied
-  to its URL the next time you run `/mcp login`.
-
-**How they behave in the harness:**
-
-- Namespaced `mcp__<server>__<tool>`, so server tools can't collide with chad's
-  builtins (`bash`/`edit`/…) or with each other.
-- Same validation path as builtins: each tool's `inputSchema` drives the typed-coerce
-  + self-repair loop (`"3"`→`3`, missing-required detection), no schema duplication.
-- Confirmation gate. A tool the server marks `readOnlyHint` runs without a prompt;
-  every other MCP tool is treated as mutating (the safe default: it might write files, hit
-  an API, or send a message), so it asks first and shows its arguments. In `--plan` mode
-  only read-only MCP tools run.
-- Graceful degradation. A server that's missing, misconfigured, slow to connect, or
-  that crashes mid-session contributes no tools and never takes the agent down. `/mcp` shows
-  each server's transport (stdio/http), status, tools (with read-only markers), and warnings.
-
-Implementation: `src/chad/mcp.py` drives the official `mcp` SDK behind a synchronous,
-cwd-keyed registry: the SDK's async event loop runs in a background thread (one
-`anyio` BlockingPortal) and every call is marshalled onto it, with the per-call timeout
-inside the coroutine so a hung server can never wedge the agent. Wired into
-`tools.active_schemas`/`dispatch_for`/`is_mutating`, the validator (`validate.py`), and the
-agent loop (`agent.py`).
+**In the harness.** Server tools are namespaced `mcp__<server>__<tool>` and go through the
+same validate-and-repair path as the builtins, driven by each tool's `inputSchema`. A
+tool the server marks `readOnlyHint` runs without a prompt; every other MCP tool asks
+first and shows its arguments, and in plan mode only read-only tools run. A server that
+is missing, slow, or crashes mid-session contributes no tools and never takes the agent
+down. `/mcp` shows each server's transport, status, tools and warnings.
 
 ## Plan mode
 
-`--plan`, or shift-tab round to `plan mode`, makes the session read-only with exactly one
+`--plan`, or shift-tab round to `plan mode`, makes the session read-only with one
 exception: `write` and `edit` are allowed when the path resolves inside **`./plans/`**.
-Every other mutating tool — `bash` included, so no commands run — is refused with a note
-telling the model to investigate read-only and write its plan instead. A write under
-`plans/` is the expected move, so it does not ask for confirmation; nothing else in plan
-mode gets the chance to. The gate resolves symlinks against the real working directory, so
-a `plans` entry that is itself a link cannot carry a write somewhere else.
+Every other mutating tool, `bash` included, is refused with a note telling the model to
+investigate read-only and write its plan instead. A plan write does not ask for
+confirmation, so plan mode refuses to replace a plan file this session did not write.
 
-**What you get back is a file.** A change request is answered with one self-contained
-`plans/NNN-kebab-title.md` (continuing whatever number sequence is already there), holding
-everything an executor needs without the chat: context, file paths with current-state
-excerpts, numbered steps, verify commands, and what is out of scope. `./plans/` is created
-on that first write, and it is an ordinary directory in your repo — commit it or add it to
-`.gitignore`, chad does not care. A plain *question* asked in plan mode is answered in
-prose instead; it does not manufacture a plan file.
+A change request is answered with one self-contained `plans/NNN-kebab-title.md`
+(continuing the number sequence already there): context, file paths with excerpts,
+numbered steps, verify commands, and what is out of scope. `./plans/` is an ordinary
+directory in your repo; commit it or ignore it. A plain question is answered in prose.
 
-**Handing the plan back.** When a plan-mode turn finishes having written a file, chad
-prints `plan ready → <path>` and waits. Type to steer (the plan turn continues), or press
-**ctrl-g** — or run **`/accept`** — to accept it: the context is cleared, the session goes
-back to the permission mode chad was started in (normal, if it was started in plan
-mode), and a fresh turn starts with an
-instruction to read that file and execute each step, running the verification commands at
-the end. Steering keeps the handoff: a revision the model makes with `edit` brings the
-banner back for the same file. **`/accept <path>`** accepts any plan file, including one
-written in an earlier session, and `/accept` with nothing pending lists the newest files in
-`./plans/`. Accepting is the only handoff; a plan left un-accepted is just a file on disk.
-
-A plan write skips confirmation, so plan mode refuses a `write` to a file that already
-exists unless this session wrote it: a plan that reuses another's number is told to pick
-the next unused one, or to revise the existing file with `edit`, rather than replacing it.
+When a plan-mode turn finishes having written or edited a plan, chad prints
+`plan ready → <path>` and waits. Type to steer, or press **ctrl-g** or run **`/accept`** to
+accept it: the context is cleared, the permission mode goes back to the one chad started
+in, and a fresh turn reads the file and executes each step, running the verification
+commands at the end. `/accept <path>` accepts any plan file, including one from an earlier
+session, and `/accept` with nothing pending lists the newest plans. A plan left
+un-accepted is just a file on disk.
 
 ## Slash commands
 
-Typed in the TUI (`/` opens a completion menu listing these alongside every installed
-skill). Most are local to the harness and cost nothing in context; `/init` and `/accept`
-are the two that start a real turn. The plain `--repl` front end runs the commands marked in
-the REPL column. A slash command that does not exist is reported, not sent to the model.
+Typed in the TUI (`/` opens a completion menu with these and every installed skill). Most
+cost nothing in context; `/init` and `/accept` start a real turn. The plain `--repl` front
+end runs the ones marked in the REPL column. A command that does not exist is reported
+with a suggestion, not sent to the model.
 
 | Command | What it does | REPL |
-| ------- | ------------ | ---- |
+|---|---|---|
 | `/help` | commands & keybindings | ✓ |
-| `/init` | analyze the project, write `CLAUDE.md` (a real turn — the model does the work) | ✓ |
-| `/skills` | list installed Agent Skills (run one with `/<name>`) | ✓ |
-| `/mcp` | MCP server status | ✓ |
-| `/mcp trust` | trust this project's `.mcp.json` servers | ✓ |
-| `/mcp login` | authenticate an MCP server (OAuth) | ✓ |
+| `/init` | analyze the project and write its instructions file (a real turn) | ✓ |
+| `/skills` | list installed Agent Skills with discovery warnings | ✓ |
+| `/mcp` | MCP server status; `/mcp trust` trusts this project's servers; `/mcp login <server>` authenticates one | ✓ |
 | `/compact` | reclaim context now | ✓ |
 | `/ctx` | where the context window is going, in tokens | – |
-| `/undo` | revert files to the last edit checkpoint, saving the state it replaces as a checkpoint first, so `/undo` again brings the change back; the model is not told about the revert | – |
+| `/undo` | revert files to the last edit checkpoint, snapshotting the current state first so `/undo` again brings it back | – |
 | `/restore` | list edit checkpoints; `/restore <hash>` reverts to one | – |
 | `/resume` | list recent sessions; `/resume <n>` forks one | – |
-| `/reset` | clear the conversation + KV cache | ✓ |
-| `/clear` | clear the conversation + KV cache | ✓ |
-| `/model` | show model + context window | ✓ |
-| `/mode` | cycle permission mode | ✓ |
-| `/speech` | toggle voice mode — all-local STT (Parakeet-on-MLX) + TTS (`say`) | – |
+| `/reset`, `/clear` | clear the conversation and the KV cache | ✓ |
+| `/model` | show model and context window | ✓ |
+| `/mode` | cycle the permission mode | ✓ |
+| `/speech` | toggle voice mode | – |
 | `/accept [path]` | accept the pending plan, or the named plan file, and implement it | – |
-| `/exit` | quit chad | ✓ |
-| `/quit` | quit chad | ✓ |
-
-A builtin always wins a name clash with a skill, so `/<name>` reaches a skill only when no
-builtin owns that name.
+| `/exit`, `/quit` | quit | ✓ |
 
 ## Context window (agentic coding needs room)
 
-By default the harness uses the model's **full native window** instead of an arbitrary cap,
-then lets the RAM-aware governor decide how much of it this machine can actually spend. On
-the shipped model native is **262k**, so there is nothing to extend; `CHAD_MAX_CONTEXT` is
-mostly a knob for an arbitrary `--model`, where it requests a larger window and
-**YaRN-extends** the checkpoint past native if its config supports it, capped at the model's
-documented max. Setting it *below* native is the one use that bites on the shipped model:
-it lowers the ceiling the governor sizes against. KV cache grows lazily, so a large window
-costs nothing until tokens fill it, and the cache is **quantized to 8-bit by default** (half
-the fp16 footprint; `CHAD_KV_BITS=0` restores fp16).
+chad uses the model's full native window, 262k on the shipped model, and lets the
+RAM-aware governor decide how much of it this machine can spend. The KV cache grows
+lazily, so a large window costs nothing until tokens fill it, and it is quantized to
+8-bit by default, which halves the footprint and is faster than fp16 at long context
+because the fused attention kernel is written for it.
 
-How much it costs is a property of the model's attention design, and the shipped one is
-unusually cheap here. Qwen3.8-27B is a **hybrid SSM/attention** model: 48 of its 64 layers
-are GatedDeltaNet and carry a *fixed-size* recurrent state no matter how long the context
-gets, so only the 16 full-attention layers grow with it. Measured footprint, at the 8-bit
-default:
+Qwen3.8-27B is a hybrid: 48 of its 64 layers carry a fixed-size recurrent state, so only
+the 16 attention layers grow with context, at **34,816 bytes per token** (a pure-attention
+transformer of the same shape would spend ~4× that):
 
-| Context | KV cache (8-bit, default) | Notes |
+| Context | KV cache (8-bit) | |
 |---|---|---|
 | 32k | 1.1 GB | |
-| ~74k | 2.6 GB | roughly where a 24 GB Mac's window lands on the shipped `UD-Q3_K_XL` file, drafter on |
+| ~74k | 2.6 GB | where a 24 GB Mac lands on the shipped `UD-Q3_K_XL` |
 | 128k | 4.6 GB | |
-| ~138k | 4.8 GB | roughly where it lands on `UD-IQ3_XXS` (`--model`), drafter on |
-| 262k (native) | 9.1 GB | the checkpoint's max; unreachable on 24 GB |
+| ~138k | 4.8 GB | where it lands on `UD-IQ3_XXS` (`--model`) |
+| 262k | 9.1 GB | native; unreachable on 24 GB |
 
-That is **34,816 bytes per token**. A pure-attention transformer of the same shape (all 64
-layers keeping per-token K/V rather than 16) would spend ~131,000 bytes per token at the
-same quantization, about **4×** as much, and its 128k row alone would exceed the whole
-machine. Trading trimmability for a flat memory profile is what buys the window
-([design](design.md#the-cache-only-appends)); `CHAD_KV_BITS=0`
-roughly doubles the numbers above. When the prompt nears the window, old verbose tool outputs
-are compacted.
+The compaction threshold is sized from the live Metal budget minus the resident weights,
+a headroom band and the prefill transient (flat at ~2 GB on the default cache, ~4.3 GB on
+fp16), then capped at the window. On 24 GB the weights (13.2 GB), drafter (1.2 GB) and
+transient spend ~86% of the budget before the first cached token, which is why it lands
+near ~74k. The banner states the window you actually got, and says when the governor
+bound it: `74k of 262k context`. The threshold also respects host free memory (pressure
+from Docker or other apps the Metal budget cannot see) and is re-checked between turns.
 
-8-bit KV used to cost ~20-30% throughput, because mlx_lm's quantized attention is unfused,
-which is why it was opt-in through most of 1.x. chad now ships a fused quantized-KV decode
-kernel, installed automatically when the model's attention shape is covered (the shipped
-model's is), which makes the quantized cache *faster* than fp16 at long context on top of
-halving the RAM. That is why it is the default. The crossover was measured on the shape that
-was shipped at the time (the 35B, at 32k: 60.2 vs 55.8 tok/s), and the mechanism is the
-kernel, not the weights, so it holds on any covered model; `chad-bench` reports what your
-machine is actually getting. `CHAD_KV_BITS=0` restores the fp16 cache; `CHAD_NO_QSDPA=1`
-keeps the quantized cache but disables the fused kernel (debug only; that combination is
-the old slow path).
+At load the engine wires the Metal working set and caps the allocator slightly below it,
+so a transient spike back-pressures instead of becoming a jetsam kill; a Metal OOM inside
+a prefill chunk halves the chunk and retries.
 
 ```bash
-CHAD_MAX_CONTEXT=131072 chad   # cap the window at 128k (the shipped model is 262k native)
+CHAD_MAX_CONTEXT=131072   chad  # cap the window; for an arbitrary --model, YaRN-extends past native
+CHAD_KV_BITS=0            chad  # fp16 KV cache (roughly doubles the table above)
+CHAD_CTX_LIMIT=28000      chad  # force the compaction threshold (overrides the governor)
+CHAD_CTX_SAFETY=0.95      chad  # fraction of the Metal budget the sizing may spend (default 0.975)
+CHAD_CTX_SLOPE_FACTOR=1.5 chad  # A/B: per-token cost multiplier for the sizing (default 1.0)
+CHAD_KV_CACHE_MAX_GB=4    chad  # disk budget for KV checkpoints (default 8; 0 = unlimited)
+CHAD_PREFILL_CHUNK=1024   chad  # fixed prefill chunk (default adaptive: 512, decaying to 256 under pressure)
+CHAD_NO_MEMORY_CLAMP=1    chad  # A/B: skip the Metal allocator clamps
+CHAD_NO_QSDPA=1           chad  # debug: quantized cache without the fused kernel (the old slow path)
 ```
+
+`CHAD_CTX_SAFETY` is the one headroom lever: lower it if you run memory-hungry apps
+beside chad. `CHAD_KV_CACHE_MAX_GB` is the only one that spends disk: `~/.cache/chad/kv`
+holds one warm-prefix checkpoint per distinct system prompt (a ~51 MB floor each, from
+the recurrent state) plus the whole-session checkpoints a quit writes (~35 KB per token
+of conversation plus 150 MB), LRU-evicted down to the budget after each write.
 
 ## Advanced (env vars)
 
-A `CHAD_*` switch is on when the variable is set to anything at all, `0` included; to
-turn one off, unset it. The exceptions: `CHAD_MCP_FULL_ENV` must be exactly `1`, and
-`CHAD_DFLASH_ADAPTIVE` and `CHAD_MCP_OAUTH` read `0` or `false` as off. Numeric variables
-must parse as numbers.
-
-The rarely-touched tuning knobs live in environment variables so they stay off the main
-`--help`. Same capability, sane defaults when unset:
-
-```bash
-CHAD_MAX_CONTEXT=131072 chad        # request a window (YaRN-extends a smaller --model past native)
-CHAD_KV_BITS=0          chad        # fp16 KV cache (8-bit fused is the default where covered)
-CHAD_KV_CACHE_MAX_GB=4  chad        # disk budget for the KV checkpoints: warm prefixes + ended sessions (default 8; 0 = unlimited)
-CHAD_CTX_LIMIT=28000    chad        # force the compaction threshold (overrides the RAM-aware default)
-CHAD_CTX_SAFETY=0.95    chad        # the single headroom lever: fraction of the Metal budget
-                                    # the auto-sizing may spend (default 0.975 — hold back 2.5%)
-CHAD_CTX_SLOPE_FACTOR=1.5 chad      # A/B knob: per-token cost multiplier for that auto-sizing
-                                    # (default 1.0 — a token's marginal cost is its KV cost)
-CHAD_MODEL=/path/to/mlx-model chad  # power-user escape hatch: run a different MLX model
-                                    # (also: --model auto|<repo> — the CLI twin, wins over this)
-CHAD_PREFILL_CHUNK=1024 chad        # force a fixed prefill chunk (default: adaptive — 512 on the
-                                    # shipped dense model, decaying to 256 as context+pressure grow)
-CHAD_NO_MEMORY_CLAMP=1  chad        # A/B knob: skip the Metal allocator clamps installed at load
-```
-
-**`CHAD_KV_CACHE_MAX_GB`** is the only one of these that spends *disk* rather than RAM.
-The warm-prefix checkpoints ([benchmarks](benchmarks.md#the-second-session-in-a-project-starts-warm))
-live in `~/.cache/chad/kv`, one file per distinct system prompt, so a machine with many
-projects accumulates them; so do the whole-session checkpoints a quit writes for `chad -c`
-([Sessions](#sessions)), at roughly 35 KB per token of conversation plus 150 MB.
-chad LRU-evicts that directory down to this budget (default
-**8 GB**) after each write, always protecting the file it just wrote and the live warm
-prefix, so trimming the budget costs a cold first turn in the least-recently-used projects
-and nothing else. `0` disables eviction. Each checkpoint has a fixed ~51 MB floor from the
-serialized recurrent SSM state, which is why the budget is in GB and not MB.
-
-By default the auto-compaction threshold (when chad reclaims old context, a full
-re-prefill on this non-trimmable cache, so we do it as rarely as RAM allows) is **sized
-automatically** from the live Metal memory budget and the model's measured per-token
-cost, then capped at the model's window. Three things are subtracted before the division:
-the resident weights, a headroom band (`CHAD_CTX_SAFETY`), and the prefill transient, the attention scratch that is live at the same moment the cache is. That last one is fixed,
-not per-token: on the default quantized cache a prefill chunk writes into the cache in
-place and runs its attention in 64-row slices, so it is flat (measured 1.4–1.9 GB from 8k
-to 64k; the governor charges 2.0 GB), and peak memory grows at exactly the KV rate. On an
-fp16 cache (`CHAD_KV_BITS=0`) or with the fused attention patch absent it climbs with
-context and saturates at ~4.15 GB, and the governor charges 4.3 GB. On a 24 GB Mac the
-shipped weights (13.2 GB) plus the drafter (1.2 GB) and the 2 GB transient spend ~86% of
-the budget before the first cached token, which is why it lands around ~74k rather than
-the 262k native window; the lighter `UD-IQ3_XXS` (10.9 GB) lands near ~138k. It
-self-calibrates per machine: less RAM compacts sooner, more RAM runs nearer the full
-window. `CHAD_CTX_LIMIT` forces an
-exact threshold (used by tests); `CHAD_CTX_SAFETY` (default 0.975) is the single
-headroom lever, the fraction of the Metal budget the sizing may spend, so lower it if
-you run other memory-hungry apps alongside chad; `CHAD_CTX_SLOPE_FACTOR` tunes the
-per-token multiplier (1.0 recovers the raw-KV sizing).
-
-The banner states the window you will **actually get**, not the checkpoint's native one.
-On a memory-tight box the two differ by more than 2x (a 262k model on a 24 GB Mac gets
-tens of thousands of tokens once the weights and the KV cache are paid for), and the
-native number is context the run can never spend. When the governor is what bound it,
-the banner says so: `74k of 262k context`.
-
-`--model` (or `CHAD_MODEL`) takes `auto` (the shipped model), a Hugging Face repo id or
-local MLX model directory, or a GGUF (a local `.gguf` path, or `owner/repo/file.gguf`), and
-nothing else. There are no size shorthands: `--model 9b` is a
-literal (and nonexistent) repo id, not an alias, and fails as one. Pointing it at other
-weights is supported and kept on purpose: one shipped model is a default, not a restriction,
-but the harness is *tuned* to the shipped model, so the realistic cost is throughput, not
-correctness. The flag wins over `CHAD_MODEL`, so a globally exported var can't pin every
-run.
-
-**Memory safety.** At load the engine wires the Metal working set and caps
-the allocator slightly below it (`mx.set_wired_limit`/`set_memory_limit`), so a
-transient spike back-pressures instead of escalating to a jetsam SIGKILL; a Metal OOM
-caught inside a prefill chunk halves the chunk and retries: on the default 8-bit cache by
-re-prefilling from the start, on an fp16 cache by rolling back the one chunk. `CHAD_NO_MEMORY_CLAMP=1` disables the clamps (A/B). The compaction threshold
-additionally respects host-physical free memory (pressure from Docker or other apps
-that the Metal budget can't see) and is re-checked between turns.
+A `CHAD_*` switch is on when the variable is set to anything at all, `0` included; to turn
+one off, unset it. Exceptions: `CHAD_MCP_FULL_ENV` must be exactly `1`, and
+`CHAD_DFLASH_ADAPTIVE` and `CHAD_MCP_OAUTH` read `0` or `false` as off. A memory-sizing
+variable that does not parse stops the run with the variable, the value and the fix; the
+budget knobs say once on stderr when a value is ignored.
 
 ### The model
 
-chad ships one: Qwen3.8-27B (a dense `qwen3_5` hybrid: 64 layers, 48 GatedDeltaNet and 16
-full attention, 262k native context) as Unsloth's [`UD-Q3_K_XL`][model] GGUF, **~13.2 GB
-resident**. chad reads the GGUF natively: the llama.cpp blocks load unchanged and chad's
-Metal kernels (`mlx_gguf.py`) decode them, bit-exact to llama.cpp's dequantizers.
-[Design](design.md#the-weights) explains why an MLX engine reads a GGUF, and why this
-replaced the ternary default.
+chad ships one: Qwen3.8-27B (a dense `qwen3_5` hybrid, 64 layers, 262k native context) as
+Unsloth's [`UD-Q3_K_XL`][model] GGUF, ~13.2 GB resident. chad reads the GGUF natively: the
+llama.cpp blocks load unchanged and chad's Metal kernels decode them, bit-exact to
+llama.cpp's dequantizers. [Design](design.md#the-weights) explains why.
 
-The tokenizer, chat template and DFlash2 drafter (4-bit, in `dflash/`) come from a 1.2 GB
-sidecar, [`nathansutton/Qwen3.8-27B-DFlash2-MLX`][sidecar], which holds no target weights.
-Its template renders `reasoning_effort=medium`; the GGUF's own defaults to xhigh. The first
-start converts the GGUF into MLX arrays (same blocks, same bytes) and saves them under
-`~/.cache/chad/gguf/`: ~13 GB more disk, ~75 s once, ~9 s every start after. A new upstream
-revision gets a fresh directory and the stale one is deleted.
+The tokenizer, chat template and 4-bit DFlash2 drafter come from a 1.2 GB sidecar,
+[`nathansutton/Qwen3.8-27B-DFlash2-MLX`][sidecar], which holds no target weights. Its
+template renders `reasoning_effort=medium`. The first start converts the GGUF into MLX
+arrays (same blocks, same bytes) under `~/.cache/chad/gguf/`: ~13 GB more disk, ~75 s
+once, ~9 s every start after. A new upstream revision gets a fresh directory and the
+stale one is deleted.
 
-`--model` also takes any other Unsloth file of this model, as a local `.gguf` path or
-`unsloth/Qwen3.8-27B-GGUF/<file>.gguf`, and the two earlier MLX packs:
+`--model` (or `CHAD_MODEL`; the flag wins) takes `auto`, a Hugging Face repo id, a local
+model dir, or a GGUF as a `.gguf` path or `owner/repo/file.gguf`. There are no size
+shorthands. Other weights run through the same engine and lose speed, not correctness:
+the drafter, the fused attention, the fast path and the governor's per-token cost each
+decline to install or fall back to a stock path. The other Unsloth files of this model
+have been measured, as has an MLX repack of the default's bit map:
 
-| weights | resident | window, 24 GB | [polyglot][runs], 3 tasks × 3 | 36 tasks |
-|---|---|---|---|---|
-| `UD-Q3_K_XL` GGUF (default) | 13.2 GB | ~74k | 9/9 | 34/36 |
-| `UD-IQ3_XXS` GGUF | 10.9 GB | ~138k | 8/9 | — |
-| [affine 3-bit repack][q3] | 12.3 GB | — | 6/9 | — |
-| [ternary pack][ternary] (the old default) | 7.2 GB | ~238k | 4/9 | 24/36 |
+| weights | resident | window, 24 GB | [polyglot][runs], 3 tasks × 3 |
+|---|---|---|---|
+| `UD-Q3_K_XL` GGUF (default) | 13.2 GB | ~74k | 9/9 |
+| `UD-IQ3_XXS` GGUF | 10.9 GB | ~138k | 8/9 |
+| [affine 3-bit repack][q3] | 12.3 GB | — | 6/9 |
 
 The affine repack is chad's MLX quantization using the bit map of Unsloth's file, not its
-recipe; the table is why it lost. The ternary pack is Prism ML's build
-([`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit),
-Apache-2.0; created using Bonsai by Prism ML), repacked text-only with the base tokenizer,
-a medium-effort template and the drafter bundled.
+recipe; the table is why it lost. Every run is in the public
+[dataset of eval runs](https://huggingface.co/datasets/nathansutton/chad-polyglot-runs).
 
 [model]: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF
 [sidecar]: https://huggingface.co/nathansutton/Qwen3.8-27B-DFlash2-MLX
-[ternary]: https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX
 [q3]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX
 [runs]: ../benchmarks/polyglot/RUNS.md
 
 **chad targets 24 GB Apple Silicon and nothing smaller.** On a smaller box it warns once
-and runs anyway, but ~14 GB of weights and drafter plus the ~2 GB prefill transient leave
-little for a KV cache, so the window shrinks toward its floor. The banner states what you
-actually got; [context window](#context-window-agentic-coding-needs-room) explains the
-sizing.
-
-To run different weights through the same engine:
-
-```bash
-chad --model mlx-community/Some-Other-Model-4bit   # any HF repo id
-chad --model /path/to/local/mlx-model              # or a local dir
-CHAD_MODEL=/path/to/local/mlx-model chad           # env equivalent
-```
-
-Precedence is `--model` → `CHAD_MODEL` → the shipped default. Both are honored without
-argument. Expect to lose speed rather than correctness: the tuning that is fitted to the
-shipped checkpoint (the DFlash2 drafter, the fused-attention coverage, the fastpath's architecture
-check, the measured per-token KV cost the governor sizes against) either declines to
-install or falls back to a stock path. The harness itself does not change.
-
-#### Running the ternary pack
-
-Every projection is Hadamard-rotated offline and stored as 2-bit affine group-128 with
-levels {−s, 0, +s}, so the matching transform has to hit the activations at runtime and be
-inverted after the embedding lookup. mlx-lm's plain loader finds tensors of the right
-shapes, skips the rotation, and returns plausible garbage without raising, so chad routes
-the pack on its `model_type` to its own loader (`prism_pack.py`). Pointing `--model` at the
-upstream pack also works; the drafter is borrowed from the shipped sidecar
-(`mlx_dflash.DONORS`). On top of that:
-
-- the fast path fuses `gate|up`, `qkv|z` and `q|k|v` behind one rotation each and folds the
-  ±1 sign vectors into the weights at install, so a rotation is one kernel on every path
-  (serial, verify, prefill). `CHAD_PRISM_ROT_FP32=1` restores the fp32 transform, an A/B
-  arm inside the noise;
-- the small-M verify kernel (`mlx_qmm_mma.py`) covers 2-bit g128, tiled past 8 rows. Stock
-  2-bit matmul re-pays the weight read per row, which made an 8-wide verify cost 9× a
-  decode step and drafting a net loss;
-- the speculative schedule is seeded with a round-cost ladder measured at this bit width;
-- the side tensors are cast to bf16 at load, since the pack's fp32 norms would otherwise
-  promote every activation to fp32 (NLL 1.502 against 1.500);
-- when the fast path declines a Prism pack it warns and says why: an unfused pack decodes
-  correctly and several times slower.
+and runs anyway, with the window shrunk toward its floor.
 
 ### Smoke test (`chad prove`)
 
-```bash
-chad prove
-```
+Downloads the shipped model if it is not cached, then drives four tiny fix-it tasks
+end-to-end: a real agent loop, real edits in a scratch directory, each verified by a check
+script rebuilt from read-only sources so an edit cannot spoof a pass. It prints what
+worked with time-to-first-token, decode speed and wall clock per task, and writes
+`results.json` to the invoking directory.
 
-Downloads the shipped model if it isn't cached, then drives four tiny fix-it tasks
-end-to-end against it: a real agent loop, real edits in a scratch directory, each verified
-by a check script re-written from read-only sources so an agent edit can't spoof a pass,
-and prints what worked, with time-to-first-token, decode speed and wall-clock per task.
-`results.json` lands in the invoking directory.
-
-Two deliberate rigidities. It **pins the shipped model**, ignoring `--model` and
-`CHAD_MODEL` (it says so when you set one): the question is "does the thing I am about to
-run work on this machine", and a smaller stand-in cannot answer it. And once the weights are
-present it **goes offline** (`HF_HUB_OFFLINE` plus an in-process socket guard), so a task
-cannot quietly reach the network. Exit codes: `0` all passed, `1` a task failed, `2` the
-preflight stopped.
-
-These are smoke tests, not a benchmark: on working hardware they should essentially never
-fail, so a failure points at the install or the machine rather than at the model's ability.
-Reach for it first when something is broadly wrong, before reading
-[Troubleshooting](troubleshooting.md).
+It pins the shipped model, ignoring `--model` and `CHAD_MODEL`, because the question is
+whether the thing you are about to run works on this machine. Once the weights are present
+it goes offline (`HF_HUB_OFFLINE` plus a socket guard). Exit codes: `0` all passed, `1` a
+task failed, `2` the preflight stopped. On working hardware it should never fail, so a
+failure points at the install or the machine, not the model.
 
 ### Alternate backend (remote)
 
-The default backend is the in-process MLX engine, the whole point of chad (a persistent
-prefix KV cache on-device). `--backend llama` instead drives the *same* harness against a
-remote **llama.cpp** server's raw `/completion` endpoint (token-id prompts). This is the
-arm used when chad runs inside a Linux benchmark container against a GGUF served on a GPU
-box, where MLX can't run. It's lossy relative to the in-process engine (the KV cache lives
-in the server, so warm-prefix checkpoints are no-ops) but keeps real
-cache telemetry and passes `<think>` back verbatim, not a general "use a cloud model" path.
+`--backend llama` drives the same harness against a remote llama.cpp server's raw
+`/completion` endpoint with token-id prompts. It is the arm used when chad runs in a Linux
+benchmark container against a GGUF served elsewhere, where MLX cannot run. The KV cache
+lives in the server, so warm-prefix checkpoints are no-ops, but cache telemetry is real
+and `<think>` comes back verbatim. It is not a general "use a cloud model" path.
 
 ```bash
 chad --backend llama --base-url http://<host>:8081   # or CHAD_LLAMA_BASE_URL
 ```
 
-- `--base-url` / `CHAD_LLAMA_BASE_URL`: the llama-server origin (bare, no `/v1`);
-  required for `--backend llama` (the flag wins; the env var is the fallback).
-- `--tokenizer` / `CHAD_TOKENIZER`: HF repo whose tokenizer matches the served
-  model's vocab; required for a GGUF server (GGUF repos ship no tokenizer).
-- `--api-key-env NAME`: the *name* of the env var holding the API key (read from that
-  var, never passed on the command line). Omit for a local endpoint that needs no key.
+- `--base-url` / `CHAD_LLAMA_BASE_URL`: the llama-server origin, no `/v1`. Required.
+- `--tokenizer` / `CHAD_TOKENIZER`: an HF repo whose tokenizer matches the served
+  model's vocab. Required for a GGUF server, since GGUF repos ship no tokenizer.
+- `--api-key-env NAME`: the name of the env var holding the API key; the key is never
+  passed on the command line.
 
 ### Sampling & reasoning effort
 
 chad samples with the model card's recipe for the mode it is in. With reasoning on (the
 default): temperature 1.0, top-p 0.95, top-k 20. With `--no-think`: temperature 0.7,
-top-p 0.80, top-k 20. A variable below overrides that one setting and leaves the rest of
-the recipe in place. Set `CHAD_TEMP=0` for greedy decoding, which is reproducible; its
-known failure is that a stalled or garbled step replays itself byte for byte on every
-retry.
+top-p 0.80, top-k 20. A variable below overrides that one setting and leaves the rest in
+place. `CHAD_TEMP=0` is greedy and reproducible; its known failure is that a stalled or
+garbled step replays itself byte for byte on every retry.
 
 ```bash
-CHAD_TEMP=0.7             chad  # sampling temperature (default 1.0; 0.7 with --no-think)
-CHAD_MIN_P=0.05           chad  # min-p tail trim (default 0 = off)
+CHAD_TEMP=0.7             chad  # temperature (default 1.0; 0.7 with --no-think)
 CHAD_TOP_P=0.95           chad  # nucleus sampling (default 0.95; 0.80 with --no-think)
 CHAD_TOP_K=20             chad  # top-k (default 20)
+CHAD_MIN_P=0.05           chad  # min-p tail trim (default 0 = off)
 CHAD_PRESENCE_PENALTY=0.5 chad  # flat penalty on already-generated tokens (default 0)
-CHAD_REASONING_EFFORT=low chad  # template-level reasoning budget, where supported
+CHAD_REASONING_EFFORT=low chad  # xhigh | medium | low, passed to the chat template
 ```
 
-- `CHAD_MIN_P` / `CHAD_TOP_P` / `CHAD_TOP_K`: anti-confabulation knobs for a heavily
-  quantized model, `CHAD_MIN_P` off by default. They trim the sub-noise-floor logit tail without
+- `CHAD_MIN_P`, `CHAD_TOP_P`, `CHAD_TOP_K` trim the sub-noise-floor logit tail without
   touching temperature, which is usually what you want when a small quant invents an API.
-- `CHAD_PRESENCE_PENALTY`: a flat score penalty on every already-emitted token.
-  Ships at **0.0** and is worth leaving there, even though model cards suggest up to 1.5:
-  those ranges are written for chat, and code is inherently repetitive: identifiers,
-  keywords and punctuation *must* be reused. Measured on one task at 1.5, the model spent
-  45 steps in pure exploration, landed zero edits, and emitted visibly corrupted tool
-  arguments. Treat it as a knob to probe, not a default to ship.
-- `CHAD_REASONING_EFFORT`: `xhigh` | `medium` | `low`, passed to the chat template as
-  a reasoning budget on checkpoints whose template accepts one (Qwen3.8). Unset, the
-  argument is not passed *at all*, so a template without the knob is unaffected. This is a
-  template-level request to the model, distinct from the harness-level
-  [think-cap](#turn-budgets--think-cap) below, which force-closes a `<think>` run the model
-  has already started.
-
-All five sampler settings are applied as one call, so every path that builds an engine
-(interactive and one-shot) honors the same set.
+- `CHAD_PRESENCE_PENALTY` ships at 0 and is worth leaving there. Model cards suggest up to
+  1.5 for chat, but code must reuse identifiers, keywords and punctuation: measured at
+  1.5, the model spent 45 steps exploring, landed zero edits, and emitted corrupted tool
+  arguments.
+- `CHAD_REASONING_EFFORT` is a template-level request on checkpoints whose template
+  accepts one (Qwen3.8); unset, the argument is not passed at all. It is distinct from the
+  harness-level [think-cap](#turn-budgets--think-cap), which force-closes a `<think>` the
+  model has already started.
 
 ### Turn budgets & think-cap
 
 A runaway-turn **governor** ends a turn that burns a lot of prefill without landing and
-verifying a change; it nudges at ~50% of budget and, at ~80%, banks a one-line progress
-note and stops. The token budget applies to every session, interactive ones included, and
-defaults to three times the context limit. The wall-clock budget is off unless you set it.
-In the TUI, a turn that stops on its budget keeps a short note of what it tried, and the
-next thing you type starts a fresh context seeded with that note; `/reset` starts clean
-without it.
+verifying a change: it nudges at ~50% of budget and at ~80% banks a one-line progress
+note and stops. The token budget applies to every session and defaults to three times the
+context limit; the wall-clock budget is off unless set. In the TUI the next thing you type
+after a stop starts a fresh context seeded with the note; `/reset` starts clean.
 
-These are env-only knobs because the only thing that sets them is an unattended harness,
-which already builds a `CHAD_*` environment. `--think-budget` is the one member of the
-family kept on the CLI, since it is a capability/latency trade a person might reach for
-interactively; the former `--think-ceiling`, `--turn-budget-tokens`, `--turn-budget-s`,
-`--auto-continue` and `--review-pass` flags are gone, and passing one is now an error
-rather than a silent no-op.
+These are env-only because the thing that sets them is an unattended harness, which
+already builds a `CHAD_*` environment. `--think-budget` is the one kept on the CLI.
 
 ```bash
-CHAD_THINK_BUDGET=1500        chad  # soft-cap each step's <think> at N tokens, then force-close + continue
-CHAD_THINK_CEILING=384        chad  # force-close a runaway <think> but keep decoding the action in the SAME step (off by default)
+CHAD_THINK_BUDGET=1500        chad  # soft-cap each step's <think> at N tokens, force-close it and END the step
+CHAD_THINK_CEILING=384        chad  # force-close a runaway <think> but keep decoding the action in the SAME step
 CHAD_TURN_BUDGET_TOKENS=90000 chad  # governor token budget (default 3× the context limit)
-CHAD_TURN_BUDGET_S=600        chad  # wall-clock variant (seconds); off by default
-CHAD_AUTO_CONTINUE=2          chad  # on a hard stop, relaunch a fresh turn seeded with the progress note, N times (default 2 for a one-shot in yolo mode, which an unattended one is; else 0)
-CHAD_REVIEW_PASS=1            chad  # if a one-shot finishes early and clean, spend the slack verifying it (needs CHAD_TURN_BUDGET_S)
-CHAD_MAX_GEN_TOKENS=32768     chad  # hard per-STEP generation cap (default 32768)
+CHAD_TURN_BUDGET_S=600        chad  # wall-clock variant, seconds (off by default)
+CHAD_AUTO_CONTINUE=2          chad  # on a hard stop, relaunch a fresh turn seeded with the note, N times (default 2 for a yolo one-shot, else 0)
+CHAD_REVIEW_PASS=1            chad  # a one-shot that finishes early spends the slack verifying (needs CHAD_TURN_BUDGET_S)
+CHAD_MAX_GEN_TOKENS=32768     chad  # hard per-step generation cap (default 32768)
 ```
 
-- `CHAD_THINK_BUDGET`: soft-caps each step's `<think>` run at N tokens, force-closes it,
-  and continues (escalates when the model is stuck); off by default.
-
-  This is the adaptive think-cap, a smarter reasoning lever than the blunt `--no-think`:
-
-  - `--no-think` kills **all** `<think>` for the whole session. It's the biggest,
-    bluntest time saver (see [benchmarks](benchmarks.md), "the most effective time-to-done
-    lever on well-scoped agentic work"), but it costs pass-rate on hard tasks that genuinely
-    need to reason. All-or-nothing.
-  - the adaptive think-cap (`--think-budget N` / `CHAD_THINK_BUDGET=N`) leaves reasoning
-    **on**, and only trims a step whose `<think>` run runs past N tokens, force-closing it
-    (prefix-safe, so the next step is a cheap append, not a re-prefill) so reasoning can't
-    balloon. The cap **escalates** with the turn's stuck-signals: a genuinely hard step that
-    keeps getting capped is given more room instead of being chopped repeatedly. So it keeps
-    full reasoning on well-scoped work and only trims the rambling. Off by default today, flipping it on by default is an eval-gated decision.
-
-  When the cap fires during a turn, the TUI status line shows a small **`✂N`** counter (N =
-  steps trimmed this turn) alongside the live ↑prefill / ↓generated readouts, so you can see
-  it acting. With the cap off (the default) nothing renders.
-- `CHAD_THINK_CEILING`: the **close-and-continue** ceiling, and the one to reach for
-  before `CHAD_THINK_BUDGET`. Where the think-cap force-closes `<think>` and *ends* the
-  step (so the model re-derives its reasoning next step), this force-closes the runaway
-  block and keeps decoding the action in the same step, the reasoning so far stays
-  in context and nothing is re-derived. **Off by default**: force-closing `</think>`
-  mid-generation is the most invasive thing the harness can do to the token stream, and
-  the measured record says the bare loop doesn't need it. Steps it fires on are counted
-  as *salvaged* in the session log.
-- `CHAD_TURN_BUDGET_TOKENS`: the governor's cumulative-prefill budget per turn; defaults
-  to 3× the context limit. Disable the governor entirely with `CHAD_NO_GOVERNOR=1` (below).
-- `CHAD_TURN_BUDGET_S`: a wall-clock (seconds) variant of the same governor; off by
-  default.
-- `CHAD_MAX_GEN_TOKENS`: the hard ceiling on a single *step's* generation, 32768 by
-  default. It is a backstop against non-repetitive runaway garble, not a reasoning lever:
-  a literal decode loop is the repeat guard's job. The ceiling is deliberately high because
-  a low one has a real loss class: a long chain of thought pins the cap while still inside
-  `<think>`, and the step ends as discarded reasoning with no action.
-
-> **`CHAD_PREFILL_TRACE=path.jsonl`** is a dev/instrumentation knob, **not** supported
-> config: it captures one JSON row per engine prefill to the given path for measurement
-> spikes. Each row also carries the loop overhead outside the engine: `render_s`
-> (chat-template re-tokenization), `compact_s`, and `prev_tools` (the prior step's tool
-> executions as `[name, seconds]` pairs), so a slow step can be attributed to prefill,
-> tokenization, compaction, or a tool without guessing. Leave it unset in normal use.
+- `CHAD_THINK_CEILING` is the one to reach for first. It force-closes the runaway block and
+  keeps decoding the action in the same step, so the reasoning so far stays in context and
+  nothing is re-derived. Off by default: force-closing `</think>` is the most invasive
+  thing the harness can do to the token stream, and the measured record says the bare
+  loop does not need it.
+- `CHAD_THINK_BUDGET` (`--think-budget`) ends the step instead, so the next step re-derives
+  its reasoning, and escalates the cap when the turn keeps getting capped. When it fires,
+  the status line shows a `✂N` counter.
+- `CHAD_MAX_GEN_TOKENS` is a backstop against non-repetitive runaway garble, not a
+  reasoning lever (a literal decode loop is the repeat guard's job). It is high on purpose:
+  a low cap ends a long chain of thought inside `<think>` as discarded reasoning with no
+  action.
+- `CHAD_NO_GOVERNOR=1` disables the governor entirely (below).
 
 ### Harness levers
 
-chad 2.0.0 ships **ten** result-channel levers, all ON by default, the survivors
-of a long measurement campaign in which nothing else beat the bare model + tool loop.
-Each one makes the `bash` route more honest or more informative (a trimmed test run
-keeps its failure rows; a grep that matched nothing says what it searched; a failed
-edit explains itself), and each keeps a name and a switch for exactly one reason:
-leave-one-out ablation. `chad levers` prints the registry (it loads no model). A name
-that isn't registered is a startup error, not a warning: a typo would otherwise run
-the unmodified harness and report the lever as having no effect.
+chad ships **ten** result-channel levers, all on by default, the survivors of a
+measurement campaign in which nothing else beat the bare model and tool loop. Each makes
+the `bash` route more honest or more informative, and each keeps a name and a switch for
+one reason: leave-one-out ablation. A name that is not registered is a startup error,
+since a typo would otherwise run the unmodified harness and report no effect.
 
 ```bash
-chad levers                          # inventory: every lever + what's active
-CHAD_DISABLE=bash_line_clip chad     # leave-one-out ablation arm
+chad levers                          # the registry, and what is active (loads no model)
+CHAD_DISABLE=bash_line_clip chad     # leave-one-out arm
 CHAD_DISABLE=all chad                # the bare model + tool loop
 ```
 
 | Lever | What it adds to the result channel |
 |---|---|
-| `env_manifest` | session-start toolchain inventory in the system prompt tail: which compilers/interpreters/package managers are present, with versions, and which commonly-probed ones are absent |
-| `bash_read_skeleton` | a one-line symbol map the first time a source file's content comes back through `cat`/`sed`/`head`, and a definition pointer when a grep for a known symbol comes back empty |
-| `bash_empty_diagnose` | why a command produced nothing: a `sed` range past EOF, or the pipeline stage whose filter matched |
-| `bash_trim_keep_failures` | when long output is head/tail-trimmed, the failure rows from the omitted middle are kept verbatim |
+| `env_manifest` | the toolchain on this machine, with versions, and the common ones missing, in the system prompt tail |
+| `bash_read_skeleton` | a one-line symbol map the first time a source file comes back through `cat`/`sed`/`head`, and a definition pointer when a grep for a known symbol is empty |
+| `bash_empty_diagnose` | why a command printed nothing: a `sed` range past EOF, or the pipeline stage that matched nothing |
+| `bash_trim_keep_failures` | when long output is head/tail-trimmed, the failure rows from the middle are kept verbatim |
 | `verify_baseline` | the pre-edit outcome of the project's test command, recalled on a failing post-edit run |
-| `bash_line_clip` | per-line cap so one minified line can't spend the whole output budget; the full text goes to a spill file |
-| `edit_miss_diagnose` | a failed edit says whether the change looks *already applied*, or the first line/column where the sent text diverges |
-| `trim_spill` | when compaction head/tail-trims an older tool result, the full original goes to a spill file and the trimmed message names the path |
-| `result_spill` | when the per-result backstop cap clips a result, the full body goes to a spill file and the notice names the path |
-| `rg_replace_flag_note` | one line naming what an `rg -r` result actually is: `-rn` is `--replace n`, not grep's recursive flag |
-
-- `CHAD_DISABLE`: comma-separated lever names to switch off (`all` = every lever).
+| `bash_line_clip` | per-line cap so one minified line cannot spend the output budget; the full text goes to a spill file |
+| `edit_miss_diagnose` | a failed edit says whether the change is already applied, or the first line and column where the sent text diverges |
+| `trim_spill` | when compaction trims an older result, the original goes to a spill file and the notice names the path |
+| `result_spill` | when the per-result cap clips a result, the full body goes to a spill file and the notice names the path |
+| `rg_replace_flag_note` | one line saying what an `rg -r` result is: `-rn` is `--replace n`, not grep's recursive flag |
 
 ### Safety & A/B opt-outs
 
-**One thing no permission mode waves through.** A `write`/`edit` whose real path is
-outside the working directory (or under `.git/hooks`) always asks, even in auto-accept
-and yolo; headless runs block it and tell the model why. The prompt names the resolved
-path, so a symlink out of the workspace shows where the write actually lands.
+**One thing no permission mode waves through.** A `write` or `edit` whose real path is
+outside the working directory, or under `.git/hooks`, always asks, even in yolo; headless
+runs block it and tell the model why. The prompt names the resolved path, so a symlink
+out of the workspace shows where the write lands.
 
-These flip behavior off rather than tune it. The two safety opt-outs **weaken** chad's
-defenses. Leave them unset in normal use; they exist for measurement and edge cases.
+These flip behaviour off rather than tune it. The ones marked unsafe weaken chad's
+defences; leave them unset outside measurement.
 
 ```bash
-CHAD_NO_VALIDATE=1          chad  # A/B knob: DISABLE arg coercion + schema validation
-CHAD_NO_GOVERNOR=1          chad  # A/B knob: DISABLE the runaway-turn governor
-CHAD_NO_REPEAT_GUARD=1      chad  # A/B knob: DISABLE the degenerate-repetition stop
-CHAD_NO_SYNTAX_GATE=1       chad  # A/B knob: DISABLE the post-edit syntax gate
-CHAD_NO_PREFIX_CACHE=1      chad  # measurement knob: drop the persistent prefix KV cache
+CHAD_NO_VALIDATE=1          chad  # A/B: no arg coercion or schema validation; strict json.loads only
+CHAD_NO_GOVERNOR=1          chad  # A/B: no runaway-turn governor
+CHAD_NO_REPEAT_GUARD=1      chad  # A/B: no degenerate-repetition stop
+CHAD_NO_SYNTAX_GATE=1       chad  # A/B: no post-edit syntax warning
+CHAD_NO_PREFIX_CACHE=1      chad  # measurement: full re-prefill every step (much slower)
 CHAD_NO_KV_RESUME=1         chad  # a quit writes no KV checkpoint; a resume re-reads the transcript
-CHAD_NO_SKILLS=1            chad  # disable Agent Skill discovery (no /<skill>)
-CHAD_NO_FASTPATH=1          chad  # A/B knob: disable the fused-projection decode fast path
-CHAD_NO_DESTRUCTIVE_GUARD=1 chad  # DISABLE the catastrophic-bash screen (unsafe)
-CHAD_NO_SEATBELT=1          chad  # DISABLE the macOS Seatbelt sandbox for yolo bash (unsafe)
-CHAD_NO_ENV_GUARD=1         chad  # let bash children inherit credential-shaped env vars
-CHAD_PROTECT_GIT=1          chad  # also write-DENY .git inside the yolo sandbox
+CHAD_NO_SKILLS=1            chad  # no Agent Skill discovery, so no /<skill> resolves
+CHAD_NO_FASTPATH=1          chad  # A/B: no fused-projection decode fast path (speed only)
+CHAD_NO_DESTRUCTIVE_GUARD=1 chad  # unsafe: no screen for rm -rf ~, mkfs, dd of=/dev/…, curl | sh
+CHAD_NO_SEATBELT=1          chad  # unsafe: no macOS Seatbelt sandbox for yolo bash
+CHAD_NO_ENV_GUARD=1         chad  # bash children inherit credential-shaped env vars
+CHAD_PROTECT_GIT=1          chad  # also write-deny .git inside the yolo sandbox
 ```
 
-- `CHAD_NO_VALIDATE`: **disables** the typia-style lenient-parse → typed-validate →
-  self-repair loop for tool-call arguments (`validate.py`), falling back to a strict
-  `json.loads` plus a terse missing-required check. This *weakens* input handling (malformed
-  or loosely-typed tool calls that chad would normally coerce/repair will instead error). An
-  A/B knob to measure what validation buys per model. Leave unset in normal use.
-- `CHAD_NO_GOVERNOR`: **disables** the runaway-turn governor (see [Turn budgets &
-  think-cap](#turn-budgets--think-cap)), so a turn is never force-ended on its
-  prefill/wall-clock budget. An A/B knob for measuring what the governor buys; the turn
-  runs until the model stops on its own.
-- `CHAD_NO_REPEAT_GUARD`: **disables** the degenerate-repetition stop (`guardrails.py`).
-  Greedy decode on a small quantized model can lock into repeating one short string until
-  the per-step token cap, minutes of dead generation per occurrence. By default chad
-  watches the generation's tail, cuts the step off as soon as it turns fully periodic, and
-  nudges the model out of the loop (aborting the turn after 3 cut-offs). Unlike the
-  think-cap this never trades capability (it only fires on output that is already garbage),
-  so it is on by default; this knob is the A/B arm.
-- `CHAD_NO_SYNTAX_GATE`: **disables** the post-edit syntax gate (`syntaxgate.py`),
-  which normally warns when an edit *introduces* a new syntax error (it never flags a
-  pre-existing one). An A/B arm for evaluation runs; leave unset in normal use.
-- `CHAD_NO_PREFIX_CACHE`: a fairness/measurement knob that **drops** the persistent
-  prefix KV cache (`engine.py`), forcing a full re-prefill every step. It exists to measure
-  what the cache is worth and makes chad much slower. Never set it in normal use.
-- `CHAD_NO_KV_RESUME`: a session that ends no longer writes its cache to disk, and a
-  resume never restores one — `chad -c` re-reads the whole transcript, as it did before
-  ([Sessions](#sessions)). For a machine short of disk, or to measure what the restore
-  is worth.
-- `CHAD_NO_DESTRUCTIVE_GUARD`: **disables** the catastrophic-bash screen
-  (`guardrails.py`) even in `--yolo` mode. With it set, an injected `rm -rf ~`,
-  `mkfs`, `dd of=/dev/…`, fork bomb, or `curl … | sh` is **not** screened before running.
-  It is a screen, not a security boundary (the sandbox below is). Leave it unset.
-- `CHAD_NO_SEATBELT`: **disables** the macOS Seatbelt sandbox (`seatbelt.py`) that
-  yolo-mode bash commands run under by default: file writes confined to the workspace,
-  temp dirs, and caches; reads and network open. Only the spawned shell child is ever
-  sandboxed. Set this only when the sandbox itself breaks a legitimate workflow. When
-  yolo cannot be sandboxed, because this is set or because chad is itself running inside
-  a sandbox, chad says so when the session enters yolo.
-- `CHAD_NO_ENV_GUARD`: bash children normally get a **filtered** copy of the
-  environment: variable names shaped like credentials are dropped — `…_TOKEN`,
-  `…_SECRET`, `…_PASSWORD`, `…_API_KEY`, `…_KEY`, `…_PAT`, `…_AUTH`, `…_DSN`,
-  `…_TOKEN_FILE`, plus `SSH_AUTH_SOCK`, `DATABASE_URL` and `AWS_PROFILE` by name. The
-  one value the guard reads is a `…_URL` carrying userinfo (`scheme://user:pass@host`),
-  dropped because the name gives no hint that it holds a password. Set this for a
-  session whose commands legitimately need a credential (e.g. `gh`, deploy scripts) — a
-  stripped variable is absent, never corrupted, so a command that needs one behaves as
-  if it had never been set: most fail with their own authentication error, and the AWS
-  CLI falls back to the default profile. chad prints the withheld names when an
-  interactive session starts. A command you type yourself with `!` is not filtered.
-- `CHAD_PROTECT_GIT`: an opt-in tier on top of the yolo sandbox: the workspace's
-  `.git` (and a worktree's external gitdir) is write-DENIED, so an unreviewed command
-  cannot destroy project history. The cost is real: every `.git`-writing git command
-  (commit, add, checkout) EPERMs inside the sandbox, which is why it is opt-in.
-- `CHAD_NO_SKILLS`: turns off [Agent Skill](#agent-skills-agentskillsio) discovery
-  entirely, so no `/<skill>` command resolves. Skills no longer touch the system prompt,
-  so this is no longer needed to keep your personal skills out of a benchmark; set it
-  when you want them unreachable from chad at all. Like every other `CHAD_NO_*` flag it
-  reads as set or unset: any non-empty value, `0` included, turns discovery off.
-- `CHAD_NO_FASTPATH`: disables the fused-projection + compiled decode step installed
-  at load for the dense `qwen3_5` hybrid (`mlx_fastpath.py`): the MLP `gate|up` concat, the
-  GDN `in_proj` concat, and the compiled S=1 layer step; on the
-  [ternary pack](#running-the-ternary-pack) also the
-  `q|k|v` concat and the one-rotation-per-fused-matmul bodies. It is a silent no-op on any
-  other checkpoint, so an arbitrary `--model` neither gains nor loses anything here. Pure speed,
-  no behavior change, so this is an A/B and bisection knob rather than something to run
-  with.
+- **The repeat guard** watches the generation's tail, cuts the step off as soon as it turns
+  fully periodic, and nudges the model out of the loop, aborting the turn after three
+  cut-offs. It only fires on output that is already garbage, so it never trades capability.
+- **The destructive-bash screen** is a screen, not a security boundary; the sandbox is.
+- **The yolo sandbox** confines file writes to the workspace, temp dirs and caches; reads
+  and network are open. Only the spawned shell is sandboxed, never chad itself, which needs
+  Metal. When yolo cannot be sandboxed, because this is set or chad is itself inside a
+  sandbox, chad says so on entering yolo. `CHAD_PROTECT_GIT` adds a write-deny on `.git`,
+  at the cost of every `.git`-writing git command failing inside the sandbox.
+- **The env guard** drops variables named like credentials (`…_TOKEN`, `…_SECRET`,
+  `…_PASSWORD`, `…_API_KEY`, `…_KEY`, `…_PAT`, `…_AUTH`, `…_DSN`, `…_TOKEN_FILE`, plus
+  `SSH_AUTH_SOCK`, `DATABASE_URL` and `AWS_PROFILE`) and any `…_URL` carrying
+  `user:pass@`. A stripped variable is absent, never corrupted: most tools fail with their
+  own auth error, and the AWS CLI falls back to the default profile. chad lists the
+  withheld names when an interactive session starts. A command you type with `!` is not
+  filtered.
+- **`CHAD_NO_FASTPATH`** is a no-op on any checkpoint the fast path does not cover; it is
+  a bisection knob, not something to run with.
 
-chad sets **no** `MLX_*` runtime variables, so there is nothing to opt out of:
-`MLX_METAL_FAST_SYNCH`, `MLX_MAX_OPS_PER_BUFFER` and `MLX_MAX_MB_PER_BUFFER` were each
-measured end-to-end and every setting was *slower* than mlx's own defaults.
-Export them yourself if you want to experiment; mlx reads them directly.
+chad sets no `MLX_*` runtime variables: `MLX_METAL_FAST_SYNCH`, `MLX_MAX_OPS_PER_BUFFER`
+and `MLX_MAX_MB_PER_BUFFER` were each measured end-to-end and every setting was slower
+than mlx's defaults. Export them yourself to experiment.
 
 ### Speculative decoding & kernel knobs
 
-Everything in this block is speed only, bisection and A/B knobs, not something to
-run with. Two different kinds of exactness live here, and the difference matters when you
-are chasing a behaviour change:
+Everything here is speed only: bisection and A/B knobs. Two kinds of exactness live here,
+and the difference matters when you are chasing a behaviour change:
 
-- The speculation knobs are exact in the acceptance rule, not bit-identical in the
-  forward. `CHAD_NO_DFLASH` and the width settings change *which* tokens get proposed;
-  every emitted token is still the target's own choice for its position, and the sampled
-  path keeps the model's true distribution. But a verified block is a batched S>1 forward
-  and a serial step is an S=1 forward, and those run different matmul and attention
-  kernels, so their logits agree to rounding, not to the bit: a greedy run therefore
-  follows serial until the first near-tie and can take the other branch there. Measured
-  on the ternary pack (`benchmarks/spec_decode.py`, greedy, 10 repo-text seeds): 4/10
-  160-token generations token-identical to serial, the rest diverging 10-95 tokens in at
-  the same positions whether or not the cache is shared, and at *different* positions
-  with `CHAD_NO_QMM_MMA=1`, the signature of rounding, not of a logic bug. A divergence
-  that is not a near-tie (different output from the first token on an ordinary prompt,
-  or a quality drop) is a bug.
-- The kernel knobs are exact to rounding, not bit-identical. `CHAD_NO_QSDPA*` swap one
-  attention kernel for another; each is within output-dtype rounding of an fp32 reference
-  (the acceptance class MLX holds its own fused kernels to), but they are not bit-identical
-  to *each other*. A greedy near-tie can therefore land on a different token and
-  autoregression will amplify it into different prose. Measured: flipping
-  `CHAD_NO_QSDPA_WIDE` on a 150-token greedy generation produced equally valid but
-  differently worded output. That is expected, not a bug, so bisect a *behaviour* change
-  with the speculation knobs, and read a kernel-knob output diff as noise unless the
-  quality moves.
+- The **speculation** knobs are exact in the acceptance rule, not bit-identical in the
+  forward. Every emitted token is the target's own choice for its position, but a verified
+  block is a batched S>1 forward and a serial step is S=1, and those run different kernels
+  whose logits agree to rounding. A greedy run follows serial until the first near-tie and
+  can take the other branch there (measured: 4 of 10 160-token greedy generations
+  token-identical to serial, the rest diverging 10–95 tokens in). A divergence that is not
+  a near-tie, or a quality drop, is a bug.
+- The **kernel** knobs swap one attention or matmul kernel for another. Each is within
+  output-dtype rounding of an fp32 reference, but not bit-identical to each other, so a
+  greedy near-tie can land on a different token and autoregression amplifies it into
+  different prose. Read a kernel-knob output diff as noise unless the quality moves.
 
 ```bash
-CHAD_NO_DFLASH=1          chad  # disable block speculation (decode serially)
+CHAD_NO_DFLASH=1          chad  # decode serially
 CHAD_DFLASH_DRAFT=7       chad  # verified-width cap per round (1..7; default the full block)
 CHAD_DFLASH_ADAPTIVE=0    chad  # verify the full block every round instead of the per-round schedule
-CHAD_DFLASH_PATH=/dir     chad  # explicit drafter checkpoint or built sidecar dir
+CHAD_DFLASH_PATH=/dir     chad  # a drafter checkpoint or built sidecar outside the model repo
 CHAD_NO_SCR=1             chad  # compaction re-reads everything after the first change
 CHAD_SCR_MAX_SPANS=6      chad  # most surviving spans a compaction moves instead of reads
-CHAD_SCR_MIN_SPAN=64      chad  # shortest survivor worth moving (shorter ones are read)
-CHAD_USE_PLD=1            chad  # OPT-IN: wide prompt-lookup decoding
-CHAD_NO_QSDPA_WIDE=1      chad  # disable the S>1 tier of the fused attention kernel
-CHAD_NO_QSDPA_WIDE_SGM=1  chad  # disable just its split-head variant
+CHAD_SCR_MIN_SPAN=64      chad  # shortest survivor worth moving
+CHAD_USE_PLD=1            chad  # opt-in: prompt-lookup decoding (does not compose with the drafter)
+CHAD_NO_QSDPA_WIDE=1      chad  # no S>1 tier of the fused attention kernel
+CHAD_NO_QSDPA_WIDE_SGM=1  chad  # no split-head variant of that tier
 CHAD_QSDPA_WIDE_SGM_RT=1  chad  # force the RT-split wide kernel instead of the one-read form
-CHAD_NO_KERNEL_WARM=1     chad  # skip warming verify-width attention kernels at load
+CHAD_QSDPA_WIDE_KERNEL=1  chad  # force the single-kernel wide variant
+CHAD_NO_PREFILL_SLICE=1   chad  # prefill attention as one slab (the transient grows; smaller window)
+CHAD_NO_KERNEL_WARM=1     chad  # skip warming the verify-width kernels at load (compiles land in your first steps)
 CHAD_NO_QMM_MMA=1         chad  # stock quantized_matmul at every verify width
-CHAD_QMM_MMA_RECAL=1      chad  # re-probe the small-M matmul kernel on this machine
+CHAD_QMM_MMA_RECAL=1      chad  # re-probe the small-M matmul kernel on this machine (after an mlx upgrade)
 ```
 
-- `CHAD_NO_DFLASH`: disables **DFlash2 block speculation** (`mlx_dflash.py`) and decodes one
-  token per forward. A 1.9B drafter (an MLX port of
-  [z-lab's DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), pre-quantized to
-  4-bit in the sidecar's `dflash/`) reads the main model's residual stream at five layers
-  and proposes a whole block of tokens in **one** forward. The block is verified in one
-  batched target forward and accepted by exact rejection sampling: every emitted token is
-  the target's own choice and sampled output keeps the model's true distribution at any
-  temperature (to kernel rounding; see above). On the shipped GGUF, `chad-bench` decodes at
-  11.6 tok/s serial and 46.1 drafted, and real agent tasks at a 21.2 tok/s median
-  ([benchmarks](benchmarks.md#two-throughput-levers)). Any checkpoint of this model's shape
-  borrows the sidecar's drafter (`mlx_dflash.DONORS`, keyed on hidden size, layer count and
-  vocab); any other `--model` decodes serially unless `CHAD_DFLASH_PATH` points at a
-  drafter built for it.
-- `CHAD_DFLASH_DRAFT` / `CHAD_DFLASH_ADAPTIVE`: the verified width. The drafter always
-  proposes its full block of 7; by default a per-round schedule (a cost model over the
-  measured round costs and recent acceptance) picks how many to verify, narrowing or
-  skipping a round when acceptance drops, so low-acceptance text never pays for a full
-  block it mostly rejects. `CHAD_DFLASH_ADAPTIVE=0` verifies the full block every round,
-  the faster arm on text the drafter knows well. `CHAD_DFLASH_DRAFT=N` caps the width (and
-  implies the fixed arm). `benchmarks/spec_decode.py` measures the arms in one load.
-- `CHAD_DFLASH_PATH`: point the loader at a drafter outside the model repo: either an
-  HF-layout checkpoint dir (quantized on first use into `~/.cache/chad/dflash/`) or an
-  already-built sidecar dir. `python -m chad.mlx_dflash <dir> --out <model_dir>/dflash`
-  builds a sidecar by hand; that is how the shipped repo's bundle was made.
-- `CHAD_NO_SCR` / `CHAD_SCR_MAX_SPANS` / `CHAD_SCR_MIN_SPAN`: **suffix reuse after
-  compaction** (`suffix_reuse.py`). A compaction rewrites the middle of the transcript,
-  and the hybrid cache cannot be rewound, so it used to cost a re-read of everything after
-  the first change. Instead, the attention rows of text that survived the edit are moved
-  to their new positions (keys re-rotated) and only the inserted text is read. The
-  recurrent layers continue from whichever state they hold (live, or the start of the last
-  turn) has just read the text the edited transcript has at that point; it still
-  summarises the deleted text. The text the model sees is unchanged; the approximation is
-  in the cache.
-  `CHAD_NO_SCR=1` restores the full re-read. At most `CHAD_SCR_MAX_SPANS` survivors are
-  moved (default 6, the largest), each at least `CHAD_SCR_MIN_SPAN` tokens (default 64);
-  everything else is read. Survivors are found as runs of eight tokens, so a transcript
-  that is one short line repeated thousands of times is re-read in full rather than
-  matched slowly. The prefill trace (`CHAD_PREFILL_TRACE`) records the moved count per
-  step as `relocated_tokens`.
-- `CHAD_USE_PLD`: turns **wide prompt-lookup decoding** back on. It was the default
-  before 2.0.0 and is now opt-in, because PLD drafts from *context recurrence* and can
-  therefore only accelerate text that already appeared. On real agentic traces that is a
-  minority of what this agent generates: ~62-66% of generated tokens are `<think>`, and
-  reasoning prose replays at only ~2.3%. Whole-session contribution measured at **+2.2%**
-  of generated tokens. It does not compose with block speculation (one generate loop each),
-  so where the DFlash2 drafter is available it is strictly the better of the two, and
-  this flag is how you measure the other arm.
-- `CHAD_NO_QSDPA_WIDE` / `CHAD_NO_QSDPA_WIDE_SGM`: disable the multi-token (S>1) tier
-  of the fused quantized-KV attention kernel (`mlx_qsdpa.py`), which serves speculative
-  verification. Without it those steps fall back to dequantizing the whole cache once per
-  attention layer, which the wide path beats by 8% at 8k context and 30% at 38k on the
-  widths the adaptive schedule actually jumps to. Same numerics class as that
-  fallback (both within output-dtype rounding of an fp32 reference), but see the
-  note above: not bit-identical to it.
-  (`CHAD_NO_QSDPA_WIDE_SGM` also lowers the width at which chad switches to that fallback,
-  because the schedule left behind replays the S=1 kernel per row and so crosses over
-  sooner.) Prefill chunks are far wider than any verify step and always take the
-  fallback: flat in width, it is the faster of the two up there.
-  (`CHAD_QSDPA_WIDE_KERNEL=1` forces the single-kernel variant instead of the split-head
-  one, a kernel-selection knob for measurement.) The bigger hammers are still
-  `CHAD_NO_QSDPA`, described under [Context window](#context-window-agentic-coding-needs-room), which disables the
-  fused kernel entirely.
-- `CHAD_QSDPA_WIDE_SGM_RT`: the wide tier has two forms. The default is *one-read*
-  (K/V bytes touched once, all row tiles resident); this forces the *RT-split* form (one
-  8-row tile per threadgroup, K/V read once per tile), which is what runs anyway at S>4.
-  Both are exact; the knob exists to A/B them at a given width.
-- `CHAD_NO_QMM_MMA` / `CHAD_QMM_MMA_RECAL`: the **small-M quantized matmul kernel**
-  (`mlx_qmm_mma.py`) that serves speculative verification. Stock `quantized_matmul` is at
-  roofline for one row and tiles well from ~13 rows, but in between (verify width = draft
-  width + 1) its cost grows almost linearly in rows, because the GEMV path re-reads the
-  weights per row (~33 ms per extra row on the shipped model). The MMA kernel (avlp12's
-  `qmm_mma4` via mlx-dspark, MIT; with a width-generic unpack so the 3-bit body and 5-bit
-  `lm_head` qualify) dequantizes each weight group once for all rows, so widths 6-8 cost
-  about what width 5 does. At load chad probes every eligible weight shape on *this*
-  chip × mlx version (numerics against the stock kernel, then a dependent-chain race at
-  each width), and routes only the (shape, width) pairs that won; the verdict is cached
-  under `~/.cache/chad/qmm_mma/`. Same exactness class as the attention-kernel knobs
-  above: within rounding of the stock kernel, not bit-identical to it. Measured on the
-  this model's shapes (dependent chains, M4 Pro): the 3-bit MLP matmuls 1.31× at six rows
-  and 1.64× at eight, the 5-bit `lm_head` 1.55× / 1.87×, and below five rows the stock
-  kernel wins, so verify widths 6-8 now cost about what width 5 does, which is what lets
-  the block drafter verify its full block (see `CHAD_DFLASH_DRAFT`). Past one tile the
-  kernel is **tiled**: a 9-24 row forward runs as 8-row kernel calls plus a remainder
-  (through the kernel when it is wide enough to win, stock otherwise). The same probe
-  races the tiled path against stock at 12, 16, 24, 32 and 48 rows per shape and keeps
-  the widest that won (24 on every shipped shape, M4 Pro: 1.5-1.8× at 12-16 rows, 1.2× at
-  24, a loss at 32, where mlx's own tiling takes over). `CHAD_NO_QMM_MMA=1` is the A/B
-  arm; `CHAD_QMM_MMA_RECAL=1` re-probes (after an mlx upgrade, say).
-  `benchmarks/verify_ladder.py` prints what a forward of each width costs on your machine.
-- `CHAD_NO_PREFILL_SLICE`: runs prefill attention as one slab instead of row slices. A
-  measurement knob: with it set the prefill transient grows with context, the governor
-  charges 4.3 GB instead of 2 GB, and the window is smaller.
-- `CHAD_NO_KERNEL_WARM`: the attention kernel is templated on its verify width, so a
-  width that has never run means a Metal compile lands on the critical path of a real
-  step. Load warms exactly the widths *this* configuration can dispatch (the ones the
-  draft schedule can pick, intersected with the ones the fused kernel serves) rather than
-  the union of everything. Opting out moves those compiles into your first few steps.
+- **DFlash2** (`mlx_dflash.py`): a 1.9B drafter, an MLX port of
+  [z-lab's DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) pre-quantized to
+  4-bit in the sidecar, reads the main model's residual stream at five layers and
+  proposes a block of 7 tokens in one forward, verified in one batched target forward. By
+  default a per-round schedule over the measured round costs and recent acceptance picks
+  how many to verify, so low-acceptance text never pays for a block it mostly rejects;
+  `CHAD_DFLASH_ADAPTIVE=0` verifies the full block every round, the faster arm on text the
+  drafter knows well. Any checkpoint of this model's shape borrows the sidecar's drafter;
+  any other `--model` decodes serially unless `CHAD_DFLASH_PATH` points at one built for it
+  (`python -m chad.mlx_dflash <dir> --out <model_dir>/dflash` builds a sidecar).
+  `benchmarks/spec_decode.py` measures the arms in one load.
+- **Suffix reuse** (`suffix_reuse.py`): after compaction, the attention rows of text that
+  survived are moved to their new positions and only the inserted text is read; the
+  recurrent layers continue from whichever held state has just read the text at that
+  point. At most `CHAD_SCR_MAX_SPANS` survivors are moved, each at least
+  `CHAD_SCR_MIN_SPAN` tokens; survivors are found as runs of eight tokens, so a transcript
+  of one short line repeated thousands of times is re-read rather than matched slowly. The
+  prefill trace records the moved count per step as `relocated_tokens`.
+- **Prompt-lookup decoding** was the default before 2.0.0. It drafts only from text that
+  already appeared in context, which on real agent traces is ~2.2% of generated tokens,
+  and it does not compose with the block drafter.
+- **The wide attention tier** (`mlx_qsdpa.py`) serves speculative verification; without
+  it those steps dequantize the whole cache per layer, which the tier beats by 8% at 8k
+  context and 30% at 38k. Prefill chunks are far wider than any verify step and always
+  take the fallback. `CHAD_NO_QSDPA` (above) disables the fused kernel entirely.
+- **The small-M matmul kernel** (`mlx_qmm_mma.py`, avlp12's `qmm_mma4` via mlx-dspark,
+  MIT) dequantizes each weight group once for all rows where the stock GEMV re-reads it
+  per row, so verify widths 6–8 cost about what width 5 does, and a 9–24 row forward
+  runs as tiled 8-row calls. At load chad probes every eligible shape on this chip and
+  mlx version, routes only the (shape, width) pairs that won, and caches the verdict under
+  `~/.cache/chad/qmm_mma/`. `benchmarks/verify_ladder.py` prints what each width costs on
+  your machine.
 
 ### Dev & instrumentation
 
-Not supported surface: they exist for debugging chad itself, and their formats can change
-between releases.
+Not supported surface: formats can change between releases.
 
 ```bash
 CHAD_TRAJECTORY_JSON=/tmp/traj.json chad  # record an ATIF trajectory (pure observer)
-CHAD_SPILL_DIR=/tmp/spill           chad  # where truncated tool output spills to disk
+CHAD_PREFILL_TRACE=/tmp/pf.jsonl    chad  # one JSON row per prefill: tokens, seconds, render/compact/tool overhead
 CHAD_DUMP_RENDER=/tmp/prompt.txt    chad  # dump the fully-rendered prompt each step
-CHAD_PREFILL_TRACE=/tmp/pf.jsonl    chad  # per-step prefill/cache telemetry
+CHAD_SPILL_DIR=/tmp/spill           chad  # where truncated tool output spills to disk
 CHAD_CHECKPOINT_DIR=/tmp/ckpt       chad  # relocate the shadow-git edit checkpoints
-CHAD_SESSION_DIR=/tmp/sessions      chad  # relocate saved sessions (--continue/--resume)
+CHAD_SESSION_DIR=/tmp/sessions      chad  # relocate saved sessions
 ```
 
-- `CHAD_CHECKPOINT_DIR`: where the shadow-git repositories backing `/undo` and
-  `/restore` live (default `~/.chad/checkpoints`, keyed per workspace). It exists so a test
-  or eval suite never writes real home state. Note this is *not* `~/.chad/history`, which is
-  the TUI's prompt-history file. The store is private (mode `0700`), never snapshots
-  `.env*`, `*.pem`, `*.key` or SSH private keys, and a workspace's snapshots are swept
-  after 30 days without an edit.
-- `CHAD_SESSION_DIR`: where saved conversations live (default `~/.chad/sessions`, one
-  directory per project) for `--continue`, `--resume` and the TUI `/resume` picker. Like
-  `CHAD_CHECKPOINT_DIR`, it exists so a test or eval suite never touches real home state.
+The last two exist so a test or eval suite never writes real home state. The checkpoint
+store (default `~/.chad/checkpoints`, mode `0700`) never snapshots `.env*`, `*.pem`,
+`*.key` or SSH private keys, and a workspace's snapshots are swept 30 days after its last
+edit.
 
 ### Tree-sitter tags (ambient structure)
 
-The `bash_read_skeleton` lever's one-line symbol maps and definition pointers come from
-a tree-sitter tags index. Defaults are tuned for a big repo on a memory-tight machine;
-you rarely need to touch this.
+The `bash_read_skeleton` lever's symbol maps come from a tree-sitter tags index, persisted
+per repo under `~/.chad/cache/repomap/` and validated per file by mtime, so warm sessions
+skip the scan.
 
 ```bash
-CHAD_REPOMAP_WORKERS=4   chad  # subprocess workers for a cold repo scan (1 = serial)
+CHAD_REPOMAP_WORKERS=4   chad  # subprocess workers for a cold repo scan (default cores−2, capped at 8)
 ```
-
-- `CHAD_REPOMAP_WORKERS`: how many `python -c` subprocess workers a cold whole-repo
-  tag scan shards across (`repomap.py`; default: cores−2, capped at 8). Workers import
-  only `chad.repomap`, never the MLX engine. Tags persist per repo under
-  `~/.chad/cache/repomap/` (mtime-validated per file), so warm sessions skip the scan.
 
 ### Voice mode (`/speech`)
 
-Voice mode is all on-device: [Parakeet-on-MLX](https://github.com/ml-explore/mlx) (vendored)
-transcribes your mic, macOS `say` speaks the replies. It needs the `speech` extra (see
-[Installing](usage.md#installing--upgrading)), and nothing leaves the machine.
+All on-device: Parakeet-on-MLX transcribes your mic, macOS `say` speaks the replies. Needs
+the `speech` extra ([installing](usage.md#installing--upgrading)).
 
 ```bash
-CHAD_VOICE="Daniel"         chad  # macOS `say` voice (default: the system voice)
-CHAD_SPEECH_RATE=200        chad  # `say` rate in words/minute (default: the system rate)
-CHAD_STT_QUANT=4            chad  # ASR weight quantization: 8 (default), 4, or none
-CHAD_STT_MODEL=<hf-repo>    chad  # override the ASR checkpoint
-CHAD_SPEECH_WORDS=/path.json chad  # personal word table (default ~/.chad/speech_words.json)
+CHAD_VOICE="Daniel"          chad  # macOS `say` voice (default: the system voice; `say -v '?'` lists them)
+CHAD_SPEECH_RATE=200         chad  # `say` rate in words/minute
+CHAD_STT_QUANT=4             chad  # ASR weight quantization: 8 (default), 4, or none
+CHAD_STT_MODEL=<hf-repo>     chad  # the ASR checkpoint (default mlx-community/parakeet-tdt-0.6b-v3; others unsupported)
+CHAD_SPEECH_WORDS=/path.json chad  # personal word table that teaches it your identifiers (default ~/.chad/speech_words.json)
 ```
 
-- `CHAD_VOICE`: an installed macOS voice name. An unknown name is refused at startup
-  with a did-you-mean rather than silently falling back; `say -v '?'` lists what you have.
-- `CHAD_STT_QUANT`: `8` by default. `4` halves the ASR weights again but is **opt-in**:
-  clean-audio testing can't rule out degradation on a noisy mic. `none` keeps full precision.
-- `CHAD_STT_MODEL`: defaults to `mlx-community/parakeet-tdt-0.6b-v3`. Anything else is
-  unsupported; the vendored decoder is written to this model's output contract.
-- `CHAD_SPEECH_WORDS`: the JSON word table that teaches the transcriber your jargon
-  (project names, library names). Relocating it is mostly useful for keeping a benchmark
-  from inheriting your personal vocabulary.
+An unknown voice name is refused at startup with a did-you-mean. `CHAD_STT_QUANT=4` halves
+the ASR weights again but is opt-in: clean-audio testing cannot rule out degradation on a
+noisy mic.
 
 ### Sessions
 
-Every conversation is persisted per *working directory*, so `-c` in a project resumes that
+Every conversation is saved per working directory, so `-c` in a project resumes that
 project's thread and nothing else:
 
 ```
-~/.chad/sessions/<cwdhash>/<session_id>.json   one file per session
+~/.chad/sessions/<cwdhash>/<session_id>.json   one file per session, mode 0600
 ~/.chad/sessions/<cwdhash>/index.json          title / last-updated / turn count
 ```
 
-The newest **20** sessions per directory are kept; older ones are pruned on save. chad
-says so when it removes one. Resuming prints the session's title and the last things you
-asked, and the pickers list all 20. Both files are created mode `0600`: they hold full
-tool arguments and results (see [Session log & privacy](#session-log--privacy)).
+The newest **20** sessions per directory are kept, and chad says when a save removes one.
+Resuming prints the session's title and the last things you asked.
 
 ```bash
 chad -c            # resume this directory's most recent session
 chad --resume      # list recent sessions, pick one by number (needs a TTY)
 ```
 
-**Resuming forks; it never overwrites.** Both flags seed a *fresh* conversation with the
-old messages, and that conversation mints its own `session_id`. The session you resumed
-from is left exactly as it was, so branching off an old thread can't destroy it and you
-can resume the same starting point twice. The practical consequence: a long session you
-resume repeatedly leaves several sessions behind, which is what `--resume`'s numbered
-list is for.
+**Resuming forks; it never overwrites.** Both flags seed a fresh conversation with the old
+messages under a new `session_id`, so the session you resumed from is left as it was and
+you can branch from the same point twice.
 
 **A resumed session does not re-read its conversation.** Quitting the TUI (`/exit`,
-ctrl-d, a second ctrl-c) or the REPL also writes the engine's cache to `~/.cache/chad/kv`
-and records where in the session file. `chad -c`, `--resume` and `/resume` restore that
-file instead of prefilling the transcript: well under a second, against about a second per
-hundred tokens of conversation on the shipped model, and the restored cache is identical
-to the one the session ended with. The resumed session keeps the system prompt it ran
-under (its workspace listing is the one the cache was built on); `/reset` starts a fresh
-one. A session that was not quit cleanly, one whose checkpoint has since been evicted
-from the disk budget, or one from another model, cache mode or window resumes cold, as
-before. The banner says which happened: `[resumed warm: N tokens of the conversation
-restored from disk]`. `CHAD_NO_KV_RESUME=1` turns the whole thing off.
+ctrl-d, a second ctrl-c) or the REPL also writes the engine's cache to `~/.cache/chad/kv`.
+`chad -c`, `--resume` and `/resume` restore that file instead of prefilling the transcript:
+well under a second, against about a second per hundred tokens on the shipped model, and
+bit-identical to the cache the session ended with. The resumed session keeps the system
+prompt it ran under; `/reset` starts a fresh one. A session that was not quit cleanly,
+whose checkpoint was evicted from the disk budget, or that ran on another model, cache
+mode or window resumes cold. The banner says which happened: `[resumed warm: N tokens of
+the conversation restored from disk]`. `CHAD_NO_KV_RESUME=1` turns it off.
 
-The facts the [result channel](#harness-levers) gathers — files edited, the test
-command's outcome before the first edit, files already shown a symbol map — are saved with
-the conversation and come back with it, so a resumed session answers "was this failing
-before I started?" the way the uninterrupted one would have.
+The facts the [result channel](#harness-levers) gathers (files edited, the test command's
+outcome before the first edit, files already shown a symbol map) are saved with the
+conversation and come back with it.
 
 ### Session log & privacy
 
-Diagnostics log: when enabled, each session appends throughput numbers and a readable
-trace (the user query, tool-call args (including bash commands and write/edit content),
-and result previews) to `~/.chad/session.log`. It's size-bounded (rotated, 5 MB × 3)
-and passes previews through a best-effort secret redactor, but it still records
-command/file previews in plaintext outside the repo, so treat it as sensitive.
+The diagnostics log is **off by default**. When enabled, each session appends throughput
+numbers and a readable trace (your query, tool-call arguments including bash commands and
+edit content, result previews) to `~/.chad/session.log`, size-rotated (5 MB × 3) and
+passed through a best-effort secret redactor. It still records previews in plaintext
+outside the repo, so treat it as sensitive.
 
-**Privacy-first default: the trace is OFF.** chad is a local, single-user agent, so
-nothing leaves your machine, but because the log lands plaintext previews under
-`~/.chad`, it is opt-in. Set **`CHAD_SESSION_LOG=1`** to turn it on (any non-empty value does, `0` included: to
-turn it off, unset it);
-the same flag also enables the persistent input history at `~/.chad/history` (mode
-`0600`). When it's off, chad installs a null handler and won't create `~/.chad` for the
-log's or history's sake.
-
-**`CHAD_NO_SESSION_LOG=1`** remains a hard kill switch: if set it forces both the log
-and the history off, and wins even when `CHAD_SESSION_LOG` is also set. (For the same
-privacy reason, the resumable conversation store under `~/.chad/sessions/` (which holds
-full tool args and results, and is written after every turn of every session) is created
-mode `0600`.)
+`CHAD_SESSION_LOG=1` turns it on, along with the persistent input history at
+`~/.chad/history` (mode `0600`). `CHAD_NO_SESSION_LOG=1` is a hard kill switch that wins
+even when both are set. The session store under `~/.chad/sessions/` holds full tool
+arguments and results for every session and is created mode `0600` for the same reason.
