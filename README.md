@@ -43,6 +43,8 @@ You do not have an Apple Silicon with 24 GB RAM.  You want to pick your local mo
   terminal UI, and the command-line flags.
 - [Throughput & performance](https://github.com/nathansutton/chad/blob/main/docs/benchmarks.md) has every number above, the stock-engine
   comparison, the model, and how to reproduce them with `chad-bench`.
+- [Bonsai 2 27B + DFlash2 on the Pi coding agent](docs/pi.md) is this fork's addition: `chad-serve`
+  exposes the engine as an OpenAI-compatible server, with setup steps for Pi on a 16 GB Mac.
 - [Design](https://github.com/nathansutton/chad/blob/main/docs/design.md) is the argument: why the agent owns the engine, why there are
   five tools, and what 1.x got wrong.
 - [Architecture](https://github.com/nathansutton/chad/blob/main/docs/architecture.md) is the module map, the session file format and the

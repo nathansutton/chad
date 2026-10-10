@@ -47,6 +47,7 @@ Tests are listed by which ones import the module.
 | `render.py` | Terminal rendering of tokens and tool results, behind the `_emit(kind, text)` callback the REPL and TUI supply. | `test_render.py`, `test_confirm_preview.py`, `test_feel_pack.py` |
 | `repomap.py` | Tree-sitter tag extraction for the ambient levers, mtime-cached per file. | `test_repomap.py`, `test_repomap_polyglot.py`, `test_ambient.py` |
 | `seatbelt.py` | macOS Seatbelt confinement for yolo-mode bash: the spawned shell, never the chad process. | `test_seatbelt.py` |
+| `serve.py` | `chad-serve`: the engine behind an OpenAI-compatible `/v1/chat/completions`, for other agents (see `docs/pi.md`). | `test_serve.py` |
 | `session.py` | Conversation persistence per project directory, with the ref to the session's KV checkpoint when it ended cleanly. | `test_session.py`, `test_cli_modes.py`, `test_kv_resume.py`, `conftest.py` |
 | `skills.py` | Agent Skills: discover `SKILL.md` dirs, parse frontmatter leniently, offer each as a slash command, load only the one asked for. | `test_skills.py`, `test_validate.py`, `test_ignore.py` |
 | `slash.py` | The check both front ends run before a line reaches the model: an unknown slash command is reported, not sent as a task. | `test_slash.py`, `test_tui.py` |
