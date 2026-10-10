@@ -16,7 +16,7 @@ uvx chad-code          # runs anywhere; `uv tool install chad-code` makes it `ch
 uvx chad-code prove    # offline smoke test: 4 tiny fix-it tasks, verified, timed 🗿
 ```
 
-The first run asks, then downloads the model once (~14 GB; it needs ~30 GB free the first time). The PyPI package is `chad-code`.
+The first run asks, then downloads the model once. On a Mac with 24 GB or more that is the ~14 GB build (it needs ~30 GB free the first time); on a 16 GB MacBook Air or Mac mini chad picks the ~8 GB ternary build of the same model instead (it needs ~11 GB free). The PyPI package is `chad-code`; the 16 GB default and `chad-serve` are this fork's, so install it from here: `uvx --from git+https://github.com/riteshdhemla/chad@mac-16gb chad`. See [chad on a 16 GB Mac](docs/16gb.md).
 
 ![chad fixing a failing test end to end: reason, read, edit, run pytest, confirm green, all on a local model](https://raw.githubusercontent.com/nathansutton/chad/main/docs/demo.gif)
 
@@ -35,7 +35,7 @@ for the same reason llama.cpp is: it works with everything. chad is moving the o
 
 ## Why not
 
-You do not have an Apple Silicon with 24 GB RAM.  You want to pick your local model.  You need a frontier model in a data center.  The list goes on. 
+You do not have an Apple Silicon with 16 GB RAM.  You want to pick your local model.  You need a frontier model in a data center.  The list goes on. 
 
 ## Documentation
 
@@ -43,6 +43,8 @@ You do not have an Apple Silicon with 24 GB RAM.  You want to pick your local mo
   terminal UI, and the command-line flags.
 - [Throughput & performance](https://github.com/nathansutton/chad/blob/main/docs/benchmarks.md) has every number above, the stock-engine
   comparison, the model, and how to reproduce them with `chad-bench`.
+- [Bonsai 2 27B + DFlash2 on the Pi coding agent](docs/pi.md) is this fork's addition: `chad-serve`
+  exposes the engine as an OpenAI-compatible server, with setup steps for Pi on a 16 GB Mac.
 - [Design](https://github.com/nathansutton/chad/blob/main/docs/design.md) is the argument: why the agent owns the engine, why there are
   five tools, and what 1.x got wrong.
 - [Architecture](https://github.com/nathansutton/chad/blob/main/docs/architecture.md) is the module map, the session file format and the

@@ -8,7 +8,7 @@ are the ones your machine produces: time-to-first-token, decode speed, and
 wall-clock per task.
 
 Contract (devex design 2026-07-11, decisions D22/D24/D27):
-- Pins the shipped model on every machine, ignoring --model/CHAD_MODEL: prove
+- Pins this machine's default model, ignoring --model/CHAD_MODEL: prove
   answers "does what I am about to run work here", which a stand-in cannot.
 - Offline guard engages only AFTER the model cache check/download: HF_HUB_OFFLINE
   plus a socket guard in this process (children only inherit the env var — the
@@ -341,13 +341,13 @@ def run(args, *, host: cli.Host = cli.HOST,
     # `chad prove` has no --model flag (argparse refuses one), so CHAD_MODEL is the only
     # override that can reach this run; the notice names both, as the main CLI takes both.
     if config.env_str("CHAD_MODEL"):
-        sys.stderr.write("[prove pins the shipped model — CHAD_MODEL and --model are "
+        sys.stderr.write("[prove pins the default model — CHAD_MODEL and --model are "
                          "ignored for this run]\n")
-    # Pinned to the shipped default rather than a smaller stand-in: prove exists to
+    # Pinned to this machine's default rather than a smaller stand-in: prove exists to
     # answer "does the thing I am about to run actually work on this machine", and a
     # smoke test of weights the user will never load cannot answer it. It costs no
     # extra download in the normal case — this is the model chad was going to fetch.
-    model_id = cli._HF_MODEL
+    model_id, _ = cli.default_model(host=host)
     invoking_dir = os.getcwd()
 
     cached = cli._cached_weights_complete(model_id, cached_file=host.cached_file)
@@ -365,14 +365,14 @@ def run(args, *, host: cli.Host = cli.HOST,
 
     big_ram_note = None
     ram = host.ram_gb()
-    if ram is not None and ram < cli._MIN_RAM_GB:
-        big_ram_note = (f"{ram:.0f} GB RAM is below the ~{cli._MIN_RAM_GB:.0f} GB chad "
-                        "targets; timings here will be pessimistic")
+    if ram is not None and ram < cli._SMALL_MIN_RAM_GB:
+        big_ram_note = (f"{ram:.0f} GB RAM is below the 16 GB the smallest build is "
+                        "sized for; timings here will be pessimistic")
         sys.stderr.write(f"[{big_ram_note}]\n")
 
     eng = make_engine(model_id)
     sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} "
-                     "[prove: pinned to the shipped model] ...\n")
+                     "[prove: pinned to the default model] ...\n")
     try:
         load_s = eng.load()
     except Exception as e:  # noqa: BLE001 — same guidance path as the main CLI

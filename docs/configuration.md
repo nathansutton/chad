@@ -298,13 +298,13 @@ and runs anyway, with the window shrunk toward its floor.
 
 ### Smoke test (`chad prove`)
 
-Downloads the shipped model if it is not cached, then drives four tiny fix-it tasks
+Downloads this machine's default model if it is not cached, then drives four tiny fix-it tasks
 end-to-end: a real agent loop, real edits in a scratch directory, each verified by a check
 script rebuilt from read-only sources so an edit cannot spoof a pass. It prints what
 worked with time-to-first-token, decode speed and wall clock per task, and writes
 `results.json` to the invoking directory.
 
-It pins the shipped model, ignoring `--model` and `CHAD_MODEL`, because the question is
+It pins that default model, ignoring `--model` and `CHAD_MODEL`, because the question is
 whether the thing you are about to run works on this machine. Once the weights are present
 it goes offline (`HF_HUB_OFFLINE` plus a socket guard). Exit codes: `0` all passed, `1` a
 task failed, `2` the preflight stopped. On working hardware it should never fail, so a

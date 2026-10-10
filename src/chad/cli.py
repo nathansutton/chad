@@ -57,12 +57,17 @@ _HF_MODEL = f"{gguf_pack.HUB_REPO}/Qwen3.8-27B-UD-Q3_K_XL.gguf"
 # A dev clone that already has the file locally should use it rather than re-download
 # — prefer this path when present.
 _LOCAL_MODEL = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-UD-Q3_K_XL.gguf")
-# chad targets 24 GB Apple Silicon and nothing smaller. Below this the model still
-# loads, but the context governor has little left to spend after ~13.2 GB of weights,
-# the ~1.2 GB drafter and the ~2 GB prefill transient, so the window shrinks toward
-# its floor. We warn and proceed rather than refuse: the harness advises, the caller
-# decides.
+# The Q3_K_XL default needs a 24 GB Mac: ~13.2 GB of weights, the ~1.2 GB drafter and
+# the ~2 GB prefill transient leave a 16 GB box nothing for the KV cache, and macOS
+# pages the weights themselves.
 _MIN_RAM_GB = 23.5
+# Below that the default is the ternary Bonsai 2 pack of the same Qwen3.8-27B: ~8 GB
+# resident with the same drafter, which leaves a 16 GB Air or mini a ~40k window. It is
+# an MLX repo with the drafter bundled, so it loads directly, with no conversion copy.
+_HF_MODEL_SMALL = "nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX"
+# Under 16 GB even the ternary pack leaves no working room. We warn and proceed rather
+# than refuse: the harness advises, the caller decides.
+_SMALL_MIN_RAM_GB = 15.5
 
 
 # These are the STRICT siblings of config.env_int/env_float: a non-numeric value raises
@@ -513,15 +518,9 @@ def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL
                 materialize: Callable[[str], str] = gguf_pack.materialize):
     """Resolve the model id and a human label for *why* it was chosen.
 
-    Order: explicit `--model` (`spec`) → CHAD_MODEL → the shipped default. There are no
-    size shorthands any more — chad ships exactly one model (2.0.0 retired the Ornith
-    35B/9B pair and the RAM-aware pick that chose between them). `auto` still means "the
-    default"; anything else is passed through untouched as an HF repo id or local dir.
-    The default is the locally-built weights at `local_model` when that directory exists
-    (a dev clone), else the Hugging Face repo.
-
-    A box below the 24 GB target is warned about once, on stderr, and then served
-    anyway: chad advises, the caller decides.
+    Order: explicit `--model` (`spec`) → CHAD_MODEL → the default for this machine's
+    RAM (`default_model`). There are no size shorthands; `auto` means "the default", and
+    anything else is passed through untouched as an HF repo id or local dir.
     """
     # Name the winning source in the reason: it is only ever ambiguous when both the
     # flag and the env var are set, which is exactly when the user needs to be told.
@@ -554,14 +553,30 @@ def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL
                     "         so it needs a network connection once and a writable cache.\n")
                 sys.exit(1)
         return spec, f"explicitly requested ({source} override)"
+    return default_model(host=host, local_model=local_model)
+
+
+def default_model(*, host: Host = HOST, local_model: str = _LOCAL_MODEL):
+    """The model chad runs when none is named, and why: the same Qwen3.8-27B in the
+    build this machine's RAM can hold.
+
+    24 GB and up gets the Q3_K_XL file (the locally-built copy at `local_model` when a
+    dev clone has one). Anything smaller gets the ternary pack, which is the only build
+    whose weights, drafter and a working KV cache fit in 16 GB together. A box under
+    16 GB, or one whose RAM cannot be read, is warned once on stderr and served the
+    ternary pack anyway.
+    """
     ram = host.ram_gb()
-    if ram is None or ram < _MIN_RAM_GB:
+    if ram is not None and ram >= _MIN_RAM_GB:
+        return _resolve(local_model, _HF_MODEL), "default"
+    if ram is None or ram < _SMALL_MIN_RAM_GB:
         got = "undetectable" if ram is None else f"{ram:.0f} GB"
         sys.stderr.write(
-            f"chad: RAM {got}, below the ~{_MIN_RAM_GB:.0f} GB chad is built for. The "
-            f"model needs ~14 GB resident plus its KV cache, so expect a small context "
-            f"window and possible thrashing. Proceeding.\n")
-    return _resolve(local_model, _HF_MODEL), "default"
+            f"chad: RAM {got}, below the 16 GB the smallest build is sized for. It needs "
+            f"~8 GB resident plus its KV cache, so expect a small context window and "
+            f"possible thrashing. Proceeding.\n")
+        return _HF_MODEL_SMALL, "default (ternary build)"
+    return _HF_MODEL_SMALL, f"default for a {ram:.0f} GB Mac (ternary build)"
 
 
 def _model_download_gb(model_id):
