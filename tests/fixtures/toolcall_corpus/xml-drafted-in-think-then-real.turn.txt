@@ -1,0 +1,16 @@
+<think>
+maybe <tool_call>
+<function=bash>
+<parameter=command>
+rm -rf x
+</parameter>
+</function>
+</tool_call>
+</think>
+<tool_call>
+<function=bash>
+<parameter=command>
+ls
+</parameter>
+</function>
+</tool_call>

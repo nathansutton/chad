@@ -1,0 +1,14 @@
+{
+ "note": "CRLF line endings throughout; framing newlines trimmed either way",
+ "calls": [
+  {
+   "name": "edit",
+   "arguments": {
+    "path": "a.py",
+    "old": "    x = 1",
+    "new": "    x = 2"
+   },
+   "errors": []
+  }
+ ]
+}

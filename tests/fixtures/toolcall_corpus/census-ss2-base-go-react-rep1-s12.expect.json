@@ -1,0 +1,15 @@
+{
+ "note": "verbatim assistant turn, react.rep1.json step 12 (2026-10-10 census)",
+ "calls": [
+  {
+   "name": "edit",
+   "errors": [
+    "$path"
+   ],
+   "argument_keys": [
+    "new",
+    "old"
+   ]
+  }
+ ]
+}

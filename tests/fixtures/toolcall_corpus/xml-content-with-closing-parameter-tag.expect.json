@@ -1,0 +1,13 @@
+{
+ "note": "a literal </parameter> inside content: the value runs to the LAST closer before the next opener (used to truncate silently)",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "see </parameter> here\nmore"
+   },
+   "errors": []
+  }
+ ]
+}

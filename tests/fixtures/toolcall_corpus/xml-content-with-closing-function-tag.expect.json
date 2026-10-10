@@ -1,0 +1,13 @@
+{
+ "note": "a literal </function> inside content (used to drop the content parameter)",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "x </function> y"
+   },
+   "errors": []
+  }
+ ]
+}

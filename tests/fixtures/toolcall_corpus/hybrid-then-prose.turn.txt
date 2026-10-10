@@ -1,0 +1,2 @@
+<tool_call>{"name": "bash" <parameter=command>ls -la</parameter></function></tool_call>
+That lists the dir.

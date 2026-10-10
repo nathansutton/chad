@@ -1,0 +1,12 @@
+{
+ "note": "the template's own JSON-in-tags shape",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

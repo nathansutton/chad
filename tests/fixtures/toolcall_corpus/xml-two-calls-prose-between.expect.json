@@ -1,0 +1,19 @@
+{
+ "note": "two XML calls with prose between",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  },
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "pwd"
+   },
+   "errors": []
+  }
+ ]
+}

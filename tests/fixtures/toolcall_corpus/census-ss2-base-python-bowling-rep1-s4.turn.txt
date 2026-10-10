@@ -1,0 +1,84 @@
+
+
+<tool_call>
+<function=write_file>
+<parameter=path>
+/home/nate/repo/chad/benchmarks/polyglot/_work/ss2-base/rep1/python/bowling/bowling.py
+</parameter>
+<parameter=content>
+class BowlingGame:
+    def __init__(self):
+        self.frames = []
+        self.current_frame = []
+
+    def roll(self, pins):
+        if pins < 0:
+            raise ValueError("roll of negative pins is invalid")
+        if pins > 10:
+            raise ValueError("roll of more than 10 pins is invalid")
+        if self.is_finished():
+            raise ValueError("cannot roll after the game is complete")
+
+        frame = self.current_frame
+        if not frame:
+            frame.append(pins)
+            if pins == 10 and len(self.frames) < 9:
+                self._close_frame()
+            return
+
+        # Second (or bonus) roll of the current frame.
+        if len(self.frames) < 9:
+            if frame[0] + pins > 10:
+                raise ValueError("two rolls in a frame cannot score more than 10")
+            frame.append(pins)
+            self._close_frame()
+            return
+
+        # Tenth frame.
+        frame.append(pins)
+        if frame[0] == 10:
+            if len(frame) == 2 and frame[1] == 10:
+                return  # third bonus roll still possible
+            if len(frame) == 3:
+                if frame[1] != 10 and frame[1] + frame[2] > 10:
+                    raise ValueError(
+                        "bonus rolls cannot score more than 10 unless the first is a strike"
+                    )
+            self._close_frame()
+            return
+
+        if frame[0] + frame[1] == 10:
+            self._close_frame()
+            return
+
+        if len(frame) == 3:
+            raise ValueError("cannot throw bonus with an open tenth frame")
+
+    def _close_frame(self):
+        self.frames.append(self.current_frame)
+        self.current_frame = []
+
+    def is_finished(self):
+        return len(self.frames) == 10
+
+    def score(self):
+        if not self.is_finished():
+            raise ValueError("score cannot be taken before the game is complete")
+        rolls = [pins for frame in self.frames for pins in frame]
+        total = 0
+        i = 0
+        for frame in self.frames:
+            if frame[0] == 10:
+                total += 10 + rolls[i + 1] + rolls[i + 2]
+                i += 1
+            elif frame[0] + frame[1] == 10:
+                total += 10 + rolls[i + 2]
+                i += 2
+            else:
+                total += frame[0] + frame[1]
+                i += 2
+        return total
+
+</parameter>
+</function>
+</tool_call>

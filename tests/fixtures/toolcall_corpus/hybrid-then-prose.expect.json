@@ -1,0 +1,12 @@
+{
+ "note": "prose after a hybrid call stays out of the value",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls -la"
+   },
+   "errors": []
+  }
+ ]
+}

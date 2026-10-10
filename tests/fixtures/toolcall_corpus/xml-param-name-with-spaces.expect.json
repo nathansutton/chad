@@ -1,0 +1,13 @@
+{
+ "note": "spaces around the parameter name (used to drop the parameter)",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "hi"
+   },
+   "errors": []
+  }
+ ]
+}

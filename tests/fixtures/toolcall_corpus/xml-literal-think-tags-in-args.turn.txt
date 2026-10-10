@@ -1,0 +1,1 @@
+<tool_call><function=edit><parameter=path>p.py</parameter><parameter=old>x = '<think>'</parameter><parameter=new>x = '</think>'</parameter></function></tool_call>

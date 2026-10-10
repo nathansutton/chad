@@ -1,0 +1,14 @@
+{
+ "note": "census shape (java/zebra-puzzle.rep1 #20)",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "content": "hello"
+   },
+   "errors": [
+    "$path"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,50 @@
+
+
+There's a subtle bug: In the diamond topology, a cell may get visited twice via different dependency paths, potentially being appended to `order` twice (the intermediate recomputation uses stale values, and unnecessary callbacks might get triggered). Fix `propagate` so that each cell is added only once:
+
+<tool_call>
+<function=edit>
+<parameter=new>
+func (c *cell) propagate() {
+	const (
+		unvisited = iota
+		inProgress
+		done
+	)
+	state := map[*cell]int{c: inProgress}
+	var order []*cell
+	var visit func(*cell)
+	visit = func(x *cell) {
+		switch state[x] {
+		case unvisited:
+			state[x] = inProgress
+			for _, o := range x.outs {
+				visit(o)
+			}
+			state[x] = done
+			order = append(order, x)
+		case done:
+			// already scheduled to recompute in this pass
+		}
+	}
+	visit(c)
+</parameter>
+<parameter=old>
+func (c *cell) propagate() {
+	pending := map[*cell]bool{c: true}
+	var order []*cell
+	var visit func(*cell)
+	visit = func(x *cell) {
+		if !pending[x] {
+			return
+		}
+		delete(pending, x)
+		for _, o := range x.outs {
+			pending[o] = true
+		}
+		order = append(order, x)
+	}
+	visit(c)
+</parameter>
+</function>
+</tool_call>

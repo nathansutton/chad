@@ -1,0 +1,47 @@
+
+
+<tool_call>
+<function=write>
+<parameter=content>
+public class Check {
+    public static void main(String[] a) {
+        String[][] h = {
+            {"Norwegian","Yellow","Water","Fox","Painter"},
+            {"Ukrainian","Blue","Tea","Horse","Reading"},
+            {"Englishman","Red","Milk","Snail","Dancing"},
+            {"Spaniard","Ivory","Orange juice","Dog","Football"},
+            {"Japanese","Green","Coffee","Zebra","Chess"}};
+        String[] clues = {
+            "2:Eng~Red","3:Span~Dog","4:Green~Coffee","5:Ukr~Tea",
+            "6a:GreenLeftIvory","6b:IvoryRightGreen","7:Dance~Snail","8:Yellow~Painter",
+            "9:MilkMid","10:Nor1st","11:Read~Fox","12:Paint~Horse","13:FB~OJ","14:Jap~Chess","15:H2Blue"};
+        for (int i = 0; i < 5; i++) {
+            String nat=h[i][0],color=h[i][1],drink=h[i][2],pet=h[i][3],hobby=h[i][4];
+            String[] bad = new String[15];
+            bad[0] = (nat.equals("Englishman") != color.equals("Red")) ? clues[0] : null;
+            bad[1] = (nat.equals("Spaniard") != pet.equals("Dog")) ? clues[1] : null;
+            bad[2] = (color.equals("Green") != drink.equals("Coffee")) ? clues[2] : null;
+            bad[3] = (nat.equals("Ukrainian") != drink.equals("Tea")) ? clues[3] : null;
+            bad[4] = (i > 0 && color.equals("Green") && !h[i-1][1].equals("Ivory")) ? clues[4] : null;
+            bad[5] = (i > 0 && h[i-1][1].equals("Ivory") && !color.equals("Green")) ? clues[5] : null;
+            bad[6] = (hobby.equals("Dancing") != pet.equals("Snail")) ? clues[6] : null;
+            bad[7] = (color.equals("Yellow") != hobby.equals("Painter")) ? clues[7] : null;
+            bad[8] = (drink.equals("Milk") != (i == 2)) ? clues[8] : null;
+            bad[9] = (nat.equals("Norwegian") != (i == 0)) ? clues[9] : null;
+            bad[10] = ((hobby.equals("Reading") && !near(h,i,3,"Fox")) || (pet.equals("Fox") && !near(h,i,4,"Reading"))) ? clues[10] : null;
+            bad[11] = ((hobby.equals("Painter") && !near(h,i,3,"Horse")) || (pet.equals("Horse") && !near(h,i,4,"Painter"))) ? clues[11] : null;
+            bad[12] = (hobby.equals("Football") != drink.equals("Orange juice")) ? clues[12] : null;
+            bad[13] = (nat.equals("Japanese") != hobby.equals("Chess")) ? clues[13] : null;
+            bad[14] = (i == 0 && !h[1][1].equals("Blue")) ? clues[14] : null;
+            for (String s : bad) if (s != null) System.out.println("house " + i + " violates " + s);
+        }
+    }
+    static boolean near(String[][] h, int i, int a, String v) {
+        return (i > 0 && h[i-1][a].equals(v)) || (i < 4 && h[i+1][a].equals(v));
+    }
+}
+EOF
+javac -d build/debug debug/Check.java && java -cp build/debug Check
+</parameter>
+</function>
+</tool_call>

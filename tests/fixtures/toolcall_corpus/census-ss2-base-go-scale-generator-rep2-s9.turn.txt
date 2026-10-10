@@ -1,0 +1,18 @@
+
+
+The issue: uppercase majors like `C`, `G` need sharps while lowercase `c`, `d` minors need flats. Fixing the key check to use exact case:
+
+<tool_call>
+<function=edit>
+<parameter=new>
+	switch tonic {
+	case "F", "f", "c", "d", "g": // F major and c/d/f/g minor use flats
+		chromatic = chromaticFlat
+</parameter>
+<parameter=old>
+	switch strings.ToLower(tonic) {
+	case "c", "d", "f", "g": // natural-tonic minor keys use flats
+		chromatic = chromaticFlat
+</parameter>
+</function>
+</tool_call>

@@ -1,0 +1,15 @@
+<tool_call>
+<function=edit>
+<parameter=path>
+a.py
+</parameter>
+<parameter=old>
+    x = 1
+    y = 2
+</parameter>
+<parameter=new>
+    x = 10
+    y = 2
+</parameter>
+</function>
+</tool_call>

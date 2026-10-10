@@ -1,0 +1,12 @@
+{
+ "note": "trailing commas; repair_json removes them outside strings",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

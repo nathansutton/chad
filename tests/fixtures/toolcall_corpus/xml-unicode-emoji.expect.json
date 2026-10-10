@@ -1,0 +1,13 @@
+{
+ "note": "non-ASCII, byte for byte",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "é.md",
+    "content": "héllo 🎉 — ok"
+   },
+   "errors": []
+  }
+ ]
+}

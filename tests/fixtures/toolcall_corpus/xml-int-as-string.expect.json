@@ -1,0 +1,13 @@
+{
+ "note": "integer parameter as text; coerced",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls",
+    "timeout": 30
+   },
+   "errors": []
+  }
+ ]
+}

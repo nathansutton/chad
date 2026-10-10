@@ -1,0 +1,3 @@
+<tool_call>
+{"name": "frobnicate", "arguments": {"x": 1}}
+</tool_call>

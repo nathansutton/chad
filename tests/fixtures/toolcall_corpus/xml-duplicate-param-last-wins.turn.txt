@@ -1,0 +1,1 @@
+<tool_call><function=bash><parameter=command>ls</parameter><parameter=command>pwd</parameter></function></tool_call>

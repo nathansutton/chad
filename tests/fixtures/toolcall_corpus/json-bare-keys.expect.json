@@ -1,0 +1,12 @@
+{
+ "note": "unquoted keys; repaired",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

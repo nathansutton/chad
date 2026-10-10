@@ -1,0 +1,19 @@
+{
+ "note": "a 55 kB write",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "big.txt"
+   },
+   "errors": [],
+   "argument_lengths": {
+    "content": 55000
+   },
+   "argument_keys": [
+    "content",
+    "path"
+   ]
+  }
+ ]
+}

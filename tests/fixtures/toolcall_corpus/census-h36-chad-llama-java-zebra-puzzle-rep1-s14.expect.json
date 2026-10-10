@@ -1,0 +1,25 @@
+{
+ "note": "verbatim assistant turn, zebra-puzzle.rep1.json step 14 (2026-10-10 census)",
+ "calls": [
+  {
+   "name": "edit",
+   "errors": [
+    "$path"
+   ],
+   "argument_keys": [
+    "new",
+    "old"
+   ]
+  },
+  {
+   "name": "edit",
+   "errors": [
+    "$path"
+   ],
+   "argument_keys": [
+    "new",
+    "old"
+   ]
+  }
+ ]
+}

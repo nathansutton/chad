@@ -1,0 +1,12 @@
+{
+ "note": "observed garble: JSON args that never close, then XML closers; salvaged",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

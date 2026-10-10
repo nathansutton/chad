@@ -1,0 +1,51 @@
+
+
+Found it — the Norwegian/Blue constraint was implemented backwards (prohibiting adjacent blue, rather than requiring the blue house to be adjacent). I'll fix it:
+
+<tool_call>
+<function=edit>
+<parameter=new>
+    private boolean adjacentOk(int a, int b) {
+        int[] x = grid[a], y = grid[b]; // a is left, b is right
+        // reading next to fox
+        if ((x[3] == 2 && y[2] == 2) || (y[3] == 2 && x[2] == 2)) return false;
+        // painting next to horse
+        if ((x[3] == 1 && y[2] == 3) || (y[3] == 1 && x[2] == 3)) return false;
+        return true;
+    }
+</parameter>
+<parameter=old>
+    private boolean adjacentOk(int a, int b) {
+        int[] x = grid[a], y = grid[b]; // a is left, b is right
+        // Norwegian's neighbor is blue
+        if ((x[0] == 4 && y[4] == 4) || (y[0] == 4 && x[4] == 4)) return false;
+        // reading next to fox
+        if ((x[3] == 2 && y[2] == 2) || (y[3] == 2 && x[2] == 2)) return false;
+        // painting next to horse
+        if ((x[3] == 1 && y[2] == 3) || (y[3] == 1 && x[2] == 3)) return false;
+        return true;
+    }
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=edit>
+<parameter=new>
+            if (hobby >= 0 && drink >= 0 && hobby == 3 && drink != 4) return false; // football: OJ
+            if (nat >= 0 && hobby >= 0 && nat == 3 && hobby != 4) return false;  // Japanese: chess
+            // Norwegian's house must have a blue neighbor
+            if (nat == 4) {
+                if (h == 0) { if (grid[1][4] >= 0 && grid[1][4] != 4) return false; }
+                else if (h == N - 1) { if (grid[N - 2][4] >= 0 && grid[N - 2][4] != 4) return false; }
+                else {
+                    int lc = grid[h - 1][4], rc = grid[h + 1][4];
+                    if ((lc >= 0 && lc != 4) && (rc >= 0 && rc != 4)) return false;
+                }
+            }
+</parameter>
+<parameter=old>
+            if (hobby >= 0 && drink >= 0 && hobby == 3 && drink != 4) return false; // football: OJ
+            if (nat >= 0 && hobby >= 0 && nat == 3 && hobby != 4) return false;  // Japanese: chess
+</parameter>
+</function>
+</tool_call>

@@ -1,0 +1,19 @@
+{
+ "note": "an enum value outside the schema",
+ "calls": [
+  {
+   "name": "write_todos",
+   "arguments": {
+    "todos": [
+     {
+      "content": "x",
+      "status": "doing"
+     }
+    ]
+   },
+   "errors": [
+    "$todos[0].status"
+   ]
+  }
+ ]
+}

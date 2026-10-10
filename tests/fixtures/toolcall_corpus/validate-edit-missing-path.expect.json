@@ -1,0 +1,15 @@
+{
+ "note": "census shape (go/react.rep1 #7, five in all)",
+ "calls": [
+  {
+   "name": "edit",
+   "arguments": {
+    "old": "x",
+    "new": "y"
+   },
+   "errors": [
+    "$path"
+   ]
+  }
+ ]
+}

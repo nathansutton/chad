@@ -1,0 +1,13 @@
+{
+ "note": "a ```json fence instead of <tool_call> tags",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "b.py",
+    "content": "x"
+   },
+   "errors": []
+  }
+ ]
+}

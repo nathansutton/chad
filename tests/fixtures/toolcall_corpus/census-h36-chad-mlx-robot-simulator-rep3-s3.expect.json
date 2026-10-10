@@ -1,0 +1,24 @@
+{
+ "note": "verbatim assistant turn, robot-simulator.rep3.json step 3 (2026-10-10 census)",
+ "calls": [
+  {
+   "name": "write_todos",
+   "errors": [
+    "$todos"
+   ],
+   "argument_keys": [
+    "odos"
+   ],
+   "unknown_keys": [
+    "odos"
+   ]
+  },
+  {
+   "name": "bash",
+   "errors": [],
+   "argument_keys": [
+    "command"
+   ]
+  }
+ ]
+}

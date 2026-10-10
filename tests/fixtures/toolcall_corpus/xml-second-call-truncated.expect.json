@@ -1,0 +1,12 @@
+{
+ "note": "the complete first call runs; the unclosed second does not",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}
