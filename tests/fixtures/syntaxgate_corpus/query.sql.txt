@@ -1,0 +1,15 @@
+-- a query
+WITH recent AS (
+  SELECT u.id, u.name, COUNT(*) OVER (PARTITION BY u.team_id) AS n
+  FROM users u
+  LEFT JOIN orders o ON o.user_id = u.id AND o.created_at > NOW() - INTERVAL '7 days'
+  WHERE u.deleted_at IS NULL
+)
+SELECT r.id, r.name, COALESCE(r.n, 0) AS n,
+       CASE WHEN r.n > 1 THEN 'many' ELSE 'one' END AS kind
+FROM recent r
+ORDER BY n DESC, r.name
+LIMIT 10;
+
+INSERT INTO log (msg) VALUES ('ok') ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS t (id SERIAL PRIMARY KEY, v JSONB NOT NULL DEFAULT '{}');

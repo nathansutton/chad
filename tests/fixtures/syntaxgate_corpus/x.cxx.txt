@@ -1,0 +1,1 @@
+namespace n { template <class T> T id(T t) { return t; } }

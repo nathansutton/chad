@@ -25,7 +25,9 @@ from .validate import (  # VALIDATE: single source of truth in validate.py
 
 _TAG_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _FENCE_RE = re.compile(r"```(?:json|tool_call)?\s*(\{.*?\})\s*```", re.DOTALL)
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
 _XML_FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
 _XML_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
 _INT_PARAMS = {"offset", "limit", "timeout"}
@@ -60,15 +62,63 @@ _TAG_SALVAGE_RE = re.compile(r"<tool_call>\s*(\{.*?)\s*</tool_call>", re.DOTALL)
 _XML_CRUFT_RE = re.compile(r"(?:\s*</?(?:parameter|function|tool_call)[^>]*>)+\s*$")
 
 
-def strip_think(text: str) -> str:
-    """Remove reasoning. Handles both an explicit <think>...</think> block and the
-    template-opened case, where generation starts inside <think> so the text has a
-    leading </think> with no opening tag."""
-    o = text.find("<think>")
-    c = text.find("</think>")
+def _call_spans(text: str) -> list[tuple[int, int]]:
+    """The closed tool-call blocks of `text` as (start, end) spans: `<tool_call>…
+    </tool_call>` and the XML dialect's `<function=…>…</function>`. A reasoning tag
+    inside one of these is argument text — a model editing this very file, or a prompt
+    that documents the tags — not a delimiter."""
+    spans = [m.span() for m in _TOOL_CALL_BLOCK_RE.finditer(text)]
+    spans += [m.span() for m in _XML_FUNC_RE.finditer(text)]
+    return spans
+
+
+def _find_outside(text: str, needle: str, start: int, spans) -> int:
+    """`text.find(needle, start)`, skipping hits that fall inside a tool-call span."""
+    i = text.find(needle, start)
+    while i != -1 and any(a < i < b for a, b in spans):
+        i = text.find(needle, i + 1)
+    return i
+
+
+def think_spans(text: str) -> list[tuple[int, int]]:
+    """The reasoning spans of `text`, in order: the template-opened block (generation
+    started inside <think>, so the text carries a leading `</think>` with no opening
+    tag) and every explicit `<think>…</think>` block. Tags inside a closed tool-call
+    block never count. A regex that matched any `<think>.*?</think>` deleted the middle
+    of an `edit` whose old/new text mentioned the tags, which made about sixty lines of
+    chad's own source impossible to edit through chad."""
+    spans = _call_spans(text)
+    out: list[tuple[int, int]] = []
+    pos = 0
+    o = _find_outside(text, _THINK_OPEN, 0, spans)
+    c = _find_outside(text, _THINK_CLOSE, 0, spans)
     if c != -1 and (o == -1 or c < o):  # leading close => everything up to it is reasoning
-        text = text[c + len("</think>"):]
-    return _THINK_RE.sub("", text)
+        pos = c + len(_THINK_CLOSE)
+        out.append((0, pos))
+    while True:
+        o = _find_outside(text, _THINK_OPEN, pos, spans)
+        if o == -1:
+            break
+        c = _find_outside(text, _THINK_CLOSE, o + len(_THINK_OPEN), spans)
+        if c == -1:
+            break
+        pos = c + len(_THINK_CLOSE)
+        out.append((o, pos))
+    return out
+
+
+def think_close_index(text: str) -> int:
+    """Index of the `</think>` that closes a template-opened block, or -1: the first
+    close that is not inside a tool-call block. What `split_inline_reasoning` splits on."""
+    return _find_outside(text, _THINK_CLOSE, 0, _call_spans(text))
+
+
+def strip_think(text: str) -> str:
+    """Remove reasoning: the template-opened block and every explicit block, leaving
+    reasoning tags inside a tool call's arguments alone (see `think_spans`)."""
+    for a, b in reversed(think_spans(text)):
+        text = text[:a] + text[b:]
+    return text
 
 
 _IDENT_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")

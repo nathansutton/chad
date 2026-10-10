@@ -1,0 +1,2 @@
+def grüße(名前: str) -> str:
+    return f'Hallo {名前} 😀'

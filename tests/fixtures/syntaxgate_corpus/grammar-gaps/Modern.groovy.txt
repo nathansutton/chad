@@ -1,0 +1,11 @@
+plugins { id 'java'; id 'application' }
+group = 'demo'
+repositories { mavenCentral() }
+dependencies {
+    implementation 'org.apache.commons:commons-lang3:3.14.0'
+    testImplementation platform("org.junit:junit-bom:5.10.0")
+}
+tasks.named('test') { useJUnitPlatform(); testLogging { events "passed", "failed" } }
+def f = { String s = "x", int n -> "${s}" * n }
+class Robot { String name; def move(cmds) { cmds.each { c -> switch (c) { case 'A': break; default: throw new IllegalArgumentException() } } } }
+application { mainClass = 'demo.Main' }

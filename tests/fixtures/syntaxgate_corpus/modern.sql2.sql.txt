@@ -1,0 +1,6 @@
+CREATE OR REPLACE FUNCTION f(x int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN x + 1;
+END;
+$$;
+SELECT * FROM t WHERE a @> '{"k":1}'::jsonb AND b ~* '^x' AND c IN (SELECT 1) GROUP BY 1 HAVING count(*) > 1;

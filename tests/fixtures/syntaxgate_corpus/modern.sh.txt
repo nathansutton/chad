@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+declare -A seen=()
+files=( "$@" )
+for f in "${files[@]:-}"; do
+  [[ -f "$f" ]] || continue
+  case "$f" in
+    *.go) echo "go: $f" ;;
+    *) (( ${#seen[@]} > 0 )) && echo "seen" ;;
+  esac
+  seen["$f"]=1
+done
+while read -r line; do printf '%s\n' "${line^^}"; done < <(printf 'a\nb\n')
+out=$(mktemp) && trap 'rm -f "$out"' EXIT
+cat <<-EOF > "$out"
+	heredoc ${HOME:-/}
+EOF
+if ! command -v jq >/dev/null 2>&1; then exit 0; fi

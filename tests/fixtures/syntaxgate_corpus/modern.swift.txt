@@ -1,0 +1,27 @@
+import Foundation
+
+protocol Shape { var area: Double { get } }
+struct Circle: Shape { let r: Double; var area: Double { .pi * r * r } }
+enum Dir: String, CaseIterable { case north, east, south, west }
+
+final class Robot {
+    private(set) var pos: (x: Int, y: Int) = (0, 0)
+    var dir: Dir = .north
+    init(dir: Dir = .north) { self.dir = dir }
+    func move(_ cmds: String) throws -> Self {
+        for c in cmds {
+            switch c {
+            case "A": pos.y += 1
+            case "L", "R": dir = Dir.allCases[(Dir.allCases.firstIndex(of: dir)! + 1) % 4]
+            default: throw NSError(domain: "bad", code: 1)
+            }
+        }
+        return self
+    }
+}
+
+@discardableResult
+func apply<T>(_ x: T, _ f: (T) -> T) -> T { f(x) }
+let s = Circle(r: 1).area
+let r = try? Robot().move("ALR")
+if let r, s > 0 { print(r.pos, "\(s)") }

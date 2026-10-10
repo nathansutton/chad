@@ -1,0 +1,3 @@
+export default function App({ title }) {
+  return <div className="app"><h1>{title ?? 'x'}</h1>{[1, 2].map(i => <b key={i}>{i}</b>)}</div>;
+}

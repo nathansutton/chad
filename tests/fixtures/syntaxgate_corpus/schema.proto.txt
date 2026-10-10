@@ -1,0 +1,17 @@
+syntax = "proto3";
+package demo.v1;
+option go_package = "example.com/demo/v1;demov1";
+import "google/protobuf/timestamp.proto";
+
+enum Dir { DIR_UNSPECIFIED = 0; DIR_NORTH = 1; reserved 5, 7 to 9; }
+
+message Robot {
+  string name = 1;
+  repeated int32 pos = 2 [packed = true];
+  map<string, Dir> dirs = 3;
+  oneof kind { bool simple = 4; Robot nested = 5; }
+  google.protobuf.Timestamp at = 6;
+  reserved "old";
+}
+
+service RobotService { rpc Move(Robot) returns (stream Robot); }

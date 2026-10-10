@@ -1,0 +1,29 @@
+package demo
+
+import kotlinx.coroutines.*
+
+sealed interface Shape { data class Circle(val r: Double) : Shape; object Empty : Shape }
+
+data class Point(val x: Int = 0, val y: Int = 0) { operator fun plus(o: Point) = Point(x + o.x, y + o.y) }
+
+inline fun <reified T> List<Any>.firstOf(): T? = firstOrNull { it is T } as? T
+
+fun area(s: Shape): Double = when (s) {
+    is Shape.Circle -> Math.PI * s.r * s.r
+    Shape.Empty -> 0.0
+}
+
+class Robot(private val name: String) {
+    var steps: Int = 0
+        private set
+    val label: String get() = "$name:$steps"
+    fun move(n: Int = 1) = apply { steps += n }
+    companion object { const val MAX = 10 }
+}
+
+suspend fun main() = coroutineScope {
+    val jobs = (1..3).map { async { delay(1); it * 2 } }
+    println(jobs.awaitAll().sumOf { it }.takeIf { it > 0 } ?: 0)
+    val (a, b) = Point(1, 2) + Point()
+    println("$a ${b + 1} ${listOf(1, 2).joinToString()}")
+}

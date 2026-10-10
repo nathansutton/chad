@@ -1,0 +1,25 @@
+#include "plain_c.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static const char *names[] = {"a", "b", NULL};
+
+int add(int a, int b) { return a + b; }
+
+size_t count(const char *s) {
+    size_t n = 0;
+    for (; *s; ++s) if (*s == 'x') n++;
+    return n;
+}
+
+int main(int argc, char **argv) {
+    (void)argc; (void)argv;
+    point_t p = {.x = 1, .y = 2};
+    int *buf = malloc(sizeof *buf * 4);
+    if (!buf) return 1;
+    memset(buf, 0, sizeof *buf * 4);
+    printf("%d %zu %s\n", add(p.x, p.y), count("xx"), names[0]);
+    free(buf);
+    return 0;
+}

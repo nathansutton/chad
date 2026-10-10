@@ -1,0 +1,2 @@
+#pragma once
+namespace n { class C { public: virtual ~C() = default; }; }

@@ -16,6 +16,7 @@ CHAD_NO_SYNTAX_GATE for A/B evaluation.
 
 import ast
 import os
+import sys
 
 from . import config, repomap
 
@@ -68,11 +69,37 @@ _NON_CODE_LANGS = frozenset({
 })
 
 
+# Grammars that reject idiomatic, valid code, so a warning from them is noise: each
+# entry was caught by a valid file in tests/fixtures/syntaxgate_corpus (CSS nesting and
+# `@container` range queries; SCSS `@each … in 1, 2` and `@extend %placeholder`; a
+# Groovy GString times an int; a PowerShell `switch` condition block; Tcl's `;`
+# command separator; V's `!` error return; NASM and GAS operands). A tree-sitter
+# grammar lags its language, and this gate has no way to tell "the model broke the
+# file" from "the grammar never learned this form", so these are not policed at all.
+_UNRELIABLE_LANGS = frozenset({
+    "css", "scss", "groovy", "powershell", "tcl", "v", "asm",
+})
+
+# JSON files that are JSONC by convention: their consumers accept comments and
+# trailing commas, the strict grammar does not.
+_JSONC_NAMES = ("tsconfig", "jsconfig", ".eslintrc", ".babelrc", ".swcrc", "devcontainer")
+_JSONC_DIRS = ("/.vscode/", "/.devcontainer/")
+
+
 def _code_lang(path: str) -> str | None:
-    """`lang_for`, filtered to languages this gate should police: None for both
-    unknown extensions and the prose/data formats above."""
+    """`lang_for`, filtered to languages this gate should police: None for unknown
+    extensions, the prose/data formats above, the grammars that reject valid code,
+    and JSON files that are JSONC by convention."""
     detected = repomap.lang_for(path)
-    return None if detected in _NON_CODE_LANGS else detected
+    if detected in _NON_CODE_LANGS or detected in _UNRELIABLE_LANGS:
+        return None
+    if detected == "json":
+        name = os.path.basename(path)
+        norm = "/" + path.replace(os.sep, "/")
+        if (name.startswith(_JSONC_NAMES) or name.endswith(".code-workspace")
+                or any(d in norm for d in _JSONC_DIRS)):
+            return None
+    return detected
 
 
 def check_syntax(path: str, before: str | None) -> str | None:
@@ -94,6 +121,11 @@ def check_syntax(path: str, before: str | None) -> str | None:
         return None
     if after == before:      # the tool didn't actually change the file — nothing to flag
         return None
+    # A byte-order mark is the file's encoding signature, not source text: every
+    # interpreter skips it, and `ast.parse` on the decoded string does not.
+    after = after.removeprefix("\ufeff")
+    if before is not None:
+        before = before.removeprefix("\ufeff")
 
     lang = _code_lang(path)
 
@@ -103,11 +135,23 @@ def check_syntax(path: str, before: str | None) -> str | None:
         except SyntaxError as e:
             lines = after.splitlines()
             line = lines[e.lineno - 1] if e.lineno and e.lineno <= len(lines) else ""
-            return (f"\n[warning: the file no longer parses — {e.msg} at line "
-                    f"{e.lineno}: {line.strip()!r}. Fix this before moving on.]")
+            # The check runs on chad's own interpreter, which may be older than the
+            # project's; the version is the provenance the model needs to discount a
+            # `type` statement or a newer form that is fine where the code will run.
+            py = "Python {}.{}".format(*sys.version_info[:2])
+            return (f"\n[warning: the file no longer parses under {py} — {e.msg} at "
+                    f"line {e.lineno}: {line.strip()!r}. Fix this before moving on.]")
         return None
 
     if lang:
+        # The language pack calls every `.h` C, and most of them are C++ (namespaces,
+        # classes, templates), which the C grammar rejects: 18 of the 19 warnings in one
+        # 90-trial eval run were valid C++ headers. An ambiguous header is judged by
+        # whichever grammar fits the file as it stood (the new content, for a new file).
+        if lang == "c" and path.endswith(".h"):
+            basis = after if before is None else before
+            counts = {lg: _ts_error_count(lg, basis) for lg in ("c", "cpp")}
+            lang = min(counts, key=lambda lg: (counts[lg] is None, counts[lg] or 0))
         after_errs = _ts_error_count(lang, after)
         if not after_errs:               # None (can't tell) or 0 (clean) -> no warning
             return None

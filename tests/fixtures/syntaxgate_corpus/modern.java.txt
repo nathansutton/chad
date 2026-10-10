@@ -1,0 +1,38 @@
+package demo;
+
+import java.util.*;
+import java.util.function.Function;
+
+public sealed interface Shape permits Circle, Square {}
+record Circle(double r) implements Shape {}
+record Square(double s) implements Shape {}
+
+public class Modern<T extends Comparable<? super T>> {
+    private static final String TEXT = """
+        hello
+        world""";
+    private final List<T> items = new ArrayList<>();
+    @SafeVarargs
+    public final Modern<T> add(T... xs) { items.addAll(List.of(xs)); return this; }
+    public static double area(Shape s) {
+        return switch (s) {
+            case Circle c -> Math.PI * c.r() * c.r();
+            case Square q -> q.s() * q.s();
+        };
+    }
+    public <R> List<R> map(Function<? super T, ? extends R> f) {
+        var out = new ArrayList<R>();
+        for (var x : items) out.add(f.apply(x));
+        return out;
+    }
+    public static void main(String[] args) throws Exception {
+        try (var sc = new Scanner(System.in)) {
+            if (args.length > 0 && args[0] instanceof String s && !s.isEmpty()) System.out.println(s);
+        }
+        int[] a = {1, 2, 3};
+        Object o = (Object) a;
+        char c = '\u0041';
+        long l = 1_000_000L;
+        label: for (int i = 0; i < 3; i++) { if (i == 1) continue label; }
+    }
+}

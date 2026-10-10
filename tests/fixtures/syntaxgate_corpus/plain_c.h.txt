@@ -1,0 +1,7 @@
+#ifndef PLAIN_H
+#define PLAIN_H
+#include <stddef.h>
+typedef struct { int x, y; } point_t;
+int add(int a, int b);
+size_t count(const char *s);
+#endif

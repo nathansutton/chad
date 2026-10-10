@@ -1,0 +1,4 @@
+import pytest
+@pytest.fixture
+def x():
+    yield 1

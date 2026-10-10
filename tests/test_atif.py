@@ -64,6 +64,14 @@ def test_split_think_no_block():
     assert r == "" and v == "plain answer"
 
 
+def test_split_think_leaves_tags_inside_a_call_alone():
+    """Reasoning tags in a tool call's arguments are the call's text, not a block:
+    the step's message keeps the whole call, and its reasoning is only the real block."""
+    call = '<tool_call>{"name":"write","arguments":{"content":"<think>x</think>"}}</tool_call>'
+    r, v = atif.split_think("r</think>" + call)
+    assert (r, v) == ("r", call)
+
+
 # --- steps_from_messages -----------------------------------------------------
 
 def test_tool_results_attach_to_the_calling_step_not_their_own():

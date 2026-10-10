@@ -15,7 +15,12 @@ Run: `.venv/bin/python test_toolcall_parse.py`
 
 import json
 
-from chad.toolcall_parse import _parse_xml_calls, parse_tool_calls, strip_think
+from chad.toolcall_parse import (
+    _parse_xml_calls,
+    parse_tool_calls,
+    strip_think,
+    think_close_index,
+)
 
 PASS = 0
 FAIL = 0
@@ -119,6 +124,34 @@ def test_parse():
         _parse_xml_calls("<function=glob><parameter=pattern>*.py</parameter><parameter=limit>5</parameter></function>"),
         [("glob", {"pattern": "*.py", "limit": 5})],
     )
+
+
+def test_literal_think_tags_inside_a_call_are_arguments():
+    """A call whose arguments mention the reasoning tags — every edit of this parser's
+    own source, or of a prompt that documents the tags — used to lose everything
+    between the literal `<think>` and `</think>`: an `edit` of about sixty lines of
+    agent.py could not be expressed through chad. Reasoning tags inside a closed
+    tool-call block are argument text; the template's own reasoning is still removed."""
+    call = ('<tool_call>\n<function=edit>\n<parameter=path>a.py</parameter>\n'
+            '<parameter=old>\nx = "<think>"\ny = 1\n</parameter>\n'
+            '<parameter=new>\nx = "</think>"\ny = 2\n</parameter>\n</function>\n</tool_call>')
+    want = [("edit", {"path": "a.py", "old": 'x = "<think>"\ny = 1', "new": 'x = "</think>"\ny = 2'})]
+    eq("t1 xml args keep the tags", parse_tool_calls(call), want)
+    eq("t2 template-opened reasoning still stripped", parse_tool_calls("plan\n</think>\n" + call), want)
+    eq("t3 strip_think leaves the call intact", strip_think("plan\n</think>\n" + call), "\n" + call)
+    json_call = ('<tool_call>{"name":"write","arguments":{"path":"p.md",'
+                 '"content":"use <think> and </think> tags"}}</tool_call>')
+    want_json = [("write", {"path": "p.md", "content": "use <think> and </think> tags"})]
+    eq("t4 json args keep the tags", parse_tool_calls("<think>r</think>" + json_call), want_json)
+    # A call the model drafted INSIDE its reasoning is reasoning, not a call — even
+    # when that draft itself mentions the tags.
+    drafted = "<think>maybe " + call + " no, write first</think>\n" + json_call
+    eq("t5 drafted call inside think is stripped", parse_tool_calls(drafted), want_json)
+    eq("t6 think_close_index skips a literal close", think_close_index("r</think>" + call), 1)
+    eq("t7 think_close_index: no template close", think_close_index(call), -1)
+    # Unchanged: an unclosed think is left alone, a stray open mid-reasoning is text.
+    eq("t8 unclosed think untouched", strip_think("<think>still going"), "<think>still going")
+    eq("t9 explicit block mid-text still removed", strip_think("a <think> b</think>c"), "a c")
 
 
 def test_salvage_garbled_tool_name():
@@ -272,6 +305,7 @@ def test_text_param_first_line_indent_preserved():
 
 if __name__ == "__main__":
     test_parse()
+    test_literal_think_tags_inside_a_call_are_arguments()
     test_salvage_garbled_tool_name()
     test_hybrid_name_parameter_dialect()
     test_salvage_closed_block_unclosed_json()

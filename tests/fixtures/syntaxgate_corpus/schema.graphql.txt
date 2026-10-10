@@ -1,0 +1,16 @@
+"""A robot"""
+type Robot implements Node @key(fields: "id") {
+  id: ID!
+  name: String
+  pos: [Int!]!
+  move(cmds: String = "A", dirs: [Dir!]): Robot
+}
+interface Node { id: ID! }
+enum Dir { NORTH EAST }
+input RobotInput { name: String! }
+union Thing = Robot
+type Query { robot(id: ID!): Robot }
+extend type Query { all: [Robot!]! }
+schema { query: Query }
+fragment F on Robot { id ...on Robot { name } }
+query Q($id: ID! = "1") @cached { robot(id: $id) { ...F } }

@@ -1,0 +1,17 @@
+#import <Foundation/Foundation.h>
+
+@interface Robot : NSObject
+@property (nonatomic, copy) NSString *name;
+- (instancetype)initWithName:(NSString *)name;
+- (void)move:(NSString *)cmds completion:(void (^)(BOOL ok))done;
+@end
+
+@implementation Robot
+- (instancetype)initWithName:(NSString *)name { if ((self = [super init])) { _name = [name copy]; } return self; }
+- (void)move:(NSString *)cmds completion:(void (^)(BOOL))done {
+    NSArray<NSString *> *parts = @[@"a", @"b"];
+    NSDictionary *d = @{@"k": @1};
+    for (NSUInteger i = 0; i < cmds.length; i++) { unichar c = [cmds characterAtIndex:i]; if (c == 'A') continue; }
+    done(parts.count > 0 && d[@"k"] != nil);
+}
+@end

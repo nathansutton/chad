@@ -1,0 +1,30 @@
+import type { Readable } from 'node:stream';
+
+export type Dir = 'N' | 'E' | 'S' | 'W';
+export interface Pos { readonly x: number; y?: number }
+type Mapped<T> = { [K in keyof T as `get${Capitalize<string & K>}`]-?: () => T[K] };
+type Cond<T> = T extends string ? 'str' : T extends number ? 'num' : never;
+
+export enum Color { Red = 'RED', Green = 'GREEN' }
+
+export abstract class Base<T extends object = {}> implements Iterable<T> {
+  protected constructor(private readonly items: T[] = []) {}
+  abstract name(): string;
+  *[Symbol.iterator](): Iterator<T> { yield* this.items; }
+  static create<U extends object>(this: new (items: U[]) => Base<U>, ...items: U[]): Base<U> { return new this(items); }
+}
+
+export function assertIs<T>(v: unknown, guard: (x: unknown) => x is T): asserts v is T {
+  if (!guard(v)) throw new Error('nope');
+}
+
+export const f = async <T,>(x: T | null): Promise<NonNullable<T>> => x!;
+declare module 'foo' { export const bar: number; }
+namespace NS { export const x = 1 satisfies number; }
+const tuple = [1, 'a'] as const;
+let r: Readable | undefined;
+export { NS, tuple, r };
+function overload(x: string): string;
+function overload(x: number): number;
+function overload(x: any) { return x; }
+export default overload;

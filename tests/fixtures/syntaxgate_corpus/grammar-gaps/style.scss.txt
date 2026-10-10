@@ -1,0 +1,6 @@
+@use "sass:math";
+$gap: 4px;
+@mixin flex($dir: row) { display: flex; flex-direction: $dir; }
+.card { @include flex(column); padding: math.div($gap, 2); &__title { font-weight: bold; } &:hover { color: darken(#abc, 10%); } @each $n in 1, 2 { .m-#{$n} { margin: $n * $gap; } } }
+%placeholder { color: red; }
+.x { @extend %placeholder; }

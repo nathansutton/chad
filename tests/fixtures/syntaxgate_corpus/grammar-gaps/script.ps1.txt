@@ -1,0 +1,10 @@
+param([string]$Name = "r", [switch]$Verbose)
+Set-StrictMode -Version Latest
+function Move-Robot { [CmdletBinding()] param([Parameter(Mandatory)][string]$Cmds)
+  $pos = @{ x = 0; y = 0 }
+  foreach ($c in $Cmds.ToCharArray()) { switch ($c) { 'A' { $pos.y++ } { $_ -in 'L','R' } { } default { throw "bad $c" } } }
+  return [pscustomobject]$pos
+}
+$r = Move-Robot -Cmds "AA"
+if ($r.y -gt 1 -and -not $Verbose) { Write-Output "$($r.y) $Name" } else { "x" | Out-Null }
+try { Get-Item "nope" -ErrorAction Stop } catch [System.Exception] { Write-Warning $_.Exception.Message } finally { }

@@ -1,0 +1,21 @@
+import std/[strutils, sequtils, tables]
+
+type
+  Dir = enum north, east, south, west
+  Robot = object
+    pos: tuple[x, y: int]
+    dir: Dir
+
+proc move(r: var Robot, cmds: string) =
+  for c in cmds:
+    case c
+    of 'A': inc r.pos.y
+    of 'L', 'R': discard
+    else: raise newException(ValueError, "bad " & $c)
+
+template twice(body: untyped) = body; body
+
+var r = Robot()
+r.move("A")
+let t = {"a": 1}.toTable
+twice: echo r.pos, " ", t["a"], " ", @[1, 2].mapIt(it * 2)

@@ -1,0 +1,29 @@
+.PHONY: all test clean
+CC ?= cc
+CFLAGS := -O2 -Wall $(if $(DEBUG),-g,)
+SRC = $(wildcard *.c)
+OBJ = $(SRC:.c=.o)
+
+all: app
+
+app: $(OBJ)
+	$(CC) $(CFLAGS) -o $@ $^
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+test: app
+	@./app && echo ok || (echo fail; exit 1)
+
+define multi
+	echo one
+	echo two
+endef
+
+clean: ; rm -f $(OBJ) app
+-include deps.mk
+ifeq ($(OS),Windows_NT)
+EXT = .exe
+else
+EXT =
+endif

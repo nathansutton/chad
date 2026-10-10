@@ -49,7 +49,7 @@ from .render import (
     render_tool_result,
     render_tool_start,
 )
-from .toolcall_parse import parse_tool_calls, strip_think
+from .toolcall_parse import parse_tool_calls, strip_think, think_close_index
 from .tools import (
     IGNORE_DIRS,
     TERMINAL,
@@ -248,9 +248,14 @@ def split_inline_reasoning(m: dict) -> dict:
     prompt already carried the empty block), and on turns compaction has already
     think-stripped."""
     content = m.get("content") or ""
-    if m.get("role") != "assistant" or "</think>" not in content:
+    if m.get("role") != "assistant":
         return m
-    head, _, tail = content.partition("</think>")
+    # The template's close, not merely the first `</think>`: one inside a tool call's
+    # arguments is argument text, and splitting there filed the call as reasoning.
+    close = think_close_index(content)
+    if close == -1:
+        return m
+    head, tail = content[:close], content[close + len("</think>"):]
     head = head.rstrip("\n")
     # Strip a LEADING `<think>` only. The generation prompt already opened the block, so
     # any later tag is reasoning the model wrote, not a delimiter. Taking the LAST one

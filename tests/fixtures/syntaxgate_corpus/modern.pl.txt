@@ -1,0 +1,18 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+package Robot;
+sub new { my ($class, %args) = @_; my $self = { pos => [0, 0], %args }; return bless $self, $class; }
+sub move {
+    my ($self, $cmds) = @_;
+    for my $c (split //, $cmds) {
+        if ($c eq 'A') { $self->{pos}[1]++ }
+        elsif ($c =~ /^[LR]$/) { next }
+        else { die "bad command $c\n" }
+    }
+    return $self;
+}
+my %h = (a => 1, b => [1, 2]);
+my @sorted = sort { $a <=> $b } map { $_ * 2 } grep { $_ } @{ $h{b} };
+print "@sorted\n" unless !@sorted;
+1;
