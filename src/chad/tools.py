@@ -980,6 +980,38 @@ def alias_write_edit(name: str, args):
     return target, out
 
 
+def infer_edit_path(args, files):
+    """Which of `files` an `edit` without `path` meant: the one file whose text contains
+    `old`. Returns `(path or None, matched)` — `path` only when exactly one matched.
+
+    `files` is the turn's own list (what bash displayed, what write/edit landed), never
+    the repository: five of the ten slips in the 2026-10-10 census were an `edit` sent
+    with `old` and `new` and no `path`, and in every one the file was among the turn's
+    own reads. Nothing here applies anything; the caller decides, fires the
+    `edit_path_inferred` lever, and leads the result with the fact. Never for `write`.
+    """
+    old = args.get("old") if is_json_object(args) else None
+    if not is_text(old) or not old:
+        return None, []
+    matched = []
+    seen = set()
+    for f in files:
+        ap = os.path.abspath(f)
+        if ap in seen:
+            continue
+        seen.add(ap)
+        try:
+            if not os.path.isfile(f) or os.path.getsize(f) > 2_000_000:
+                continue
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        if old in text:
+            matched.append(f)
+    return (matched[0] if len(matched) == 1 else None), matched
+
+
 # Each entry takes (args, should_stop); long-running tools honor should_stop so a
 # ctrl-c interrupt can abort them mid-flight.
 DISPATCH = {
@@ -1009,6 +1041,11 @@ JsonValue = Union[None, bool, int, float, str, Sequence["JsonValue"], Mapping[st
 def is_json_object(value: JsonValue) -> "TypeIs[dict[str, JsonValue]]":
     """A JSON object: the only shape a tool call's arguments can dispatch as."""
     return isinstance(value, dict)
+
+
+def is_text(value: JsonValue) -> "TypeIs[str]":
+    """A JSON string: what a text parameter (`old`, `new`, `content`, a path) must be."""
+    return isinstance(value, str)
 
 
 class FunctionSchema(TypedDict):

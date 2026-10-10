@@ -615,6 +615,35 @@ def test_write_edit_aliases_are_not_advertised_to_the_model():
 
 
 # ---------------------------------------------------------------------------
+# Edit path inference: which of the turn's own files an `edit` without `path` meant.
+# ---------------------------------------------------------------------------
+
+
+def test_infer_edit_path_picks_the_one_file_containing_old(tmp_path):
+    a = tmp_path / "a.py"; a.write_text("alpha\nbeta\n")
+    b = tmp_path / "b.py"; b.write_text("gamma\n")
+    chosen, matched = tools.infer_edit_path({"old": "beta", "new": "x"}, [str(a), str(b)])
+    assert chosen == str(a) and matched == [str(a)]
+
+
+def test_infer_edit_path_declines_when_zero_or_several_match(tmp_path):
+    a = tmp_path / "a.py"; a.write_text("beta\n")
+    b = tmp_path / "b.py"; b.write_text("beta\n")
+    assert tools.infer_edit_path({"old": "beta"}, [str(a), str(b)]) == (None, [str(a), str(b)])
+    assert tools.infer_edit_path({"old": "zeta"}, [str(a), str(b)]) == (None, [])
+    assert tools.infer_edit_path({"old": "beta"}, []) == (None, [])
+
+
+def test_infer_edit_path_ignores_missing_files_and_empty_old(tmp_path):
+    a = tmp_path / "a.py"; a.write_text("beta\n")
+    assert tools.infer_edit_path({"old": "beta"}, [str(tmp_path / "gone.py"), str(a)]) == (
+        str(a), [str(a)])
+    assert tools.infer_edit_path({"old": ""}, [str(a)]) == (None, [])
+    assert tools.infer_edit_path({"new": "x"}, [str(a)]) == (None, [])
+    assert tools.infer_edit_path("not an object", [str(a)]) == (None, [])
+
+
+# ---------------------------------------------------------------------------
 # Plan state read by the `done` guardrail.
 # ---------------------------------------------------------------------------
 

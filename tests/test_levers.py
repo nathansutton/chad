@@ -17,7 +17,7 @@ LEAN_SET = {
     "env_manifest", "bash_read_skeleton", "bash_empty_diagnose",
     "bash_trim_keep_failures", "verify_baseline", "bash_line_clip",
     "edit_miss_diagnose", "rg_replace_flag_note",
-    "trim_spill", "result_spill", "tool_name_alias",
+    "trim_spill", "result_spill", "tool_name_alias", "edit_path_inferred",
 }
 
 

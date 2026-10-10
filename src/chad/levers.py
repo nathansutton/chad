@@ -79,6 +79,12 @@ LEVERS: dict[str, Lever] = {
         "meant, keys renamed, with one fact line prepended to the result — "
         "instead of an unknown-tool rejection and a step spent re-emitting "
         "the same call. A real tool of that name always wins."),
+    "edit_path_inferred": Lever(
+        "An edit sent with old/new and no path is applied to the one file, "
+        "among those this turn read or changed, that contains old — the "
+        "result leads with that fact. Zero or several such files: rejected as "
+        "before, with the candidates named. Never for write; never from files "
+        "the turn did not touch."),
     "rg_replace_flag_note": Lever(
         "One line naming what an `rg -r` result actually is (rewritten output, "
         "not the file's text) — `-rn` is `--replace n`, not grep's recursive "
