@@ -402,6 +402,9 @@ def test_release_model_is_a_noop_when_nothing_is_loaded():
 
 def test_release_model_clears_the_cache(monkeypatch):
     fake_mx = type("mx", (), {"clear_cache": staticmethod(lambda: None)})
+    # `import mlx.core` resolves the parent package first, so a host without mlx
+    # (Linux) needs the fake parent too, not just the submodule.
+    monkeypatch.setitem(sys.modules, "mlx", type("mlx", (), {"core": fake_mx}))
     monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
     monkeypatch.setattr(speech, "_stt", {("m", 8): object()})
     assert speech.release_model() is True

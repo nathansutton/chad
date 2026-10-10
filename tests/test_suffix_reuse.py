@@ -231,7 +231,7 @@ def _keys(shape=(1, 4, 8, 256), dtype=None):
 
 
 def test_rerotate_plain_rope_matches_a_fresh_rotation():
-    import mlx.core as mx
+    mx = pytest.importorskip("mlx.core")
     rope, k = _rope(), _keys()
     moved = suffix_reuse.rerotate_keys(rope(k, offset=5000), rope, -2000)
     assert mx.allclose(moved, rope(k, offset=3000), rtol=1e-3, atol=1e-3).item()
@@ -239,7 +239,7 @@ def test_rerotate_plain_rope_matches_a_fresh_rotation():
 
 
 def test_rerotate_yarn_is_not_double_scaled():
-    import mlx.core as mx
+    mx = pytest.importorskip("mlx.core")
     rope = _rope({"rope_type": "yarn", "factor": 4.0,
                   "original_max_position_embeddings": 262144})
     assert rope.mscale != 1.0
@@ -258,7 +258,7 @@ def test_rerotate_yarn_is_not_double_scaled():
 
 
 def test_rerotate_zero_delta_is_identity():
-    import mlx.core as mx
+    mx = pytest.importorskip("mlx.core")
     rope, k = _rope(), _keys()
     rotated = rope(k, offset=777)
     assert mx.array_equal(suffix_reuse.rerotate_keys(rotated, rope, 0), rotated).item()
@@ -289,7 +289,7 @@ def _arrays(cache):
 
 @pytest.mark.parametrize("quantized", [False, True])
 def test_take_then_append_reproduces_the_rows(quantized):
-    import mlx.core as mx
+    mx = pytest.importorskip("mlx.core")
     cache = _filled(quantized)
     cap = suffix_reuse._parts(cache)[0][0].shape[-2]   # step-rounded, past T
     assert T < cap < 800
@@ -325,7 +325,7 @@ def test_take_then_append_reproduces_the_rows(quantized):
 
 
 def test_quantized_rerotation_is_close_to_the_truth():
-    import mlx.core as mx
+    mx = pytest.importorskip("mlx.core")
     rope = _rope()
     raw = _keys((1, 4, T, 256), mx.float16)
     cache = _filled(True, keys=rope(raw))
@@ -348,7 +348,7 @@ def tiny_hybrid():
     attention layers with real caches, so the splice meets a real forward."""
     import copy
 
-    import mlx.core as mx
+    mx = pytest.importorskip("mlx.core")
     from mlx_lm.models.qwen3_5 import Model, ModelArgs
 
     from test_mlx_fastpath import TINY_CFG
