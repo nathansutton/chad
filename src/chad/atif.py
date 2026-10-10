@@ -42,7 +42,6 @@ by the real step once its message lands.
 import json
 import logging
 import os
-import re
 import tempfile
 import threading
 import uuid
@@ -52,13 +51,12 @@ from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from . import config
-from .toolcall_parse import parse_tool_calls, strip_think
+from .toolcall_parse import parse_tool_calls, strip_think, think_spans
 from .tools import JsonValue, is_json_object
 
 log = logging.getLogger("chad")
 
 SCHEMA_VERSION = "ATIF-v1.7"
-_THINK_BLOCK = re.compile(r"<think>(.*?)</think>", re.S)
 
 
 def now() -> str:
@@ -66,15 +64,17 @@ def now() -> str:
 
 
 def split_think(text: str) -> tuple[str, str]:
-    """(reasoning, visible). Mirrors `strip_think`'s two cases: an explicit
-    `<think>…</think>` block, and the template-opened case where generation starts *inside*
-    the block so the text carries a leading `</think>` with no opening tag."""
-    close = text.find("</think>")
-    open_ = text.find("<think>")
-    if close != -1 and (open_ == -1 or close < open_):
-        return text[:close], text[close + len("</think>"):]
-    reasoning = "\n".join(m.group(1) for m in _THINK_BLOCK.finditer(text))
-    return reasoning, strip_think(text)
+    """(reasoning, visible). The spans `strip_think` removes — the template-opened block
+    (generation starts *inside* <think>, so the text carries a leading `</think>` with no
+    opening tag) and every explicit `<think>…</think>` block, never a tag inside a tool
+    call's arguments — with their tags dropped and their texts joined by newlines."""
+    parts = []
+    for a, b in think_spans(text):
+        inner = text[a:b]
+        if inner.startswith("<think>"):
+            inner = inner[len("<think>"):]
+        parts.append(inner[:-len("</think>")])
+    return "\n".join(parts), strip_think(text)
 
 
 PENDING_EVERY = 256     # tokens between rewrites of the in-flight step (~10 s of decode)

@@ -4,6 +4,13 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**A tool call whose arguments mention the reasoning tags is parsed whole.** The parser
+removed every `<think>…</think>` span from a turn before reading its calls, including
+one spelled out inside an `edit`'s old/new text, so the middle of the call vanished and
+chad could not edit about sixty lines of its own source (the selfsearch improver found
+this; its fix did nothing). Reasoning is now removed only outside closed tool-call
+blocks, in the parser, the trajectory writer and the reasoning split alike.
+
 ## [2.4.0] — 2026-10-04
 
 The model is unchanged: no re-download.

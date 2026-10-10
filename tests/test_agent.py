@@ -160,6 +160,16 @@ def test_split_inline_reasoning():
     check("stray tag keeps whole reasoning",
           out["reasoning_content"] == "first half <think> second half", out)
     check("stray tag keeps action", out["content"] == "ans", out)
+    # A `</think>` inside a tool call's arguments (the model editing this file, say) is
+    # argument text: the split happens at the template's close, and a no-think turn
+    # whose call mentions the tag is left alone.
+    call = '<tool_call>{"name":"edit","arguments":{"old":"a</think>b","new":"c"}}</tool_call>'
+    out = split_inline_reasoning({"role": "assistant", "content": "plan\n</think>\n" + call})
+    check("literal close in args is not the split",
+          out["reasoning_content"] == "plan" and out["content"] == call, out)
+    nothink = {"role": "assistant", "content": call}
+    check("no-think turn with a literal close untouched",
+          split_inline_reasoning(nothink) is nothink)
 
 
 def test_reasoning_split_probe_classifies_templates():
