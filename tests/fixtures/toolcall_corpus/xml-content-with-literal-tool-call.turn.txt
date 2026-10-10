@@ -1,0 +1,10 @@
+<tool_call>
+<function=write>
+<parameter=path>
+a.md
+</parameter>
+<parameter=content>
+emit <tool_call> blocks
+</parameter>
+</function>
+</tool_call>

@@ -1,0 +1,14 @@
+<tool_call>
+<function=bash>
+<parameter=command>
+ls
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=write>
+<parameter=path>
+a
+</parameter>
+<parameter=content>
+half

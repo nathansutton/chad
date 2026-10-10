@@ -1,0 +1,19 @@
+{
+ "note": "census shape (cpp/dnd-character.rep3 #8): the model meant write",
+ "calls": [
+  {
+   "name": "edit",
+   "arguments": {
+    "path": "a.cpp",
+    "content": "int x;"
+   },
+   "errors": [
+    "$new",
+    "$old"
+   ],
+   "unknown_keys": [
+    "content"
+   ]
+  }
+ ]
+}

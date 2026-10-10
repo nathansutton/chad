@@ -1,0 +1,14 @@
+{
+ "note": "the whole arguments object sent as one JSON string (Qwen3's signature slip)",
+ "calls": [
+  {
+   "name": "edit",
+   "arguments": {
+    "path": "a",
+    "old": "x",
+    "new": "y"
+   },
+   "errors": []
+  }
+ ]
+}

@@ -1,0 +1,19 @@
+{
+ "note": "each opener owns the parameters up to the next",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  },
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "pwd"
+   },
+   "errors": []
+  }
+ ]
+}

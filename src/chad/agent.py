@@ -54,12 +54,16 @@ from .tools import (
     IGNORE_DIRS,
     TERMINAL,
     active_schemas,
+    alias_by_shape,
     alias_to_bash,
+    alias_write_edit,
     clear_todos,
     dispatch_for,
+    infer_edit_path,
     is_json_object,
     is_mutating,
     outside_workspace,
+    tool_params,
     unfinished_todos,
 )
 from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_repair
@@ -1164,6 +1168,8 @@ class Agent:
         thrash_nudges = 0
         todo_nudges = 0
         planned_this_turn = False  # write_todos ran this turn
+        turn_files: list = []  # files this turn displayed via bash or landed a write/edit on,
+                               # in order — the only candidates `edit_path_inferred` may use
         # Files edited this turn -> mtime at last syntax check. Bash can mutate files
         # too (sed -i, python rewrites) but bypasses the write/edit syntax gate; watch
         # edited files and re-check them after any bash that touched them (a measured
@@ -1583,7 +1589,25 @@ class Agent:
                          think_cap, think_cap_hits)
                 continue
 
-            calls = [alias_to_bash(n, a) for n, a in parse_tool_calls(text)]
+            calls = []
+            aliased: dict[int, str] = {}   # call index -> the fact about the name sent
+            for _n, _a in parse_tool_calls(text):
+                _n2, _a2 = alias_to_bash(_n, _a)
+                if _n2 == _n and levers.enabled("tool_name_alias"):
+                    _n2, _a2 = alias_write_edit(_n, _a)
+                    if _n2 != _n:
+                        levers.fired("tool_name_alias", step=step, kind="name",
+                                     sent=_n, ran=_n2)
+                        aliased[len(calls)] = f"no tool is named {_n}"
+                    else:
+                        _n2, _a2 = alias_by_shape(_n, _a)
+                        if _n2 != _n:
+                            levers.fired("tool_name_alias", step=step, kind="shape",
+                                         sent=_n, ran=_n2)
+                            aliased[len(calls)] = (
+                                f"{_n} takes {', '.join(tool_params(_n))}; the call "
+                                f"carried {', '.join(_a)}")
+                calls.append((_n2, _a2))
             if not calls:
                 # No tool call this step. Decide whether this is a genuine final answer
                 # or a stall to push past. Three stalls telemetry caught, in priority
@@ -1703,7 +1727,31 @@ class Agent:
             _gov_prev_made = made_edit
             _gov_prev_unverified = unverified_edit
             step_tool_chars = 0  # tool-output chars appended this step (see _step_tool_cap)
-            for name, args in calls:
+            for ci, (name, args) in enumerate(calls):
+                # An `edit` with old/new and no path: when exactly one of the files this
+                # turn read or changed contains `old`, that is the file. Decided before
+                # validation so the normal path runs on the completed call; the fact is
+                # stated ahead of the result below. Never for `write`.
+                inferred_path = ""
+                path_hint = ""
+                if (name == "edit" and is_json_object(args)
+                        and not str(args.get("path", "") or "").strip()
+                        and levers.enabled("edit_path_inferred")):
+                    chosen, matched = infer_edit_path(args, turn_files)
+                    if chosen is not None:
+                        args = {**args, "path": chosen}
+                        inferred_path = chosen
+                        levers.fired("edit_path_inferred", step=step, kind="applied",
+                                     path=chosen)
+                    elif turn_files:
+                        levers.fired("edit_path_inferred", step=step, kind="listed",
+                                     matched=len(matched))
+                        if matched:
+                            path_hint = (f"\n  old matched {len(matched)} of the files this "
+                                         f"turn read or changed: {', '.join(matched)}")
+                        else:
+                            path_hint = ("\n  old matched none of the files this turn read "
+                                         f"or changed: {', '.join(turn_files)}")
                 render_tool_start(self._emit, name, args)
                 # typia stages 2+3: coerce loosely-typed args toward the schema
                 # ("10"->10, '["x"]'->[...]) and validate. On failure, feed the
@@ -1717,7 +1765,7 @@ class Agent:
                     coerced, reject, detail = args, legacy_validate(name, args), ""
                 fn = dispatch_for(name)
                 if reject is not None:
-                    result = reject
+                    result = reject + path_hint
                     self._validate_fails += 1
                     # Loop breaker (plan): the same call rejected identically back-to-back
                     # means the repair message isn't landing (the model can't see the fix,
@@ -1735,6 +1783,8 @@ class Agent:
                         log.info("VALIDATE %s rejected identically %dx -> escalate",
                                  name, self._reject_repeats + 1)
                     log.info("VALIDATE %s rejected (%d): %s", name, self._validate_fails, detail)
+                    if ci in aliased:
+                        result = f"[{aliased[ci]}; read as {name}]\n" + result
                     render_tool_result(self._emit, name, args, result)
                     self.messages.append({"role": "tool", "name": name, "content": result})
                     continue
@@ -1815,6 +1865,16 @@ class Agent:
                     step_tool_chars += len(result)
                     if _PREFILL_TRACE:
                         self._trace_tools_pending.append([name, round(_tool_s, 4)])
+                if ci in aliased:
+                    # The one fact the model needs, stated once, ahead of the normal
+                    # result (which is byte-identical to a correctly named call's).
+                    result = f"[{aliased[ci]}; ran {name}]\n" + result
+                if inferred_path:
+                    landed = result.startswith("[edited")
+                    result = (f"[path was not given; old matched only {inferred_path} among "
+                              "the files this turn read or changed"
+                              + (f"; edited {inferred_path}]" if landed else "]")
+                              + "\n" + result)
                 render_tool_result(self._emit, name, args, result)
                 log.info("TOOL %s(%s) -> %s [%.2fs]", name, args_preview(args),
                          result_preview(result), _tool_s)
@@ -1823,6 +1883,17 @@ class Agent:
                 # unverified_edit) for this tool result — see guardrails.update_work_flags.
                 did_work, made_edit, unverified_edit = guardrails.update_work_flags(
                     name, args, result, did_work, made_edit, unverified_edit)
+                # The turn's own files, for `edit_path_inferred`: what bash displayed and
+                # what a write/edit landed on. Facts only; the lever reads them.
+                if name in ("write", "edit") and result.startswith(("[wrote", "[edited")):
+                    _tf = str(args.get("path", "") or "")
+                    if _tf and _tf not in turn_files:
+                        turn_files.append(_tf)
+                elif name == "bash" and not result.startswith(
+                        ("[timed out", "[interrupted", "[failed to launch")):
+                    for _tf in ambient.opened_paths(str(args.get("command", "") or "")):
+                        if _tf not in turn_files:
+                            turn_files.append(_tf)
                 if name in ("edit", "write"):
                     if not guardrails.edit_failed_to_land(result):
                         recent_sigs.clear()  # a landed change resets the identical-call

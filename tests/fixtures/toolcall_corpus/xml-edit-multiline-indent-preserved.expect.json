@@ -1,0 +1,14 @@
+{
+ "note": "the first line's indentation of a text parameter is content",
+ "calls": [
+  {
+   "name": "edit",
+   "arguments": {
+    "path": "a.py",
+    "old": "    x = 1\n    y = 2",
+    "new": "    x = 10\n    y = 2"
+   },
+   "errors": []
+  }
+ ]
+}

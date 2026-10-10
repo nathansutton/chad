@@ -1,0 +1,2 @@
+{"name": "bash" <parameter=command>ls</parameter>
+{"name": "bash" <parameter=command>pwd</parameter>

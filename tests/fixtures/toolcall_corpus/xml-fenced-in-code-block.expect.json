@@ -1,0 +1,12 @@
+{
+ "note": "the whole call inside a ```xml fence",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

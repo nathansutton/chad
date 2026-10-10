@@ -1,0 +1,7 @@
+<tool_call>
+<function=write_todos>
+<parameter=todos>
+[{"content": "x", "status": "pending"}]
+</parameter>
+</function>
+</tool_call>

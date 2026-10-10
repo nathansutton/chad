@@ -1,0 +1,12 @@
+{
+ "note": "no tags, no fence: the bare-object fallback",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

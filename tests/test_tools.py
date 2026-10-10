@@ -556,6 +556,136 @@ def test_aliases_are_not_advertised_to_the_model():
 
 
 # ---------------------------------------------------------------------------
+# Write/edit aliases: a well-formed call under a name this surface does not expose.
+# The 2026-10-10 slip census found two `write_file` calls in 90 trials, each costing
+# the step that re-emitted it as `write` (plan 004, step 3).
+# ---------------------------------------------------------------------------
+
+
+def test_write_alias_dispatches_to_write_with_keys_renamed():
+    assert tools.alias_write_edit("write_file", {"path": "a.py", "content": "x"}) == (
+        "write", {"path": "a.py", "content": "x"})
+    assert tools.alias_write_edit("create_file", {"file_path": "a.py", "file_text": "x"}) == (
+        "write", {"path": "a.py", "content": "x"})
+    for name in tools.WRITE_ALIASES:
+        assert tools.alias_write_edit(name, {"path": "a", "content": "b"})[0] == "write", name
+
+
+def test_edit_alias_dispatches_to_edit_with_keys_renamed():
+    assert tools.alias_write_edit(
+        "str_replace_editor", {"file_path": "a.py", "old_str": "x", "new_str": "y"}) == (
+        "edit", {"path": "a.py", "old": "x", "new": "y"})
+    assert tools.alias_write_edit(
+        "edit_file", {"path": "a.py", "old_string": "x", "new_string": "y"}) == (
+        "edit", {"path": "a.py", "old": "x", "new": "y"})
+    for name in tools.EDIT_ALIASES:
+        assert tools.alias_write_edit(name, {"path": "a", "old": "b", "new": "c"})[0] == "edit", name
+
+
+def test_write_edit_alias_leaves_missing_fields_for_the_validator():
+    # Nothing is invented: a pathless write_file becomes a pathless write, and the
+    # validator names the missing field exactly as it would for the canonical call.
+    assert tools.alias_write_edit("write_file", {"content": "x"}) == ("write", {"content": "x"})
+    # A canonical key already present is never overwritten by a synonym.
+    assert tools.alias_write_edit("edit_file", {"path": "a", "old": "o", "old_str": "z",
+                                                "new": "n"})[1]["old"] == "o"
+
+
+def test_write_edit_alias_never_shadows_a_real_dispatch():
+    """An MCP server may expose `replace`; that tool must win over the shim."""
+    tools.DISPATCH["replace"] = lambda a, ss=None: "from the real tool"
+    try:
+        assert tools.alias_write_edit("replace", {"path": "a", "old": "b", "new": "c"}) == (
+            "replace", {"path": "a", "old": "b", "new": "c"})
+    finally:
+        del tools.DISPATCH["replace"]
+
+
+def test_write_edit_alias_passes_other_names_through_untouched():
+    assert tools.alias_write_edit("write", {"path": "a", "content": "b"}) == (
+        "write", {"path": "a", "content": "b"})
+    assert tools.alias_write_edit("frobnicate", {"x": 1}) == ("frobnicate", {"x": 1})
+    assert tools.alias_write_edit("write_file", "not an object") == ("write_file", "not an object")
+
+
+def test_write_edit_aliases_are_not_advertised_to_the_model():
+    exposed = {s["function"]["name"] for s in tools.SCHEMAS}
+    assert not (exposed & (tools.WRITE_ALIASES | tools.EDIT_ALIASES))
+    assert not (tools.READ_ALIASES & (tools.WRITE_ALIASES | tools.EDIT_ALIASES))
+
+
+# ---------------------------------------------------------------------------
+# Shape alias: a built-in called with exactly another built-in's parameters. The
+# 2026-10-10 paired block found four `write` calls whose only key was `todos`.
+# ---------------------------------------------------------------------------
+
+
+def test_shape_alias_write_with_only_todos_is_write_todos():
+    todos = '[{"content": "x", "status": "pending"}]'
+    assert tools.alias_by_shape("write", {"todos": todos}) == ("write_todos", {"todos": todos})
+    assert tools.alias_by_shape("edit", {"todos": todos}) == ("write_todos", {"todos": todos})
+
+
+def test_shape_alias_requires_the_other_tools_whole_required_set():
+    # write_todos sent with write's two required keys is a write; with only one, it is not.
+    assert tools.alias_by_shape("write_todos", {"path": "a", "content": "b"})[0] == "write"
+    assert tools.alias_by_shape("write_todos", {"content": "b"})[0] == "write_todos"
+    # optional keys of the target are allowed alongside
+    assert tools.alias_by_shape("done", {"command": "ls", "timeout": 5})[0] == "bash"
+
+
+def test_shape_alias_never_fires_when_any_own_key_is_present():
+    """The census shape `edit` + path + content: path is edit's own key, and the model may
+    have meant to append — the validator names the stray key instead (plan 004 step 4)."""
+    assert tools.alias_by_shape("edit", {"path": "a.cpp", "content": "x"}) == (
+        "edit", {"path": "a.cpp", "content": "x"})
+    assert tools.alias_by_shape("write", {"path": "a"}) == ("write", {"path": "a"})
+
+
+def test_shape_alias_leaves_everything_else_alone():
+    assert tools.alias_by_shape("write", {}) == ("write", {})
+    assert tools.alias_by_shape("write", {"zzz": 1}) == ("write", {"zzz": 1})
+    assert tools.alias_by_shape("write", "not an object") == ("write", "not an object")
+    assert tools.alias_by_shape("mcp__srv__thing", {"todos": "[]"}) == ("mcp__srv__thing", {"todos": "[]"})
+    assert tools.alias_by_shape("frobnicate", {"todos": "[]"}) == ("frobnicate", {"todos": "[]"})
+
+
+def test_tool_params_lists_schema_order():
+    assert tools.tool_params("write") == ["path", "content"]
+    assert tools.tool_params("edit") == ["path", "old", "new"]
+    assert tools.tool_params("nope") == []
+
+
+# ---------------------------------------------------------------------------
+# Edit path inference: which of the turn's own files an `edit` without `path` meant.
+# ---------------------------------------------------------------------------
+
+
+def test_infer_edit_path_picks_the_one_file_containing_old(tmp_path):
+    a = tmp_path / "a.py"; a.write_text("alpha\nbeta\n")
+    b = tmp_path / "b.py"; b.write_text("gamma\n")
+    chosen, matched = tools.infer_edit_path({"old": "beta", "new": "x"}, [str(a), str(b)])
+    assert chosen == str(a) and matched == [str(a)]
+
+
+def test_infer_edit_path_declines_when_zero_or_several_match(tmp_path):
+    a = tmp_path / "a.py"; a.write_text("beta\n")
+    b = tmp_path / "b.py"; b.write_text("beta\n")
+    assert tools.infer_edit_path({"old": "beta"}, [str(a), str(b)]) == (None, [str(a), str(b)])
+    assert tools.infer_edit_path({"old": "zeta"}, [str(a), str(b)]) == (None, [])
+    assert tools.infer_edit_path({"old": "beta"}, []) == (None, [])
+
+
+def test_infer_edit_path_ignores_missing_files_and_empty_old(tmp_path):
+    a = tmp_path / "a.py"; a.write_text("beta\n")
+    assert tools.infer_edit_path({"old": "beta"}, [str(tmp_path / "gone.py"), str(a)]) == (
+        str(a), [str(a)])
+    assert tools.infer_edit_path({"old": ""}, [str(a)]) == (None, [])
+    assert tools.infer_edit_path({"new": "x"}, [str(a)]) == (None, [])
+    assert tools.infer_edit_path("not an object", [str(a)]) == (None, [])
+
+
+# ---------------------------------------------------------------------------
 # Plan state read by the `done` guardrail.
 # ---------------------------------------------------------------------------
 

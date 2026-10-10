@@ -1,0 +1,16 @@
+
+
+<tool_call>
+<function=bash>
+<parameter=command>
+cat go-counting.js; echo ---; head -50 go-counting.spec.js
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=write>
+<parameter=todos>
+[{"content": "Inspect existing files and tests", "status": "in_progress"}, {"content": "Implement go-counting.js", "status": "pending"}, {"content": "Run test suite until green", "status": "pending"}]
+</parameter>
+</function>
+</tool_call>

@@ -170,6 +170,216 @@ def test_agent_loop_writes_file_reads_it_back_then_terminates(tmp_path, monkeypa
     assert agent.engine._i == len(script)
 
 
+def _xml_call(name, **args):
+    """One `<tool_call>` block in the XML dialect the chat template mandates — the shape
+    the census steps were actually emitted in."""
+    parts = [f"<tool_call>\n<function={name}>"]
+    for k, v in args.items():
+        parts.append(f"<parameter={k}>\n{v}\n</parameter>")
+    parts.append("</function>\n</tool_call>")
+    return "\n".join(parts)
+
+
+def test_a_write_under_a_hallucinated_name_runs_as_write(tmp_path, monkeypatch):
+    """`write_file` with a path and content (the census shape) lands the file, and the
+    result leads with the one fact and is otherwise the normal `write` result."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    target = tmp_path / "note.txt"
+    script = [
+        _xml_call("write_file", path=str(target), content="hello"),
+        _tool_call("done", summary="ok"),
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("create note.txt")
+    assert target.read_text() == "hello"
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    assert tool_turns[0]["name"] == "write"
+    head, _, rest = tool_turns[0]["content"].partition("\n")
+    assert head == "[no tool is named write_file; ran write]"
+    assert rest.startswith("[wrote")
+
+
+def test_an_edit_under_a_hallucinated_name_runs_as_edit(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    target = tmp_path / "a.txt"
+    target.write_text("alpha\nbeta\n")
+    script = [
+        _xml_call("str_replace_editor", file_path=str(target), old_str="beta", new_str="gamma"),
+        _tool_call("done", summary="ok"),
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("rename beta")
+    assert target.read_text() == "alpha\ngamma\n"
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    assert tool_turns[0]["name"] == "edit"
+    assert tool_turns[0]["content"].startswith("[no tool is named str_replace_editor; ran edit]\n[edited")
+
+
+def test_an_aliased_call_that_still_fails_validation_says_so_without_claiming_a_run(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    script = [
+        _xml_call("write_file", content="hello"),            # no path under any name
+        "There is nothing to write to.",                     # prose end on a read-only ask
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what would you write?")
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    content = tool_turns[0]["content"]
+    assert content.startswith("[no tool is named write_file; read as write]\n[invalid arguments for `write`")
+    assert "✗ $path" in content
+    assert "ran write" not in content
+
+
+def test_disabling_tool_name_alias_restores_the_unknown_tool_message(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CHAD_DISABLE", "tool_name_alias")
+    target = tmp_path / "note.txt"
+    script = [
+        _xml_call("write_file", path=str(target), content="hello"),
+        "There is no such tool.",
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what is in note.txt?")
+    assert not target.exists()
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    assert tool_turns[0]["name"] == "write_file"
+    assert tool_turns[0]["content"].startswith("[unknown tool 'write_file'")
+
+
+def test_a_write_carrying_only_todos_runs_as_write_todos(tmp_path, monkeypatch):
+    """The paired-block shape (javascript/zipper.rep2 #3, four in 90 trials): the model named
+    `write` and filled in `write_todos`' form. It runs as write_todos; the result leads with
+    the fact and is otherwise the normal plan result."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    todos = '[{"content": "Read the tests", "status": "in_progress"}]'
+    script = [
+        _xml_call("write", todos=todos),
+        "Plan recorded.",
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what is the plan?")
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    assert tool_turns[0]["name"] == "write_todos"
+    head, _, rest = tool_turns[0]["content"].partition("\n")
+    assert head == "[write takes path, content; the call carried todos; ran write_todos]"
+    assert rest.startswith("Plan updated:")
+    assert tools.unfinished_todos() == ["Read the tests"]
+    assert not list(tmp_path.iterdir())          # nothing was written to disk
+
+
+def test_disabling_tool_name_alias_restores_the_write_rejection_for_a_todos_call(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CHAD_DISABLE", "tool_name_alias")
+    script = [_xml_call("write", todos="[]"), "No plan."]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what is the plan?")
+    content = [m for m in agent.messages if m.get("role") == "tool"][0]["content"]
+    assert content.startswith("[invalid arguments for `write`")
+    assert "✗ todos → not a parameter of write (write takes path, content)" in content
+    assert "ran write_todos" not in content
+
+
+# --- edit_path_inferred: an `edit` with old/new and no path (plan 004, step 6) --------
+
+def _rejection_as_today(name, args):
+    from chad import validate
+    coerced, errs = validate.coerce_and_validate(name, args)
+    return validate.render_repair(name, coerced, errs)
+
+
+def test_pathless_edit_is_applied_to_the_one_file_read_this_turn_that_contains_old(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    (tmp_path / "a.txt").write_text("alpha\nbeta\n")
+    (tmp_path / "b.txt").write_text("gamma\n")
+    script = [
+        _tool_call("bash", command="cat a.txt b.txt"),
+        _xml_call("edit", old="beta", new="delta"),          # no path
+        _tool_call("done", summary="ok"),
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("rename beta in the file")
+    assert (tmp_path / "a.txt").read_text() == "alpha\ndelta\n"
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    assert tool_turns[1]["name"] == "edit"
+    head, _, rest = tool_turns[1]["content"].partition("\n")
+    assert head == ("[path was not given; old matched only a.txt among the files this turn "
+                    "read or changed; edited a.txt]")
+    assert rest.startswith("[edited")
+
+
+def test_pathless_edit_with_two_candidates_is_rejected_naming_both(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    (tmp_path / "a.txt").write_text("beta\n")
+    (tmp_path / "b.txt").write_text("beta\n")
+    script = [
+        _tool_call("bash", command="cat a.txt b.txt"),
+        _xml_call("edit", old="beta", new="delta"),
+        "Which file did you mean?",
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("which file has beta?")
+    assert (tmp_path / "a.txt").read_text() == "beta\n" and (tmp_path / "b.txt").read_text() == "beta\n"
+    content = [m for m in agent.messages if m.get("role") == "tool"][1]["content"]
+    assert content.startswith(_rejection_as_today("edit", {"old": "beta", "new": "delta"}))
+    assert content.endswith("\n  old matched 2 of the files this turn read or changed: a.txt, b.txt")
+
+
+def test_pathless_edit_with_no_reads_this_turn_is_rejected_as_before(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    (tmp_path / "a.txt").write_text("beta\n")
+    script = [_xml_call("edit", old="beta", new="delta"), "Nothing was read."]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what has beta?")
+    content = [m for m in agent.messages if m.get("role") == "tool"][0]["content"]
+    assert content == _rejection_as_today("edit", {"old": "beta", "new": "delta"})
+    assert (tmp_path / "a.txt").read_text() == "beta\n"
+
+
+def test_pathless_edit_whose_old_matches_no_read_file_lists_the_files_read(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    (tmp_path / "a.txt").write_text("alpha\n")
+    script = [_tool_call("bash", command="cat a.txt"),
+              _xml_call("edit", old="beta", new="delta"), "No file has beta."]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what has beta?")
+    content = [m for m in agent.messages if m.get("role") == "tool"][1]["content"]
+    assert content.endswith("\n  old matched none of the files this turn read or changed: a.txt")
+
+
+def test_pathless_write_is_rejected_unchanged_even_after_reads(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    (tmp_path / "a.txt").write_text("beta\n")
+    script = [_tool_call("bash", command="cat a.txt"),
+              _xml_call("write", content="whole new file"), "Where should it go?"]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what is in a.txt?")
+    content = [m for m in agent.messages if m.get("role") == "tool"][1]["content"]
+    assert content == _rejection_as_today("write", {"content": "whole new file"})
+    assert (tmp_path / "a.txt").read_text() == "beta\n"
+
+
+def test_disabling_edit_path_inferred_restores_the_plain_rejection(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CHAD_DISABLE", "edit_path_inferred")
+    (tmp_path / "a.txt").write_text("beta\n")
+    script = [_tool_call("bash", command="cat a.txt"),
+              _xml_call("edit", old="beta", new="delta"), "Which file?"]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what has beta?")
+    content = [m for m in agent.messages if m.get("role") == "tool"][1]["content"]
+    assert content == _rejection_as_today("edit", {"old": "beta", "new": "delta"})
+    assert (tmp_path / "a.txt").read_text() == "beta\n"
+
+
 def test_agent_loop_terminates_on_a_plain_final_answer(tmp_path):
     """A read-only task that ends with a no-tool-call assistant turn returns that text —
     the other loop-exit path (final answer vs the `done` terminal tool)."""

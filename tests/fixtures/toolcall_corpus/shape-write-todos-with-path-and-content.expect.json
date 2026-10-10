@@ -1,0 +1,13 @@
+{
+ "note": "the reverse: write_todos named, write's whole form filled in",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "hi"
+   },
+   "errors": []
+  }
+ ]
+}

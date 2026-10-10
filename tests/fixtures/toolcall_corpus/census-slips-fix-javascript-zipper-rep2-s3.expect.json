@@ -1,0 +1,12 @@
+{
+ "note": "verbatim assistant turn, zipper.rep2.json step 3 (2026-10-10 paired block, fix arm)",
+ "calls": [
+  {
+   "name": "write_todos",
+   "errors": [],
+   "argument_keys": [
+    "todos"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,17 @@
+{
+ "note": "census shape (h36-chad-mlx robot-simulator.rep3 #3): `odos`",
+ "calls": [
+  {
+   "name": "write_todos",
+   "arguments": {
+    "odos": "[{\"content\": \"x\", \"status\": \"pending\"}]"
+   },
+   "errors": [
+    "$todos"
+   ],
+   "unknown_keys": [
+    "odos"
+   ]
+  }
+ ]
+}

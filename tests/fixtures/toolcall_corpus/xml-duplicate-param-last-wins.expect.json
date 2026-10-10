@@ -1,0 +1,12 @@
+{
+ "note": "the same parameter twice: the last one wins",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "pwd"
+   },
+   "errors": []
+  }
+ ]
+}

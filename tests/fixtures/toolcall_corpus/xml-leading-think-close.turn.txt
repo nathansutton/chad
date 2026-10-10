@@ -1,0 +1,10 @@
+I will list the directory.
+</think>
+
+<tool_call>
+<function=bash>
+<parameter=command>
+ls
+</parameter>
+</function>
+</tool_call>

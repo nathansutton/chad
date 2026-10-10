@@ -1,0 +1,13 @@
+{
+ "note": "a fence inside a JSON string must not be taken for a fenced call",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "```json\n{\"a\": 1}\n```\n"
+   },
+   "errors": []
+  }
+ ]
+}

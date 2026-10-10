@@ -1,0 +1,10 @@
+<tool_call>
+<function=write_todos>
+<parameter=path>
+a.md
+</parameter>
+<parameter=content>
+hi
+</parameter>
+</function>
+</tool_call>

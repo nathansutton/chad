@@ -1,0 +1,11 @@
+<tool_call>
+<function=write>
+<parameter=path>
+a.md
+</parameter>
+<parameter=content>
+ends with </parameter>
+</function> then more
+</parameter>
+</function>
+</tool_call>

@@ -1,0 +1,10 @@
+<tool_call>
+<function=edit>
+<parameter=path>
+a.cpp
+</parameter>
+<parameter=content>
+int x;
+</parameter>
+</function>
+</tool_call>

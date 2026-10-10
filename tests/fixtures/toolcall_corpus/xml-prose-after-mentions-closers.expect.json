@@ -1,0 +1,12 @@
+{
+ "note": "prose after the call that names the closers",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

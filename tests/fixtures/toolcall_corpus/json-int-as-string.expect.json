@@ -1,0 +1,13 @@
+{
+ "note": "an integer field sent as a string; coerced",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls",
+    "timeout": 30
+   },
+   "errors": []
+  }
+ ]
+}

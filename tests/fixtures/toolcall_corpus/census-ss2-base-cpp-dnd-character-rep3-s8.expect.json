@@ -1,0 +1,27 @@
+{
+ "note": "verbatim assistant turn, dnd-character.rep3.json step 8 (2026-10-10 census)",
+ "calls": [
+  {
+   "name": "write",
+   "errors": [],
+   "argument_keys": [
+    "content",
+    "path"
+   ]
+  },
+  {
+   "name": "edit",
+   "errors": [
+    "$new",
+    "$old"
+   ],
+   "argument_keys": [
+    "content",
+    "path"
+   ],
+   "unknown_keys": [
+    "content"
+   ]
+  }
+ ]
+}

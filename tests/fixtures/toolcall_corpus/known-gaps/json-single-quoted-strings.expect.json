@@ -1,0 +1,14 @@
+{
+ "note": "Python-style single-quoted strings for the whole call",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ],
+ "today": "parses to nothing (repair_json does not convert quotes)",
+ "reason": "a quote-flipping repair would have to understand apostrophes inside values and risks rewriting content; not seen in 960 census steps."
+}

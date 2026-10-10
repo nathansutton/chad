@@ -1,0 +1,14 @@
+{
+ "note": "an own key is present, so the call is the tool it names, rejected for what it lacks",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md"
+   },
+   "errors": [
+    "$content"
+   ]
+  }
+ ]
+}

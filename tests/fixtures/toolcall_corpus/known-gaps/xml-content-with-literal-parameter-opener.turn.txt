@@ -1,0 +1,10 @@
+<tool_call>
+<function=write>
+<parameter=path>
+a.md
+</parameter>
+<parameter=content>
+use <parameter=x> to pass x
+</parameter>
+</function>
+</tool_call>

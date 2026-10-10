@@ -1,0 +1,12 @@
+{
+ "note": "observed constantly under temperature: a JSON opener with XML parameters",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

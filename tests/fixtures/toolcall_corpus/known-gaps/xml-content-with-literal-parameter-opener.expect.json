@@ -1,0 +1,15 @@
+{
+ "note": "a literal <parameter= opener inside a value",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "use <parameter=x> to pass x"
+   },
+   "errors": []
+  }
+ ],
+ "today": "the opener starts a new parameter named x; content ends before it",
+ "reason": "the dialect has no escape, so a value containing its own opener has no unambiguous parse; a model writing about the dialect should use the JSON form (which handles it). Not seen in 960 census steps."
+}

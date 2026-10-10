@@ -1,0 +1,13 @@
+{
+ "note": "a code fence inside content",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "```python\nprint(1)\n```"
+   },
+   "errors": []
+  }
+ ]
+}

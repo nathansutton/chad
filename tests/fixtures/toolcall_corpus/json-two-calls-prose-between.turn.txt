@@ -1,0 +1,7 @@
+<tool_call>
+{"name": "bash", "arguments": {"command": "ls"}}
+</tool_call>
+Now the working directory.
+<tool_call>
+{"name": "bash", "arguments": {"command": "pwd"}}
+</tool_call>

@@ -1,0 +1,12 @@
+{
+ "note": "`parameters` where the template says `arguments`",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

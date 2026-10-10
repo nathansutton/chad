@@ -1,0 +1,10 @@
+<tool_call>
+<function=bash>
+<parameter=command>
+ls
+</parameter>
+<parameter=timeout>
+30
+</parameter>
+</function>
+</tool_call>

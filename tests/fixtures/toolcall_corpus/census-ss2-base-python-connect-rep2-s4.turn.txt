@@ -1,0 +1,63 @@
+
+
+<tool_call>
+<function=write_file>
+<parameter=path>
+/home/nate/repo/chad/benchmarks/polyglot/_work/ss2-base/rep2/python/connect/connect.py
+</parameter>
+<parameter=content>
+from collections import deque
+
+
+class ConnectGame:
+    def __init__(self, board):
+        # Row r has r+1 cells: (r, 0) is the left edge, (r, r) the right edge.
+        self.grid = [line.strip().split() for line in board.strip().splitlines() if line.strip()]
+        self.rows = len(self.grid)
+
+    def _neighbors(self, r, c):
+        yield from [
+            (r - 1, c - 1),
+            (r - 1, c),
+            (r, c - 1),
+            (r, c + 1),
+            (r + 1, c),
+            (r + 1, c + 1),
+        ]
+
+    def _reaches(self, player, is_edge, goal):
+        start = [
+            (r, c)
+            for r, row in enumerate(self.grid)
+            for c in range(len(row))
+            if row[c] == player and is_edge(r, c)
+        ]
+        seen = set(start)
+        queue = deque(start)
+        while queue:
+            r, c = queue.popleft()
+            if goal(r, c):
+                return True
+            for nr, nc in self._neighbors(r, c):
+                if (
+                    0 <= nr < self.rows
+                    and 0 <= nc < len(self.grid[nr])
+                    and self.grid[nr][nc] == player
+                    and (nr, nc) not in seen
+                ):
+                    seen.add((nr, nc))
+                    queue.append((nr, nc))
+        return False
+
+    def get_winner(self):
+        if not self.grid:
+            return ""
+        if self._reaches("X", lambda r, c: c == 0, lambda r, c: c == r):
+            return "X"
+        if self._reaches("O", lambda r, c: r == 0, lambda r, c: r == self.rows - 1):
+            return "O"
+        return ""
+
+</parameter>
+</function>
+</tool_call>

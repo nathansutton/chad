@@ -1,0 +1,12 @@
+{
+ "note": "a </tool_call> after the XML closers with no opener",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

@@ -1,0 +1,1 @@
+<tool_call>{"name": "bash", "arguments": {"command": "ls", "timeout": "30"}}</tool_call>

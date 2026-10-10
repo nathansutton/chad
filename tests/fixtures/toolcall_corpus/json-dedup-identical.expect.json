@@ -1,0 +1,12 @@
+{
+ "note": "the exact same JSON twice is one call",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

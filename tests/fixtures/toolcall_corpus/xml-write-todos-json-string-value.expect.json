@@ -1,0 +1,17 @@
+{
+ "note": "a structured parameter in the XML dialect is a JSON string; un-stringified",
+ "calls": [
+  {
+   "name": "write_todos",
+   "arguments": {
+    "todos": [
+     {
+      "content": "x",
+      "status": "pending"
+     }
+    ]
+   },
+   "errors": []
+  }
+ ]
+}

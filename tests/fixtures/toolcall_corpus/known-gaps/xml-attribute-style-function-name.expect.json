@@ -1,0 +1,14 @@
+{
+ "note": "attribute-style tags, another template's dialect",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ],
+ "today": "parses to nothing; the model gets the markers-but-no-call nudge",
+ "reason": "not emitted by any model chad targets (zero in 960 census steps); add the grammar when a trajectory shows it."
+}
