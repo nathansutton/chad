@@ -1,0 +1,15 @@
+<script lang="ts">
+  export let title: string;
+  let n = 0;
+  $: label = `${title}: ${n}`;
+</script>
+
+{#if title}
+  <button class:on={n > 0} on:click={() => n++}>{label}</button>
+{:else}
+  <ul>{#each [1, 2, 3] as i (i)}<li>{i}</li>{/each}</ul>
+{/if}
+
+<style>
+  button { color: red }
+</style>

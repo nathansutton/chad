@@ -1,0 +1,15 @@
+<script setup lang="ts">
+import { ref, computed } from 'vue'
+const props = defineProps<{ title: string }>()
+const n = ref(0)
+const label = computed(() => `${props.title}: ${n.value}`)
+</script>
+
+<template>
+  <button :class="{ on: n > 0 }" @click="n++" v-if="title">{{ label }}</button>
+  <ul v-else><li v-for="i in 3" :key="i">{{ i }}</li></ul>
+</template>
+
+<style scoped>
+button { color: red }
+</style>

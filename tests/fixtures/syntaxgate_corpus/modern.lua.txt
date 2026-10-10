@@ -1,0 +1,28 @@
+local M = {}
+local Robot = {}
+Robot.__index = Robot
+
+function Robot.new(name)
+  local self = setmetatable({}, Robot)
+  self.name = name or "r"
+  self.pos = { x = 0, y = 0 }
+  return self
+end
+
+function Robot:move(cmds)
+  for c in cmds:gmatch(".") do
+    if c == "A" then self.pos.y = self.pos.y + 1
+    elseif c == "L" or c == "R" then goto continue
+    else error(("bad command %q"):format(c)) end
+    ::continue::
+  end
+  return self
+end
+
+M.solve = function(t)
+  local out = {}
+  for i, v in ipairs(t) do out[#out + 1] = v * 2 end
+  return out, select("#", ...)
+end
+
+return M

@@ -1,0 +1,4 @@
+package x
+
+// Grüße
+func Grüße(名前 string) string { return "Hallo " + 名前 + " 😀" }

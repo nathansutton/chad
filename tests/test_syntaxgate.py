@@ -8,7 +8,10 @@ Pure + fast: no model load. Run: `uv run python tests/test_syntaxgate.py`
 import os
 import tempfile
 
+from chad.syntaxgate import _code_lang
 from chad.tools import tool_edit, tool_write
+
+_CORPUS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "syntaxgate_corpus")
 
 PASS = 0
 FAIL = 0
@@ -118,8 +121,80 @@ def test_plain_text_never_policed():
     check("python still policed", "no longer parses" in res, res)
 
 
+def test_cpp_header_judged_by_the_grammar_that_fits():
+    # The language pack calls every `.h` C. Exercism's C++ track, like most C++, declares
+    # namespaces and classes in `.h`, which the C grammar rejects: 18 of the 19 syntax
+    # warnings in one 90-trial eval run were correct C++ headers. The header is judged by
+    # whichever grammar fits it, and a real break under that grammar still warns.
+    d = tempfile.mkdtemp(prefix="syntaxgate_")
+    p = os.path.join(d, "yacht.h")
+    res = tool_write(p, "#pragma once\n#include <string>\nnamespace yacht {\n"
+                        "class score { public: int value() const; };\n}\n")
+    check("cpp header write silent", "warning" not in res, res)
+    res = tool_edit(p, "int value() const;", "int value() const")
+    check("cpp header broken edit warns", "syntax error" in res, res)
+    p = os.path.join(d, "plain.h")
+    res = tool_write(p, "#ifndef PLAIN_H\n#define PLAIN_H\nint add(int a, int b);\n#endif\n")
+    check("c header write silent", "warning" not in res, res)
+    res = tool_edit(p, "int b);", "int b")
+    check("c header broken edit warns", "syntax error" in res, res)
+
+
+def test_python_check_names_its_interpreter_and_skips_a_bom():
+    # The check runs on chad's interpreter, which may be older than the project's (a
+    # 3.12 `type` statement on a 3.11 chad): the warning says which, so the model can
+    # weigh it. A byte-order mark is an encoding signature every interpreter skips.
+    p = _tmp("v.py", "")
+    res = tool_write(p, "def f(:\n")
+    check("warning names the interpreter", "under Python 3." in res, res)
+    p = _tmp("b.py", "")
+    res = tool_write(p, "\ufeffimport os\nprint(os.sep)\n")
+    check("bom write silent", "warning" not in res, res)
+    res = tool_edit(p, "print(os.sep)", "print(os.sep, 1)")
+    check("bom edit silent", "warning" not in res, res)
+
+
+def test_jsonc_by_convention_is_not_policed():
+    for rel in ("tsconfig.json", "tsconfig.build.json", "jsconfig.json", ".eslintrc.json",
+                os.path.join(".vscode", "settings.json"), "demo.code-workspace"):
+        check(f"{rel} unpoliced", _code_lang(os.path.join("/w", rel)) is None, rel)
+    check("package.json still policed", _code_lang("/w/package.json") == "json")
+    p = _tmp("package.json", "")
+    res = tool_write(p, '{"name": "x",}\n')
+    check("broken package.json warns", "syntax error" in res, res)
+
+
+def test_valid_files_in_many_languages_are_silent():
+    """Idiomatic, valid files in every language a coding agent is likely to write, each
+    landed as a fresh write (baseline zero, the strictest case). A grammar that rejects
+    one of these belongs in `syntaxgate._UNRELIABLE_LANGS`, with the file kept under
+    `grammar-gaps/` as the evidence; those files must stay unpoliced. Each is stored
+    with a `.txt` suffix so no Python tooling mistakes the corpus for code; the real
+    name is what the gate sees."""
+    d = tempfile.mkdtemp(prefix="syntaxgate_corpus_")
+    seen = 0
+    for root, _, files in os.walk(_CORPUS):
+        gap = os.path.basename(root) == "grammar-gaps"
+        for stored in sorted(files):
+            name = stored.removesuffix(".txt")
+            with open(os.path.join(root, stored), "rb") as f:
+                text = f.read().decode("utf-8", errors="replace")
+            p = os.path.join(d, "gaps" if gap else "ok", name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            res = tool_write(p, text)
+            check(f"{name} fresh write silent", "warning" not in res, res)
+            if gap:
+                check(f"{name} is unpoliced", _code_lang(p) is None, _code_lang(p))
+            seen += 1
+    check("corpus present", seen > 50, seen)
+
+
 if __name__ == "__main__":
     test_python()
+    test_cpp_header_judged_by_the_grammar_that_fits()
+    test_python_check_names_its_interpreter_and_skips_a_bom()
+    test_jsonc_by_convention_is_not_policed()
+    test_valid_files_in_many_languages_are_silent()
     test_plain_text_never_policed()
     test_tree_sitter_delta()
     test_opt_out()

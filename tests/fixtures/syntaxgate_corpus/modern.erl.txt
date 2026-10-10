@@ -1,0 +1,13 @@
+-module(robot).
+-export([move/2, start/0]).
+-record(robot, {pos = {0, 0}, dir = north}).
+
+move(#robot{pos = {X, Y}} = R, [$A | T]) -> move(R#robot{pos = {X, Y + 1}}, T);
+move(R, [C | T]) when C =:= $L; C =:= $R -> move(R, T);
+move(R, []) -> {ok, R};
+move(_, [C | _]) -> {error, C}.
+
+start() ->
+    Pid = spawn(fun() -> receive {From, Msg} -> From ! {self(), Msg} after 1000 -> timeout end end),
+    Pid ! {self(), <<"hi">>},
+    [X * 2 || X <- lists:seq(1, 3), X rem 2 =:= 1].

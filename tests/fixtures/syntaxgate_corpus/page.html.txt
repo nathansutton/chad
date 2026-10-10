@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Demo</title>
+  <style> body { margin: 0 } .x::before { content: "<" } </style>
+  <script type="module">
+    const x = 1 < 2 && 3 > 2;
+    document.querySelector('#app').textContent = `${x}`;
+  </script>
+</head>
+<body>
+  <div id="app" data-x='1' hidden></div>
+  <input type="checkbox" checked disabled>
+  <img src="a.png" alt=""><br>
+  <!-- comment -->
+  <svg viewBox="0 0 1 1"><path d="M0 0L1 1"/></svg>
+  <template><slot name="x"></slot></template>
+</body>
+</html>

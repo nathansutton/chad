@@ -1,0 +1,30 @@
+# config
+version: 2.1
+anchors: &defaults
+  retries: 3
+  timeout: 30s
+services:
+  web:
+    <<: *defaults
+    image: "nginx:1.25"
+    ports: ["80:80", '443:443']
+    env:
+      - KEY=value
+      - EMPTY=
+    command: >
+      sh -c "echo hi &&
+      exec nginx"
+    healthcheck: |
+      curl -f http://localhost/ || exit 1
+  db: { image: postgres, ports: [5432] }
+list_of_maps:
+  - name: a
+    value: 1
+  - name: b
+    value: ~
+multi: "line one
+  line two"
+date: 2024-01-01
+tagged: !!str 123
+? complex key
+: complex value

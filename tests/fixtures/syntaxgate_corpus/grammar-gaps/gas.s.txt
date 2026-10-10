@@ -1,0 +1,12 @@
+    .text
+    .globl main
+main:
+    pushq %rbp
+    movq %rsp, %rbp
+    leaq msg(%rip), %rdi
+    call puts@PLT
+    xorl %eax, %eax
+    popq %rbp
+    ret
+    .section .rodata
+msg: .string "hi"

@@ -1,0 +1,18 @@
+#!/usr/bin/env tclsh
+package require Tcl 8.6
+namespace eval robot {
+    variable pos {0 0}
+    proc move {cmds} {
+        variable pos
+        foreach c [split $cmds ""] {
+            switch -- $c {
+                A { lset pos 1 [expr {[lindex $pos 1] + 1}] }
+                L - R { }
+                default { error "bad $c" }
+            }
+        }
+        return $pos
+    }
+}
+puts [robot::move "AA"]
+dict set d a 1; if {[dict get $d a] > 0 && ![string is space "x"]} { puts "ok" }

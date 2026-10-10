@@ -1,0 +1,35 @@
+# frozen_string_literal: true
+
+require "set"
+
+module Robot
+  class Error < StandardError; end
+  Point = Struct.new(:x, :y, keyword_init: true)
+
+  class Base
+    attr_reader :name
+    def initialize(name: "r") = @name = name
+    def each(&block) = [1, 2].each(&block)
+    def to_s = "#{self.class}(#{name})"
+  end
+
+  def self.solve(input)
+    case input
+    in { x: Integer => x, y: Integer => y } then Point.new(x:, y:)
+    in [first, *rest] then rest
+    else nil
+    end
+  rescue Error => e
+    warn e.message
+  ensure
+    puts <<~TXT
+      done
+    TXT
+  end
+
+  private_constant :Error
+end
+
+%w[a b].map(&:upcase).each_with_index { |s, i| p(s => i) }
+x = ->(a, b = 1, *c, d:, **e) { [a, b, c, d, e] }
+x.(1, d: 2) if __FILE__ == $PROGRAM_NAME

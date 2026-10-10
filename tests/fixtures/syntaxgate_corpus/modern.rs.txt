@@ -1,0 +1,48 @@
+use std::collections::HashMap;
+use std::fmt::{self, Display};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct Point<T = i32> { pub x: T, pub y: T }
+
+pub trait Shape: Display { fn area(&self) -> f64; fn name(&self) -> &'static str { "shape" } }
+
+impl<T: Display> Display for Point<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "({}, {})", self.x, self.y) }
+}
+
+macro_rules! square { ($x:expr) => { $x * $x }; }
+
+pub fn longest<'a>(a: &'a str, b: &'a str) -> &'a str { if a.len() >= b.len() { a } else { b } }
+
+pub async fn fetch(n: u32) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let v: Vec<u8> = (0..n).map(|i| (i % 256) as u8).collect();
+    let m: HashMap<_, _> = v.iter().enumerate().map(|(i, b)| (i, *b)).collect();
+    let _ = m.get(&0).copied().unwrap_or_default();
+    match v.as_slice() {
+        [] => Err("empty".into()),
+        [first, .., last] if first == last => Ok(vec![*first]),
+        [first, rest @ ..] => { let _ = rest; Ok(vec![*first]) }
+    }
+}
+
+pub fn solve(s: &str) -> Option<u64> {
+    let mut acc = 0u64;
+    for (i, ch) in s.chars().rev().enumerate() {
+        let d = ch.to_digit(10)? as u64;
+        acc = acc.checked_add(d.checked_mul(10u64.pow(i as u32))?)?;
+    }
+    let x = square!(3);
+    let closure = move |y: i32| -> i32 { x + y };
+    let _ = closure(1);
+    let s = r#"raw "string""#;
+    let _b = b'a';
+    let _ = s;
+    Some(acc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn it_works() { assert_eq!(solve("12"), Some(12)); }
+}

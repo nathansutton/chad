@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim AS base
+ARG VERSION=1
+ENV PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY --chown=1000:1000 requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache pip install -r requirements.txt \
+ && rm -rf /tmp/*
+COPY . .
+EXPOSE 8000
+HEALTHCHECK --interval=30s CMD curl -f http://localhost:8000/ || exit 1
+ENTRYPOINT ["python", "-m", "app"]
+CMD ["--port", "8000"]

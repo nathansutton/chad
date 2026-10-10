@@ -1,0 +1,15 @@
+type dir = North | East | South | West
+type robot = { pos : int * int; dir : dir }
+
+let move r cmds =
+  String.fold_left
+    (fun r c ->
+      match c with
+      | 'A' -> let x, y = r.pos in { r with pos = (x, y + 1) }
+      | 'L' | 'R' -> r
+      | c -> failwith (Printf.sprintf "bad %c" c))
+    r cmds
+
+module type S = sig val x : int end
+module M : S = struct let x = 1 end
+let () = let r = move { pos = (0, 0); dir = North } "AA" in Printf.printf "%d\n" (snd r.pos + M.x)

@@ -1,0 +1,20 @@
+package demo
+
+import scala.collection.mutable
+
+sealed trait Shape
+final case class Circle(r: Double) extends Shape
+case object Empty extends Shape
+
+object Modern:
+  given Ordering[Circle] = Ordering.by(_.r)
+  extension (s: String) def shout: String = s.toUpperCase + "!"
+  enum Color:
+    case Red, Green
+  def area(s: Shape): Double = s match
+    case Circle(r) => math.Pi * r * r
+    case Empty     => 0.0
+  def main(args: Array[String]): Unit =
+    val m = mutable.Map.empty[String, Int]
+    for i <- 1 to 3 if i % 2 == 1 do m(i.toString) = i
+    println(s"${"x".shout} ${m.values.sum}")

@@ -1,0 +1,11 @@
+import React, { useState } from 'react';
+type Props<T> = { items: T[]; render?: (t: T) => React.ReactNode };
+export function List<T,>({ items, render = (t) => String(t) }: Props<T>) {
+  const [n, setN] = useState<number>(0);
+  return (
+    <ul onClick={() => setN((v) => v + 1)} data-n={n}>
+      {items.map((it, i) => <li key={i}>{render(it)}</li>)}
+      <>{n > 0 && <span>{`clicked ${n}`}</span>}</>
+    </ul>
+  );
+}

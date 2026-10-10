@@ -1,0 +1,20 @@
+import 'dart:async';
+
+sealed class Shape { double get area; }
+class Circle extends Shape { final double r; const Circle(this.r); @override double get area => 3.14 * r * r; }
+
+extension Shout on String { String get shout => '${toUpperCase()}!'; }
+
+Future<int> compute(List<int> xs, {int Function(int)? f, required bool strict}) async {
+  final g = f ?? (x) => x * 2;
+  var total = 0;
+  for (final x in xs) { total += g(x); }
+  await Future<void>.delayed(Duration.zero);
+  return switch (total) { > 10 => total, _ => 0 };
+}
+
+void main() async {
+  final r = await compute([1, 2], strict: true);
+  final m = <String, int?>{'a': 1, 'b': null};
+  print('${'hi'.shout} $r ${m['a'] ?? 0} ${Circle(1).area}');
+}

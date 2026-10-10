@@ -1,0 +1,18 @@
+defmodule Robot do
+  @moduledoc "A robot."
+  defstruct pos: {0, 0}, dir: :north
+
+  @type t :: %__MODULE__{pos: {integer, integer}, dir: atom}
+
+  @spec move(t, String.t()) :: {:ok, t} | {:error, term}
+  def move(%__MODULE__{} = r, cmds) when is_binary(cmds) do
+    cmds
+    |> String.graphemes()
+    |> Enum.reduce_while({:ok, r}, fn
+      "A", {:ok, %{pos: {x, y}} = r} -> {:cont, {:ok, %{r | pos: {x, y + 1}}}}
+      c, _ -> {:halt, {:error, c}}
+    end)
+  end
+
+  defmacro unless_nil(x, do: block), do: quote(do: if(unquote(x) != nil, do: unquote(block)))
+end

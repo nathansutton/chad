@@ -1,0 +1,18 @@
+(ns robot.core
+  (:require [clojure.string :as str]))
+
+(defrecord Robot [pos dir])
+
+(defn move [{:keys [pos] :as r} cmds]
+  (reduce (fn [r c]
+            (case c
+              \A (update-in r [:pos 1] inc)
+              (\L \R) r
+              (throw (ex-info "bad" {:c c}))))
+          r cmds))
+
+(defmacro unless-nil [x & body] `(when (some? ~x) ~@body))
+
+(let [r (->Robot [0 0] :north)
+      #{a} #{1}]
+  (-> r (move "AA") :pos (str/join ",")))

@@ -11,6 +11,17 @@ chad could not edit about sixty lines of its own source (the selfsearch improver
 this; its fix did nothing). Reasoning is now removed only outside closed tool-call
 blocks, in the parser, the trajectory writer and the reasoning split alike.
 
+**The syntax warning stops crying wolf.** `.h` files were parsed as C, so a correct C++
+header with a namespace or a class drew "this edit introduced a syntax error" on the
+write that created it: 18 of the 19 warnings in a 90-trial eval run. An ambiguous
+header is now judged by whichever of the C and C++ grammars fits it. A corpus of valid
+files in some sixty languages (`tests/fixtures/syntaxgate_corpus`) also caught grammars
+that reject idiomatic code (CSS nesting, SCSS, Groovy, PowerShell, Tcl, V, assembler),
+which are no longer policed; JSON files that are JSONC by convention (`tsconfig.json`,
+`.vscode/`) are left alone; a byte-order mark no longer fails the Python check; and the
+Python warning names the interpreter it ran under, since chad's may be older than the
+project's.
+
 ## [2.4.0] — 2026-10-04
 
 The model is unchanged: no re-download.

@@ -1,0 +1,9 @@
+@import url("a.css") screen;
+:root { --gap: 4px; --c: #abc; }
+@media (min-width: 600px) and (prefers-color-scheme: dark) { :root { --c: #fff } }
+.a > .b + .c ~ .d, a:not(.x):nth-child(2n+1)::after { content: "\201C"; color: var(--c, red); gap: calc(var(--gap) * 2) }
+@supports (display: grid) { .g { display: grid; grid-template-columns: repeat(auto-fill, minmax(10ch, 1fr)); } }
+@keyframes spin { from { transform: rotate(0) } to { transform: rotate(360deg) } }
+@layer base, theme;
+.n { &:hover { color: red } .child & { color: blue } }
+@container (width > 400px) { .card { font-size: clamp(1rem, 2vw, 2rem) } }

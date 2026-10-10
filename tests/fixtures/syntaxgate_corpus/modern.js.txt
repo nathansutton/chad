@@ -1,0 +1,25 @@
+#!/usr/bin/env node
+// @ts-check
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+
+export class Robot extends EventTarget {
+  #name;
+  static #count = 0;
+  static { Robot.#count = 0; }
+  constructor(name = 'r') { super(); this.#name = name; Robot.#count++; }
+  get name() { return this.#name; }
+  async *walk(n) { for (let i = 0; i < n; i++) yield await Promise.resolve(i); }
+  toString() { return `Robot(${this.#name})`; }
+}
+
+export const parse = (s) => s?.trim?.() ?? '';
+export default function main({ a = 1, ...rest } = {}) {
+  const re = /^(?<year>\d{4})-(?<m>\d{2})$/u;
+  const m = '2024-01'.match(re)?.groups;
+  label: for (const [k, v] of Object.entries({ a, ...rest })) { if (!v) continue label; }
+  const big = 10n ** 20n;
+  const obj = { [`k${a}`]: 1, async f() {}, get g() { return 1 }, 'quoted-key': 2 };
+  let x = 0; x ||= 1; x &&= 2; x ??= 3;
+  return [m, big, obj, path.basename('a/b'), readFile];
+}

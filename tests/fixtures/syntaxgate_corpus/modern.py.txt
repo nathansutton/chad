@@ -1,0 +1,23 @@
+from __future__ import annotations
+import asyncio
+from dataclasses import dataclass, field
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+
+@dataclass(frozen=True, slots=True)
+class Node(Generic[T]):
+    value: T
+    kids: list[Node[T]] = field(default_factory=list)
+
+def solve(cmd: str) -> int | None:
+    match cmd.split():
+        case ["go", ("north" | "south") as d]: return len(d)
+        case [x, *rest] if rest: return len(rest)
+        case _: return None
+
+async def main() -> None:
+    async with asyncio.timeout(1):
+        await asyncio.sleep(0)
+    print(f"{1 + 1 = }", rf"\d{{2}}")
+

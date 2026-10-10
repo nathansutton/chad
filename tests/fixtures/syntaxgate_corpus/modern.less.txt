@@ -1,0 +1,4 @@
+@c: #abc;
+.mixin(@w: 1px) { border: @w solid @c; }
+.a { .mixin(2px); &:hover { color: darken(@c, 10%); } .b & { x: 1 } }
+@media (min-width: 600px) { .a { width: ~"calc(100% - @{c})"; } }

@@ -1,0 +1,25 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace Demo;
+
+public record Point(int X, int Y);
+public interface IShape { double Area { get; } }
+public readonly record struct Circle(double R) : IShape { public double Area => Math.PI * R * R; }
+
+public static class Program
+{
+    public static T? FirstOrNull<T>(this IEnumerable<T> xs) where T : class => xs.FirstOrDefault();
+
+    public static async Task<int> Main(string[] args)
+    {
+        var pts = new List<Point> { new(1, 2), new(3, 4) };
+        var q = from p in pts where p.X > 0 select p with { Y = 0 };
+        string s = args is [var first, ..] ? first : "none";
+        var r = pts[0] switch { { X: > 0 } p => p.X, _ => 0 };
+        await Task.Delay(1);
+        Console.WriteLine($"{s} {r} {q.Count()}");
+        return 0;
+    }
+}

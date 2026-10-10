@@ -1,0 +1,24 @@
+{-# LANGUAGE LambdaCase, ScopedTypeVariables #-}
+module Robot (Dir(..), move, solve) where
+
+import qualified Data.Map.Strict as M
+import Data.Maybe (fromMaybe)
+
+data Dir = N | E | S | W deriving (Show, Eq, Enum, Bounded)
+
+newtype Robot = Robot { pos :: (Int, Int) } deriving Show
+
+class Shape a where
+  area :: a -> Double
+  area _ = 0
+
+instance Shape Robot
+
+move :: Dir -> Robot -> Robot
+move = \case
+  N -> \r@(Robot (x, y)) -> r { pos = (x, y + 1) }
+  _ -> id
+
+solve :: forall a. (Ord a) => [a] -> M.Map a Int
+solve xs = M.fromListWith (+) [(x, 1) | x <- xs]
+  where _unused = fromMaybe 0 Nothing :: Int

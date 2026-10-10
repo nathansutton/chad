@@ -1,0 +1,62 @@
+#include <algorithm>
+#include <concepts>
+#include <memory>
+#include <optional>
+#include <ranges>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+namespace demo {
+
+template <typename T>
+concept Numeric = std::integral<T> || std::floating_point<T>;
+
+template <Numeric T>
+constexpr T square(T x) noexcept { return x * x; }
+
+class robot {
+public:
+    explicit robot(std::string name) : name_{std::move(name)} {}
+    virtual ~robot() = default;
+    [[nodiscard]] const std::string& name() const& { return name_; }
+    auto operator<=>(const robot&) const = default;
+    static inline int count = 0;
+private:
+    std::string name_;
+};
+
+struct point { int x{}, y{}; };
+
+enum class dir : unsigned char { north, east, south, west };
+
+inline std::optional<int> parse(std::string_view sv) {
+    if (sv.empty()) return std::nullopt;
+    int v = 0;
+    for (char c : sv) { if (c < '0' || c > '9') return {}; v = v * 10 + (c - '0'); }
+    return v;
+}
+
+template <typename... Args>
+auto sum(Args... args) { return (args + ...); }
+
+inline void demo_fn() {
+    std::vector<int> v{3, 1, 2};
+    std::ranges::sort(v);
+    auto evens = v | std::views::filter([](int i) { return i % 2 == 0; });
+    for (auto&& e : evens) { (void)e; }
+    auto p = std::make_unique<robot>("r2");
+    std::unordered_map<std::string, std::vector<point>> m;
+    m["a"].push_back({.x = 1, .y = 2});
+    auto [a, b] = std::pair{1, 2};
+    (void)a; (void)b;
+    auto lam = [&, x = 1]<typename T>(T t) mutable -> T { return t + x; };
+    (void)lam(1);
+    if (auto r = parse("12"); r && *r > 0) {}
+    using namespace std::literals;
+    auto s = "abc"s;
+    (void)s;
+}
+
+}  // namespace demo

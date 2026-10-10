@@ -1,0 +1,2 @@
+(ns x)
+(defn f [x] #?(:clj (inc x) :cljs (dec x)))

@@ -1,0 +1,23 @@
+module main
+
+struct Robot {
+mut:
+	x int
+	y int
+}
+
+fn (mut r Robot) move(cmds string) ! {
+	for c in cmds {
+		match c {
+			`A` { r.y++ }
+			`L`, `R` {}
+			else { return error('bad ${c}') }
+		}
+	}
+}
+
+fn main() {
+	mut r := Robot{}
+	r.move('A') or { panic(err) }
+	println(r)
+}

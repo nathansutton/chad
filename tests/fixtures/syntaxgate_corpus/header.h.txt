@@ -1,0 +1,19 @@
+#pragma once
+#include <string>
+#include <vector>
+
+namespace yacht {
+
+class score_card {
+public:
+    score_card() = default;
+    explicit score_card(std::vector<int> dice);
+    int score(const std::string& category) const;
+    template <typename F> int fold(F f) const { int acc = 0; for (int d : dice_) acc = f(acc, d); return acc; }
+private:
+    std::vector<int> dice_;
+};
+
+int score(const std::vector<int>& dice, const std::string& category);
+
+}  // namespace yacht
