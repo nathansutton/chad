@@ -1043,7 +1043,8 @@ SCHEMAS: list[ToolSchema] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {"type": "string",
+                             "description": "Relative file path."},
                     "content": {"type": "string"},
                 },
                 "required": ["path", "content"],
@@ -1061,7 +1062,8 @@ SCHEMAS: list[ToolSchema] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {"type": "string",
+                             "description": "Relative file path."},
                     "old": {"type": "string", "description": "Exact text to replace (must be unique)."},
                     "new": {"type": "string"},
                 },
