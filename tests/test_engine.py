@@ -64,6 +64,13 @@ def _model_tests_enabled() -> bool:
     return bool(os.environ.get("CHAD_MODEL_TESTS"))
 
 
+def _mlx_missing() -> bool:
+    """These tier-1 tests drive real mlx / mlx-lm cache and sampler code with fake
+    models, so they need the Apple-only wheels and skip on a Linux host."""
+    import importlib.util
+    return importlib.util.find_spec("mlx") is None
+
+
 def _is_quantized(model_dir):
     """True if the model dir's config.json declares quantization (mlx/awq/gptq).
 
@@ -125,6 +132,8 @@ def test_prefill_progress_callback():
     that here by asserting the sequence of forward-pass shapes is the same with and
     without the callback (full decoded-output equivalence is the model-gated tier-2
     job; this path feeds the non-trimmable cache, so the no-op guarantee matters)."""
+    if _mlx_missing():
+        return skip("prefill_progress_callback", "mlx not installed (Apple Silicon only)")
     import mlx.core as mx
 
     from chad.engine import Engine
@@ -173,6 +182,9 @@ def test_interrupted_prefill_records_only_fed_tokens():
     remaining suffix rebuilds the full prefix with every token fed exactly once (no gap,
     no double-feed). Removing the `fed < len(prefix_ids)` guard (recording the full prefix)
     makes the length assertion below go RED."""
+    if _mlx_missing():
+        return skip("interrupted_prefill_records_only_fed_tokens",
+                    "mlx not installed (Apple Silicon only)")
     import mlx.core as mx
 
     from chad.engine import Engine
@@ -233,6 +245,8 @@ def test_stop_condition_soft_close():
     decode path once tokens stream), asserting: the cap stops us while still inside
     <think> (before the faked </think>), the flag is set, and — critically — a None
     stop_condition is a byte-identical no-op (same tokens consumed, flag stays False)."""
+    if _mlx_missing():
+        return skip("stop_condition_soft_close", "mlx not installed (Apple Silicon only)")
     from chad import engine as eng_mod
     from chad.engine import Engine
 
@@ -853,23 +867,35 @@ def test_adaptive_chunk_bounds():
         head_dim-256 score tensor makes big chunks the long-context OOM vector; the
         cap math cannot exceed the floor at kv=3M on any real Mac's free band).
     """
+    from chad import engine as engmod
     from chad.engine import Engine
 
-    eng = object.__new__(Engine)  # bypass __init__ (no weights)
-    # No _is_moe/_n_attn_heads set: getattr defaults (dense, 16 heads) apply — the
-    # same shape a fake-engine test double presents.
-    # kv=50M: the score-tensor cap math would need a >1.6 TB free band to beat the
-    # floor, so this asserts the floor on any real machine, laptop or Studio.
-    check("dense short-ctx chunk is the 512 base", eng._adaptive_chunk(0) == 512,
-          eng._adaptive_chunk(0))
-    check("huge-ctx chunk hits the 256 floor", eng._adaptive_chunk(50_000_000) == 256,
-          eng._adaptive_chunk(50_000_000))
-    eng._is_moe = True
-    eng._n_attn_heads = 16
-    got = eng._adaptive_chunk(0)
-    check("MoE short-ctx chunk is the 2048 base", got == 2048, got)
-    check("MoE huge-ctx chunk hits the 256 floor too",
-          eng._adaptive_chunk(50_000_000) == 256)
+    # Without mlx (Linux) the memory probe raises and the chunk falls back to the
+    # static base, so stand in a 24 GB Mac's probe to keep the cap math under test.
+    orig_mx = engmod.mx
+    if orig_mx is None:
+        engmod.mx = type("mx", (), {
+            "device_info": staticmethod(lambda: {"max_recommended_working_set_size": 18e9}),
+            "get_active_memory": staticmethod(lambda: 0),
+        })
+    try:
+        eng = object.__new__(Engine)  # bypass __init__ (no weights)
+        # No _is_moe/_n_attn_heads set: getattr defaults (dense, 16 heads) apply — the
+        # same shape a fake-engine test double presents.
+        # kv=50M: the score-tensor cap math would need a >1.6 TB free band to beat the
+        # floor, so this asserts the floor on any real machine, laptop or Studio.
+        check("dense short-ctx chunk is the 512 base", eng._adaptive_chunk(0) == 512,
+              eng._adaptive_chunk(0))
+        check("huge-ctx chunk hits the 256 floor", eng._adaptive_chunk(50_000_000) == 256,
+              eng._adaptive_chunk(50_000_000))
+        eng._is_moe = True
+        eng._n_attn_heads = 16
+        got = eng._adaptive_chunk(0)
+        check("MoE short-ctx chunk is the 2048 base", got == 2048, got)
+        check("MoE huge-ctx chunk hits the 256 floor too",
+              eng._adaptive_chunk(50_000_000) == 256)
+    finally:
+        engmod.mx = orig_mx
 
 
 def test_load_fails_fast_without_mlx():
@@ -907,6 +933,8 @@ def test_prefill_oom_retry_rolls_back():
     mlx>=0.32) must (a) restore every cache layer's state to the pre-chunk
     snapshot, (b) retry at half the width, and (c) still feed every token exactly
     once. A non-memory RuntimeError must propagate unchanged."""
+    if _mlx_missing():
+        return skip("prefill_oom_retry_rolls_back", "mlx not installed (Apple Silicon only)")
     import mlx.core as mx
 
     from chad.engine import Engine
@@ -975,6 +1003,8 @@ def test_bounded_rewind_orchestration():
     report common=12 — never a cache reset. Then: a divergence BEFORE the snapshot
     must fall back to the full rebuild (reset + warm-prefix reload), and a missing
     snapshot must too."""
+    if _mlx_missing():
+        return skip("bounded_rewind_orchestration", "mlx not installed (Apple Silicon only)")
     from chad.engine import Engine
 
     class _NoTrim:
@@ -1045,6 +1075,8 @@ def test_suffix_reuse_orchestration():
     to condition on), hence the trailing q. Expected: trim the attention KV back to
     P, prefill only what the edit inserted, append the survivors re-rotated by the
     distance they moved, and never reset the cache."""
+    if _mlx_missing():
+        return skip("suffix_reuse_orchestration", "mlx not installed (Apple Silicon only)")
     from chad import suffix_reuse
     from chad.engine import Engine
 
@@ -1241,6 +1273,8 @@ def test_rewind_to_honors_short_prefill():
     `_rewind_to` must land the ledger at target[:11] and return 11, and `_sync_to` must
     hand 11 back as the resident prefix. Recording target[:12] would make the caller's
     next prefill start one token past the end of the cache."""
+    if _mlx_missing():
+        return skip("rewind_to_honors_short_prefill", "mlx not installed (Apple Silicon only)")
     from chad.engine import Engine
 
     class _NoTrim:
@@ -1364,6 +1398,8 @@ def test_generate_exception_resets_ledger():
     progress is internal to it). It must drop the cache and record nothing resident:
     keeping the pre-turn ledger would let the next turn prefill on top of tokens the
     ledger never recorded."""
+    if _mlx_missing():
+        return skip("generate_exception_resets_ledger", "mlx not installed (Apple Silicon only)")
     resets = []
     eng = _plain_generate_engine(resets)
     eng._cached_ids = [1, 2]                  # the prompt's first two tokens are resident
@@ -1386,6 +1422,9 @@ def test_salvage_records_only_the_close_it_feeds():
     ids through the cache. When the budget can't fit them, the turn ends without them:
     `text`, `gen_ids` and the ledger all describe the tokens the cache holds, and a close
     that was recorded but never fed would put phantom tokens in all three."""
+    if _mlx_missing():
+        return skip("salvage_records_only_the_close_it_feeds",
+                    "mlx not installed (Apple Silicon only)")
     from chad import engine as eng_mod
 
     class _Resp:
@@ -1478,6 +1517,8 @@ def test_snapshot_survives_empty_kvcache():
     property. A snapshot/restore round-trip on an empty-KVCache-like item must not
     raise, must restore attribute values exactly, and must deep-copy list attrs one
     level (ArraysCache mutates its list elements in place)."""
+    if _mlx_missing():
+        return skip("snapshot_survives_empty_kvcache", "mlx not installed (Apple Silicon only)")
     from chad.engine import Engine
 
     class _EmptyKVLike:
