@@ -249,6 +249,40 @@ def test_disabling_tool_name_alias_restores_the_unknown_tool_message(tmp_path, m
     assert tool_turns[0]["content"].startswith("[unknown tool 'write_file'")
 
 
+def test_a_write_carrying_only_todos_runs_as_write_todos(tmp_path, monkeypatch):
+    """The paired-block shape (javascript/zipper.rep2 #3, four in 90 trials): the model named
+    `write` and filled in `write_todos`' form. It runs as write_todos; the result leads with
+    the fact and is otherwise the normal plan result."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    todos = '[{"content": "Read the tests", "status": "in_progress"}]'
+    script = [
+        _xml_call("write", todos=todos),
+        "Plan recorded.",
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what is the plan?")
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    assert tool_turns[0]["name"] == "write_todos"
+    head, _, rest = tool_turns[0]["content"].partition("\n")
+    assert head == "[write takes path, content; the call carried todos; ran write_todos]"
+    assert rest.startswith("Plan updated:")
+    assert tools.unfinished_todos() == ["Read the tests"]
+    assert not list(tmp_path.iterdir())          # nothing was written to disk
+
+
+def test_disabling_tool_name_alias_restores_the_write_rejection_for_a_todos_call(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CHAD_DISABLE", "tool_name_alias")
+    script = [_xml_call("write", todos="[]"), "No plan."]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what is the plan?")
+    content = [m for m in agent.messages if m.get("role") == "tool"][0]["content"]
+    assert content.startswith("[invalid arguments for `write`")
+    assert "✗ todos → not a parameter of write (write takes path, content)" in content
+    assert "ran write_todos" not in content
+
+
 # --- edit_path_inferred: an `edit` with old/new and no path (plan 004, step 6) --------
 
 def _rejection_as_today(name, args):

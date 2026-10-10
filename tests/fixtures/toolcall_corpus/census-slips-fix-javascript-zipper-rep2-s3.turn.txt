@@ -1,0 +1,9 @@
+
+
+<tool_call>
+<function=write>
+<parameter=todos>
+[{"content": "Read zipper.js and tests to understand expected API", "status": "in_progress"}, {"content": "Implement binary tree zipper in zipper.js", "status": "pending"}, {"content": "Run run-tests.sh until passing", "status": "pending"}]
+</parameter>
+</function>
+</tool_call>

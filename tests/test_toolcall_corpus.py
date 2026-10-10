@@ -5,7 +5,7 @@ The syntax gate looked fine in unit tests and was wrong 18 times out of 19 in th
 until a corpus of real files found the gaps (PR #121). This is the same treatment for
 the other format-fragile surface: `tests/fixtures/toolcall_corpus/<shape>.turn.txt` is
 the turn, byte for byte (CRLF files included), and `<shape>.expect.json` is what the
-agent's own pipeline — parse, name aliases, coerce + validate, repair message — must
+agent's own pipeline — parse, name and shape aliases, coerce + validate, repair message — must
 make of it. Nine turns are verbatim from the 2026-10-10 slip census.
 
 `known-gaps/` holds shapes whose expectation is what SHOULD happen; each carries a
@@ -22,7 +22,7 @@ import re
 import time
 
 from chad.toolcall_parse import parse_tool_calls
-from chad.tools import alias_to_bash, alias_write_edit
+from chad.tools import alias_by_shape, alias_to_bash, alias_write_edit
 from chad.validate import coerce_and_validate, render_repair
 
 _CORPUS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "toolcall_corpus")
@@ -34,7 +34,10 @@ def pipeline(turn: str) -> list:
     out = []
     for name, args in parse_tool_calls(turn):
         name, args = alias_to_bash(name, args)
-        name, args = alias_write_edit(name, args)
+        renamed, args = alias_write_edit(name, args)
+        if renamed == name:
+            renamed, args = alias_by_shape(name, args)
+        name = renamed
         coerced, errs = coerce_and_validate(name, args)
         msg = render_repair(name, coerced, errs) if errs else ""
         out.append({"name": name, "arguments": coerced,
@@ -107,9 +110,12 @@ def test_every_turn_in_the_corpus_parses_to_the_intended_calls():
 
 def test_the_pipeline_matches_the_agents_own_order():
     """The corpus is only evidence if `pipeline` does what run_turn does: read alias,
-    then write/edit alias, then coerce + validate. A `write_file` with `file_text`
-    exercises both the alias and the key rename before validation sees it."""
+    then write/edit name alias, then shape alias (only when the name alias did nothing),
+    then coerce + validate. A `write_file` with `file_text` exercises both the alias and
+    the key rename before validation sees it; a `write` with only `todos` the shape."""
     got = pipeline("<function=write_file><parameter=file_path>a</parameter>"
                    "<parameter=file_text>x</parameter></function>")
     assert got == [{"name": "write", "arguments": {"path": "a", "content": "x"},
                     "errors": [], "unknown_keys": []}]
+    got = pipeline("<function=write><parameter=todos>[]</parameter></function>")
+    assert got[0]["name"] == "write_todos" and got[0]["errors"] == []

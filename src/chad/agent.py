@@ -54,6 +54,7 @@ from .tools import (
     IGNORE_DIRS,
     TERMINAL,
     active_schemas,
+    alias_by_shape,
     alias_to_bash,
     alias_write_edit,
     clear_todos,
@@ -62,6 +63,7 @@ from .tools import (
     is_json_object,
     is_mutating,
     outside_workspace,
+    tool_params,
     unfinished_todos,
 )
 from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_repair
@@ -1588,14 +1590,23 @@ class Agent:
                 continue
 
             calls = []
-            aliased: dict[int, str] = {}   # call index -> the name the model sent
+            aliased: dict[int, str] = {}   # call index -> the fact about the name sent
             for _n, _a in parse_tool_calls(text):
                 _n2, _a2 = alias_to_bash(_n, _a)
                 if _n2 == _n and levers.enabled("tool_name_alias"):
                     _n2, _a2 = alias_write_edit(_n, _a)
                     if _n2 != _n:
-                        levers.fired("tool_name_alias", step=step, sent=_n, ran=_n2)
-                        aliased[len(calls)] = _n
+                        levers.fired("tool_name_alias", step=step, kind="name",
+                                     sent=_n, ran=_n2)
+                        aliased[len(calls)] = f"no tool is named {_n}"
+                    else:
+                        _n2, _a2 = alias_by_shape(_n, _a)
+                        if _n2 != _n:
+                            levers.fired("tool_name_alias", step=step, kind="shape",
+                                         sent=_n, ran=_n2)
+                            aliased[len(calls)] = (
+                                f"{_n} takes {', '.join(tool_params(_n))}; the call "
+                                f"carried {', '.join(_a)}")
                 calls.append((_n2, _a2))
             if not calls:
                 # No tool call this step. Decide whether this is a genuine final answer
@@ -1773,7 +1784,7 @@ class Agent:
                                  name, self._reject_repeats + 1)
                     log.info("VALIDATE %s rejected (%d): %s", name, self._validate_fails, detail)
                     if ci in aliased:
-                        result = f"[no tool is named {aliased[ci]}; read as {name}]\n" + result
+                        result = f"[{aliased[ci]}; read as {name}]\n" + result
                     render_tool_result(self._emit, name, args, result)
                     self.messages.append({"role": "tool", "name": name, "content": result})
                     continue
@@ -1857,7 +1868,7 @@ class Agent:
                 if ci in aliased:
                     # The one fact the model needs, stated once, ahead of the normal
                     # result (which is byte-identical to a correctly named call's).
-                    result = f"[no tool is named {aliased[ci]}; ran {name}]\n" + result
+                    result = f"[{aliased[ci]}; ran {name}]\n" + result
                 if inferred_path:
                     landed = result.startswith("[edited")
                     result = (f"[path was not given; old matched only {inferred_path} among "

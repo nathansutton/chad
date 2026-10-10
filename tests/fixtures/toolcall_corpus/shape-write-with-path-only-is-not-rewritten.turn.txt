@@ -1,0 +1,7 @@
+<tool_call>
+<function=write>
+<parameter=path>
+a.md
+</parameter>
+</function>
+</tool_call>

@@ -980,6 +980,56 @@ def alias_write_edit(name: str, args):
     return target, out
 
 
+def alias_by_shape(name: str, args):
+    """Rewrite a built-in call that carries another built-in's parameters into that tool.
+
+    The 2026-10-10 paired block (plan 004) found four `write` calls whose only parameter
+    was `todos`: the model named one tool and filled in another's form. The rule is
+    general and strict so that it never guesses: `name` must be one of chad's own tools,
+    none of the keys sent may belong to it, and exactly one other built-in must accept
+    every key sent and have all of its required keys present. Anything looser stays a
+    rejection — `edit` sent with `path` and `content` is NOT rewritten to `write`, because
+    `path` is `edit`'s own key and the model may have meant to append; the validator
+    names the stray key instead. Returns `(name, args)` unchanged when the rule does not
+    apply. The same `tool_name_alias` lever as `alias_write_edit` guards the call site.
+    """
+    if not is_json_object(args) or not args:
+        return name, args
+    params = {s["function"]["name"]: s["function"].get("parameters", {}) for s in SCHEMAS}
+    own = params.get(name)
+    if own is None:
+        return name, args
+    keys = set(args)
+    if keys & set(_schema_names(own, "properties")):
+        return name, args
+    fits = [t for t, p in params.items()
+            if t != name
+            and keys <= set(_schema_names(p, "properties"))
+            and set(_schema_names(p, "required")) <= keys]
+    if len(fits) != 1:
+        return name, args
+    return fits[0], args
+
+
+def _schema_names(params: dict, field: str) -> list:
+    """The names a JSON-Schema object lists under `field`: the keys of `properties`, or
+    the strings of `required`; [] when the field is absent or not of that shape."""
+    v = params.get(field)
+    if is_json_object(v):
+        return list(v)
+    if is_json_array(v):
+        return [x for x in v if is_text(x)]
+    return []
+
+
+def tool_params(name: str) -> list:
+    """The parameter names of a built-in tool, in schema order; [] for any other name."""
+    for s in SCHEMAS:
+        if s["function"]["name"] == name:
+            return _schema_names(s["function"].get("parameters", {}), "properties")
+    return []
+
+
 def infer_edit_path(args, files):
     """Which of `files` an `edit` without `path` meant: the one file whose text contains
     `old`. Returns `(path or None, matched)` — `path` only when exactly one matched.
@@ -1046,6 +1096,11 @@ def is_json_object(value: JsonValue) -> "TypeIs[dict[str, JsonValue]]":
 def is_text(value: JsonValue) -> "TypeIs[str]":
     """A JSON string: what a text parameter (`old`, `new`, `content`, a path) must be."""
     return isinstance(value, str)
+
+
+def is_json_array(value: JsonValue) -> "TypeIs[list[JsonValue]]":
+    """A JSON array, as `json.loads` produces it."""
+    return isinstance(value, list)
 
 
 class FunctionSchema(TypedDict):

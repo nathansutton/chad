@@ -74,11 +74,13 @@ LEVERS: dict[str, Lever] = {
         "goes to a spill file and the notice names the path, so the model can "
         "grep for what was dropped instead of re-running the call."),
     "tool_name_alias": Lever(
-        "A write or edit sent under a name this surface does not expose "
-        "(write_file, str_replace_editor, …) dispatches to the built-in it "
-        "meant, keys renamed, with one fact line prepended to the result — "
-        "instead of an unknown-tool rejection and a step spent re-emitting "
-        "the same call. A real tool of that name always wins."),
+        "A call that named the wrong tool dispatches to the one it meant, with "
+        "one fact line prepended to the result, instead of a rejection and a "
+        "step spent re-emitting the same call: a write or edit under a name "
+        "this surface does not expose (write_file, str_replace_editor, …; keys "
+        "renamed; a real tool of that name always wins), or a built-in called "
+        "with none of its own parameters and exactly another built-in's "
+        "(write with only todos → write_todos)."),
     "edit_path_inferred": Lever(
         "An edit sent with old/new and no path is applied to the one file, "
         "among those this turn read or changed, that contains old — the "

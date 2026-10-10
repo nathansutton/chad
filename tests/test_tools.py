@@ -615,6 +615,48 @@ def test_write_edit_aliases_are_not_advertised_to_the_model():
 
 
 # ---------------------------------------------------------------------------
+# Shape alias: a built-in called with exactly another built-in's parameters. The
+# 2026-10-10 paired block found four `write` calls whose only key was `todos`.
+# ---------------------------------------------------------------------------
+
+
+def test_shape_alias_write_with_only_todos_is_write_todos():
+    todos = '[{"content": "x", "status": "pending"}]'
+    assert tools.alias_by_shape("write", {"todos": todos}) == ("write_todos", {"todos": todos})
+    assert tools.alias_by_shape("edit", {"todos": todos}) == ("write_todos", {"todos": todos})
+
+
+def test_shape_alias_requires_the_other_tools_whole_required_set():
+    # write_todos sent with write's two required keys is a write; with only one, it is not.
+    assert tools.alias_by_shape("write_todos", {"path": "a", "content": "b"})[0] == "write"
+    assert tools.alias_by_shape("write_todos", {"content": "b"})[0] == "write_todos"
+    # optional keys of the target are allowed alongside
+    assert tools.alias_by_shape("done", {"command": "ls", "timeout": 5})[0] == "bash"
+
+
+def test_shape_alias_never_fires_when_any_own_key_is_present():
+    """The census shape `edit` + path + content: path is edit's own key, and the model may
+    have meant to append — the validator names the stray key instead (plan 004 step 4)."""
+    assert tools.alias_by_shape("edit", {"path": "a.cpp", "content": "x"}) == (
+        "edit", {"path": "a.cpp", "content": "x"})
+    assert tools.alias_by_shape("write", {"path": "a"}) == ("write", {"path": "a"})
+
+
+def test_shape_alias_leaves_everything_else_alone():
+    assert tools.alias_by_shape("write", {}) == ("write", {})
+    assert tools.alias_by_shape("write", {"zzz": 1}) == ("write", {"zzz": 1})
+    assert tools.alias_by_shape("write", "not an object") == ("write", "not an object")
+    assert tools.alias_by_shape("mcp__srv__thing", {"todos": "[]"}) == ("mcp__srv__thing", {"todos": "[]"})
+    assert tools.alias_by_shape("frobnicate", {"todos": "[]"}) == ("frobnicate", {"todos": "[]"})
+
+
+def test_tool_params_lists_schema_order():
+    assert tools.tool_params("write") == ["path", "content"]
+    assert tools.tool_params("edit") == ["path", "old", "new"]
+    assert tools.tool_params("nope") == []
+
+
+# ---------------------------------------------------------------------------
 # Edit path inference: which of the turn's own files an `edit` without `path` meant.
 # ---------------------------------------------------------------------------
 
