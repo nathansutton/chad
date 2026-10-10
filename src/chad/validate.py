@@ -417,11 +417,33 @@ def render_repair(name: str, args: JsonValue, errors: List[Err]) -> str:
             lines.append(f"  ✗ {e.path}  → required, but missing (expected {e.expected})")
         else:
             lines.append(f"  ✗ {e.path} = {e.got}  → expected {e.expected}")
+    # A key the schema does not have, named — for chad's own tools only. The census
+    # shape: `edit` sent with `content`, told only that `old` and `new` were missing;
+    # the model meant `write`. Unknown keys stay in the args (MCP schemas are loose and
+    # a stray key must not fail a call that is otherwise valid); only this message, on
+    # a call already being rejected, changes.
+    lines += _unknown_key_lines(name, args)
     echo = _echo_call(name, args)
     if echo and len(echo) <= 600:
         lines.append("your call was:")
         lines.append(echo)
     return "\n".join(lines)
+
+
+def _unknown_key_lines(name: str, args: JsonValue) -> List[str]:
+    if name not in _builtin_names() or not is_json_object(args):
+        return []
+    props = list((_param_schema(name) or {}).get("properties", {}))
+    extra = [k for k in args if k not in props]
+    if not extra:
+        return []
+    takes = ", ".join(props)
+    return [f"  ✗ {k} → not a parameter of {name} ({name} takes {takes})" for k in extra]
+
+
+def _builtin_names() -> frozenset:
+    from .tools import SCHEMAS
+    return frozenset(s["function"]["name"] for s in SCHEMAS)
 
 
 def _echo_call(name: str, args: JsonValue) -> str:
