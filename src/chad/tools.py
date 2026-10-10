@@ -923,6 +923,63 @@ def alias_to_bash(name: str, args):
     return "bash", {"command": cmd}
 
 
+# The same for writes and edits. The 2026-10-10 slip census (plan 004) found two
+# `write_file` calls in 90 trials, each a well-formed `write` under the wrong name, each
+# costing the step that re-emitted it. Unlike the read aliases these rewrite to the
+# built-in tool itself, so the agent prepends one fact line to the result
+# (`[no tool is named write_file; ran write]`); the rewrite is the `tool_name_alias`
+# lever, fired at the rewrite site in agent.py.
+WRITE_ALIASES = frozenset({"write_file", "create_file", "save_file", "writefile"})
+EDIT_ALIASES = frozenset({
+    "edit_file", "replace", "str_replace", "str_replace_editor", "replace_in_file",
+})
+
+# Argument names the model uses for the three fields, under any alias. Checked in
+# order, so a call that already carries the canonical key is never touched.
+_CONTENT_KEYS = ("content", "contents", "file_text", "text", "new_content")
+_OLD_KEYS = ("old", "old_string", "old_str", "old_text", "search")
+_NEW_KEYS = ("new", "new_string", "new_str", "new_text", "replace")
+
+
+def _rekey(args: dict, keys, canonical: str) -> dict:
+    """Move the first present key in `keys` to `canonical`, if `canonical` is absent."""
+    if canonical in args:
+        return args
+    for k in keys:
+        if k in args and k != canonical:
+            out = dict(args)
+            out[canonical] = out.pop(k)
+            return out
+    return args
+
+
+def alias_write_edit(name: str, args):
+    """Rewrite a hallucinated write/edit name into the built-in call it meant.
+
+    Returns `(name, args)` unchanged when `name` is not an alias, when a real tool (an
+    MCP server's) answers to the name, or when the arguments are not an object. Keys
+    are renamed (`file_path` → `path`, `old_str` → `old`, …); whatever is still missing
+    is left for the validator to name, as it would for the canonical call.
+    """
+    if not is_json_object(args):
+        return name, args
+    if name in WRITE_ALIASES:
+        target = "write"
+    elif name in EDIT_ALIASES:
+        target = "edit"
+    else:
+        return name, args
+    if dispatch_for(name) is not None:
+        return name, args
+    out = _rekey(dict(args), _PATH_KEYS, "path")
+    if target == "write":
+        out = _rekey(out, _CONTENT_KEYS, "content")
+    else:
+        out = _rekey(out, _OLD_KEYS, "old")
+        out = _rekey(out, _NEW_KEYS, "new")
+    return target, out
+
+
 # Each entry takes (args, should_stop); long-running tools honor should_stop so a
 # ctrl-c interrupt can abort them mid-flight.
 DISPATCH = {

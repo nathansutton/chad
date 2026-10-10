@@ -55,6 +55,7 @@ from .tools import (
     TERMINAL,
     active_schemas,
     alias_to_bash,
+    alias_write_edit,
     clear_todos,
     dispatch_for,
     is_json_object,
@@ -1583,7 +1584,16 @@ class Agent:
                          think_cap, think_cap_hits)
                 continue
 
-            calls = [alias_to_bash(n, a) for n, a in parse_tool_calls(text)]
+            calls = []
+            aliased: dict[int, str] = {}   # call index -> the name the model sent
+            for _n, _a in parse_tool_calls(text):
+                _n2, _a2 = alias_to_bash(_n, _a)
+                if _n2 == _n and levers.enabled("tool_name_alias"):
+                    _n2, _a2 = alias_write_edit(_n, _a)
+                    if _n2 != _n:
+                        levers.fired("tool_name_alias", step=step, sent=_n, ran=_n2)
+                        aliased[len(calls)] = _n
+                calls.append((_n2, _a2))
             if not calls:
                 # No tool call this step. Decide whether this is a genuine final answer
                 # or a stall to push past. Three stalls telemetry caught, in priority
@@ -1703,7 +1713,7 @@ class Agent:
             _gov_prev_made = made_edit
             _gov_prev_unverified = unverified_edit
             step_tool_chars = 0  # tool-output chars appended this step (see _step_tool_cap)
-            for name, args in calls:
+            for ci, (name, args) in enumerate(calls):
                 render_tool_start(self._emit, name, args)
                 # typia stages 2+3: coerce loosely-typed args toward the schema
                 # ("10"->10, '["x"]'->[...]) and validate. On failure, feed the
@@ -1735,6 +1745,8 @@ class Agent:
                         log.info("VALIDATE %s rejected identically %dx -> escalate",
                                  name, self._reject_repeats + 1)
                     log.info("VALIDATE %s rejected (%d): %s", name, self._validate_fails, detail)
+                    if ci in aliased:
+                        result = f"[no tool is named {aliased[ci]}; read as {name}]\n" + result
                     render_tool_result(self._emit, name, args, result)
                     self.messages.append({"role": "tool", "name": name, "content": result})
                     continue
@@ -1815,6 +1827,10 @@ class Agent:
                     step_tool_chars += len(result)
                     if _PREFILL_TRACE:
                         self._trace_tools_pending.append([name, round(_tool_s, 4)])
+                if ci in aliased:
+                    # The one fact the model needs, stated once, ahead of the normal
+                    # result (which is byte-identical to a correctly named call's).
+                    result = f"[no tool is named {aliased[ci]}; ran {name}]\n" + result
                 render_tool_result(self._emit, name, args, result)
                 log.info("TOOL %s(%s) -> %s [%.2fs]", name, args_preview(args),
                          result_preview(result), _tool_s)

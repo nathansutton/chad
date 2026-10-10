@@ -170,6 +170,85 @@ def test_agent_loop_writes_file_reads_it_back_then_terminates(tmp_path, monkeypa
     assert agent.engine._i == len(script)
 
 
+def _xml_call(name, **args):
+    """One `<tool_call>` block in the XML dialect the chat template mandates — the shape
+    the census steps were actually emitted in."""
+    parts = [f"<tool_call>\n<function={name}>"]
+    for k, v in args.items():
+        parts.append(f"<parameter={k}>\n{v}\n</parameter>")
+    parts.append("</function>\n</tool_call>")
+    return "\n".join(parts)
+
+
+def test_a_write_under_a_hallucinated_name_runs_as_write(tmp_path, monkeypatch):
+    """`write_file` with a path and content (the census shape) lands the file, and the
+    result leads with the one fact and is otherwise the normal `write` result."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    target = tmp_path / "note.txt"
+    script = [
+        _xml_call("write_file", path=str(target), content="hello"),
+        _tool_call("done", summary="ok"),
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("create note.txt")
+    assert target.read_text() == "hello"
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    assert tool_turns[0]["name"] == "write"
+    head, _, rest = tool_turns[0]["content"].partition("\n")
+    assert head == "[no tool is named write_file; ran write]"
+    assert rest.startswith("[wrote")
+
+
+def test_an_edit_under_a_hallucinated_name_runs_as_edit(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    target = tmp_path / "a.txt"
+    target.write_text("alpha\nbeta\n")
+    script = [
+        _xml_call("str_replace_editor", file_path=str(target), old_str="beta", new_str="gamma"),
+        _tool_call("done", summary="ok"),
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("rename beta")
+    assert target.read_text() == "alpha\ngamma\n"
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    assert tool_turns[0]["name"] == "edit"
+    assert tool_turns[0]["content"].startswith("[no tool is named str_replace_editor; ran edit]\n[edited")
+
+
+def test_an_aliased_call_that_still_fails_validation_says_so_without_claiming_a_run(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CHAD_DISABLE", raising=False)
+    script = [
+        _xml_call("write_file", content="hello"),            # no path under any name
+        "There is nothing to write to.",                     # prose end on a read-only ask
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what would you write?")
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    content = tool_turns[0]["content"]
+    assert content.startswith("[no tool is named write_file; read as write]\n[invalid arguments for `write`")
+    assert "✗ $path" in content
+    assert "ran write" not in content
+
+
+def test_disabling_tool_name_alias_restores_the_unknown_tool_message(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CHAD_DISABLE", "tool_name_alias")
+    target = tmp_path / "note.txt"
+    script = [
+        _xml_call("write_file", path=str(target), content="hello"),
+        "There is no such tool.",
+    ]
+    agent = _agent(script, max_steps=10)
+    agent.run_turn("what is in note.txt?")
+    assert not target.exists()
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    assert tool_turns[0]["name"] == "write_file"
+    assert tool_turns[0]["content"].startswith("[unknown tool 'write_file'")
+
+
 def test_agent_loop_terminates_on_a_plain_final_answer(tmp_path):
     """A read-only task that ends with a no-tool-call assistant turn returns that text —
     the other loop-exit path (final answer vs the `done` terminal tool)."""

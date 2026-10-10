@@ -556,6 +556,65 @@ def test_aliases_are_not_advertised_to_the_model():
 
 
 # ---------------------------------------------------------------------------
+# Write/edit aliases: a well-formed call under a name this surface does not expose.
+# The 2026-10-10 slip census found two `write_file` calls in 90 trials, each costing
+# the step that re-emitted it as `write` (plan 004, step 3).
+# ---------------------------------------------------------------------------
+
+
+def test_write_alias_dispatches_to_write_with_keys_renamed():
+    assert tools.alias_write_edit("write_file", {"path": "a.py", "content": "x"}) == (
+        "write", {"path": "a.py", "content": "x"})
+    assert tools.alias_write_edit("create_file", {"file_path": "a.py", "file_text": "x"}) == (
+        "write", {"path": "a.py", "content": "x"})
+    for name in tools.WRITE_ALIASES:
+        assert tools.alias_write_edit(name, {"path": "a", "content": "b"})[0] == "write", name
+
+
+def test_edit_alias_dispatches_to_edit_with_keys_renamed():
+    assert tools.alias_write_edit(
+        "str_replace_editor", {"file_path": "a.py", "old_str": "x", "new_str": "y"}) == (
+        "edit", {"path": "a.py", "old": "x", "new": "y"})
+    assert tools.alias_write_edit(
+        "edit_file", {"path": "a.py", "old_string": "x", "new_string": "y"}) == (
+        "edit", {"path": "a.py", "old": "x", "new": "y"})
+    for name in tools.EDIT_ALIASES:
+        assert tools.alias_write_edit(name, {"path": "a", "old": "b", "new": "c"})[0] == "edit", name
+
+
+def test_write_edit_alias_leaves_missing_fields_for_the_validator():
+    # Nothing is invented: a pathless write_file becomes a pathless write, and the
+    # validator names the missing field exactly as it would for the canonical call.
+    assert tools.alias_write_edit("write_file", {"content": "x"}) == ("write", {"content": "x"})
+    # A canonical key already present is never overwritten by a synonym.
+    assert tools.alias_write_edit("edit_file", {"path": "a", "old": "o", "old_str": "z",
+                                                "new": "n"})[1]["old"] == "o"
+
+
+def test_write_edit_alias_never_shadows_a_real_dispatch():
+    """An MCP server may expose `replace`; that tool must win over the shim."""
+    tools.DISPATCH["replace"] = lambda a, ss=None: "from the real tool"
+    try:
+        assert tools.alias_write_edit("replace", {"path": "a", "old": "b", "new": "c"}) == (
+            "replace", {"path": "a", "old": "b", "new": "c"})
+    finally:
+        del tools.DISPATCH["replace"]
+
+
+def test_write_edit_alias_passes_other_names_through_untouched():
+    assert tools.alias_write_edit("write", {"path": "a", "content": "b"}) == (
+        "write", {"path": "a", "content": "b"})
+    assert tools.alias_write_edit("frobnicate", {"x": 1}) == ("frobnicate", {"x": 1})
+    assert tools.alias_write_edit("write_file", "not an object") == ("write_file", "not an object")
+
+
+def test_write_edit_aliases_are_not_advertised_to_the_model():
+    exposed = {s["function"]["name"] for s in tools.SCHEMAS}
+    assert not (exposed & (tools.WRITE_ALIASES | tools.EDIT_ALIASES))
+    assert not (tools.READ_ALIASES & (tools.WRITE_ALIASES | tools.EDIT_ALIASES))
+
+
+# ---------------------------------------------------------------------------
 # Plan state read by the `done` guardrail.
 # ---------------------------------------------------------------------------
 

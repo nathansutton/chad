@@ -73,6 +73,12 @@ LEVERS: dict[str, Lever] = {
         "When the per-result backstop cap clips a tool result, the full body "
         "goes to a spill file and the notice names the path, so the model can "
         "grep for what was dropped instead of re-running the call."),
+    "tool_name_alias": Lever(
+        "A write or edit sent under a name this surface does not expose "
+        "(write_file, str_replace_editor, …) dispatches to the built-in it "
+        "meant, keys renamed, with one fact line prepended to the result — "
+        "instead of an unknown-tool rejection and a step spent re-emitting "
+        "the same call. A real tool of that name always wins."),
     "rg_replace_flag_note": Lever(
         "One line naming what an `rg -r` result actually is (rewritten output, "
         "not the file's text) — `-rn` is `--replace n`, not grep's recursive "
