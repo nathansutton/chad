@@ -5,8 +5,9 @@ drafted decode and persistent prefix cache `chad` itself runs on, without chad's
 loop. One model, one request at a time, loopback by default: this is a single-user
 server for the machine it runs on, not a multi-tenant endpoint.
 
-The default model is the ternary Bonsai 2 27B pack with its DFlash2 drafter, which is
-the build that fits a 16 GB Mac; `--model` / CHAD_MODEL select another.
+The model is chosen as `chad` chooses it: `--model`, else CHAD_MODEL, else the default
+for this machine's RAM (the ternary Bonsai 2 27B pack with its DFlash2 drafter on a
+16 GB Mac).
 """
 from __future__ import annotations
 
@@ -22,12 +23,10 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING
 
-from . import config
-
 if TYPE_CHECKING:
     from .engine import Engine
 
-DEFAULT_MODEL = "nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX"
+# The id clients address the one loaded model by, whichever build that is.
 MODEL_ALIAS = "bonsai-2-27b-mlx"
 DEFAULT_MAX_TOKENS = 8192
 THINK_END = "</think>"
@@ -519,9 +518,9 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int, default=8081, help="port to listen on (default: 8081)")
     ap.add_argument("--model", default=None,
                     help="HF repo id, local model dir or GGUF, as `chad --model` takes it "
-                         f"(default: CHAD_MODEL, else {DEFAULT_MODEL})")
+                         "(default: CHAD_MODEL, else the default for this machine's RAM)")
     args = ap.parse_args(argv)
-    WORKER = Worker(args.model or config.env_str("CHAD_MODEL") or DEFAULT_MODEL)
+    WORKER = Worker(args.model)
     WORKER.start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True

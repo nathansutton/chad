@@ -4,6 +4,13 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**chad runs on a 16 GB Mac.** With less than 24 GB of RAM the default model is now the
+ternary Bonsai 2 pack of the same Qwen3.8-27B (~8 GB resident, DFlash2 drafter bundled)
+instead of the 14 GB Q3_K_XL file, which loaded on a 16 GB Air or mini only to page its
+own weights. `chad`, `chad prove`, `chad-bench` and `chad-serve` all follow the same
+RAM-aware default; `--model` and `CHAD_MODEL` still override it. `docs/16gb.md` has what
+changes and what to expect.
+
 **`chad-serve` puts the engine behind an OpenAI-compatible API.** Other coding agents
 can now run on chad's drafted decode and prefix cache: `chad-serve` answers
 `/v1/chat/completions` (streaming, tool calls, reasoning) on loopback, defaulting to the

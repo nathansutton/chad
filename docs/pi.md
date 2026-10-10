@@ -5,11 +5,12 @@
 completions) runs on the same drafted decode and prefix cache chad uses, without chad's
 own agent loop.
 
-The default model is the ternary
+On a 16 GB Mac the model is the ternary
 [Bonsai 2 27B pack](https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX)
-with its DFlash2 drafter: about 8 GB resident, which is the build that fits a 16 GB Mac.
+with its DFlash2 drafter, about 8 GB resident. `chad-serve` picks the model as `chad`
+does: with 24 GB or more it loads the larger Q3_K_XL build unless `--model` says otherwise.
 
-`chad-serve` lives in this fork (`riteshdhemla/chad`, branch `pi-server`); it is not in
+`chad-serve` lives in this fork (`riteshdhemla/chad`, branch `mac-16gb`); it is not in
 upstream chad or the `chad-code` package on PyPI.
 
 ## Requirements
@@ -22,7 +23,7 @@ upstream chad or the `chad-code` package on PyPI.
 ## 1. Start the server
 
 ```bash
-uvx --from git+https://github.com/riteshdhemla/chad@pi-server chad-serve
+uvx --from git+https://github.com/riteshdhemla/chad@mac-16gb chad-serve
 ```
 
 The first run downloads the model (8.8 GB) into `~/.cache/huggingface`; later starts
@@ -44,7 +45,7 @@ From a clone of this repo, `uv run chad-serve` does the same.
 |------|---------|---------|
 | `--port` | `8081` | Port to listen on. |
 | `--host` | `127.0.0.1` | Address to bind. There is no authentication; keep it on loopback. |
-| `--model` | the ternary pack | An HF repo id, local model dir or GGUF, as `chad --model` takes it. `CHAD_MODEL` is read when the flag is absent. |
+| `--model` | by RAM | An HF repo id, local model dir or GGUF, as `chad --model` takes it. `CHAD_MODEL` is read when the flag is absent. |
 
 The `CHAD_*` engine variables in [configuration.md](configuration.md) apply unchanged,
 for example `CHAD_NO_DFLASH=1` to decode without the drafter, or `CHAD_MAX_CONTEXT` to
@@ -123,11 +124,13 @@ changing earlier turns between requests.
 
 Measured on a base M5 MacBook with 16 GB, driving real Pi tasks:
 
-- Decode: 13 to 26 tokens/second, mostly 14 to 20. It moves with how much of each
-  drafted block the model accepts (16% to 61% observed).
-- Reading a fresh prompt: about 180 tokens/second.
-- A follow-up agent step: about 0.7 s before the first token, because only the new
-  tokens are read.
+- A short task (a five-call bug fix, 45 seconds end to end): 15 to 26 tokens/second
+  decoding, about 9 seconds to read Pi's first 1,600-token prompt, and about 1 second
+  before the first token on each later step.
+- Long generations are slower: a single 5,000-token answer over a 12,000-token context
+  decoded at about 6 tokens/second.
+- In an uninterrupted session about three quarters of all prompt tokens came from the
+  prefix cache.
 
 `chad-bench` reports a higher decode figure (36 tokens/second on the same machine). It
 is a ceiling: the benchmark decodes greedily and continues a tiled block of code, which
