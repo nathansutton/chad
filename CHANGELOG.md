@@ -9,7 +9,12 @@ ternary Bonsai 2 pack of the same Qwen3.8-27B (~8 GB resident, DFlash2 drafter b
 instead of the 14 GB Q3_K_XL file, which loaded on a 16 GB Air or mini only to page its
 own weights. `chad`, `chad prove`, `chad-bench` and `chad-serve` all follow the same
 RAM-aware default; `--model` and `CHAD_MODEL` still override it. `docs/16gb.md` has what
-changes and what to expect.
+changes, measurements from a 16 GB MacBook Air, and how to get the most out of one.
+
+**`chad-serve` can turn the model's reasoning off.** A request with
+`enable_thinking: false` is answered without a reasoning block, on the non-thinking
+sampling recipe. Pi sends it for `--thinking off` once the model is configured with
+`thinkingFormat: "qwen"`.
 
 **`chad-serve` puts the engine behind an OpenAI-compatible API.** Other coding agents
 can now run on chad's drafted decode and prefix cache: `chad-serve` answers

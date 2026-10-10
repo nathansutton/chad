@@ -77,6 +77,7 @@ file already exists):
           "input": ["text"],
           "contextWindow": 40000,
           "maxTokens": 8192,
+          "compat": { "thinkingFormat": "qwen" },
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
         }
       ]
@@ -89,6 +90,9 @@ Set `contextWindow` a little under the safe limit the server printed. Pi compact
 conversation as it approaches that number; a prompt over the server's limit is refused
 with a `context length exceeded` error rather than risking an out-of-memory crash.
 
+`thinkingFormat: "qwen"` is what lets Pi switch the model's reasoning off: Pi then sends
+`enable_thinking` with each request, which the server honours.
+
 ## 4. Run Pi
 
 From the project you want to work in:
@@ -99,6 +103,10 @@ pi --model bonsai-mlx/bonsai-2-27b-mlx
 
 Or pick "Ternary Bonsai 2 27B (local MLX + DFlash2)" under `/model` inside Pi. A
 one-shot run is `pi -p --model bonsai-mlx/bonsai-2-27b-mlx "your task"`.
+
+Add `--thinking off` for routine work. The model then answers without a reasoning block,
+which roughly halves the tokens it writes; on a 16 GB Air a module-and-tests task took
+55 seconds that way against 159 with thinking on. Leave thinking on for hard problems.
 
 ## Check it works
 
@@ -122,31 +130,26 @@ changing earlier turns between requests.
 
 ## What to expect
 
-Measured on a base M5 MacBook with 16 GB, driving real Pi tasks:
-
-- A short task (a five-call bug fix, 45 seconds end to end): 15 to 26 tokens/second
-  decoding, about 9 seconds to read Pi's first 1,600-token prompt, and about 1 second
-  before the first token on each later step.
-- Long generations are slower: a single 5,000-token answer over a 12,000-token context
-  decoded at about 6 tokens/second.
-- In an uninterrupted session about three quarters of all prompt tokens came from the
-  prefix cache.
-
-`chad-bench` reports a higher decode figure (36 tokens/second on the same machine). It
-is a ceiling: the benchmark decodes greedily and continues a tiled block of code, which
-the drafter predicts almost perfectly.
+On a base M5 MacBook Air with 16 GB, a five-call bug fix takes about a minute: 9 to 10
+seconds to read Pi's first 1,600-token prompt, about a second before the first token on
+each later step, and 13 to 30 tokens/second decoding depending on what is being written.
+[16gb.md](16gb.md) has the full table, and the reason long tasks slow down on a fanless
+machine.
 
 ## How it behaves
 
 - **One request at a time.** There is one model and one KV cache; concurrent requests
   queue. The prefix cache follows the most recent conversation, so alternating between
   two sessions re-reads each prompt in turn.
-- **Reasoning.** The model always thinks. Reasoning is streamed as `reasoning_content`.
-  Pi's thinking levels map onto the model's two supported efforts: `high` and above run
-  as `xhigh`, everything else as `medium`. Changing the level mid-session changes the
-  system block and costs one full re-read of the prompt.
-- **Sampling.** The model card's thinking recipe (temperature 1.0, top-p 0.95, top-k 20)
-  is the default. A request's `temperature`, `top_p`, `top_k`, `min_p` and
+- **Reasoning.** The model thinks unless the request says `enable_thinking: false`
+  (top-level, or inside `chat_template_kwargs`). Reasoning is streamed as
+  `reasoning_content`. Pi's thinking levels map onto the model's two supported efforts:
+  `high` and above run as `xhigh`, everything else as `medium`. Changing the level
+  mid-session changes the system block and costs one full re-read of the prompt.
+- **Streaming with thinking off.** A turn that is only a tool call sends nothing until
+  the call is complete, because tool calls are returned whole.
+- **Sampling.** The model card's recipe for the mode is the default: temperature 1.0,
+  top-p 0.95, top-k 20 when thinking, and 0.7 / 0.80 / 20 when not. A request's `temperature`, `top_p`, `top_k`, `min_p` and
   `presence_penalty` override it for that request.
 - **Tool calls.** The model writes calls in the Qwen XML dialect; the server returns
   them as OpenAI `tool_calls`, converting non-string parameters by the tool's JSON

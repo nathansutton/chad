@@ -130,12 +130,13 @@ def _partial_suffix(s: str, marks) -> int:
 class Splitter:
     """Split the streamed completion into reasoning, content and the tool-call tail.
 
-    Generation starts inside the template-opened <think> block, so everything up to
-    </think> is reasoning. Text that might be the start of a marker is held back until
+    A thinking turn starts inside the template-opened <think> block, so everything up to
+    </think> is reasoning; a non-thinking turn starts in the answer, the template having
+    closed the block itself. Text that might be the start of a marker is held back until
     it is known not to be one."""
 
-    def __init__(self):
-        self.phase = "think"
+    def __init__(self, thinking: bool = True):
+        self.phase = "think" if thinking else "content"
         self.buf = ""
         self.reasoning, self.content = [], []
         self.tool = ""
@@ -246,6 +247,12 @@ def _number(value, default: float) -> float:
 class Job:
     def __init__(self, body: dict):
         self.body = body
+        # The model thinks unless the request turns it off, either top-level (the Qwen
+        # API spelling) or through chat_template_kwargs (the llama.cpp / vLLM one).
+        kwargs = body.get("chat_template_kwargs")
+        off = body.get("enable_thinking") is False or (
+            isinstance(kwargs, dict) and kwargs.get("enable_thinking") is False)
+        self.thinking = not off
         self.events: queue.Queue = queue.Queue()
         self.cancel = threading.Event()
 
@@ -260,6 +267,7 @@ class Worker(threading.Thread):
         self.ready = threading.Event()
         self.failed: str | None = None
         self.memo: dict = {}
+        self._samplers: dict = {}
 
     def run(self):
         try:
@@ -277,9 +285,12 @@ class Worker(threading.Thread):
             eng = Engine(model_id=model_id, cache_dir=None,
                          kv_bits=_env_int("CHAD_KV_BITS"),
                          max_context=_env_int("CHAD_MAX_CONTEXT"))
-            apply_sampler_preset(eng, thinking=True)
-            apply_sampler_env(eng)
-            self._sampler = (eng.temp, eng.top_p, eng.top_k, eng.min_p, eng.presence_penalty)
+            # Each mode has its own model-card recipe; CHAD_* overrides apply to both.
+            for thinking in (False, True):
+                apply_sampler_preset(eng, thinking=thinking)
+                apply_sampler_env(eng)
+                self._samplers[thinking] = (eng.temp, eng.top_p, eng.top_k, eng.min_p,
+                                            eng.presence_penalty)
             log(f"loading {model_id} [{why}] ...")
             load_s = eng.load()
             log(f"ready in {load_s:.1f}s | context {eng.effective_ctx} tokens "
@@ -312,7 +323,8 @@ class Worker(threading.Thread):
                   or eng.reasoning_effort_default or "medium")
         try:
             ids = eng.tok.apply_chat_template(messages, tools=tools, add_generation_prompt=True,
-                                              enable_thinking=True, reasoning_effort=effort)
+                                              enable_thinking=job.thinking,
+                                              reasoning_effort=effort)
         except Exception as e:  # noqa: BLE001 — template errors are the client's request
             job.events.put(("error", 400, f"could not render messages: {e}"))
             return
@@ -327,8 +339,8 @@ class Worker(threading.Thread):
         want = body.get("max_completion_tokens") or body.get("max_tokens") or DEFAULT_MAX_TOKENS
         max_new = max(1, min(int(want), eng.effective_ctx - len(ids) - 8))
 
-        # The model card's thinking recipe is the default; a request may override it.
-        temp, top_p, top_k, min_p, presence = self._sampler
+        # The model card's recipe for the mode is the default; a request may override it.
+        temp, top_p, top_k, min_p, presence = self._samplers[job.thinking]
         eng.temp = _number(body.get("temperature"), temp)
         eng.top_p = _number(body.get("top_p"), top_p)
         eng.top_k = int(_number(body.get("top_k"), top_k))
@@ -406,7 +418,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # Both paths drain the same event queue; `emit` is None for the blocking one.
     def _consume(self, job: Job, emit, idle):
-        split = Splitter()
+        split = Splitter(job.thinking)
         while True:
             try:
                 ev = job.events.get(timeout=5)

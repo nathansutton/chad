@@ -50,6 +50,25 @@ def test_unclosed_think_is_all_reasoning():
     assert not split.content and not split.tool
 
 
+def test_non_thinking_turn_starts_in_the_answer():
+    """With thinking off the template closes the block itself, so the completion is the
+    answer from its first token and nothing is routed to reasoning."""
+    split = serve.Splitter(thinking=False)
+    split.feed("Done.\n\n<tool_call>\n<function=read>\n<parameter=path>\nx\n</parameter>\n"
+               "</function>\n</tool_call>")
+    split.finish()
+    assert not split.reasoning
+    assert "".join(split.content) == "Done."
+    assert serve.parse_tool_calls(split.tool, TOOLS) == [("read", {"path": "x"})]
+
+
+def test_thinking_is_on_unless_the_request_turns_it_off():
+    assert serve.Job({}).thinking
+    assert serve.Job({"enable_thinking": True}).thinking
+    assert not serve.Job({"enable_thinking": False}).thinking
+    assert not serve.Job({"chat_template_kwargs": {"enable_thinking": False}}).thinking
+
+
 def test_json_tool_call_dialect():
     split = _split('r</think>\n\n<tool_call>\n{"name":"read","arguments":{"path":"x"}}\n'
                    "</tool_call>", 5)
