@@ -11,16 +11,11 @@ own weights. `chad`, `chad prove`, `chad-bench` and `chad-serve` all follow the 
 RAM-aware default; `--model` and `CHAD_MODEL` still override it. `docs/16gb.md` has what
 changes, measurements from a 16 GB MacBook Air, and how to get the most out of one.
 
-**`chad-serve` can turn the model's reasoning off.** A request with
-`enable_thinking: false` is answered without a reasoning block, on the non-thinking
-sampling recipe. Pi sends it for `--thinking off` once the model is configured with
-`thinkingFormat: "qwen"`.
-
 **`chad-serve` puts the engine behind an OpenAI-compatible API.** Other coding agents
 can now run on chad's drafted decode and prefix cache: `chad-serve` answers
-`/v1/chat/completions` (streaming, tool calls, reasoning) on loopback, defaulting to the
-ternary Bonsai 2 27B pack with its DFlash2 drafter, which fits a 16 GB Mac. `docs/pi.md`
-has the setup for the Pi coding agent.
+`/v1/chat/completions` (streaming, tool calls, reasoning) on loopback, one request at a
+time, on the same model `chad` would load. A request with `enable_thinking: false` is
+answered without a reasoning block. `docs/pi.md` has the setup for the Pi coding agent.
 
 **A tool call whose arguments mention the reasoning tags is parsed whole.** The parser
 removed every `<think>…</think>` span from a turn before reading its calls, including

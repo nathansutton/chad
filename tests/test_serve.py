@@ -69,6 +69,13 @@ def test_thinking_is_on_unless_the_request_turns_it_off():
     assert not serve.Job({"chat_template_kwargs": {"enable_thinking": False}}).thinking
 
 
+def test_effort_names_map_onto_the_templates_three():
+    """The template raises on any effort but xhigh, medium and low, so every OpenAI-style
+    name a client may send has to land on one of them."""
+    assert set(serve.EFFORT.values()) == {"low", "medium", "xhigh"}
+    assert serve.EFFORT["minimal"] == "low" and serve.EFFORT["high"] == "xhigh"
+
+
 def test_json_tool_call_dialect():
     split = _split('r</think>\n\n<tool_call>\n{"name":"read","arguments":{"path":"x"}}\n'
                    "</tool_call>", 5)

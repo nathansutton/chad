@@ -1,41 +1,43 @@
-# Bonsai 2 27B + DFlash2 on the Pi coding agent
+# Serving the engine to other agents (`chad-serve`)
 
 `chad-serve` puts chad's MLX engine behind an OpenAI-compatible
 `/v1/chat/completions`, so [Pi](https://pi.dev) (or any agent that speaks OpenAI chat
 completions) runs on the same drafted decode and prefix cache chad uses, without chad's
 own agent loop.
 
-On a 16 GB Mac the model is the ternary
-[Bonsai 2 27B pack](https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX)
-with its DFlash2 drafter, about 8 GB resident. `chad-serve` picks the model as `chad`
-does: with 24 GB or more it loads the larger Q3_K_XL build unless `--model` says otherwise.
+It picks the model as `chad` does: the Q3_K_XL build with 24 GB or more, the ternary
+Bonsai 2 pack on a 16 GB Mac ([16gb.md](16gb.md)), both with the DFlash2 drafter, unless
+`--model` or `CHAD_MODEL` says otherwise.
 
-`chad-serve` lives in this fork (`riteshdhemla/chad`, branch `mac-16gb`); it is not in
-upstream chad or the `chad-code` package on PyPI.
+chad's own loop still owns its engine in-process, and that is the path the project
+tunes and measures. `chad-serve` is for when you want a different harness on the same
+engine.
+
+This page sets up Pi; the server section applies to any client.
 
 ## Requirements
 
 - An Apple Silicon Mac with 16 GB of RAM or more, on macOS 14 or later.
 - [`uv`](https://docs.astral.sh/uv/) (`brew install uv`).
 - Node.js 20 or later, for Pi (`brew install node`).
-- About 10 GB of free disk for the model.
+- Free disk for the model: about 11 GB on a 16 GB Mac, about 30 GB with 24 GB or more.
 
 ## 1. Start the server
 
 ```bash
-uvx --from git+https://github.com/riteshdhemla/chad@mac-16gb chad-serve
+uvx --from chad-code chad-serve     # or `chad-serve` after `uv tool install chad-code`
 ```
 
-The first run downloads the model (8.8 GB) into `~/.cache/huggingface`; later starts
-load in a few seconds. It is ready when it prints a line like:
+The first run downloads the model into `~/.cache/huggingface`; later starts load in a
+few seconds. It is ready when it prints a line like:
 
 ```
 ready in 5.6s | context 262144 tokens (safe limit 41750)
 ```
 
 Note the **safe limit**: it is what this machine's memory can hold, and it is the number
-to give Pi as the context window in the next step. On a 16 GB Mac it lands around 40,000
-tokens; it is larger with more RAM.
+to give Pi as the context window in the next step. It lands around 40,000 tokens on a
+16 GB Mac and around 74,000 on 24 GB.
 
 The server listens on `http://127.0.0.1:8081/v1`. Leave it running in its own terminal.
 
@@ -59,20 +61,20 @@ npm install -g @earendil-works/pi-coding-agent
 
 ## 3. Point Pi at the server
 
-Create `~/.pi/agent/models.json` (merge the `bonsai-mlx` entry into `providers` if the
+Create `~/.pi/agent/models.json` (merge the `chad` entry into `providers` if the
 file already exists):
 
 ```json
 {
   "providers": {
-    "bonsai-mlx": {
+    "chad": {
       "baseUrl": "http://127.0.0.1:8081/v1",
       "api": "openai-completions",
       "apiKey": "local",
       "models": [
         {
-          "id": "bonsai-2-27b-mlx",
-          "name": "Ternary Bonsai 2 27B (local MLX + DFlash2)",
+          "id": "chad",
+          "name": "chad (local Qwen3.8-27B)",
           "reasoning": true,
           "input": ["text"],
           "contextWindow": 40000,
@@ -98,11 +100,11 @@ with a `context length exceeded` error rather than risking an out-of-memory cras
 From the project you want to work in:
 
 ```bash
-pi --model bonsai-mlx/bonsai-2-27b-mlx
+pi --model chad/chad
 ```
 
-Or pick "Ternary Bonsai 2 27B (local MLX + DFlash2)" under `/model` inside Pi. A
-one-shot run is `pi -p --model bonsai-mlx/bonsai-2-27b-mlx "your task"`.
+Or pick "chad (local Qwen3.8-27B)" under `/model` inside Pi. A one-shot run is
+`pi -p --model chad/chad "your task"`.
 
 Add `--thinking off` for routine work. The model then answers without a reasoning block,
 which roughly halves the tokens it writes; on a 16 GB Air a module-and-tests task took
@@ -143,8 +145,9 @@ machine.
   two sessions re-reads each prompt in turn.
 - **Reasoning.** The model thinks unless the request says `enable_thinking: false`
   (top-level, or inside `chat_template_kwargs`). Reasoning is streamed as
-  `reasoning_content`. Pi's thinking levels map onto the model's two supported efforts:
-  `high` and above run as `xhigh`, everything else as `medium`. Changing the level
+  `reasoning_content`. A request's `reasoning_effort` maps onto the template's three:
+  `minimal` and `low` run as `low`, `medium` as `medium`, `high` and above as `xhigh`;
+  with none sent, the loaded model's default applies. Changing the level
   mid-session changes the system block and costs one full re-read of the prompt.
 - **Streaming with thinking off.** A turn that is only a tool call sends nothing until
   the call is complete, because tool calls are returned whole.

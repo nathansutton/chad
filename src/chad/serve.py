@@ -26,13 +26,14 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .engine import Engine
 
-# The id clients address the one loaded model by, whichever build that is.
-MODEL_ALIAS = "bonsai-2-27b-mlx"
+# The id clients address the one loaded model by, whichever build that is. The `model`
+# field of a request is not used to choose anything.
+MODEL_ALIAS = "chad"
 DEFAULT_MAX_TOKENS = 8192
 THINK_END = "</think>"
 TOOL_MARKS = ("<tool_call>", "<function=")
-# Bonsai 2 does not support low effort; anything below medium runs as medium.
-EFFORT = {"minimal": "medium", "low": "medium", "medium": "medium",
+# OpenAI-style effort names onto the three the Qwen3.8 template takes.
+EFFORT = {"minimal": "low", "low": "low", "medium": "medium",
           "high": "xhigh", "xhigh": "xhigh"}
 
 _FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)(?:</function>|\Z)", re.DOTALL)
