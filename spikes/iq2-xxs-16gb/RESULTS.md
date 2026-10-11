@@ -164,3 +164,53 @@ nothing on go (it barely acted).
   `total: think 430 tok, decode 201 s, prefill 220 s, 5.1 tok/s, cache hit 90%, 1 compactions`.
 - For contrast, **cpp/grade-school rep 1 (pass):** `think 2095 tok, decode 628 s, prefill 252 s, 5.8 tok/s, 2 compactions`.
   It used 88% of the wall cap on a task the ternary passed in 600 s on 24 GB.
+
+## Phase 4: UD-IQ2_S (8.37 GB)
+
+Run from a script that does, in order: the Phase 1 roman.py task on a first load (`CHAD_SESSION_LOG=1`, 30 min cap
+after `ready`), then `uv run chad-bench`. Same task text as above, `CHAD_MODEL=unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ2_S.gguf`.
+Clean machine this time: no other heavy apps, nothing compiling.
+
+### Phase 1 (IQ2_S)
+
+- First load (download + conversion): `ready in 40.9s | context 262144 tokens (compact at 8192)`. **Swap stayed flat
+  at 0.74 GB during the conversion**, which points to the 8 GB peak in the IQ2_XXS first load coming from
+  `gold.py` compiling in parallel, not from the conversion.
+- `GOVERNOR ctx_limit=8,192 | budget=11.45 GB active=9.57 GB transient=4.30 GB host_avail=3.32 GB kv=65536 B/tok`.
+  That's 1.1 GB more resident than IQ2_XXS, and the window is on the same 8192 floor. The same QSDPA self-check failure applies, with the same borrowed drafter.
+- **Metal OOM during prefill, 4 times, each caught and retried with a smaller chunk; no crash:**
+  ```
+  22:48:13 WARNING PREFILL Metal OOM at 0/559 (kv=5657): retrying with chunk=235
+  22:48:23 WARNING PREFILL Metal OOM at 0/559 (kv=5657): retrying with chunk=117
+  22:58:09 WARNING PREFILL Metal OOM at 0/1037 (kv=6452): retrying with chunk=206
+  22:58:28 WARNING PREFILL Metal OOM at 206/1037 (kv=6658): retrying with chunk=103
+  ```
+  The plan lists "hits a Metal OOM" as a stop condition. These were recovered, not fatal, but they show IQ2_S
+  is at the edge of the Metal budget on 16 GB once the KV reaches about 5.6k tokens.
+- **Real task: finished.** `exit=0`, 1628 s wall from launch (download included) and about 26 min after `ready`, 16 steps.
+  Final answer: "Created roman.py ... and test_roman.py; all 25 pytest tests pass, verified by a full 1..3999 round-trip check."
+  Verified independently: `uv run python -m pytest -q test_roman.py` → `25 passed`; round-trip over 1..3999 holds;
+  `to_roman(3999) == 'MMMCMXCIX'`. Along the way it hit a real bug (888 → `DCCC`), wrote its own round-trip
+  check, and fixed the bug. Tool calls were well formed and nothing leaked out of the think block.
+- Decode in the agent: 5.5–6.1 tok/s per step; draft acceptance about 0.41–0.42 per turn.
+- Swap: 0.735–0.743 GB for the whole run, **no growth**.
+- `uv run chad-bench` (IQ2_S):
+  ```
+  model load                  6.0 s
+  1. prefill (cold)          5000 tok in 212.75 s   ->      24 tok/s
+  2. decode                   128 tok in   9.89 s   ->    12.9 tok/s
+  3. warm step                 16 new tok prefilled (5127 cached)
+                             1.57 s of prefill for the follow-up turn
+  ```
+  Swap 0.735 GB flat during the bench. No OOM during the bench.
+
+| metric | IQ2_XXS | IQ2_S |
+|---|---|---|
+| resident (`active`) | 8.47 GB | 9.57 GB |
+| compact at | 8192 (floor) | 8192 (floor) |
+| first / second load | 127.0 s (confounded) / 6.2 s | 40.9 s / 6.0 s |
+| swap during generation | flat | flat |
+| Metal OOM | none | 4 prefill OOMs, all recovered by chunk retry |
+| prefill / decode (chad-bench) | 32 / 10.0 tok/s | 24 / 12.9 tok/s |
+| decode in agent | 4.2–6.5 tok/s | 5.5–6.1 tok/s |
+| roman.py task | not finished in 30 min, zero tool calls | **finished in ~26 min, 25 tests pass (verified)** |
