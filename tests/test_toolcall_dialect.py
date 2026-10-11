@@ -55,22 +55,24 @@ def test_repair_messages_never_teach_the_json_form():
     msg = validate.render_repair(garbled, {}, validate.coerce_and_validate(garbled, {})[1])
     assert "<function=grep>" in msg and not _JSON_CALL.search(msg)
 
-    # The invalid-arguments path echoes the model's OWN call back to it.
+    # The invalid-arguments path marks fields; it shows no call in any dialect.
     args = {"path": "a.py", "old": "x"}          # `new` missing -> repair message
     coerced, errs = validate.coerce_and_validate("edit", args)
-    echoed = validate.render_repair("edit", coerced, errs)
-    assert errs and "<function=edit>" in echoed and "<parameter=path>" in echoed
-    assert not _JSON_CALL.search(echoed)
+    msg = validate.render_repair("edit", coerced, errs)
+    assert errs and "✗ $new" in msg
+    assert not _JSON_CALL.search(msg)
 
 
-def test_the_echo_round_trips_through_the_parser():
-    """The echoed call is what we are asking the model to copy, so it has to be a call
-    chad can actually parse — otherwise the repair path hands back a shape that fails
-    the same way the original did."""
-    from chad import toolcall_parse
-    echo = validate._echo_call("bash", {"command": "ls /app\nwc -l x.py"})
-    calls = toolcall_parse.parse_tool_calls(echo)
-    assert calls == [("bash", {"command": "ls /app\nwc -l x.py"})]
+def test_the_repair_message_does_not_echo_the_call():
+    """The model's call is the assistant message directly above the result; echoing it
+    back doubled the prefill and (plan 004 census, 10 slips) changed nothing about the
+    next step. The message is the marks and the fact lines, whatever the call's size."""
+    big = {"content": "x" * 5000}                 # a long write with no path
+    coerced, errs = validate.coerce_and_validate("write", big)
+    msg = validate.render_repair("write", coerced, errs)
+    assert "your call was" not in msg and "<function=" not in msg and "xxxx" not in msg
+    assert "✗ $path" in msg
+    assert len(msg) < 400
 
 
 def test_nudges_do_not_demand_json_arguments():

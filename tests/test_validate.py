@@ -150,6 +150,36 @@ def test_render():
     check("render malformed name does not list tools", "Available tools" not in msg3)
 
 
+def test_render_names_a_key_that_does_not_belong():
+    """The census shape (cpp/dnd-character.rep3 #8): `edit` sent with `content` and
+    `path`. The model meant `write`; telling it only that `old` and `new` were missing
+    sent it a second guess. Three ✗ lines, the third naming the stray key and what the
+    tool takes."""
+    args = {"path": "a.cpp", "content": "int x;"}
+    a, e = coerce_and_validate("edit", args)
+    msg = render_repair("edit", a, e)
+    marks = [ln for ln in msg.splitlines() if ln.lstrip().startswith("✗")]
+    check("three marks", len(marks) == 3, f"msg={msg!r}")
+    check("old missing", any("$old" in m and "missing" in m for m in marks))
+    check("new missing", any("$new" in m and "missing" in m for m in marks))
+    check("stray key named",
+          "  ✗ content → not a parameter of edit (edit takes path, old, new)" in marks,
+          f"marks={marks!r}")
+    # The args are kept whole: leniency is unchanged, only the message grew.
+    check("unknown key kept in args", a.get("content") == "int x;", f"a={a!r}")
+
+
+def test_unknown_keys_are_not_named_for_non_builtin_tools():
+    """An MCP tool's schema may be loose; a stray key there gets no line. The guard is
+    the tool name: only chad's own five tools are policed."""
+    from chad.validate import _unknown_key_lines
+    check("stray key not named for a non-builtin", _unknown_key_lines("mcp__srv__thing", {"extra": 1}) == [])
+    check("stray key named for a builtin",
+          _unknown_key_lines("write", {"path": "a", "content": "b", "mode": "w"}) ==
+          ["  ✗ mode → not a parameter of write (write takes path, content)"])
+    check("nothing to name when every key belongs", _unknown_key_lines("write", {"path": "a", "content": "b"}) == [])
+
+
 def test_legacy_validate():
     # The CHAD_NO_VALIDATE A/B baseline: terse unknown/non-object/missing checks,
     # no coercion. Returns an error string, or None when args pass.

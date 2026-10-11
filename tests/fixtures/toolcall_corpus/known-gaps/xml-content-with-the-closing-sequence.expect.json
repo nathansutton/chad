@@ -1,0 +1,15 @@
+{
+ "note": "a value containing the dialect's own closing sequence: </parameter> then (whitespace) </function>",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "ends with </parameter>\n</function> then more"
+   },
+   "errors": []
+  }
+ ],
+ "today": "the value ends at that </parameter>; the rest becomes prose after the call",
+ "reason": "indistinguishable from a real close followed by prose; the dialect has no escape. The JSON form carries it. Not seen in 960 census steps."
+}

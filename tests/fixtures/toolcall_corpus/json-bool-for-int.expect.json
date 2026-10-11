@@ -1,0 +1,15 @@
+{
+ "note": "a boolean where an integer is required; not coercible",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls",
+    "timeout": true
+   },
+   "errors": [
+    "$timeout"
+   ]
+  }
+ ]
+}

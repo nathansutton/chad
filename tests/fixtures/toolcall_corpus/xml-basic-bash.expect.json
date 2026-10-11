@@ -1,0 +1,12 @@
+{
+ "note": "the template's XML dialect",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

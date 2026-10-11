@@ -1,0 +1,10 @@
+<tool_call>
+<function=write_file>
+<parameter=path>
+a.py
+</parameter>
+<parameter=content>
+x
+</parameter>
+</function>
+</tool_call>

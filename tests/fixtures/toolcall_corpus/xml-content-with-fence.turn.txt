@@ -1,0 +1,12 @@
+<tool_call>
+<function=write>
+<parameter=path>
+a.md
+</parameter>
+<parameter=content>
+```python
+print(1)
+```
+</parameter>
+</function>
+</tool_call>

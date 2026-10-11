@@ -1,0 +1,10 @@
+<tool_call>
+<function=edit>
+<parameter=old>
+x
+</parameter>
+<parameter=new>
+y
+</parameter>
+</function>
+</tool_call>

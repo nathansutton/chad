@@ -1,0 +1,12 @@
+{
+ "note": "a read alias becomes the bash it meant",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "cat -n a.py"
+   },
+   "errors": []
+  }
+ ]
+}

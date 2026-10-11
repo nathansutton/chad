@@ -1,0 +1,19 @@
+{
+ "note": "two tagged calls with a prose line between",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  },
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "pwd"
+   },
+   "errors": []
+  }
+ ]
+}

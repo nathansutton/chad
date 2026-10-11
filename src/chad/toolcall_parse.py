@@ -28,8 +28,26 @@ _FENCE_RE = re.compile(r"```(?:json|tool_call)?\s*(\{.*?\})\s*```", re.DOTALL)
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
-_XML_FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
-_XML_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
+# The XML dialect's openers and closers. A block owns the text up to the next opener of
+# its kind, and ends at the first closer in that stretch that sits at a block boundary
+# (see `_segments`) — not simply the first closer: a non-greedy `.*?</parameter>` cut a
+# write's content at the first `</parameter>` the content itself contained and landed
+# the truncated file with no error (found by the tool-call corpus,
+# tests/fixtures/toolcall_corpus). Nor simply the last: prose after a call that mentions
+# the closers would be swallowed into the value. The dialect has no escape, so a value
+# containing a literal `<parameter=` opener, or the dialect's own closing sequence
+# (`</parameter>` then `</function>`), is still unexpressible (known-gaps/).
+# `\s*` after `=` accepts `<parameter= path >`, which used to drop the parameter.
+_XML_FUNC_OPEN_RE = re.compile(r"<function=\s*([^>\s]+)\s*>")
+_XML_PARAM_OPEN_RE = re.compile(r"<parameter=\s*([^>\s]+)\s*>")
+_FUNC_CLOSE = "</function>"
+_PARAM_CLOSE = "</parameter>"
+# A `</parameter>` ends its parameter when only whitespace separates it from the next
+# parameter (the segment's end), the function's closer, or the block's closer.
+_AFTER_PARAM_CLOSE_RE = re.compile(r"\s*(?:</function>|</tool_call>|\Z)")
+# A `</function>` ends its function when the body before it is whole: it follows a
+# `</parameter>` (or the opener itself) with nothing but whitespace between.
+_BEFORE_FUNC_CLOSE_RE = re.compile(r"(?:</parameter>|\A)\s*\Z")
 _INT_PARAMS = {"offset", "limit", "timeout"}
 # Params whose value is file/command text, where leading whitespace on the FIRST line
 # is content: a wholesale .strip() eats the opening tab/spaces of an `edit` old/new
@@ -62,13 +80,64 @@ _TAG_SALVAGE_RE = re.compile(r"<tool_call>\s*(\{.*?)\s*</tool_call>", re.DOTALL)
 _XML_CRUFT_RE = re.compile(r"(?:\s*</?(?:parameter|function|tool_call)[^>]*>)+\s*$")
 
 
+def _close_index(seg: str, close: str, at_boundary) -> int:
+    """Where the block that `seg` begins ends: the first `close` for which
+    `at_boundary(seg, k)` holds, else the last `close` in `seg`, else -1 (unclosed)."""
+    last = -1
+    pos = 0
+    while True:
+        k = seg.find(close, pos)
+        if k == -1:
+            return last
+        if at_boundary(seg, k):
+            return k
+        last = k
+        pos = k + 1
+
+
+def _param_boundary(seg: str, k: int) -> bool:
+    return _AFTER_PARAM_CLOSE_RE.match(seg, k + len(_PARAM_CLOSE)) is not None
+
+
+def _func_boundary(seg: str, k: int) -> bool:
+    return _BEFORE_FUNC_CLOSE_RE.search(seg, 0, k) is not None
+
+
+def _segments(text: str, open_re, close: str, at_boundary) -> list[tuple[int, int, str, str]]:
+    """Each closed `<open=name>…</close>` block of `text` as (start, end, name, body).
+    A block owns the text up to the next opener of its kind; within that, its closer is
+    the first one at a block boundary (`at_boundary`), so a closer that appears inside a
+    value (a write whose content documents the dialect) is content, not a delimiter,
+    while prose after the call that mentions the closers is never reached. A block with
+    no closer before the next opener is unclosed — generation stopped inside it — and is
+    dropped: running a half-emitted call is worse than the malformed-call nudge."""
+    opens = list(open_re.finditer(text))
+    out = []
+    for i, m in enumerate(opens):
+        seg_end = opens[i + 1].start() if i + 1 < len(opens) else len(text)
+        seg = text[m.end():seg_end]
+        k = _close_index(seg, close, at_boundary)
+        if k == -1:
+            continue
+        out.append((m.start(), m.end() + k + len(close), m.group(1).strip(), seg[:k]))
+    return out
+
+
+def _func_segments(text: str):
+    return _segments(text, _XML_FUNC_OPEN_RE, _FUNC_CLOSE, _func_boundary)
+
+
+def _param_segments(body: str):
+    return _segments(body, _XML_PARAM_OPEN_RE, _PARAM_CLOSE, _param_boundary)
+
+
 def _call_spans(text: str) -> list[tuple[int, int]]:
     """The closed tool-call blocks of `text` as (start, end) spans: `<tool_call>…
     </tool_call>` and the XML dialect's `<function=…>…</function>`. A reasoning tag
     inside one of these is argument text — a model editing this very file, or a prompt
     that documents the tags — not a delimiter."""
     spans = [m.span() for m in _TOOL_CALL_BLOCK_RE.finditer(text)]
-    spans += [m.span() for m in _XML_FUNC_RE.finditer(text)]
+    spans += [(a, b) for a, b, _, _ in _func_segments(text)]
     return spans
 
 
@@ -146,17 +215,16 @@ def _parse_params(body: str) -> dict:
     with the same int-coercion as the XML dialect. Shared by the `<function=…>` and the
     hybrid `{"name":…}`+`<parameter>` parsers."""
     args: dict[str, JsonValue] = {}
-    for pm in _XML_PARAM_RE.finditer(body):
-        key = pm.group(1).strip()
+    for _, _, key, raw in _param_segments(body):
         val: JsonValue
-        if key in _TEXT_PARAMS and "\n" in pm.group(2):
+        if key in _TEXT_PARAMS and "\n" in raw:
             # Multi-line text value: the first line's indentation is content. A
             # single-line value keeps the legacy full strip — models emit inline
             # `<parameter=command> ls / </parameter>` padding, and single-line edits
             # are what the whitespace-flexible matcher already handles well.
-            val = _FRAME_RE.sub("", pm.group(2))
+            val = _FRAME_RE.sub("", raw)
         else:
-            text = pm.group(2).strip()
+            text = raw.strip()
             val = int(text) if key in _INT_PARAMS and text.lstrip("-").isdigit() else text
         args[key] = val
     return args
@@ -164,10 +232,10 @@ def _parse_params(body: str) -> dict:
 
 def _parse_xml_calls(text: str):
     calls = []
-    for fm in _XML_FUNC_RE.finditer(text):
-        name = salvage_tool_name(fm.group(1).strip())
+    for _, _, raw_name, body in _func_segments(text):
+        name = salvage_tool_name(raw_name)
         if name:
-            calls.append((name, _parse_params(fm.group(2))))
+            calls.append((name, _parse_params(body)))
     return calls
 
 

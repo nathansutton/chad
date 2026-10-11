@@ -1,0 +1,10 @@
+<tool_call>
+<function=write>
+<parameter=path>
+é.md
+</parameter>
+<parameter=content>
+héllo 🎉 — ok
+</parameter>
+</function>
+</tool_call>

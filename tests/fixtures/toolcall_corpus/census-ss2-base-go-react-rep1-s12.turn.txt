@@ -1,0 +1,111 @@
+
+
+Reordering is wrong: post-order over *outs* puts dependents before their dependencies. Need a proper downstream closure + deps-first topo order, recomputing only cells whose deps changed:
+
+<tool_call>
+<function=edit>
+<parameter=new>
+func (c *cell) propagate() {
+	// Collect the downstream closure of c.
+	closure := map[*cell]bool{}
+	stack := []*cell{c}
+	for len(stack) > 0 {
+		x := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if closure[x] {
+			continue
+		}
+		closure[x] = true
+		for _, o := range x.outs {
+			stack = append(stack, o)
+		}
+	}
+	// Topologically sort the closure, dependencies first.
+	var order []*cell
+	seen := map[*cell]bool{}
+	var build func(*cell)
+	build = func(x *cell) {
+		if seen[x] {
+			return
+		}
+		seen[x] = true
+		for _, d := range x.deps {
+			if closure[d] {
+				build(d)
+			}
+		}
+		order = append(order, x)
+	}
+	for x := range closure {
+		build(x)
+	}
+	// Recompute each affected cell once, in dependency order.
+	changed := map[*cell]bool{c: true}
+	for _, x := range order {
+		if x.compute == nil {
+			continue
+		}
+		vals := make([]int, len(x.deps))
+		anyDepChanged := false
+		for i, d := range x.deps {
+			vals[i] = d.value
+			anyDepChanged = anyDepChanged || changed[d]
+		}
+		if !anyDepChanged {
+			continue
+		}
+		newValue := x.compute(vals)
+		if newValue == x.value {
+			continue
+		}
+		x.value = newValue
+		changed[x] = true
+		for _, cb := range x.callbacks {
+			cb.callback(newValue)
+		}
+	}
+}
+</parameter>
+<parameter=old>
+func (c *cell) propagate() {
+	const (
+		unvisited = iota
+		inProgress
+		done
+	)
+	state := map[*cell]int{}
+	var order []*cell
+	var visit func(*cell)
+	visit = func(x *cell) {
+		switch state[x] {
+		case unvisited:
+			state[x] = inProgress
+			for _, o := range x.outs {
+				visit(o)
+			}
+			state[x] = done
+			order = append(order, x)
+		}
+	}
+	visit(c)
+	for _, x := range order {
+		if x.compute == nil {
+			continue
+		}
+		vals := make([]int, len(x.deps))
+		for i, d := range x.deps {
+			vals[i] = d.value
+		}
+		newValue := x.compute(vals)
+		if newValue == x.value {
+			continue
+		}
+		x.value = newValue
+		for _, cb := range x.callbacks {
+			cb.callback(newValue)
+		}
+	}
+}
+</parameter>
+</function>
+</tool_call>

@@ -1,0 +1,14 @@
+{
+ "note": "reasoning tags inside a call's arguments are text (PR #121)",
+ "calls": [
+  {
+   "name": "edit",
+   "arguments": {
+    "path": "p.py",
+    "old": "x = '<think>'",
+    "new": "x = '</think>'"
+   },
+   "errors": []
+  }
+ ]
+}

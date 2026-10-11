@@ -1,0 +1,13 @@
+{
+ "note": "content before path",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "hi"
+   },
+   "errors": []
+  }
+ ]
+}

@@ -286,6 +286,13 @@ def _opened_paths(command: str) -> list:
             if _PATHISH_RE.match(t) and os.path.isfile(t)]
 
 
+def opened_paths(command: str) -> list:
+    """Public name for `_opened_paths`: the files a bash display command put on screen.
+    The agent keeps a per-turn list of these (plus landed writes/edits) for the
+    `edit_path_inferred` lever."""
+    return _opened_paths(command)
+
+
 def _grep_ident(command: str) -> str:
     """The identifier a bash grep searched for, or "". First non-flag argument
     of the first grep/rg/ag segment, identifier-shaped only."""

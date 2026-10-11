@@ -1,0 +1,52 @@
+
+
+The test constructs `Character character;` with no arguments, so the struct needs a generating default constructor (uninitialized ints would fail the range checks):
+
+<tool_call>
+<function=write>
+<parameter=content>
+#pragma once
+
+namespace dnd_character {
+
+int modifier(int score);
+int ability();
+
+struct Character {
+    Character();
+    int strength;
+    int dexterity;
+    int constitution;
+    int intelligence;
+    int wisdom;
+    int charisma;
+    int hitpoints;
+};
+
+}  // namespace dnd_character
+
+</parameter>
+<parameter=path>
+dnd_character.h
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=edit>
+<parameter=content>
+Character::Character() {
+    strength = ability();
+    dexterity = ability();
+    constitution = ability();
+    intelligence = ability();
+    wisdom = ability();
+    charisma = ability();
+    hitpoints = 10 + modifier(constitution);
+}
+
+</parameter>
+<parameter=path>
+dnd_character.cpp
+</parameter>
+</function>
+</tool_call>

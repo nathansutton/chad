@@ -1,0 +1,12 @@
+{
+ "note": "a call drafted inside <think> is reasoning; only the real one runs",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

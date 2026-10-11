@@ -1,0 +1,3 @@
+```json
+{"name": "write", "arguments": {"path": "b.py", "content": "x"}}
+```

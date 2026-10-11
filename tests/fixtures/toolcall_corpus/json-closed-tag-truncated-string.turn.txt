@@ -1,0 +1,3 @@
+<tool_call>
+{"name": "write", "arguments": {"path": "a.md", "content": "half of
+</tool_call>

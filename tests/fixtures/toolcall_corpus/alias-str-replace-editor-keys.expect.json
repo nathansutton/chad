@@ -1,0 +1,14 @@
+{
+ "note": "another harness's editor name and keys",
+ "calls": [
+  {
+   "name": "edit",
+   "arguments": {
+    "path": "a.py",
+    "old": "x",
+    "new": "y"
+   },
+   "errors": []
+  }
+ ]
+}

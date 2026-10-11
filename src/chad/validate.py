@@ -7,9 +7,9 @@ string. The cloud fix (typia, https://typia.io) is a three-stage harness —
 
     lenient PARSE  ->  type COERCE  ->  typed VALIDATE
 
-— and on failure it feeds the model back its OWN arguments annotated with
-exactly which fields are wrong and what was expected, so it repairs only the
-marked fields instead of regenerating blindly. typia reports this took Qwen
+— and on failure it tells the model exactly which of its fields are wrong and
+what was expected, so it repairs only the marked fields instead of regenerating
+blindly. typia reports this took Qwen
 6.75% -> 100% on a hard nested-union schema.
 
 This is the Python port over chad's EXISTING JSON-Schema tool definitions
@@ -417,27 +417,33 @@ def render_repair(name: str, args: JsonValue, errors: List[Err]) -> str:
             lines.append(f"  ✗ {e.path}  → required, but missing (expected {e.expected})")
         else:
             lines.append(f"  ✗ {e.path} = {e.got}  → expected {e.expected}")
-    echo = _echo_call(name, args)
-    if echo and len(echo) <= 600:
-        lines.append("your call was:")
-        lines.append(echo)
+    # A key the schema does not have, named — for chad's own tools only. The census
+    # shape: `edit` sent with `content`, told only that `old` and `new` were missing;
+    # the model meant `write`. Unknown keys stay in the args (MCP schemas are loose and
+    # a stray key must not fail a call that is otherwise valid); only this message, on
+    # a call already being rejected, changes.
+    lines += _unknown_key_lines(name, args)
+    # The call is NOT echoed back. It used to be, when under 600 characters, re-rendered
+    # in the template's dialect as a few-shot of the shape; the 2026-10-10 census (plan
+    # 004) read every rejection in 100 trials: shown on 3, dropped on 7, and the model
+    # regenerated the whole call and recovered on the next step at the same rate either
+    # way (2/3 vs 6/7). Its own call is the assistant message directly above this
+    # result, so the echo was a verbatim duplicate paid as prefill — most expensive on
+    # the long writes that were over the cap and never saw it anyway.
     return "\n".join(lines)
 
 
-def _echo_call(name: str, args: JsonValue) -> str:
-    """The model's own call, re-rendered in the dialect the chat template mandates.
-    This echo sits directly above the model's retry, so it is a few-shot example of the
-    call shape whether or not it is meant as one; rendering it as a JSON object showed
-    the model a format its template forbids, and misquoted what it had actually sent."""
-    if not is_json_object(args):
-        return ""
-    parts = [f"<tool_call>\n<function={name}>"]
-    for k, v in args.items():
-        if not isinstance(v, str):
-            try:
-                v = json.dumps(v, ensure_ascii=False)
-            except (TypeError, ValueError):
-                v = str(v)
-        parts.append(f"<parameter={k}>\n{v}\n</parameter>")
-    parts.append("</function>\n</tool_call>")
-    return "\n".join(parts)
+def _unknown_key_lines(name: str, args: JsonValue) -> List[str]:
+    if name not in _builtin_names() or not is_json_object(args):
+        return []
+    props = list((_param_schema(name) or {}).get("properties", {}))
+    extra = [k for k in args if k not in props]
+    if not extra:
+        return []
+    takes = ", ".join(props)
+    return [f"  ✗ {k} → not a parameter of {name} ({name} takes {takes})" for k in extra]
+
+
+def _builtin_names() -> frozenset:
+    from .tools import SCHEMAS
+    return frozenset(s["function"]["name"] for s in SCHEMAS)

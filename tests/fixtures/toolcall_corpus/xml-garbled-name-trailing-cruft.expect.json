@@ -1,0 +1,12 @@
+{
+ "note": "observed on the llama backend: the name's close garbled (`bash</argstr`); the leading identifier is salvaged",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

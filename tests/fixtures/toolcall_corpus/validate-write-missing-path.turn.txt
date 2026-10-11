@@ -1,0 +1,7 @@
+<tool_call>
+<function=write>
+<parameter=content>
+hello
+</parameter>
+</function>
+</tool_call>

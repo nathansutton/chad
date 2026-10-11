@@ -1,0 +1,7 @@
+<tool_call>
+<function=bash >
+<parameter=command>
+ls
+</parameter>
+</function>
+</tool_call>

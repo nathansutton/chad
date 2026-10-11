@@ -1,0 +1,13 @@
+{
+ "note": "the outer tag name inside content",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "emit <tool_call> blocks"
+   },
+   "errors": []
+  }
+ ]
+}

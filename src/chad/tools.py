@@ -923,6 +923,145 @@ def alias_to_bash(name: str, args):
     return "bash", {"command": cmd}
 
 
+# The same for writes and edits. The 2026-10-10 slip census (plan 004) found two
+# `write_file` calls in 90 trials, each a well-formed `write` under the wrong name, each
+# costing the step that re-emitted it. Unlike the read aliases these rewrite to the
+# built-in tool itself, so the agent prepends one fact line to the result
+# (`[no tool is named write_file; ran write]`); the rewrite is the `tool_name_alias`
+# lever, fired at the rewrite site in agent.py.
+WRITE_ALIASES = frozenset({"write_file", "create_file", "save_file", "writefile"})
+EDIT_ALIASES = frozenset({
+    "edit_file", "replace", "str_replace", "str_replace_editor", "replace_in_file",
+})
+
+# Argument names the model uses for the three fields, under any alias. Checked in
+# order, so a call that already carries the canonical key is never touched.
+_CONTENT_KEYS = ("content", "contents", "file_text", "text", "new_content")
+_OLD_KEYS = ("old", "old_string", "old_str", "old_text", "search")
+_NEW_KEYS = ("new", "new_string", "new_str", "new_text", "replace")
+
+
+def _rekey(args: dict, keys, canonical: str) -> dict:
+    """Move the first present key in `keys` to `canonical`, if `canonical` is absent."""
+    if canonical in args:
+        return args
+    for k in keys:
+        if k in args and k != canonical:
+            out = dict(args)
+            out[canonical] = out.pop(k)
+            return out
+    return args
+
+
+def alias_write_edit(name: str, args):
+    """Rewrite a hallucinated write/edit name into the built-in call it meant.
+
+    Returns `(name, args)` unchanged when `name` is not an alias, when a real tool (an
+    MCP server's) answers to the name, or when the arguments are not an object. Keys
+    are renamed (`file_path` → `path`, `old_str` → `old`, …); whatever is still missing
+    is left for the validator to name, as it would for the canonical call.
+    """
+    if not is_json_object(args):
+        return name, args
+    if name in WRITE_ALIASES:
+        target = "write"
+    elif name in EDIT_ALIASES:
+        target = "edit"
+    else:
+        return name, args
+    if dispatch_for(name) is not None:
+        return name, args
+    out = _rekey(dict(args), _PATH_KEYS, "path")
+    if target == "write":
+        out = _rekey(out, _CONTENT_KEYS, "content")
+    else:
+        out = _rekey(out, _OLD_KEYS, "old")
+        out = _rekey(out, _NEW_KEYS, "new")
+    return target, out
+
+
+def alias_by_shape(name: str, args):
+    """Rewrite a built-in call that carries another built-in's parameters into that tool.
+
+    The 2026-10-10 paired block (plan 004) found four `write` calls whose only parameter
+    was `todos`: the model named one tool and filled in another's form. The rule is
+    general and strict so that it never guesses: `name` must be one of chad's own tools,
+    none of the keys sent may belong to it, and exactly one other built-in must accept
+    every key sent and have all of its required keys present. Anything looser stays a
+    rejection — `edit` sent with `path` and `content` is NOT rewritten to `write`, because
+    `path` is `edit`'s own key and the model may have meant to append; the validator
+    names the stray key instead. Returns `(name, args)` unchanged when the rule does not
+    apply. The same `tool_name_alias` lever as `alias_write_edit` guards the call site.
+    """
+    if not is_json_object(args) or not args:
+        return name, args
+    params = {s["function"]["name"]: s["function"].get("parameters", {}) for s in SCHEMAS}
+    own = params.get(name)
+    if own is None:
+        return name, args
+    keys = set(args)
+    if keys & set(_schema_names(own, "properties")):
+        return name, args
+    fits = [t for t, p in params.items()
+            if t != name
+            and keys <= set(_schema_names(p, "properties"))
+            and set(_schema_names(p, "required")) <= keys]
+    if len(fits) != 1:
+        return name, args
+    return fits[0], args
+
+
+def _schema_names(params: dict, field: str) -> list:
+    """The names a JSON-Schema object lists under `field`: the keys of `properties`, or
+    the strings of `required`; [] when the field is absent or not of that shape."""
+    v = params.get(field)
+    if is_json_object(v):
+        return list(v)
+    if is_json_array(v):
+        return [x for x in v if is_text(x)]
+    return []
+
+
+def tool_params(name: str) -> list:
+    """The parameter names of a built-in tool, in schema order; [] for any other name."""
+    for s in SCHEMAS:
+        if s["function"]["name"] == name:
+            return _schema_names(s["function"].get("parameters", {}), "properties")
+    return []
+
+
+def infer_edit_path(args, files):
+    """Which of `files` an `edit` without `path` meant: the one file whose text contains
+    `old`. Returns `(path or None, matched)` — `path` only when exactly one matched.
+
+    `files` is the turn's own list (what bash displayed, what write/edit landed), never
+    the repository: five of the ten slips in the 2026-10-10 census were an `edit` sent
+    with `old` and `new` and no `path`, and in every one the file was among the turn's
+    own reads. Nothing here applies anything; the caller decides, fires the
+    `edit_path_inferred` lever, and leads the result with the fact. Never for `write`.
+    """
+    old = args.get("old") if is_json_object(args) else None
+    if not is_text(old) or not old:
+        return None, []
+    matched = []
+    seen = set()
+    for f in files:
+        ap = os.path.abspath(f)
+        if ap in seen:
+            continue
+        seen.add(ap)
+        try:
+            if not os.path.isfile(f) or os.path.getsize(f) > 2_000_000:
+                continue
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        if old in text:
+            matched.append(f)
+    return (matched[0] if len(matched) == 1 else None), matched
+
+
 # Each entry takes (args, should_stop); long-running tools honor should_stop so a
 # ctrl-c interrupt can abort them mid-flight.
 DISPATCH = {
@@ -952,6 +1091,16 @@ JsonValue = Union[None, bool, int, float, str, Sequence["JsonValue"], Mapping[st
 def is_json_object(value: JsonValue) -> "TypeIs[dict[str, JsonValue]]":
     """A JSON object: the only shape a tool call's arguments can dispatch as."""
     return isinstance(value, dict)
+
+
+def is_text(value: JsonValue) -> "TypeIs[str]":
+    """A JSON string: what a text parameter (`old`, `new`, `content`, a path) must be."""
+    return isinstance(value, str)
+
+
+def is_json_array(value: JsonValue) -> "TypeIs[list[JsonValue]]":
+    """A JSON array, as `json.loads` produces it."""
+    return isinstance(value, list)
 
 
 class FunctionSchema(TypedDict):
@@ -1043,7 +1192,8 @@ SCHEMAS: list[ToolSchema] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {"type": "string",
+                             "description": "Relative file path."},
                     "content": {"type": "string"},
                 },
                 "required": ["path", "content"],
@@ -1061,7 +1211,8 @@ SCHEMAS: list[ToolSchema] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {"type": "string",
+                             "description": "Relative file path."},
                     "old": {"type": "string", "description": "Exact text to replace (must be unique)."},
                     "new": {"type": "string"},
                 },

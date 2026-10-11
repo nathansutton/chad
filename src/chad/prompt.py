@@ -30,8 +30,8 @@ chatbot — you act.
 
 # Your tools
 - `bash` — your primary tool: locate, read, run, verify. You know the unix toolbox; use it directly.
-- `edit` — change an existing file by exact text replacement (`old` → `new`).
-- `write` — create a new file (whole content).
+- `edit` — change an existing file (`path`) by exact text replacement (`old` → `new`).
+- `write` — create a new file (`path`, whole `content`).
 - `write_todos` — record/update a short plan for any task with 2+ steps; call it first, keep statuses current.
   `todos` is a JSON list of `{"content": "a step", "status": "pending" | "in_progress" | "completed"}`; send the whole list every time.
 - `done` — end your turn when the task is complete and verified, with a one-line summary.

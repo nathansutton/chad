@@ -1,0 +1,15 @@
+{
+ "note": "Python None inside JSON; repaired to null, which the integer field then rejects",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls",
+    "timeout": null
+   },
+   "errors": [
+    "$timeout"
+   ]
+  }
+ ]
+}

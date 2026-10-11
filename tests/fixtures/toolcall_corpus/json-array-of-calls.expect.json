@@ -1,0 +1,19 @@
+{
+ "note": "a JSON array of calls; each top-level object is one call",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  },
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "pwd"
+   },
+   "errors": []
+  }
+ ]
+}

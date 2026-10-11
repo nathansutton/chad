@@ -1,0 +1,13 @@
+{
+ "note": "a CLOSED block whose string never closed: the model emitted the closer, so this is the deliberate salvage, not a truncation",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "half of"
+   },
+   "errors": []
+  }
+ ]
+}

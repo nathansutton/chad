@@ -1,0 +1,14 @@
+{
+ "note": "a name nothing answers to",
+ "calls": [
+  {
+   "name": "frobnicate",
+   "arguments": {
+    "x": 1
+   },
+   "errors": [
+    "$"
+   ]
+  }
+ ]
+}

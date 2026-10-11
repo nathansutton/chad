@@ -1,0 +1,12 @@
+{
+ "note": "a space before the opener's >",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

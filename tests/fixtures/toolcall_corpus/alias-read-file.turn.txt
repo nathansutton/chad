@@ -1,0 +1,3 @@
+<tool_call>
+{"name": "read_file", "arguments": {"path": "a.py"}}
+</tool_call>

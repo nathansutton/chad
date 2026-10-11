@@ -1,0 +1,13 @@
+{
+ "note": "census shape (python/bowling.rep1 #4): a complete write under the wrong name",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.py",
+    "content": "x"
+   },
+   "errors": []
+  }
+ ]
+}

@@ -1,0 +1,15 @@
+{
+ "note": "an aliased edit still missing path is told so under the real name",
+ "calls": [
+  {
+   "name": "edit",
+   "arguments": {
+    "old": "x",
+    "new": "y"
+   },
+   "errors": [
+    "$path"
+   ]
+  }
+ ]
+}

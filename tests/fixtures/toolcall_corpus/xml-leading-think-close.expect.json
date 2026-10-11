@@ -1,0 +1,12 @@
+{
+ "note": "the template-opened reasoning block: a leading </think> with no opener",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}

@@ -1,0 +1,8 @@
+<tool_call>
+<function=bash>
+<parameter=command>
+ls
+</parameter>
+</function>
+</tool_call>
+Note: every block ends with </parameter> and </function>.

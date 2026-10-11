@@ -1,0 +1,10 @@
+<tool_call>
+<function=write>
+<parameter=content>
+hi
+</parameter>
+<parameter=path>
+a.md
+</parameter>
+</function>
+</tool_call>

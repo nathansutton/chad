@@ -1,0 +1,13 @@
+{
+ "note": "the tag names inside a JSON string",
+ "calls": [
+  {
+   "name": "write",
+   "arguments": {
+    "path": "a.md",
+    "content": "emit <tool_call> blocks </tool_call> ok"
+   },
+   "errors": []
+  }
+ ]
+}

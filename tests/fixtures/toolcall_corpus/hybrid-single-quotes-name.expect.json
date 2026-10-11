@@ -1,0 +1,12 @@
+{
+ "note": "single-quoted opener",
+ "calls": [
+  {
+   "name": "bash",
+   "arguments": {
+    "command": "ls"
+   },
+   "errors": []
+  }
+ ]
+}
