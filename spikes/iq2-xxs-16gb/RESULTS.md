@@ -1,6 +1,14 @@
 # IQ2_XXS on a 16 GB Mac — results
 
-**Verdict:** _pending_
+**Verdict: IQ2_XXS doesn't work on this machine** (16 GB **M1**). It loads and fits (no swap growth) but failed the
+Phase 2 gate at **2/9** (cpp 2/3, go 0/3, rust 0/3; 7 capped), and on the Phase 1 task it thought for 30 min without a
+single tool call. UD-IQ2_S did the smoke task (~26 min, verified) but hit **4 Metal OOMs** in prefill (recovered), so
+per the plan it stopped there. The ternary did the smoke task fastest (~20 min, verified, no OOM, decode 15.0 tok/s
+in the bench), then went 0/3 on h3 rep 1 before the run was cancelled.
+
+Nothing here supports pointing PR #124's contributor at IQ2_XXS instead of the ternary. On this M1 both
+are wall-cap-bound at ~5 tok/s in the agent, and the gate as designed can't tell them apart. A 16 GB **M2** (or
+a longer `--wall-cap`) is still needed to answer the original question.
 
 ## Machine
 
@@ -214,3 +222,69 @@ Clean machine this time: no other heavy apps, nothing compiling.
 | prefill / decode (chad-bench) | 32 / 10.0 tok/s | 24 / 12.9 tok/s |
 | decode in agent | 4.2–6.5 tok/s | 5.5–6.1 tok/s |
 | roman.py task | not finished in 30 min, zero tool calls | **finished in ~26 min, 25 tests pass (verified)** |
+
+**Stopped Phase 4 at IQ2_S on the owner's call** (Metal OOMs = stop). IQ2_S's gate block was not run. Afterwards the
+owner deleted the IQ2_XXS and IQ2_S caches (`~/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF`,
+`~/.cache/chad/gguf/Qwen3.8-27B-UD-IQ2_{XXS,S}-*`; about 30 GB) and asked for the ternary pack to be
+tested on this machine with the same protocol.
+
+## Ternary Bonsai 2 pack on the same M1 16 GB
+
+`CHAD_MODEL=nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX`, same script and same roman.py task as Phase 4.
+
+- First load (download): `ready in 123.1s | context 262144 tokens (compact at 8192)`.
+- `GOVERNOR ctx_limit=8,192 | budget=11.45 GB active=8.76 GB transient=4.30 GB host_avail=3.03 GB kv=65536 B/tok`,
+  the same 8192 floor as both quants.
+- It uses its own bundled drafter (`.../Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX/.../dflash`) instead of borrowing one.
+  The QSDPA self-check fails the same way.
+- **Real task: finished.** `exit=0`, 1532 s wall from launch (download included); `ready` 09:10:00 → `DONE accepted` 09:30:15,
+  so **about 20 min, 13 steps**. Final answer: "Wrote roman.py (to_roman/from_roman for 1..3999; from_roman rejects
+  non-canonical forms) and test_roman.py (15 pytest tests ...); pytest passed 15/15 and a full-range 1..3999 round-trip
+  sanity check passed." Verified independently: `15 passed`; round-trip over 1..3999 holds; `to_roman(3999) == 'MMMCMXCIX'`.
+  First tool call came about 2 min after `ready`.
+- **No Metal OOM.** Swap 0.62–0.64 GB, flat.
+- `uv run chad-bench` (ternary): load 5.6 s; prefill 5000 tok in 186.33 s → **27 tok/s**; decode 128 tok in 8.51 s → **15.0 tok/s**;
+  warm step 1.45 s. Swap 0.62 GB flat.
+
+| metric | IQ2_XXS | IQ2_S | ternary |
+|---|---|---|---|
+| resident (`active`) | 8.47 GB | 9.57 GB | 8.76 GB |
+| compact at | 8192 | 8192 | 8192 |
+| Metal OOM | none | 4 (recovered) | none |
+| prefill / decode (chad-bench) | 32 / 10.0 | 24 / 12.9 | 27 / 15.0 tok/s |
+| roman.py | not finished (30 min, 0 tool calls) | finished ~26 min | finished ~20 min, 13 steps |
+
+### Ternary harness-3 (cancelled by the owner after rep 1)
+
+```sh
+CHAD_MODEL=nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX \
+  uv run python benchmarks/polyglot/run.py --label tern-m1-h3 \
+    --tasks-file benchmarks/polyglot/subsets/harness-3.txt --reps 3
+```
+
+| task | rep | passed | capped | wall s | steps | gen tok | peak ctx |
+|---|---|---|---|---|---|---|---|
+| cpp/grade-school | 1 | ❌ | cap | 1199.9 | 4 | 5415 | 6812 |
+| go/scale-generator | 1 | ❌ | cap | 1200.0 | 3 | 6034 | 5616 |
+| rust/alphametics | 1 | ❌ | cap | 1199.9 | 12 | 4145 | 8119 |
+
+0/3 on rep 1, all capped. IQ2_XXS's rep 1 on the same machine was 1/3. Three trials can't separate the two.
+- **cpp/grade-school rep 1:** three bash steps exploring, then a 3,072-token think block (577 s) about the 656 KB
+  Catch2 header (`test/catch.hpp`). It never edited the solution. `think 3245 tok, decode 655 s, prefill 84 s, 5.4 tok/s`;
+  draft acceptance 38% think / 30% act. In the agent the ternary decodes at about 5.4 tok/s, the same as IQ2_XXS,
+  even though `chad-bench` says 15.0.
+
+## What surprised me / what I could not do
+
+- **The machine is an M1, not an M2.** Every quant and the ternary decoded at about 5–6 tok/s inside the agent, and with
+  that and an 8k compaction trigger, most trials run out the 1200 s cap. On this hardware the wall cap, more than the
+  quant, decides most trials.
+- **On 16 GB the governor puts every candidate on the 8192 floor** (8.47–9.57 GB resident + 4.30 GB transient vs an
+  11.45 GB Metal budget).
+- **The QSDPA fused kernel fails its NaN self-check on M1** for every model, and chad falls back to stock attention.
+- **`chad-bench` decode overstates agent decode by 2–3×** (10–15 tok/s bench vs 5–6 in the agent at 28–48% draft
+  acceptance), and the default bench reports neither the serial/drafted split nor acceptance.
+- The plan's disk budget leaves out the ~7–8 GB converted copy each GGUF quant writes to `~/.cache/chad`.
+- `run.py`'s one-block guard fires on an ancestor `caffeinate` whose argv contains the script path (see Phase 2).
+- **Not done:** Phase 3 (h36 paired runs), IQ2_S's Phase 2, UD-Q2_K_XL, and the remaining 6 ternary h3 trials.
+  So there is **no same-machine paired comparison** between IQ2_XXS and the ternary.
