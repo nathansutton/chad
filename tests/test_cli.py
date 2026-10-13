@@ -144,30 +144,42 @@ def test_pick_model_no_size_shorthands(monkeypatch, tmp_path):
         check(f"--model {spec} reason says requested", "requested" in why.lower(), why)
 
 
-def test_pick_model_one_model_every_box(monkeypatch, tmp_path):
-    """One model, whatever the RAM: there is no smaller tier to fall back to."""
+def test_pick_model_default_follows_ram(monkeypatch, tmp_path):
+    """The same Qwen3.8-27B on every box, in the build its RAM can hold: the Q3_K_XL
+    file from 24 GB up, the ternary pack below."""
     monkeypatch.delenv("CHAD_MODEL", raising=False)
     no_local = str(tmp_path / "no-local-build")   # no local build -> HF repo
-    for ram in (16.0, 24.0, 64.0, None):
+    for ram, want in ((16.0, cli._HF_MODEL_SMALL), (18.0, cli._HF_MODEL_SMALL),
+                      (24.0, cli._HF_MODEL), (64.0, cli._HF_MODEL)):
         model, why = cli._pick_model(host=_host(ram), local_model=no_local)
-        check(f"RAM {ram} -> the shipped repo", model == cli._HF_MODEL, model)
+        check(f"RAM {ram} -> its build", model == want, model)
         check(f"RAM {ram} reason is a default", "default" in why, why)
+    # A dev clone's local Q3_K_XL build is preferred only where that build is the default.
+    local = tmp_path / "local-build"
+    local.mkdir()
+    model, _ = cli._pick_model(host=_host(64.0), local_model=str(local))
+    check("24 GB+ prefers the local build", model == str(local), model)
+    model, _ = cli._pick_model(host=_host(16.0), local_model=str(local))
+    check("16 GB ignores the local 14 GB build", model == cli._HF_MODEL_SMALL, model)
 
 
-def test_pick_model_small_box_warns(monkeypatch, capsys, tmp_path):
-    """Below the 24 GB target chad warns and proceeds — it advises, it does not gate.
-
-    Retiring the 9B removed the safe fallback, so this warning is the only thing
-    standing between a 16 GB Mac and a silently unusable context window.
-    """
+def test_pick_model_16gb_is_served_quietly(monkeypatch, capsys, tmp_path):
+    """A 16 GB Mac is a supported box: it gets the ternary pack, told why in the
+    reason, with no warning. Only a box under 16 GB, or one whose RAM cannot be read,
+    is warned, and it is still served: chad advises, it does not gate."""
     monkeypatch.delenv("CHAD_MODEL", raising=False)
     no_local = str(tmp_path / "no-local-build")
 
-    model, _ = cli._pick_model(host=_host(16.0), local_model=no_local)
+    model, why = cli._pick_model(host=_host(16.0), local_model=no_local)
+    check("16 GB gets the ternary pack", model == cli._HF_MODEL_SMALL, model)
+    check("16 GB does not warn", capsys.readouterr().err == "")
+    check("the reason names the RAM read", "16 GB" in why, why)
+
+    model, _ = cli._pick_model(host=_host(8.0), local_model=no_local)
     err = capsys.readouterr().err
-    check("small box still served", model == cli._HF_MODEL, model)
+    check("small box still served", model == cli._HF_MODEL_SMALL, model)
     check("small box warns", "below the" in err, err)
-    check("warning names the RAM read", "16 GB" in err, err)
+    check("warning names the RAM read", "8 GB" in err, err)
 
     # RAM unreadable: same warning path, named as undetectable rather than a number.
     cli._pick_model(host=_host(None), local_model=no_local)

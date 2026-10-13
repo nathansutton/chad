@@ -43,10 +43,11 @@ Tests are listed by which ones import the module.
 | `mlx_qsdpa.py` | Fused attention over the 8-bit quantized KV cache, for decode, verify and prefill. | `test_mlx_qsdpa.py`, `test_engine_kvquant.py` |
 | `prism_pack.py` | Loader for Hadamard-rotated 2-bit packs, which mlx-lm's plain loader would load without the rotation. | `test_prism_pack.py` |
 | `prompt.py` | System-prompt construction and the answer-on-paper / verify-nudge intent classifier. | `test_intent.py`, `test_warm_prefix_tiers.py`, `test_ambient.py`, `test_skills.py` |
-| `prove.py` | `chad prove`: a smoke test pinned to the shipped model, offline after the cache check. | `test_prove.py` |
+| `prove.py` | `chad prove`: a smoke test pinned to this machine's default model, offline after the cache check. | `test_prove.py` |
 | `render.py` | Terminal rendering of tokens and tool results, behind the `_emit(kind, text)` callback the REPL and TUI supply. | `test_render.py`, `test_confirm_preview.py`, `test_feel_pack.py` |
 | `repomap.py` | Tree-sitter tag extraction for the ambient levers, mtime-cached per file. | `test_repomap.py`, `test_repomap_polyglot.py`, `test_ambient.py` |
 | `seatbelt.py` | macOS Seatbelt confinement for yolo-mode bash: the spawned shell, never the chad process. | `test_seatbelt.py` |
+| `serve.py` | `chad-serve`: the engine behind an OpenAI-compatible `/v1/chat/completions`, for other agents (see `docs/pi.md`). | `test_serve.py` |
 | `session.py` | Conversation persistence per project directory, with the ref to the session's KV checkpoint when it ended cleanly. | `test_session.py`, `test_cli_modes.py`, `test_kv_resume.py`, `conftest.py` |
 | `skills.py` | Agent Skills: discover `SKILL.md` dirs, parse frontmatter leniently, offer each as a slash command, load only the one asked for. | `test_skills.py`, `test_validate.py`, `test_ignore.py` |
 | `slash.py` | The check both front ends run before a line reaches the model: an unknown slash command is reported, not sent as a task. | `test_slash.py`, `test_tui.py` |

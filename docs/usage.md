@@ -2,11 +2,14 @@
 
 ## Before you start
 
-- An Apple Silicon Mac with 24 GB of RAM or more, on macOS 14 or later.
+- An Apple Silicon Mac with 16 GB of RAM or more, on macOS 14 or later. 24 GB and up
+  runs the full build; a 16 GB Air or mini runs the smaller ternary build, chosen for
+  you ([what changes on 16 GB](16gb.md)).
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/), which installs and
   runs chad.
-- About 30 GB of free disk for the first run: a ~14 GB download plus a ~13 GB converted
-  copy that makes later starts fast. chad checks before it downloads.
+- About 30 GB of free disk for the first run on 24 GB and up: a ~14 GB download plus a
+  ~13 GB converted copy that makes later starts fast. On 16 GB it is about 11 GB: one
+  ~9 GB download, no converted copy. chad checks before it downloads.
 - `git`, which `/undo` uses to snapshot your files (`xcode-select --install` on a new Mac).
 
 Then, from inside a project:

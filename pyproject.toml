@@ -5,7 +5,7 @@
 # script added under [project.scripts].
 name = "chad-code"
 version = "2.4.0"
-description = "Claude-Code-style coding agent that runs entirely on a 24 GB Apple Silicon Mac (MLX, Qwen3.8-27B)"
+description = "Claude-Code-style coding agent that runs entirely on a 16 GB or larger Apple Silicon Mac (MLX, Qwen3.8-27B)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -104,13 +104,15 @@ speech = [
     "sounddevice>=0.5",
 ]
 
-# The one entrypoint: `uv run chad`. (`chad-bench` reproduces docs/benchmarks.md.)
+# The one entrypoint: `uv run chad`. (`chad-bench` reproduces docs/benchmarks.md;
+# `chad-serve` exposes the engine to other agents, see docs/pi.md.)
 # `chad-code` is an alias so `uvx chad-code` (which runs the console script matching
 # the DISTRIBUTION name) just works; the command you actually type stays `chad`.
 [project.scripts]
 chad = "chad.cli:main"
 chad-code = "chad.cli:main"
 chad-bench = "chad.bench:main"
+chad-serve = "chad.serve:main"
 
 [project.urls]
 Repository = "https://github.com/nathansutton/chad"
