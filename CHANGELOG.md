@@ -4,6 +4,15 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**GGUFs of the qwen35 family from other converters load.** The loader required a BOS id
+in the header and quantized GDN gate projections, which held for Unsloth's files but
+not for bartowski's or Ornith's own: Qwen prepends no BOS, so those converters omit the
+key, and bartowski's also leaves the 32-row `ssm_alpha`/`ssm_beta` gates as F32. A
+missing BOS id now falls back to the padding id (the same `<|endoftext|>` the donor
+config names for both), and a float gate takes the dense path it already had for small
+projections. A large float projection is still refused. The shipped model's files are
+unaffected.
+
 **A tool call whose arguments mention the reasoning tags is parsed whole.** The parser
 removed every `<think>…</think>` span from a turn before reading its calls, including
 one spelled out inside an `edit`'s old/new text, so the middle of the call vanished and
