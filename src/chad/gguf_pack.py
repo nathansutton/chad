@@ -250,9 +250,23 @@ def read_geometry(reader) -> Geometry:
         rms_eps=float(a("attention.layer_norm_rms_epsilon")),
         context=int(a("context_length")),
         vocab=int(embd.shape[1]),
-        bos=int(_field(reader, "tokenizer.ggml.bos_token_id")),
+        bos=_bos_id(reader),
         eos=int(_field(reader, "tokenizer.ggml.eos_token_id")),
     )
+
+
+def _bos_id(reader) -> int:
+    """The id the config names as BOS, which also becomes the second stop id. Qwen
+    prepends no BOS, so converters disagree on writing one: some store
+    `<|endoftext|>` there, others (`add_bos_token` false) omit the key and carry the
+    same token only as the padding id. Falling back to it reproduces the donor's
+    generation config, where bos and pad are the one `<|endoftext|>`."""
+    if "tokenizer.ggml.bos_token_id" in reader.fields:
+        return int(_field(reader, "tokenizer.ggml.bos_token_id"))
+    if "tokenizer.ggml.padding_token_id" in reader.fields:
+        return int(_field(reader, "tokenizer.ggml.padding_token_id"))
+    raise ValueError("GGUF header has neither 'tokenizer.ggml.bos_token_id' nor "
+                     "'tokenizer.ggml.padding_token_id'")
 
 
 def text_config(g: Geometry) -> dict:
@@ -742,17 +756,20 @@ def _convert(config: dict) -> "tuple[nn.Module, dict[str, Slot]]":
         if perm is not None:
             raw = raw[perm]
         if p.kind in ("linear", "embedding"):
-            if not quantized:
+            dense_gate = p.kind == "linear" and raw.shape[0] < _DENSE_ROWS
+            if not quantized and not dense_gate:
                 raise ValueError(f"{t.name}: float projection {t.tensor_type.name}")
-            if qtype not in mlx_gguf.FORMATS:
+            if quantized and qtype not in mlx_gguf.FORMATS:
                 raise ValueError(f"{t.name}: unsupported GGUF format {t.tensor_type.name}")
             in_dims = int(t.shape[0])
             w = mx.array(raw)
-            if p.kind == "linear" and raw.shape[0] < _DENSE_ROWS:
+            if dense_gate:
                 # The GDN's per-head gate projections are a few dozen rows: too few
-                # to occupy the fused kernel, and a few hundred KB each as bf16.
+                # to occupy the fused kernel, and a few hundred KB each as bf16. Some
+                # converters leave them unquantized, already the floats this wants.
                 lin = nn.Linear(in_dims, raw.shape[0], bias=False)
-                dense = mlx_gguf.dequantize(w, qtype, in_dims, dtype)
+                dense = (mlx_gguf.dequantize(w, qtype, in_dims, dtype) if quantized
+                         else w.astype(dtype))
                 if p.col_gather:        # dense: permute the columns themselves
                     dense = dense[:, mx.array(v_head_order(g, g.v_head_dim))]
                 lin.weight = dense

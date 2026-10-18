@@ -208,9 +208,13 @@ def _hf_weights(g: gguf_pack.Geometry, rng) -> dict[str, np.ndarray]:
 _GGUF_ROLE = {v.path: k for k, v in gguf_pack._LAYER_ROLES.items()}
 
 
-def _write_gguf(path: str, g: gguf_pack.Geometry, w: dict[str, np.ndarray]) -> dict:
+def _write_gguf(path: str, g: gguf_pack.Geometry, w: dict[str, np.ndarray],
+                bos_key: str | None = "tokenizer.ggml.bos_token_id",
+                float_gates: bool = False) -> dict:
     """Write `w` the way llama.cpp's converter would (tiled value heads, -exp(A_log),
-    squeezed conv), every projection Q8_0. Returns the Q8_0 round-tripped float
+    squeezed conv), every projection Q8_0. `bos_key` is where the header carries the
+    BOS id, or None to leave it out. `float_gates` stores the GDN gate projections
+    (`in_proj_a`, `in_proj_b`) as F32, as some converters do. Returns the Q8_0 round-tripped float
     weights in mlx-lm's layout — what the loaded model must compute with."""
     q8 = gguf.GGMLQuantizationType.Q8_0
     wr = gguf.GGUFWriter(path, "qwen35")
@@ -233,7 +237,8 @@ def _write_gguf(path: str, g: gguf_pack.Geometry, w: dict[str, np.ndarray]) -> d
     wr.add_uint32(a + "ssm.time_step_rank", g.v_heads)
     wr.add_uint32(a + "ssm.inner_size", g.v_heads * g.v_head_dim)
     wr.add_uint32(a + "full_attention_interval", g.full_attention_interval)
-    wr.add_uint32("tokenizer.ggml.bos_token_id", g.bos)
+    if bos_key is not None:
+        wr.add_uint32(bos_key, g.bos)
     wr.add_uint32("tokenizer.ggml.eos_token_id", g.eos)
     kd = g.k_heads * g.k_head_dim
     expect: dict[str, np.ndarray] = {}
@@ -264,7 +269,8 @@ def _write_gguf(path: str, g: gguf_pack.Geometry, w: dict[str, np.ndarray]) -> d
                 stored = -np.exp(stored)
             if key.endswith("conv1d.weight"):
                 stored = stored[:, :, 0]
-        if stored.ndim == 2 and not key.endswith("conv1d.weight"):
+        float_gate = float_gates and key.endswith(("in_proj_a.weight", "in_proj_b.weight"))
+        if stored.ndim == 2 and not key.endswith("conv1d.weight") and not float_gate:
             raw = gguf.quants.quantize(stored, q8)
             wr.add_tensor(name, raw, raw_shape=raw.shape, raw_dtype=q8)
             back = gguf.quants.dequantize(raw, q8)
@@ -286,12 +292,11 @@ def _write_gguf(path: str, g: gguf_pack.Geometry, w: dict[str, np.ndarray]) -> d
     return expect
 
 
-@pytest.fixture
-def tiny(tmp_path):
+def _pack(tmp_path, float_gates: bool = False):
     g = _geometry()
     w = _hf_weights(g, np.random.default_rng(7))
     path = str(tmp_path / "tiny.gguf")
-    expect = _write_gguf(path, g, w)
+    expect = _write_gguf(path, g, w, float_gates=float_gates)
     donor = tmp_path / "donor"
     donor.mkdir()
     (donor / "tokenizer_config.json").write_text("{}")
@@ -299,6 +304,27 @@ def tiny(tmp_path):
     out = gguf_pack.materialize(path, cache_root=str(tmp_path / "cache"),
                                 donor_dir=str(donor))
     return g, expect, out
+
+
+@pytest.fixture
+def tiny(tmp_path):
+    return _pack(tmp_path)
+
+
+def test_a_header_without_bos_falls_back_to_the_padding_id(tmp_path):
+    g = _geometry()
+    path = str(tmp_path / "nobos.gguf")
+    _write_gguf(path, g, _hf_weights(g, np.random.default_rng(7)),
+                bos_key="tokenizer.ggml.padding_token_id")
+    assert gguf_pack.read_geometry(gguf.GGUFReader(path)).bos == g.bos
+
+
+def test_a_header_without_bos_or_padding_id_raises(tmp_path):
+    g = _geometry()
+    path = str(tmp_path / "nobos.gguf")
+    _write_gguf(path, g, _hf_weights(g, np.random.default_rng(7)), bos_key=None)
+    with pytest.raises(ValueError, match="bos_token_id"):
+        gguf_pack.read_geometry(gguf.GGUFReader(path))
 
 
 def test_materialize_writes_a_routable_config(tiny):
@@ -313,9 +339,16 @@ def test_materialize_writes_a_routable_config(tiny):
 
 
 def test_loaded_model_matches_mlx_lm_on_the_same_weights(tiny):
+    _assert_matches_mlx_lm(*tiny)
+
+
+def test_float_gate_projections_load_and_match_mlx_lm(tmp_path):
+    _assert_matches_mlx_lm(*_pack(tmp_path, float_gates=True))
+
+
+def _assert_matches_mlx_lm(g: gguf_pack.Geometry, expect: dict, out: str) -> None:
     mx = pytest.importorskip("mlx.core")
     q35 = pytest.importorskip("mlx_lm.models.qwen3_5")
-    g, expect, out = tiny
     with open(os.path.join(out, "config.json")) as f:
         cfg = json.load(f)
     model = gguf_pack.load(out, cfg)
