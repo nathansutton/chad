@@ -81,6 +81,15 @@ uv run python benchmarks/polyglot/run.py --label h3-pi --harness pi \
 python benchmarks/polyglot/stats.py scorecard --ref _runs/h3-chad-llama _runs/h3-*
 ```
 
+The in-process arm can also run against a llama.cpp server: `--harness chad --backend llama
+--server http://127.0.0.1:8081` builds the same `Agent` the Mac arm does on a
+`CompletionEngine` instead of MLX weights, which is how a Linux box evaluates chad. That
+makes a llama block against an MLX block an engine comparison, and two llama blocks on the
+same server a harness comparison. chad renders its own prompts, so it needs the served
+model's tokenizer locally: set `CHAD_MODEL` to the GGUF the server serves, and the block
+reads the tokenizer from the pack built around it. `meta.json` records the backend, the
+server and the file it served.
+
 The scorecard reads each arm the way the harness article did: the prompt tax of turn 1,
 the tokens the prefix cache could not serve on later turns and their wait, cache reuse,
 side requests, and pass rate paired with the reference arm by task.

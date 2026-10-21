@@ -3,6 +3,7 @@ and config files; a CLI trial runs confined to its workspace and throwaway home;
 cap takes the whole process group; the lock refuses a drifted version; and chad in
 process still writes the rows it always has. No model, no server, no network: the CLI arm
 under test is a fake agent in tmp_path, and chad runs on the scripted engine."""
+import argparse
 import http.server
 import json
 import os
@@ -23,9 +24,10 @@ import run  # noqa: E402
 import workspace  # noqa: E402
 from catalog import Task  # noqa: E402
 from harness import Solved, Trial, cli  # noqa: E402
-from harness.chad_inprocess import ChadInProcess, Loaded  # noqa: E402
+from harness.chad_inprocess import ChadInProcess, Loaded, llama_engine, prime  # noqa: E402
 
 from chad import seatbelt  # noqa: E402
+from chad.completion_engine import CompletionEngine  # noqa: E402
 from test_agent_e2e import ScriptedEngine, _tool_call  # noqa: E402
 from test_polyglot_kit import _exercise  # noqa: E402
 
@@ -308,3 +310,63 @@ def test_the_row_frame_is_the_same_for_every_arm():
     assert record["trajectory"] == "trajectories/go/x.rep2.json"
     assert run.row(task, "arm", 2, Solved(1.0, False, {}), verdict, None, "t.json", "")[
         "trajectory"] is None
+
+
+# -- chad in process on llama-server (--backend llama) -------------------------------
+
+def _llama_args(**overrides):
+    args = dict(harness="chad", backend="llama", server="http://127.0.0.1:8081/", model="",
+                no_think=True, max_steps=10)
+    return argparse.Namespace(**{**args, **overrides})
+
+
+class _Served(ScriptedEngine):
+    """chad's llama backend with the HTTP replaced by a script: `load` sizes the window
+    from what /props reports for the box's one 128k slot, as `CompletionEngine.load` does."""
+
+    def __init__(self, script):
+        super().__init__(script, effective_ctx=0)
+
+    def load(self):
+        self.effective_ctx = 131072
+        return 0.0
+
+
+def _llama_arm(refused=None, tokenizer="/models/tok", load=None):
+    return run.llama_arm(_llama_args(), refuse=(refused if refused is not None else []).append,
+                         served=lambda origin: "/models/m.gguf", tokenizer=lambda: tokenizer,
+                         load=load)
+
+
+def test_a_llama_block_drives_a_completion_engine_beside_the_running_server():
+    refused = []
+    arm = _llama_arm(refused)
+    assert refused == ["cli block"]            # the server is this arm's engine, not a rival
+    assert (arm.server, arm.served) == ("http://127.0.0.1:8081", "/models/m.gguf")
+    eng = llama_engine(arm.server, "/models/tok")
+    assert isinstance(eng, CompletionEngine)
+    assert (eng.model_id, eng.url, eng.effective_ctx) == (
+        harnesses.SERVED_MODEL, "http://127.0.0.1:8081/completion", 0)
+
+
+def test_a_llama_block_without_a_local_tokenizer_names_the_fix():
+    with pytest.raises(cli.HarnessError, match="CHAD_MODEL"):
+        _llama_arm(tokenizer="")
+
+
+def test_a_llama_block_records_its_backend_and_server_in_meta(tmp_path):
+    task = _exercise(tmp_path / "up")
+    label, runs, kit = "llama", tmp_path / "_runs", str(tmp_path / "kit")
+    ws = os.path.join(kit, "_work", label, "rep1", "python", "two-fer")
+    script = [_tool_call("write", path=os.path.join(ws, "two_fer.py"), content=GOLD),
+              _tool_call("bash", command="sh run-tests.sh"),
+              _tool_call("done", summary="implemented two_fer")]
+    arm = _llama_arm(load=lambda _model, thinking: prime(_Served(script), thinking, "llama"))
+    arm.root = kit
+    assert run.Block(label, arm, wall_cap=120, runs=str(runs)).run([task], reps=1) == 0
+
+    meta = json.loads((runs / label / "meta.json").read_text())
+    assert (meta["backend"], meta["server"], meta["served_file"]) == (
+        "llama", "http://127.0.0.1:8081", "/models/m.gguf")
+    assert meta["ctx_limit"] > 0
+    assert json.loads((runs / label / "trials.jsonl").read_text())["passed"] is True
