@@ -334,6 +334,17 @@ def test_bash_spill():
             os.environ["CHAD_SPILL_DIR"] = old
 
 
+def test_bash_budget_splits_head_and_tail():
+    assert tools.bash_budget(20000) == (20000, 8000, 12000)
+    assert tools.bash_budget(6000) == (6000, 2400, 3600)
+    # a nonsense knob is floored, never a degenerate split
+    assert tools.bash_budget(10) == (2000, 800, 1200)
+
+
+def test_bash_cap_default_matches_the_documented_number():
+    assert (tools.BASH_MAX_CHARS, tools.BASH_HEAD_CHARS, tools.BASH_TAIL_CHARS) == (20000, 8000, 12000)
+
+
 def test_bash_headtail_keeps_a_body_that_fits_under_the_cap():
     """A body in the narrow band just below the cap, carrying a clip note. The note is
     metadata ABOUT the body, not part of its budget: counting it sent a body that

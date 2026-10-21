@@ -222,10 +222,19 @@ def _bash_killed(reason: str, partial: str | None) -> str:
 # summary (`=== N failed ===`, the traceback tail) at the BOTTOM. On a noisy run a
 # head-only cap shows 20k chars of passing dots and hides the failure, undermining the
 # verify loop guardrails.py exists to enforce. So keep HEAD and TAIL (Claude Code does
-# the same), biased toward the tail where the summary lives.
-BASH_MAX_CHARS = 20000
-BASH_HEAD_CHARS = 8000
-BASH_TAIL_CHARS = 12000
+# the same), biased toward the tail where the summary lives. `CHAD_BASH_MAX_CHARS` sets
+# the cap for an A/B; the default is the measured-nothing-yet 20,000.
+def bash_budget(max_chars: int) -> tuple[int, int, int]:
+    """(max, head, tail) for a bash result. Head 40%, tail 60%: the summary a test runner
+    or compiler prints lives at the bottom. Floored so a typo'd knob cannot make the
+    head/tail split degenerate (two clipped lines already need more than this)."""
+    max_chars = max(2000, max_chars)
+    head = max_chars * 2 // 5
+    return max_chars, head, max_chars - head
+
+
+BASH_MAX_CHARS, BASH_HEAD_CHARS, BASH_TAIL_CHARS = bash_budget(
+    config.env_int("CHAD_BASH_MAX_CHARS", 20000))
 
 # When output overflows the head/tail budget, the omitted middle used to be simply
 # gone — the model's only way back to it (the first error of a cascade, one failing
