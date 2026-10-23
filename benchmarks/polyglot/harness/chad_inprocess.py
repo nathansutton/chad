@@ -19,7 +19,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import catalog
 import workspace
@@ -30,6 +30,8 @@ from harness import AtifDoc, Solved, Trial
 if TYPE_CHECKING:
     from chad.atif import TrajectoryRecorder
     from chad.base_engine import BaseEngine
+    from chad.completion_engine import CompletionEngine
+    from chad.engine import Engine
 
 KV_CACHE_MAX_BYTES = 4 * 1024**3
 
@@ -39,18 +41,43 @@ class Loaded:
     engine: BaseEngine
     ctx_limit: int
     load_s: float
+    backend: str = "mlx"
 
 
-def load_engine(model: str, thinking: bool) -> Loaded:
-    """The engine as the shipped CLI builds it: preset first, CHAD_* env second."""
-    from chad.cli import _compute_ctx_limit, apply_sampler_env, apply_sampler_preset
+def load_engine(model: str, thinking: bool, *, backend: str = "mlx", server: str = "",
+                tokenizer: str = "") -> Loaded:
+    """The engine as the shipped CLI builds it: preset first, CHAD_* env second.
+
+    `backend="llama"` is `chad --backend llama`: the same Agent on a `CompletionEngine`
+    against the llama-server at `server`, rendering its prompts with the local
+    `tokenizer`. No weights load in this process, and the window is the server's own."""
+    if backend == "llama":
+        return prime(llama_engine(server, tokenizer), thinking, backend)
     from chad.engine import Engine
-    eng = Engine(model_id=model, cache_dir=os.path.join(catalog.ROOT, "_kv"),
-                 kv_cache_max_bytes=KV_CACHE_MAX_BYTES)
+    return prime(Engine(model_id=model, cache_dir=os.path.join(catalog.ROOT, "_kv"),
+                        kv_cache_max_bytes=KV_CACHE_MAX_BYTES), thinking, backend)
+
+
+def llama_engine(server: str, tokenizer: str) -> CompletionEngine:
+    """chad's llama backend on the server at `server`, as the CLI builds it: the window
+    left at 0 so `load()` reads the one the server enforces."""
+    import harnesses
+
+    from chad.completion_engine import CompletionEngine
+    return CompletionEngine(model_id=harnesses.SERVED_MODEL, base_url=server,
+                            tokenizer_id=tokenizer, effective_ctx=0)
+
+
+def prime(eng: Engine | CompletionEngine, thinking: bool, backend: str) -> Loaded:
+    """Sampler preset, CHAD_* overrides, load, then the context limit the load measured."""
+    from chad.cli import _compute_ctx_limit, apply_sampler_env, apply_sampler_preset
     apply_sampler_preset(eng, thinking=thinking)
     apply_sampler_env(eng)
     load_s = eng.load()
-    return Loaded(eng, _compute_ctx_limit(eng), load_s)
+    # SAFETY: CompletionEngine declares `reasoning_effort_default: None`, narrower than
+    # the protocol's `str | None` and so not a BaseEngine to mypy; it never assigns the
+    # attribute, and the CLI hands Agent this same object.
+    return Loaded(cast("BaseEngine", eng), _compute_ctx_limit(eng), load_s, backend)
 
 
 @contextlib.contextmanager
@@ -75,10 +102,16 @@ class ChadInProcess:
     name = "chad"
 
     def __init__(self, model: str, thinking: bool, max_steps: int | None,
-                 load: Callable[[str, bool], Loaded] = load_engine, root: str = catalog.ROOT):
+                 load: Callable[[str, bool], Loaded] | None = None, root: str = catalog.ROOT,
+                 *, backend: str = "mlx", server: str = "", tokenizer: str = "",
+                 served: str = ""):
         self.model, self.thinking, self.max_steps = model, thinking, max_steps
         self.root = root
-        self._load = load
+        # `served` is the file the server reports loading: the record that a llama block
+        # ran the bytes it names, read by the caller while it checks the server is up.
+        self.server, self.served = server, served
+        self._load = load or functools.partial(load_engine, backend=backend, server=server,
+                                               tokenizer=tokenizer)
         self._loaded: Loaded | None = None
         self._recorder: TrajectoryRecorder | None = None
 
@@ -90,7 +123,11 @@ class ChadInProcess:
         from chad import levers
         from chad.tools import active_schemas
         loaded = self._loaded = self._load(self.model, self.thinking)
+        engine: dict[str, JsonValue] = {"backend": loaded.backend}
+        if loaded.backend == "llama":
+            engine |= {"server": self.server, "served_file": self.served}
         return {
+            **engine,
             "model": self.model, "thinking": self.thinking, "ctx_limit": loaded.ctx_limit,
             "max_steps": self.max_steps, "load_s": round(loaded.load_s, 1),
             "levers_active": levers.active(),

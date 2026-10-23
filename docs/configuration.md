@@ -543,6 +543,7 @@ Not supported surface: formats can change between releases.
 CHAD_TRAJECTORY_JSON=/tmp/traj.json chad  # record an ATIF trajectory (pure observer)
 CHAD_PREFILL_TRACE=/tmp/pf.jsonl    chad  # one JSON row per prefill: tokens, seconds, render/compact/tool overhead
 CHAD_DUMP_RENDER=/tmp/prompt.txt    chad  # dump the fully-rendered prompt each step
+CHAD_BASH_MAX_CHARS=6000            chad  # per-result cap on bash output before the head/tail clip (default 20000; the full body still spills to disk)
 CHAD_SPILL_DIR=/tmp/spill           chad  # where truncated tool output spills to disk
 CHAD_CHECKPOINT_DIR=/tmp/ckpt       chad  # relocate the shadow-git edit checkpoints
 CHAD_SESSION_DIR=/tmp/sessions      chad  # relocate saved sessions

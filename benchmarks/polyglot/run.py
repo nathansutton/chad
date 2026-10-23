@@ -56,7 +56,7 @@ import server  # noqa: E402
 import workspace  # noqa: E402
 from catalog import JsonValue, Task, is_object  # noqa: E402
 from harness import AtifDoc, Harness, Solved, Trial  # noqa: E402
-from harness.chad_inprocess import ChadInProcess  # noqa: E402
+from harness.chad_inprocess import ChadInProcess, Loaded  # noqa: E402
 from harness.cli import (  # noqa: E402
     CliHarness,
     Endpoint,
@@ -252,7 +252,28 @@ def token_counter(tokenizer: str) -> Callable[[str], int] | None:
     return lambda text: len(tok.encode(text, add_special_tokens=False))
 
 
+def llama_arm(args: argparse.Namespace, refuse: Callable[[str], None] = server.refuse,
+              served: Callable[[str], str] = served_file,
+              tokenizer: Callable[[], str] = tokenizer_dir,
+              load: Callable[[str, bool], Loaded] | None = None) -> ChadInProcess:
+    """chad in process on the running llama-server: `chad --backend llama`'s engine."""
+    # The running server IS this arm's engine: required, not refused. Another block is
+    # still refused, since two would share its one slot.
+    refuse("cli block")
+    origin = args.server.rstrip("/")
+    served_path = served(origin)       # also the check that it is up, before any load
+    tok = tokenizer()
+    if not tok:
+        raise HarnessError("chad on llama-server renders its own prompts and found no "
+                           "local tokenizer: set CHAD_MODEL to the GGUF the server serves")
+    return ChadInProcess(args.model or harnesses.SERVED_MODEL, not args.no_think,
+                         args.max_steps, load, backend="llama", server=origin,
+                         tokenizer=tok, served=served_path)
+
+
 def build_harness(args: argparse.Namespace, stack: contextlib.ExitStack) -> Harness:
+    if args.harness == "chad" and args.backend == "llama":
+        return llama_arm(args)
     if args.harness == "chad":
         server.refuse("in-process block")
         model = args.model
@@ -290,15 +311,20 @@ def main() -> int:
     chad.add_argument("--model", default="", help="HF repo or local dir (default: the shipped model)")
     chad.add_argument("--no-think", action="store_true")
     chad.add_argument("--max-steps", type=int, default=None, help="default: the agent's own")
+    chad.add_argument("--backend", choices=("mlx", "llama"), default="mlx",
+                      help="mlx: weights in this process (Metal); llama: the same Agent "
+                           "against the running --server, as `chad --backend llama`")
     cli = ap.add_argument_group("any other harness")
     cli.add_argument("--server", default=DEFAULT_SERVER,
                      help="origin of the running llama-server (`server.py`); every trial "
-                          "reaches it through the block's own proxy")
+                          "reaches it through the block's own proxy (chad --backend llama "
+                          "reaches it directly)")
     cli.add_argument("--served-model", default=harnesses.SERVED_MODEL,
                      help="the model id that server answers to (its --alias)")
     args = ap.parse_args()
-    if args.harness != "chad" and (args.model or args.no_think or args.max_steps is not None):
-        ap.error("--model, --no-think and --max-steps apply to --harness chad only")
+    if args.harness != "chad" and (args.model or args.no_think or args.max_steps is not None
+                                   or args.backend != "mlx"):
+        ap.error("--model, --no-think, --max-steps and --backend apply to --harness chad only")
 
     tasks = select_tasks(args.only, args.tasks_file, args.limit)
     if not tasks:
