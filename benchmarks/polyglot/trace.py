@@ -6,6 +6,7 @@
     python benchmarks/polyglot/trace.py <dir> --counts > x.jsonl   # per-trial tool counts, and
     python benchmarks/polyglot/trace.py x.jsonl                # the tool mix back from them
     python benchmarks/polyglot/trace.py --autopsy _runs/a _runs/b   # the longest think of every trial
+    python benchmarks/polyglot/trace.py --reclassify _runs/a    # write each row's `stop` from its trajectory
 
 `hit` is the share of the step's prompt served from the KV cache (a `*` marks a step that
 re-prefilled after compaction); `t/s` is decode speed. `acc` is the share of drafted tokens accepted; `a/rT` and `a/rA` are tokens accepted per
@@ -27,6 +28,11 @@ think it would have cut, how many passing trials it would have touched, and how 
 those cuts would land before the think's first draft (the half-plan risk). Offsets are in
 tokens of the served model when `CHAD_MODEL` names its GGUF, else chars ÷ 3.6, and the
 table's heading says which.
+
+`--reclassify` back-fills the `stop` object (`stops.py`) into a run's rows from their
+trajectories, so a run published before rows carried one gets the column without a
+rerun. A row the wall did not end reads `done`: the agent's own stop word was not
+recorded then. Rows are rewritten in place, in order, every other field untouched.
 """
 from __future__ import annotations
 
@@ -40,6 +46,7 @@ from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import stops  # noqa: E402
 from catalog import JsonValue, is_array, is_number, is_object, is_text  # noqa: E402
 
 
@@ -358,6 +365,46 @@ def autopsy_run(run_dir: str, count: Callable[[str], int] | None = None) -> list
     return out
 
 
+def reclassify(run_dir: str) -> dict[str, int]:
+    """Rewrite `trials.jsonl` with a `stop` on every row, from the trajectory each names
+    (a row without one, or whose trajectory is missing, is classified from its flags
+    alone). Returns the kinds written, by count."""
+    path = os.path.join(run_dir, "trials.jsonl")
+    rows: list[dict[str, JsonValue]] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(dict(_obj(json.loads(line))))
+    kinds: dict[str, int] = {}
+    for row in rows:
+        doc: JsonValue = None
+        rel = row.get("trajectory")
+        if is_text(rel) and os.path.exists(os.path.join(run_dir, rel)):
+            with open(os.path.join(run_dir, rel), encoding="utf-8") as f:
+                doc = json.load(f)
+        stop = stops.classify(doc, row.get("capped") is True, _num(row.get("wall_s")))
+        # Keep the row's own order, with `stop` beside `capped` as a fresh row writes it.
+        rebuilt: dict[str, JsonValue] = {}
+        for key, value in row.items():
+            if key == "stop":
+                continue
+            rebuilt[key] = value
+            if key == "capped":
+                rebuilt["stop"] = stop
+        if "stop" not in rebuilt:
+            rebuilt["stop"] = stop
+        row.clear()
+        row.update(rebuilt)
+        kind = _text(stop.get("kind"))
+        kinds[kind] = kinds.get(kind, 0) + 1
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    os.replace(tmp, path)
+    return kinds
+
+
 def tokenizer_counter() -> Callable[[str], int] | None:
     """The served model's tokenizer, when `CHAD_MODEL` names a GGUF that is local and
     `transformers` is installed; None (chars ÷ 3.6) otherwise. The one place this
@@ -414,7 +461,14 @@ def main() -> int:
                          "ceiling would have done to it")
     ap.add_argument("--ceilings", default=",".join(str(n) for n in CEILINGS),
                     help="candidate CHAD_THINK_CEILING values for the autopsy summary")
+    ap.add_argument("--reclassify", action="store_true",
+                    help="with run directories: rewrite each row's `stop` from its trajectory")
     args = ap.parse_args()
+    if args.reclassify:
+        for run_dir in args.trajectory:
+            kinds = reclassify(run_dir)
+            print(f"{run_dir}: " + ", ".join(f"{k} {n}" for k, n in sorted(kinds.items())))
+        return 0
     if args.autopsy:
         count = tokenizer_counter()
         rows = [a for run_dir in args.trajectory for a in autopsy_run(run_dir, count)]

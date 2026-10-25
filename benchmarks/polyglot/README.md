@@ -44,7 +44,10 @@ to five minutes a task on a 24 GB M4 Pro: about 16 hours for one pass over all 2
 - **Offline trials.** Dependencies are fetched up front and pinned; nothing a trial runs
   reaches the network.
 - **It is the shipped agent.** Shipped model, sampler and context limit. The one cap the
-  benchmark adds is wall clock per trial (`--wall-cap`, 1200 s), recorded as `capped`.
+  benchmark adds is wall clock per trial (`--wall-cap`, 1200 s), recorded as `capped`, and
+  each row's `stop` says what the agent was doing when it fell (`stops.py`): a think
+  runaway, a hung test and a dead server are different failures, and only the first two
+  are the model's. `infra` rows are redone on resume and left out of `stats.py compare`.
 
 ## Comparing two versions
 

@@ -53,8 +53,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import catalog  # noqa: E402
 import harnesses  # noqa: E402
 import server  # noqa: E402
+import stops  # noqa: E402
 import workspace  # noqa: E402
-from catalog import JsonValue, Task, is_object  # noqa: E402
+from catalog import JsonValue, Task, is_number, is_object  # noqa: E402
 from harness import AtifDoc, Harness, Solved, Trial  # noqa: E402
 from harness.chad_inprocess import ChadInProcess, Loaded  # noqa: E402
 from harness.cli import (  # noqa: E402
@@ -106,14 +107,16 @@ def thermal() -> str:
 
 
 def done_keys(trials_path: str) -> set[tuple[str, int]]:
-    """(task, rep) pairs already recorded — what a resumed block skips."""
+    """(task, rep) pairs already recorded — what a resumed block skips. A row whose stop
+    is `infra` is not a trial of the model and is redone, as GVS5H's runner redoes its
+    `infra` cells on a checkpoint resume."""
     keys: set[tuple[str, int]] = set()
     if not os.path.exists(trials_path):
         return keys
     with open(trials_path, encoding="utf-8") as f:
         for line in f:
             row: JsonValue = json.loads(line)
-            if catalog.is_object(row):
+            if catalog.is_object(row) and stops.kind_of(row) != stops.INFRA:
                 task, rep = row.get("task"), row.get("rep")
                 if catalog.is_text(task) and catalog.is_number(rep):
                     keys.add((task, int(rep)))
@@ -138,9 +141,14 @@ def row(task: Task, label: str, rep: int, solved: Solved, verdict: workspace.Ver
     """One trial's record: the same frame for every arm, with the arm's own fields in the
     middle. `trajectory` is the document's path relative to the run."""
     final = doc.get("final_metrics") if doc is not None else None
+    exit_code = solved.fields.get("exit_code")
+    ended = solved.stop_kind or ("error" if is_number(exit_code) and exit_code != 0 else None)
     return {
         "task": task.name, "language": task.language, "label": label, "rep": rep,
         "passed": verdict.passed, "capped": solved.capped,
+        # What ended the trial and how its seconds split: `capped` alone cannot tell a
+        # think runaway from a hung test or a dead server (see stops.py).
+        "stop": stops.classify(doc, solved.capped, solved.wall_s, ended),
         "wall_s": round(solved.wall_s, 1), "verify_s": round(verdict.seconds, 1),
         **solved.fields,
         "thermal": machine,

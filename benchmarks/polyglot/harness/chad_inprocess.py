@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import io
+import logging
 import os
 import sys
 import time
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
     from chad.engine import Engine
 
 KV_CACHE_MAX_BYTES = 4 * 1024**3
+log = logging.getLogger("polyglot")
 
 
 @dataclass(frozen=True)
@@ -141,6 +143,7 @@ class ChadInProcess:
     def solve(self, trial: Trial) -> Solved:
         from chad import atif, levers
         from chad.agent import Agent
+        from chad.base_engine import BackendError
 
         if self._loaded is None:
             raise RuntimeError("solve() before start(): the engine is not loaded")
@@ -159,8 +162,16 @@ class ChadInProcess:
             # No --max-steps keeps the agent's own default rather than restating it here.
             agent = build() if self.max_steps is None else build(max_steps=self.max_steps)
             t0 = time.time()
+            stop_kind: str | None = None
             with contextlib.redirect_stdout(io.StringIO()), _stdin_from_devnull():
-                agent.run_turn(trial.prompt, stream=False)
+                try:
+                    agent.run_turn(trial.prompt, stream=False)
+                except BackendError as e:
+                    # The engine or server failed, not the model: the row says `infra`,
+                    # the block goes on, and a resume redoes the trial (`run.done_keys`).
+                    stop_kind = "infra"
+                    log.warning("%s: engine failed mid-trial, row marked infra: %s",
+                                os.path.basename(trial.workspace), e)
             wall = time.time() - t0
         finally:
             os.chdir(start_dir)
@@ -176,7 +187,7 @@ class ChadInProcess:
             "prefill_tokens": agent.prefill_tokens, "peak_ctx": agent.peak_ctx,
             "gen_time_s": round(agent.gen_time, 1),
             "levers_fired": fired,
-        })
+        }, stop_kind=stop_kind or agent.stop_kind)
 
     def trajectory(self) -> AtifDoc | None:
         return self._recorder.to_dict() if self._recorder else None

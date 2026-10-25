@@ -41,11 +41,11 @@ ENVIRON = {"PATH": "/usr/bin:/bin", "HOME": "/Users/tester", "LANG": "C.UTF-8",
 GOLD = "def two_fer(name='you'):\n    return f'One for {name}, one for me.'\n"
 
 # The row `--harness chad` has always written, key for key and in order.
-CHAD_ROW = ["task", "language", "label", "rep", "passed", "capped", "wall_s", "verify_s",
+CHAD_ROW = ["task", "language", "label", "rep", "passed", "capped", "stop", "wall_s", "verify_s",
             "steps", "tool_dispatches", "gen_tokens", "think_tokens", "prefill_tokens",
             "peak_ctx", "gen_time_s", "levers_fired", "thermal", "metrics", "trajectory",
             "test_tail"]
-CLI_ROW = ["task", "language", "label", "rep", "passed", "capped", "wall_s", "verify_s",
+CLI_ROW = ["task", "language", "label", "rep", "passed", "capped", "stop", "wall_s", "verify_s",
            "exit_code", "thermal", "metrics", "trajectory", "test_tail"]
 
 

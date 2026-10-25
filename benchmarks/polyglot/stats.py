@@ -56,12 +56,13 @@ import math
 import os
 import random
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import stops  # noqa: E402
 from catalog import JsonValue, is_array, is_number, is_object, is_text  # noqa: E402
 
 
@@ -73,6 +74,7 @@ class Trial:
     wall_s: float
     gen_tokens: int
     capped: bool
+    stop_kind: str = ""          # the row's `stop.kind`; "" on rows written before it existed
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,7 @@ class Comparison:
     wall_ratio: float
     up_tasks: tuple[str, ...]
     down_tasks: tuple[str, ...]
+    infra: tuple[int, int] = (0, 0)   # rows left out of A and B: an engine failure is not a trial
 
 
 def _number(row: Mapping[str, JsonValue], key: str) -> float:
@@ -107,8 +110,19 @@ def load_trials(path: str) -> list[Trial]:
             if not (is_text(task) and is_text(language)):
                 raise ValueError(f"{path}: a row has no task/language")
             trials.append(Trial(task, language, row.get("passed") is True, _number(row, "wall_s"),
-                                int(_number(row, "gen_tokens")), row.get("capped") is True))
+                                int(_number(row, "gen_tokens")), row.get("capped") is True,
+                                stops.kind_of(row)))
     return trials
+
+
+def without_infra(trials: Sequence[Trial]) -> list[Trial]:
+    return [t for t in trials if t.stop_kind != stops.INFRA]
+
+
+def stop_counts(trials: Sequence[Trial]) -> dict[str, int]:
+    """How the trials ended, by `stop.kind`, most common first; empty when no row says."""
+    counts = Counter(t.stop_kind for t in trials if t.stop_kind)
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def pass_rates(trials: Sequence[Trial]) -> dict[str, float]:
@@ -141,6 +155,10 @@ def flips_needed(alpha: float = 0.05) -> int:
 
 
 def compare(a: Sequence[Trial], b: Sequence[Trial]) -> Comparison:
+    """`infra` rows are dropped from both arms first: a server that stopped answering is
+    not a trial of the model, and a six-flip threshold cannot afford it counted as one."""
+    infra = (len(a) - len(without_infra(a)), len(b) - len(without_infra(b)))
+    a, b = without_infra(a), without_infra(b)
     rates_a, rates_b = pass_rates(a), pass_rates(b)
     shared = sorted(set(rates_a) & set(rates_b))
     if not shared:
@@ -160,7 +178,7 @@ def compare(a: Sequence[Trial], b: Sequence[Trial]) -> Comparison:
         rate_b=sum(rates_b[t] for t in shared) / len(shared),
         token_ratio=mean(b, "gen_tokens") / tokens_a if tokens_a else 0.0,
         wall_ratio=mean(b, "wall_s") / wall_a if wall_a else 0.0,
-        up_tasks=up, down_tasks=down)
+        up_tasks=up, down_tasks=down, infra=infra)
 
 
 def pool(trials: Sequence[Trial], include_never: bool = False) -> list[str]:
@@ -225,6 +243,7 @@ class Card:
     steps: float                 # agent turns per trial
     side: float                  # requests beside the agent loop, per trial
     gen_tokens: float            # generated tokens per trial
+    stops: str = ""              # how the trials ended, by kind ("" when no row says)
 
 
 def _median(values: Sequence[float]) -> float:
@@ -274,21 +293,23 @@ def card(run_dir: str) -> Card:
             uncached.append(prompt - cached)
             waits.append(_number(_obj(turn.get("extra")), "prefill_s"))
             prompt_sum, cached_sum = prompt_sum + prompt, cached_sum + cached
+    kinds = Counter(stops.kind_of(r) for r in rows if stops.kind_of(r))
     return Card(os.path.basename(os.path.normpath(run_dir)), len(rows),
                 sum(1 for r in rows if r.get("passed") is True),
                 sum(1 for r in rows if r.get("capped") is True),
                 _median(tax), _median(first_wait), _median(uncached), _median(waits),
                 cached_sum / prompt_sum if prompt_sum else 0.0, _median(steps),
-                sum(side) / len(side) if side else 0.0, _median(gen))
+                sum(side) / len(side) if side else 0.0, _median(gen),
+                " ".join(f"{k} {n}" for k, n in sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0]))))
 
 
 def scorecard_report(ref: str, runs: Sequence[str]) -> str:
     """The scorecard as a markdown table, each arm paired with `ref` by task."""
     reference = load_trials(os.path.join(ref, "trials.jsonl"))
     header = ("| arm | pass | capped | tax (tok) | turn-1 wait | uncached / later turn "
-              "| wait / later turn | cache reuse | turns | side req | gen tok "
+              "| wait / later turn | cache reuse | turns | side req | gen tok | stops "
               f"| vs {os.path.basename(os.path.normpath(ref))}: up / down (p) |")
-    lines = [header, "|" + "---|" * 12]
+    lines = [header, "|" + "---|" * 13]
     for run_dir in runs:
         c = card(run_dir)
         if os.path.normpath(run_dir) == os.path.normpath(ref):
@@ -299,7 +320,7 @@ def scorecard_report(ref: str, runs: Sequence[str]) -> str:
         lines.append(f"| {c.label} | {c.passed}/{c.trials} | {c.capped} | {c.tax:,.0f} "
                      f"| {c.first_wait_s:.1f} s | {c.later_uncached:,.0f} | {c.later_wait_s:.1f} s "
                      f"| {100 * c.reuse:.0f}% | {c.steps:.0f} | {c.side:.1f} | {c.gen_tokens:,.0f} "
-                     f"| {paired} |")
+                     f"| {c.stops} | {paired} |")
     return "\n".join(lines)
 
 
@@ -322,6 +343,9 @@ def score_report(trials: Sequence[Trial]) -> str:
     lines.append(f"hit the wall cap: {capped} trials | median wall "
                  f"{sorted(t.wall_s for t in trials)[len(trials) // 2]:.0f} s | "
                  f"total {sum(t.wall_s for t in trials) / 3600:.1f} h")
+    kinds = stop_counts(trials)
+    if kinds:
+        lines.append("stops: " + ", ".join(f"{k} {n}" for k, n in kinds.items()))
     return "\n".join(lines)
 
 
@@ -333,6 +357,8 @@ def compare_report(c: Comparison) -> str:
         f"p = {c.p_value:.3f} (exact sign test, two-sided)",
         f"cost: B uses {c.token_ratio:.2f}x the generated tokens, {c.wall_ratio:.2f}x the wall clock",
     ]
+    if any(c.infra):
+        lines.append(f"infra rows left out: A {c.infra[0]}, B {c.infra[1]}")
     if c.up_tasks:
         lines.append("up:   " + " ".join(c.up_tasks))
     if c.down_tasks:
