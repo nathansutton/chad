@@ -369,7 +369,7 @@ already builds a `CHAD_*` environment. `--think-budget` is the one kept on the C
 
 ```bash
 CHAD_THINK_BUDGET=1500        chad  # soft-cap each step's <think> at N tokens, force-close it and END the step
-CHAD_THINK_CEILING=384        chad  # force-close a runaway <think> but keep decoding the action in the SAME step
+CHAD_THINK_CEILING=4096       chad  # force-close a <think> past N tokens but keep decoding the action in the SAME step (default 2048; 0 = off)
 CHAD_TURN_BUDGET_TOKENS=90000 chad  # governor token budget (default 3× the context limit)
 CHAD_TURN_BUDGET_S=600        chad  # wall-clock variant, seconds (off by default)
 CHAD_AUTO_CONTINUE=2          chad  # on a hard stop, relaunch a fresh turn seeded with the note, N times (default 2 for a yolo one-shot, else 0)
@@ -377,11 +377,13 @@ CHAD_REVIEW_PASS=1            chad  # a one-shot that finishes early spends the 
 CHAD_MAX_GEN_TOKENS=32768     chad  # hard per-step generation cap (default 32768)
 ```
 
-- `CHAD_THINK_CEILING` is the one to reach for first. It force-closes the runaway block and
-  keeps decoding the action in the same step, so the reasoning so far stays in context and
-  nothing is re-derived. Off by default: force-closing `</think>` is the most invasive
-  thing the harness can do to the token stream, and the measured record says the bare
-  loop does not need it.
+- `CHAD_THINK_CEILING` is on by default at 2048. It force-closes the block past that many
+  tokens and keeps decoding the action in the same step, so the reasoning so far stays in
+  context and nothing is re-derived. Every wall-cap failure in the published runs was one
+  `<think>` that never closed; the paired A/B on the 30-task pool put 2048 at no flips
+  down, the never-pass task up, and 0.92x the wall, with every force-closed step going
+  straight to an action. `CHAD_THINK_CEILING=0` turns it off; raise it for a model whose
+  useful reasoning runs longer.
 - `CHAD_THINK_BUDGET` (`--think-budget`) ends the step instead, so the next step re-derives
   its reasoning, and escalates the cap when the turn keeps getting capped. When it fires,
   the status line shows a `✂N` counter.

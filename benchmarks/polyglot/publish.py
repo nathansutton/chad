@@ -134,6 +134,22 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def name_weights(meta_text: str) -> str:
+    """`meta.json` with every GGUF path outside the Hugging Face cache cut to the file's
+    name: `served_file`, and the `CHAD_MODEL` the arm's environment records. The run
+    writes the file llama-server loaded by its full path, which is wherever this machine
+    keeps weights; the name is what identifies the quant, and the only part a reader can
+    use. A hub snapshot path stays whole: `runs_row` names the model by its repo from it."""
+    def cut(value: JsonValue) -> JsonValue:
+        if is_text(value):
+            local = value.endswith(".gguf") and "/" in value and not _HUB_SNAPSHOT.search(value)
+            return os.path.basename(value) if local else value
+        if is_object(value):
+            return {k: cut(v) for k, v in value.items()}
+        return value
+    return json.dumps(cut(_read_meta(meta_text)), indent=1) + "\n"
+
+
 def _read_meta(text: str) -> dict[str, JsonValue]:
     doc: JsonValue = json.loads(text)
     return dict(doc) if is_object(doc) else {}
@@ -205,7 +221,10 @@ def bundle(run_dir: str, out_dir: str, roots: Roots, with_trajectories: bool = F
     refused = []
     for name, path in sources:
         with open(path, encoding="utf-8") as f:
-            text = redact(f.read(), roots, isolated)
+            text = f.read()
+        if name == "meta.json":
+            text = name_weights(text)
+        text = redact(text, roots, isolated)
         refused += [f"{name}: {why}" for why in problems(text, roots)]
         clean[name] = text
     if refused:

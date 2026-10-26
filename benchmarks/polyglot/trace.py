@@ -5,6 +5,8 @@
     python benchmarks/polyglot/trace.py _runs/baseline         # the whole run in one profile
     python benchmarks/polyglot/trace.py <dir> --counts > x.jsonl   # per-trial tool counts, and
     python benchmarks/polyglot/trace.py x.jsonl                # the tool mix back from them
+    python benchmarks/polyglot/trace.py --autopsy _runs/a _runs/b   # the longest think of every trial
+    python benchmarks/polyglot/trace.py --reclassify _runs/a    # write each row's `stop` from its trajectory
 
 `hit` is the share of the step's prompt served from the KV cache (a `*` marks a step that
 re-prefilled after compaction); `t/s` is decode speed. `acc` is the share of drafted tokens accepted; `a/rT` and `a/rA` are tokens accepted per
@@ -15,6 +17,22 @@ exactly 0, 1, 2, … tokens.
 
 Works on a trial that is still running — the runner rewrites the file as it goes, and the
 last row is then the step being generated (`finish` reads `...`). Stdlib only.
+
+`--autopsy` reads a run's rows and trajectories together and reports, per trial, the step
+that reasoned the longest: how many think tokens, how many seconds of decode, whether it
+was the step running when the wall killed the trial, where in its reasoning the first
+complete fenced code block and the first "let me write it" phrase appear, how many fenced
+drafts it holds, and whether any later step emitted a `write` or `edit`. The summary
+underneath says, for each candidate `CHAD_THINK_CEILING`, how many failing trials' longest
+think it would have cut, how many passing trials it would have touched, and how many of
+those cuts would land before the think's first draft (the half-plan risk). Offsets are in
+tokens of the served model when `CHAD_MODEL` names its GGUF, else chars ÷ 3.6, and the
+table's heading says which.
+
+`--reclassify` back-fills the `stop` object (`stops.py`) into a run's rows from their
+trajectories, so a run published before rows carried one gets the column without a
+rerun. A row the wall did not end reads `done`: the agent's own stop word was not
+recorded then. Rows are rewritten in place, in order, every other field untouched.
 """
 from __future__ import annotations
 
@@ -23,10 +41,12 @@ import json
 import os
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import stops  # noqa: E402
 from catalog import JsonValue, is_array, is_number, is_object, is_text  # noqa: E402
 
 
@@ -237,26 +257,239 @@ def load_counts(path: str) -> list[Mapping[str, int]]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Autopsy: the longest think of every trial, and what a ceiling would have done to it
+# ---------------------------------------------------------------------------
+
+CEILINGS = (1024, 1536, 2048, 3072, 4096, 8192)
+CHARS_PER_TOKEN = 3.6            # the fallback when no tokenizer is at hand
+
+# A fenced code block that has CLOSED: the draft is whole, whatever follows it.
+_FENCE = re.compile(r"```[^\n]*\n.*?\n[ \t]*```", re.S)
+# The model announcing that it is done designing: the phrase that, in the fatal thinks
+# read by hand, precedes the first of many rewrites of the same program.
+_WRITE_PHRASE = re.compile(
+    r"\b(?:let'?s|let me|now|time to|i'?ll|i will|going to|ready to)\s+"
+    r"(?:write|create|implement|code|put)\b"
+    r"|\bwrite (?:the|this|out the) (?:file|solution|code|program)\b"
+    r"|\bimplement(?:ing)? (?:it|this|the (?:solution|code|function|program))\b", re.I)
+
+
+@dataclass(frozen=True)
+class Autopsy:
+    """One trial's longest think. Offsets are from the start of that step's reasoning,
+    in the unit the report names; None when the thing never appears."""
+
+    run: str
+    task: str
+    rep: int
+    passed: bool
+    capped: bool
+    wall_s: float
+    step_id: int                 # the step that reasoned the longest
+    think_tokens: int            # the engine's count for that step (in-flight: generated)
+    gen_s: float | None          # its decode seconds; None while in flight (never measured)
+    at_kill: bool                # it was the step running when the wall ended the trial
+    first_fence: int | None      # offset of the first closed fenced block
+    first_write: int | None      # offset of the first "let me write it" phrase
+    drafts: int                  # closed fenced blocks in the reasoning
+    wrote_later: bool            # a later step emitted a write or edit
+
+
+def step_think_tokens(step: Mapping[str, JsonValue]) -> int:
+    """A finished step's reasoning slice; for the step in flight, everything generated so
+    far (a thinking step that has not closed its block is all reasoning)."""
+    extra = _obj(step.get("extra"))
+    if extra.get("in_flight") is True:
+        return int(_num(extra.get("generated_tokens")))
+    return int(_num(_obj(_obj(step.get("metrics")).get("extra")).get("think_tokens")))
+
+
+def _offset(text: str, index: int | None, count: Callable[[str], int] | None) -> int | None:
+    if index is None:
+        return None
+    return count(text[:index]) if count else round(index / CHARS_PER_TOKEN)
+
+
+def autopsy(doc: JsonValue, row: Mapping[str, JsonValue], run: str,
+            count: Callable[[str], int] | None = None) -> Autopsy | None:
+    steps = agent_steps(doc)
+    if not steps:
+        return None
+    longest = max(steps, key=step_think_tokens)
+    last = steps[-1]
+    extra = _obj(longest.get("extra"))
+    in_flight = extra.get("in_flight") is True
+    finish = _text(_obj(_obj(longest.get("metrics")).get("extra")).get("finish"))
+    reasoning = _text(longest.get("reasoning_content"))
+    fence = _FENCE.search(reasoning)
+    phrase = _WRITE_PHRASE.search(reasoning)
+    later = steps[steps.index(longest) + 1:]
+    wrote = any(_text(_obj(c).get("function_name")) in ("write", "edit")
+                for s in later for c in _items(s.get("tool_calls")))
+    return Autopsy(
+        run=run, task=_text(row.get("task")), rep=int(_num(row.get("rep"))),
+        passed=row.get("passed") is True, capped=row.get("capped") is True,
+        wall_s=_num(row.get("wall_s")), step_id=int(_num(longest.get("step_id"))),
+        think_tokens=step_think_tokens(longest),
+        gen_s=None if in_flight else _num(_obj(_obj(longest.get("metrics")).get("extra")).get("gen_s")),
+        at_kill=longest is last and (in_flight or finish == "interrupted"),
+        first_fence=_offset(reasoning, fence.start() if fence else None, count),
+        first_write=_offset(reasoning, phrase.start() if phrase else None, count),
+        drafts=len(_FENCE.findall(reasoning)), wrote_later=wrote)
+
+
+def load_rows(run_dir: str) -> dict[str, Mapping[str, JsonValue]]:
+    """A run's trial rows keyed by the trajectory path each names."""
+    rows: dict[str, Mapping[str, JsonValue]] = {}
+    with open(os.path.join(run_dir, "trials.jsonl"), encoding="utf-8") as f:
+        for line in f:
+            row: JsonValue = json.loads(line) if line.strip() else None
+            path = _obj(row).get("trajectory")
+            if is_text(path):
+                rows[os.path.normpath(path)] = _obj(row)
+    return rows
+
+
+def autopsy_run(run_dir: str, count: Callable[[str], int] | None = None) -> list[Autopsy]:
+    rows = load_rows(run_dir)
+    label = os.path.basename(os.path.normpath(run_dir))
+    out = []
+    for path, doc in load_run(run_dir):
+        row = rows.get(os.path.normpath(path))
+        if row is None:
+            continue
+        found = autopsy(doc, row, label, count)
+        if found is not None:
+            out.append(found)
+    return out
+
+
+def reclassify(run_dir: str) -> dict[str, int]:
+    """Rewrite `trials.jsonl` with a `stop` on every row, from the trajectory each names
+    (a row without one, or whose trajectory is missing, is classified from its flags
+    alone). Returns the kinds written, by count."""
+    path = os.path.join(run_dir, "trials.jsonl")
+    rows: list[dict[str, JsonValue]] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(dict(_obj(json.loads(line))))
+    kinds: dict[str, int] = {}
+    for row in rows:
+        doc: JsonValue = None
+        rel = row.get("trajectory")
+        if is_text(rel) and os.path.exists(os.path.join(run_dir, rel)):
+            with open(os.path.join(run_dir, rel), encoding="utf-8") as f:
+                doc = json.load(f)
+        stop = stops.classify(doc, row.get("capped") is True, _num(row.get("wall_s")))
+        # Keep the row's own order, with `stop` beside `capped` as a fresh row writes it.
+        rebuilt: dict[str, JsonValue] = {}
+        for key, value in row.items():
+            if key == "stop":
+                continue
+            rebuilt[key] = value
+            if key == "capped":
+                rebuilt["stop"] = stop
+        if "stop" not in rebuilt:
+            rebuilt["stop"] = stop
+        row.clear()
+        row.update(rebuilt)
+        kind = _text(stop.get("kind"))
+        kinds[kind] = kinds.get(kind, 0) + 1
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    os.replace(tmp, path)
+    return kinds
+
+
+def tokenizer_counter() -> Callable[[str], int] | None:
+    """The served model's tokenizer, when `CHAD_MODEL` names a GGUF that is local and
+    `transformers` is installed; None (chars ÷ 3.6) otherwise. The one place this
+    module reaches past the stdlib, and only on request."""
+    if not os.environ.get("CHAD_MODEL"):
+        return None
+    try:
+        from run import token_counter, tokenizer_dir
+        return token_counter(tokenizer_dir())
+    except Exception:  # noqa: BLE001 — no chad install, no tokenizer: the estimate will do
+        return None
+
+
+def _cell(value: int | float | None, fmt: str = "{}") -> str:
+    return "-" if value is None else fmt.format(value)
+
+
+def autopsy_report(rows: Sequence[Autopsy], ceilings: Sequence[int], unit: str) -> str:
+    """The per-trial table, failures first, then the ceiling summary."""
+    lines = [f"| run | task | rep | result | wall s | step | think tok | decode s | at kill "
+             f"| first fence ({unit}) | first write ({unit}) | drafts | wrote later |",
+             "|" + "---|" * 13]
+    for a in sorted(rows, key=lambda a: (a.passed, -a.think_tokens)):
+        lines.append(f"| {a.run} | {a.task} | {a.rep} | {'pass' if a.passed else 'FAIL'}"
+                     f"{' capped' if a.capped else ''} | {a.wall_s:.0f} | {a.step_id} "
+                     f"| {a.think_tokens} | {_cell(a.gen_s, '{:.0f}')} | {'yes' if a.at_kill else ''} "
+                     f"| {_cell(a.first_fence)} | {_cell(a.first_write)} | {a.drafts} "
+                     f"| {'yes' if a.wrote_later else ''} |")
+    fails = [a for a in rows if not a.passed]
+    passes = [a for a in rows if a.passed]
+    lines += ["", f"{len(fails)} failing trials, {len(passes)} passing; offsets in {unit}",
+              "| ceiling | failing longest thinks cut | passing trials touched "
+              "| passes cut before their first draft |", "|---|---|---|---|"]
+    for n in ceilings:
+        cut = sum(1 for a in fails if a.think_tokens > n)
+        touched = [a for a in passes if a.think_tokens > n]
+        early = sum(1 for a in touched if a.first_fence is None or a.first_fence > n)
+        lines.append(f"| {n} | {cut} of {len(fails)} | {len(touched)} of {len(passes)} "
+                     f"| {early} |")
+    return "\n".join(lines)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("trajectory", help="a trajectory, a directory of them, or --counts rows")
+    ap.add_argument("trajectory", nargs="+",
+                    help="a trajectory, a directory of them, or --counts rows; "
+                         "--autopsy takes any number of run directories")
     ap.add_argument("--step", type=int, default=0, help="print one step in full")
     ap.add_argument("--width", type=int, default=90, help="action column width")
     ap.add_argument("--counts", action="store_true",
                     help="with a directory: one JSON line of tool-call counts per trial")
+    ap.add_argument("--autopsy", action="store_true",
+                    help="with run directories: every trial's longest think, and what a "
+                         "ceiling would have done to it")
+    ap.add_argument("--ceilings", default=",".join(str(n) for n in CEILINGS),
+                    help="candidate CHAD_THINK_CEILING values for the autopsy summary")
+    ap.add_argument("--reclassify", action="store_true",
+                    help="with run directories: rewrite each row's `stop` from its trajectory")
     args = ap.parse_args()
-    if args.trajectory.endswith(".jsonl"):
-        print(profile([], load_counts(args.trajectory)))
+    if args.reclassify:
+        for run_dir in args.trajectory:
+            kinds = reclassify(run_dir)
+            print(f"{run_dir}: " + ", ".join(f"{k} {n}" for k, n in sorted(kinds.items())))
         return 0
-    if os.path.isdir(args.trajectory):
-        run = load_run(args.trajectory)
+    if args.autopsy:
+        count = tokenizer_counter()
+        rows = [a for run_dir in args.trajectory for a in autopsy_run(run_dir, count)]
+        ceilings = [int(n) for n in args.ceilings.split(",") if n.strip()]
+        print(autopsy_report(rows, ceilings, "tokens" if count else "chars/3.6"))
+        return 0
+    if len(args.trajectory) != 1:
+        ap.error("one trajectory, directory or rows file at a time (several only with --autopsy)")
+    target = args.trajectory[0]
+    if target.endswith(".jsonl"):
+        print(profile([], load_counts(target)))
+        return 0
+    if os.path.isdir(target):
+        run = load_run(target)
         if args.counts:
             for path, doc in run:
                 print(json.dumps({"trajectory": path, "calls": tool_counts(doc)}, sort_keys=True))
         else:
             print(profile([doc for _, doc in run], [tool_counts(doc) for _, doc in run]))
         return 0
-    with open(args.trajectory, encoding="utf-8") as f:
+    with open(target, encoding="utf-8") as f:
         trajectory: JsonValue = json.load(f)
     print(full_step(trajectory, args.step) if args.step else table(trajectory, args.width))
     return 0

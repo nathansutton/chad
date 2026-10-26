@@ -295,6 +295,18 @@ def _run_dir(root, message=f"cd {WS} && go test ./...", tail=""):
     return run_dir
 
 
+def test_publish_names_the_weights_without_their_directory():
+    meta = json.dumps({"label": "arm", "served_file": "/home/nate/models/q/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+                       "model": "qwen3.8-27b-local",
+                       "env": {"CHAD_MODEL": "/home/nate/models/q/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+                               "CHAD_CTX_LIMIT": "74547"}})
+    out = json.loads(publish.name_weights(meta))
+    assert out["served_file"] == "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    assert out["env"]["CHAD_MODEL"] == "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    assert out["env"]["CHAD_CTX_LIMIT"] == "74547" and out["model"] == "qwen3.8-27b-local"
+    assert "/home/nate" not in publish.name_weights(meta)
+
+
 def test_publish_rewrites_every_local_path(tmp_path):
     out = tmp_path / "out"
     b = publish.bundle(str(_run_dir(tmp_path)), str(out), ROOTS, with_trajectories=True)

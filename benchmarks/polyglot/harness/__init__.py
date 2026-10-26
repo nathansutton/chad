@@ -41,6 +41,9 @@ class Solved:
     wall_s: float
     capped: bool                 # stopped by the wall cap, not by the agent
     fields: Mapping[str, JsonValue]   # the arm's own row fields, in row order
+    stop_kind: str | None = None      # the arm's own word for what ended the trial when the
+                                      # wall did not (chad's `Agent.stop_kind`, `infra` for
+                                      # an engine failure); None when it ended as intended
 
 
 class Harness(Protocol):

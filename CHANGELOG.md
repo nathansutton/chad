@@ -4,6 +4,19 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**The think ceiling is on by default, at 2048 tokens.** Every wall-cap failure in the
+published polyglot runs was one `<think>` that never closed: 13 of 20 were killed
+mid-think, two more right after a 5–7k-token think. `CHAD_THINK_CEILING` force-closes
+the block past N tokens and keeps decoding the action in the same step, and was off.
+A paired A/B on the 30-task pool (`gv-base` vs `gv-ceil2048`, 3 reps each) put 2048 at
+90/90 against 88/90: the never-pass task flipped up, nothing flipped down, 0.92x the
+wall and 0.87x the generated tokens. The ceiling fired 31 times in 20 trials and every
+salvaged step went straight to a `write`, `edit`, `bash` or todo. `CHAD_THINK_CEILING=0`
+restores the old behaviour. Every `trials.jsonl` row now also says how the trial ended
+(`stop: {kind, step, where}`; engine failures are `infra` rows a resume redoes and
+`stats.py compare` leaves out), and `trace.py --autopsy` reports each trial's longest
+think and what a ceiling would have cut.
+
 **GGUFs of the qwen35 family from other converters load.** The loader required a BOS id
 in the header and quantized GDN gate projections, which held for Unsloth's files but
 not for bartowski's or Ornith's own: Qwen prepends no BOS, so those converters omit the

@@ -805,8 +805,8 @@ class _CappedEngine(ScriptedEngine):
 
 
 def _run_escalation(monkeypatch, *, ablated: bool):
-    # Arm the close-and-continue ceiling so escalation is active at all (it is gated on the
-    # ceiling being set, so default chad is unaffected).
+    # Pin the close-and-continue ceiling (escalation is gated on it being set; it is on by
+    # default at 2048, pinned here so the test does not move with the default).
     monkeypatch.setenv("CHAD_THINK_CEILING", "3000")
     if ablated:
         monkeypatch.setenv("CHAD_DISABLE", "no_think_escalation")
@@ -1389,3 +1389,15 @@ def test_plan_write_may_replace_the_plan_this_session_wrote(tmp_path, monkeypatc
     ])
     agent.run_turn("plan it")
     assert (tmp_path / "plans" / "002-new.md").read_text() == "second\n"
+
+
+def test_think_ceiling_default_is_2048_and_zero_turns_it_off(monkeypatch):
+    """The ceiling is on by default (spikes/gvs5h: every published wall-cap failure was one
+    think that never closed; the paired A/B at 2048 had no flips down and 0.92x wall) and
+    CHAD_THINK_CEILING=0 is the documented way back to the bare loop."""
+    monkeypatch.delenv("CHAD_THINK_CEILING", raising=False)
+    assert Agent(ScriptedEngine(["done"]), mode="yolo", thinking=True).think_ceiling == 2048
+    monkeypatch.setenv("CHAD_THINK_CEILING", "0")
+    assert Agent(ScriptedEngine(["done"]), mode="yolo", thinking=True).think_ceiling == 0
+    monkeypatch.setenv("CHAD_THINK_CEILING", "4096")
+    assert Agent(ScriptedEngine(["done"]), mode="yolo", thinking=True).think_ceiling == 4096
