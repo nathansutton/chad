@@ -12,6 +12,8 @@ The task lists runs here cite, each committed before any arm ran on it:
   6 tasks per language, `stats.py subset --per-language 6 --seed harness-1`.
 - `subsets/harness-3.txt`, sha256 `b848c8f293d8cf400fea62ee069a701e77dd1629d3cce97fee5246975c222011`:
   3 of those 36 in 3 languages, `stats.py subset --spread 3 --seed harness-3 --from subsets/harness-36.txt`.
+- `subsets/harness-30-linux.txt`, sha256 `aa9c4550136db0fc393a42b94e80d2df153313f85a6b47073d35de854f0522d2`:
+  the 30 of the 36 a Linux box can verify (no Swift), the SelfSearch v2 and spike pool.
 
 | label | date | chad | harness | model | tasks × reps | dataset path | trials.jsonl sha256 |
 |---|---|---|---|---|---|---|---|
@@ -30,3 +32,5 @@ The task lists runs here cite, each committed before any arm ran on it:
 | h36-mini | 2026-10-02 | 2.3.0 (9315d60) | mini | qwen3.8-27b-local | 36 × 3 | hf://datasets/nathansutton/chad-polyglot-runs/polyglot/h36-mini | ef53a9c4100c8e49c1a0c91c56e41a684e54daf661eb8c590f9289734fd2df26 |
 | h36-crush | 2026-10-02 | 2.3.0 (9315d60) | crush | qwen3.8-27b-local | 36 × 3 | hf://datasets/nathansutton/chad-polyglot-runs/polyglot/h36-crush | e1b91819ce5639909b322986973aa451f1807cae3ee05b62c4d1968a4d95a129 |
 | h36-chad-mlx | 2026-10-02 | 2.3.0 (9315d60) | chad | unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf | 36 × 3 | hf://datasets/nathansutton/chad-polyglot-runs/polyglot/h36-chad-mlx | c2c41deddd65b4fc150385cab87d28b3488e615954e2a210964f3c5a0643beb2 |
+| gv-base | 2026-10-25 | 2.4.0 (7d985fe) | chad | qwen3.8-27b-local | 30 × 3 | hf://datasets/nathansutton/chad-polyglot-runs/polyglot/gv-base | f0f0f86f2b4823aedf7da0cde8a18238b473db4e98f2f006782276fb27333fd3 |
+| gv-ceil2048 | 2026-10-25 | 2.4.0 (7d985fe) | chad | qwen3.8-27b-local | 30 × 3 | hf://datasets/nathansutton/chad-polyglot-runs/polyglot/gv-ceil2048 | e42a0b320d8458f9d29f1c34f5a09c1b30805cf1e432f2dc4cee287ab361a1be |

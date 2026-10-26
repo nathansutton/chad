@@ -568,12 +568,13 @@ class Agent:
         self.think_budget = think_budget
         # Close-and-continue think ceiling: force-closes a runaway <think> and
         # CONTINUES decoding the action in the same step, so the reasoning so far
-        # stays in context and nothing is re-derived. OFF by default: force-closing
-        # </think> mid-generation is the most invasive thing the harness can do to
-        # the token stream, and the measured record says the bare loop doesn't need
-        # it. CHAD_THINK_CEILING=N arms it.
+        # stays in context and nothing is re-derived. Default 2048: every published
+        # wall-cap failure was one think that never closed, and the paired A/B on the
+        # 30-task pool (spikes/gvs5h) put a 2048 ceiling at 0 flips down, the never-pass
+        # task up, 0.92x wall. Every salvaged step there went straight to an action.
+        # CHAD_THINK_CEILING=0 turns it off.
         if think_ceiling is None:
-            think_ceiling = config.env_int("CHAD_THINK_CEILING", 0)
+            think_ceiling = config.env_int("CHAD_THINK_CEILING", 2048)
         self.think_ceiling = think_ceiling
         # Template-level reasoning budget (Qwen3.8: xhigh | medium | low). Unset =>
         # the template's own default, and the argument is not passed at all, so
@@ -1382,8 +1383,9 @@ class Agent:
                     self._emit("prefill", f"{done}/{total}")
 
             # Close-and-continue ceiling: armed only when CHAD_THINK_CEILING is
-            # set AND this step is actually thinking (a no-think escalation step has no
-            # <think> to salvage). None => the engine path is byte-identical to before.
+            # non-zero AND this step is actually thinking (a no-think escalation step
+            # has no <think> to salvage). None => the engine path is byte-identical to
+            # a run with the ceiling off.
             step_ceiling = self.think_ceiling if (self.think_ceiling and step_thinking) else None
             text, stats = self.engine.generate(
                 prompt_ids, max_tokens=self.max_gen_tokens, on_token=on_token,

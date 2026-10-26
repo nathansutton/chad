@@ -13,7 +13,7 @@ broken" from "the model struggled with my task" in about a minute.
 
 | You see | What's happening | Reach for |
 |---|---|---|
-| Long `<think>` before every action | reasoning is on by default and is ~65% of what the model generates | `--no-think` for well-scoped work. To trim only the rambles, `CHAD_THINK_CEILING=384` force-closes a runaway block and keeps going in the same step; `--think-budget 1500` is the blunter version that ends the step ([turn budgets](configuration.md#turn-budgets--think-cap)) |
+| Long `<think>` before every action | reasoning is on by default and is ~65% of what the model generates | `--no-think` for well-scoped work. A block past 2048 tokens is already force-closed and the step continues (`CHAD_THINK_CEILING`, lower it to trim more); `--think-budget 1500` is the blunter version that ends the step ([turn budgets](configuration.md#turn-budgets--think-cap)) |
 | A turn burns minutes without landing an edit | runaway turn | the governor ends it once its token budget is spent; before that, ctrl-c and re-scope the ask smaller |
 | The same `sed -n` / `rg` over and over | the loop guard will abort the turn; the ask is probably too vague | a smaller, concrete task; name the file |
 | First turn in a **new** project takes over a minute | the system+tools prefix is built once per distinct prompt, then cached on disk | expected once; the banner's `[warm start: …]` line says which turn you are having ([benchmarks](benchmarks.md#the-second-session-in-a-project-starts-warm)) |
