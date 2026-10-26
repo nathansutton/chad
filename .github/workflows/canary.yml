@@ -18,7 +18,7 @@ jobs:
   cold-install:
     runs-on: macos-14
     steps:
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         # NO actions/checkout and NO uv cache: the point is to reproduce what a new
         # user gets — a cold resolve of the git ref straight from GitHub + PyPI.
       - name: README one-liner resolves and the entrypoint parses (git main)
