@@ -4,6 +4,12 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+## [2.5.0] — 2026-10-30
+
+The model is unchanged: no re-download.
+
+<!-- RELEASE-EVAL: rel-240 vs rel-250 paired line goes here when both arms finish -->
+
 **The think ceiling is on by default, at 2048 tokens.** Every wall-cap failure in the
 published polyglot runs was one `<think>` that never closed: 13 of 20 were killed
 mid-think, two more right after a 5–7k-token think. `CHAD_THINK_CEILING` force-closes
@@ -43,6 +49,25 @@ which are no longer policed; JSON files that are JSONC by convention (`tsconfig.
 `.vscode/`) are left alone; a byte-order mark no longer fails the Python check; and the
 Python warning names the interpreter it ran under, since chad's may be older than the
 project's.
+
+**A slip in how a tool call is filled in no longer costs a step.** Every such slip used to
+be answered with a rejection, and the model regenerated the whole call: once, a 990-token
+Java file re-emitted because the first attempt had no `path`. Now an `edit` with no `path`
+is applied to the one file this turn read or changed that contains `old` (never for
+`write`, never to a file the turn did not touch). A hallucinated name like `write_file` or
+`str_replace_editor` runs the tool it meant, and a built-in called with another built-in's
+parameters runs that tool. The result says so in its first line. A key that is not a
+parameter is named in the rejection. Two silent faults in the XML call dialect are gone:
+a literal `</parameter>` inside a write's content truncated the file, and a space after
+`<parameter=` dropped the parameter. Each new behaviour is a lever (`tool_name_alias`,
+`edit_path_inferred`), and a correct call's result is byte-identical. On 30 tasks × 3
+the block went 86/90 → 87/90 with zero rejections of these kinds.
+
+**`CHAD_BASH_MAX_CHARS` sets the per-result cap on bash output** before the head/tail
+clip (default 20,000, floor 2,000; the full body still spills to disk). At the default
+nothing changes. A 6,000 cap was measured on the 11 tasks whose output crossed it: no
+pass moved, and it cost 1.47x the wall clock in re-fetch and re-run turns, so the default
+stays where it was.
 
 ## [2.4.0] — 2026-10-04
 
