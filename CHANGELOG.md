@@ -4,11 +4,15 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
-## [2.5.0] — 2026-10-30
+## [2.5.0] — 2026-10-31
 
 The model is unchanged: no re-download.
 
-<!-- RELEASE-EVAL: rel-240 vs rel-250 paired line goes here when both arms finish -->
+Against 2.4.0 on the 30-task Linux pool (3 reps each, same server and model), 2.5.0 passed
+89/90 to 88/90: one task up, none down. Both of 2.4.0's failures were a think that ran
+into the wall; 2.5.0 had none, and its one failure fell during a tool call. Wall clock was
+1.07x, all but 2% of it one task (`javascript/complex-numbers`) whose occasional long
+rep shows up in every arm.
 
 **The think ceiling is on by default, at 2048 tokens.** Every wall-cap failure in the
 published polyglot runs was one `<think>` that never closed: 13 of 20 were killed
