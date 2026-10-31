@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   cold-install:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
         # NO actions/checkout and NO uv cache: the point is to reproduce what a new
