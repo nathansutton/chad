@@ -34,3 +34,4 @@ The task lists runs here cite, each committed before any arm ran on it:
 | h36-chad-mlx | 2026-10-02 | 2.3.0 (9315d60) | chad | unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf | 36 × 3 | hf://datasets/nathansutton/chad-polyglot-runs/polyglot/h36-chad-mlx | c2c41deddd65b4fc150385cab87d28b3488e615954e2a210964f3c5a0643beb2 |
 | gv-base | 2026-10-25 | 2.4.0 (7d985fe) | chad | qwen3.8-27b-local | 30 × 3 | hf://datasets/nathansutton/chad-polyglot-runs/polyglot/gv-base | f0f0f86f2b4823aedf7da0cde8a18238b473db4e98f2f006782276fb27333fd3 |
 | gv-ceil2048 | 2026-10-25 | 2.4.0 (7d985fe) | chad | qwen3.8-27b-local | 30 × 3 | hf://datasets/nathansutton/chad-polyglot-runs/polyglot/gv-ceil2048 | e42a0b320d8458f9d29f1c34f5a09c1b30805cf1e432f2dc4cee287ab361a1be |
+| rel-240 | 2026-10-30 | 2.4.0 (0e4fc7b+dirty) | chad | qwen3.8-27b-local | 30 × 3 | hf://datasets/nathansutton/chad-polyglot-runs/polyglot/rel-240 | d2f9b4c7107490780c4771610ea3a937d43200b43f6c4eff2ada316b839846a1 |
