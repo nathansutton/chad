@@ -20,10 +20,10 @@ permissions:
 
 jobs:
   audit:
-    # pip-audit against the resolved environment. macos-14 because the deps include
+    # pip-audit against the resolved environment. macos-15 because the deps include
     # MLX (arm64); we audit the live synced env rather than re-resolving in a fresh
     # venv, which is both faster and avoids ensurepip flakiness.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2

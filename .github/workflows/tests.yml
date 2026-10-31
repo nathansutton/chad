@@ -1,7 +1,7 @@
 name: tests
 
 # Apple Silicon only: MLX builds/runs on arm64 macOS, so every job that imports
-# chad runs on macos-14 (GitHub's arm64 runner). Lint, typecheck and test each run the
+# chad runs on macos-15 (GitHub's arm64 runner). Lint, typecheck and test each run the
 # Makefile target of the same name, so CI checks exactly what the docs tell contributors
 # to run. The fast unit gate loads NO model and finishes in seconds; the tier-2
 # proxy-model tests are opt-in and not run here — run
@@ -24,7 +24,7 @@ permissions:
 jobs:
   lint:
     # ruff is platform-independent, so it runs on the cheap Linux runner like the `lock`
-    # job, not the ~10×-pricier macos-14. mypy does NOT run here: see `typecheck`.
+    # job, not the ~10×-pricier macos-15. mypy does NOT run here: see `typecheck`.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -43,7 +43,7 @@ jobs:
     # over exactly the engine and kernel modules it should guard — while the same command
     # failed on a Mac. Type-check the environment users actually run. One interpreter is
     # enough: the config pins python 3.11.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
@@ -57,7 +57,7 @@ jobs:
         run: make typecheck
 
   test:
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
@@ -87,7 +87,7 @@ jobs:
     # from PyPI and IGNORES uv.lock. A dep bump that breaks a clean resolve would pass
     # the locked test job but break every new user, so we build the dist and install
     # it into a lock-free venv, then confirm the console script resolves.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
